@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REMRUN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export REMRUN_ROOT
+export PYTHONPATH="$REMRUN_ROOT/src:${PYTHONPATH:-}"
+# Prefer python3 (macOS has no bare `python`); fall back to python.
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "remrun: no python3/python found on PATH" >&2
+  exit 1
+fi
+exec "$PY" -m remrun.cli "$@"

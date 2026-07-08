@@ -1,0 +1,111 @@
+# Copy this file to config/devices.toml and replace every path/name/command with
+# values for your own fleet. This file is intentionally schematic: remrun's core
+# does not ship device names, worker names, model names, or workflow paths.
+
+[project_roots]
+macos = "~/projects"
+windows = 'C:\Users\you\projects'
+default = "~/projects"
+
+# Optional named output trees for `remrun sync <tree>/<subpath> <device>`.
+[sync_roots.outputs]
+macos = "~/remrun-outputs"
+windows = 'C:\Users\you\remrun-outputs'
+default = "~/remrun-outputs"
+
+[offload]
+default = "ask"
+
+# Leave [scheduler].primary/fallback unset in most deployments; remrun derives
+# order from enabled devices in the order they appear below.
+# [scheduler]
+# primary = "macbox"
+# fallback = ["winbox"]
+
+[devices.local]
+enabled = true
+kind = "local-sim"
+os = "default"
+project_root = ""
+state_root = ""
+cache_root = ""
+max_jobs = 1
+
+[devices.macbox]
+enabled = false
+kind = "ssh-posix"
+os = "macos"
+address_candidates = ["macbox.local"]
+project_root = "~/projects"
+state_root = "~/.local/state/remrun"
+cache_root = "~/.cache/remrun"
+remote_python = "python3"
+perf_cores = 8
+eff_cores = 4
+ram_gb = 32
+vram_gb = 0
+
+# Best-effort cancel configuration for POSIX targets. Empty/missing lists are no-ops.
+[devices.macbox.cancel]
+process_patterns = ["your-worker-process-regex"]
+lock_paths = ["/tmp/your-worker.lock"]
+
+[devices.winbox]
+enabled = false
+kind = "ssh-powershell"
+os = "windows"
+address_candidates = ["winbox.local"]
+project_root = 'C:\Users\you\projects'
+state_root = 'C:\Users\you\AppData\Local\remrun'
+cache_root = 'C:\Users\you\AppData\Local\remrun\cache'
+remote_python = "python"
+shell = "powershell"
+login_shell = false
+perf_cores = 8
+eff_cores = 8
+ram_gb = 64
+vram_gb = 12
+
+# Best-effort cancel configuration for Windows targets. Native process_patterns
+# are matched against CommandLine via PowerShell regex. WSL lists are optional.
+[devices.winbox.cancel]
+process_patterns = ["your-worker-process-regex"]
+lock_paths = ['C:\Users\you\AppData\Local\remrun\your-worker.lock']
+wsl_process_patterns = ["your-wsl-worker-regex"]
+wsl_lock_paths = ["/tmp/your-worker.lock"]
+
+[fleet]
+# Optional task-variant hooks. Each command runs on the controller; the last stdout
+# line becomes the variant part of the learned cost key. With no hook/default,
+# remrun does not infer workflow-specific variants.
+# [fleet.classify]
+# ocr = "python ./choose_ocr_variant.py {input}"
+# tts = "python ./choose_tts_variant.py {input}"
+
+[fleet.default_variants]
+# ocr = "vision"
+# tts = "plain"
+
+[fleet.pools]
+gpu = 1
+
+# Fleet adapters live here, not in core. Device table names must match [devices.*].
+[fleet.adapters.tts.macbox]
+engine = "example-tts-mac"
+output_root = "~/remrun-outputs/tts"
+output_in_cmd = false
+pool = "gpu"
+memory_kind = "gpu"
+capability = ["~/bin/example-tts-worker"]
+cmd = ["~/bin/example-tts-worker", "{stage}"]
+
+[fleet.adapters.ocr.winbox]
+engine = "example-ocr-remote"
+output_root = 'C:\Users\you\remrun-outputs\ocr'
+output_in_cmd = true
+pool = "gpu"
+memory_kind = "gpu"
+capability = ['C:\Users\you\bin\example-ocr-worker.ps1']
+cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+       'C:\Users\you\bin\example-ocr-worker.ps1', "-InputDir", "{stage}",
+       "-OutputRoot", "{output_root}"]

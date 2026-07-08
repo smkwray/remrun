@@ -1,0 +1,23 @@
+# Optional shared measured cost profiles. Copy to config/fleet_costs.toml if you
+# want a checked-in baseline for a public/team deployment, or leave absent and
+# remrun will use generic priors until it learns local EWMA costs.
+#
+# Key format: "task_type|engine|device|variant" where engine/device/variant are
+# the names from your devices.toml adapters and classifiers. Values are examples,
+# not tuned for any real deployment.
+
+[costs."tts|example-tts-mac|macbox|default"]
+fixed_load_s = 20.0
+var_per_unit_s = 5.0
+peak_rss_mb = 1024.0
+peak_vram_mb = 2048.0
+n = 1
+updated = "example"
+
+[costs."ocr|example-ocr-remote|winbox|vision"]
+fixed_load_s = 30.0
+var_per_unit_s = 3.0
+peak_rss_mb = 2048.0
+peak_vram_mb = 4096.0
+n = 1
+updated = "example"

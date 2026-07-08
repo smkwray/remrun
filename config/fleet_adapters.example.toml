@@ -1,0 +1,60 @@
+# ============================================================================================
+# fleet adapters — EXAMPLE / TEMPLATE (copy the [fleet.adapters.*] tables into your devices.toml)
+# ============================================================================================
+# remrun's published core ships NO adapters: the (task, device) -> engine / worker-command /
+# output-root mapping is entirely YOUR deployment config, so nothing workflow-specific lives in
+# the code. Define one table per (task_type, device-name) you want the fleet to route to.
+#
+# Placeholders the fleet substitutes into `cmd` at run time:
+#   {stage}        — the directory the inputs were staged into on the remote
+#   {output_root}  — the resolved output root (this adapter's `output_root`, or a per-job override)
+#   {opt:<name>}   — task option <name> (e.g. {opt:voice}, {opt:profile})
+#
+# Spec fields:
+#   engine        (str)  cost-profile + capability label, e.g. "tts-gpu"; any string you choose
+#   output_root   (str)  where the worker writes outputs (recorded in remrun's manifest)
+#   output_in_cmd (bool) true if the worker takes the output root as an argument (use {output_root})
+#   pool          (str)  resource pool for the exclusive GPU lease; for example "gpu"
+#   memory_kind   (str)  "gpu" (footprint = VRAM on a discrete GPU, unified RAM on a Mac) | "cpu"
+#   capability   ([str]) paths that must exist on the device for this engine to be usable
+#   cmd          ([str]) the worker command token list (the FIRST element is the executable)
+#
+# Device names ("WINBOX"/"MACBOX" below) must match your [devices.*] table names.
+
+[fleet.adapters.tts.WINBOX]
+engine = "tts-gpu-win"
+output_root = 'C:\path\to\tts-output'
+output_in_cmd = false
+pool = "gpu"
+memory_kind = "gpu"
+capability = ['C:\path\to\your-tts-worker.ps1']
+cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+       "-File", 'C:\path\to\your-tts-worker.ps1', "-InputDir", "{stage}"]
+
+[fleet.adapters.tts.MACBOX]
+engine = "tts-gpu-mac"
+output_root = "~/path/to/tts-output"
+output_in_cmd = false
+pool = "gpu"
+memory_kind = "gpu"
+capability = ["~/path/to/your-tts-worker.sh"]
+cmd = ["~/path/to/your-tts-worker.sh", "{stage}"]
+
+[fleet.adapters.ocr.WINBOX]
+engine = "ocr-gpu-win"
+output_root = 'C:\path\to\ocr-output'
+output_in_cmd = true
+pool = "gpu"
+memory_kind = "gpu"
+capability = ['C:\path\to\your-ocr-worker.ps1']
+cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+       "-File", 'C:\path\to\your-ocr-worker.ps1', "-InputDir", "{stage}", "-OutputRoot", "{output_root}"]
+
+[fleet.adapters.ocr.MACBOX]
+engine = "ocr-gpu-mac"
+output_root = "~/path/to/ocr-output"
+output_in_cmd = true
+pool = "gpu"
+memory_kind = "gpu"
+capability = ["~/path/to/your-ocr-worker.sh"]
+cmd = ["~/path/to/your-ocr-worker.sh", "{stage}", "{output_root}"]

@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "run_id": "20260628T120000Z-macbox-paper1-a1b2c3",
+  "project_id": "paper1",
+  "project_root": "~/projects/paper1",
+  "relative_cwd": "analysis",
+  "command": ["Rscript", "do/tmp/test.R"],
+  "env": {},
+  "capture": true,
+  "telemetry": {
+    "enabled": true,
+    "sample_interval_sec": 2
+  }
+}

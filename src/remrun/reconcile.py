@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+import shutil
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+
+from .config import case_insensitive, casefold_collisions, current_os_key, device_os_key
+from .manifest import FileEntry, Manifest, build_manifest, sha256_file, should_exclude
+from .transfer_plan import (
+    ABORT_CONFLICT,
+    DELETE_LOCAL,
+    DELETE_REMOTE,
+    PULL,
+    PUSH,
+    ClassifiedPath,
+    _changed_since,
+    compare_manifests,
+    diff_remote_changes,
+    entries_same,
+)
+from .transport import BaseTransport, TransportError
+
+
+@dataclass
+class ReconcileResult:
+    pulled: list[str] = field(default_factory=list)
+    pushed: list[str] = field(default_factory=list)
+    deleted_local: list[str] = field(default_factory=list)
+    deleted_remote: list[str] = field(default_factory=list)
+    conflicts: list[ClassifiedPath] = field(default_factory=list)
+    # Converged manifests after reconcile == pre-run baselines.
+    local_manifest: Manifest = field(default_factory=dict)
+    remote_manifest: Manifest = field(default_factory=dict)
+
+    @property
+    def has_conflicts(self) -> bool:
+        return bool(self.conflicts)
+
+
+@dataclass
+class PullbackResult:
+    pulled: list[str] = field(default_factory=list)
+    deleted_local: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    skipped_identical: list[str] = field(default_factory=list)   # local already == remote (Syncthing delivered)
+    post_remote_manifest: Manifest = field(default_factory=dict)
+    local_manifest_after: Manifest = field(default_factory=dict)
+
+
+def _fresh_local_entry(path: Path, *, hash_if_size: int | None) -> FileEntry | None:
+    """Re-stat ONE local file RIGHT NOW (not from a pre-built manifest) so the pull decision uses
+    live content — Syncthing may have delivered the same bytes since the loop's manifest was built.
+    Hashes the file only when its size matches the remote candidate (a size mismatch already proves
+    they differ, so hashing would be wasted)."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        st = path.stat()
+    except OSError:
+        return None
+    digest = sha256_file(path) if (hash_if_size is not None and st.st_size == hash_if_size) else None
+    return FileEntry(path=path.name, kind="file", size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=digest)
+
+
+def _remote_root_present(transport: BaseTransport, remote_root: str) -> bool:
+    """Best-effort 'does the remote root exist?' for the vanished-root guard.
+
+    Any uncertainty (backend without the probe, transient error) is treated as
+    'not present' so the guard errs toward aborting rather than mass-deleting.
+    """
+    try:
+        return bool(transport.remote_path_exists(remote_root))
+    except (TransportError, NotImplementedError, OSError):
+        return False
+
+
+def _backup_local(local_root: Path, rel: str, backup_root: Path, max_bytes: int = 0) -> bool:
+    """Snapshot a local file aside before it's overwritten/deleted. Returns whether a
+    copy was made. Skips a file larger than ``max_bytes`` (when >0) to bound state
+    growth — large files are regenerable/re-syncable, and snapshotting them on every
+    run is the main growth risk; the size budget in prune_state is the hard backstop."""
+    src = local_root / rel
+    if not src.exists():
+        return False
+    if max_bytes and src.stat().st_size > max_bytes:
+        return False
+    dest = backup_root / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    return True
+
+
+def _matches_any_scope_path(rel: str, patterns: list[str] | tuple[str, ...]) -> bool:
+    return any(should_exclude(rel, [pattern]) for pattern in patterns)
+
+
+def preflight_reconcile(
+    *,
+    transport: BaseTransport,
+    local_root: Path,
+    remote_root: str,
+    excludes: list[str],
+    hash_below_bytes: int,
+    prev_local: Manifest | None,
+    prev_remote: Manifest | None,
+    backup_root: Path,
+    backup_below_bytes: int = 0,
+) -> ReconcileResult:
+    """Reconcile the active run surface before running the command (Mode 1/safe).
+
+    Conflicts abort *before* any mutation. Otherwise pulls remote-newer/-only,
+    pushes local-newer/-only, and applies only known-safe deletes (backing up
+    local files before deleting them). Returns converged manifests to serve as
+    pre-run baselines.
+    """
+    result = ReconcileResult()
+
+    local_manifest = build_manifest(local_root, excludes, hash_below_bytes=hash_below_bytes or None)
+    remote_manifest = transport.manifest(remote_root, excludes, hash_below_bytes)
+
+    # Vanished-root guard. If a side comes back *entirely empty* while its previous
+    # baseline had files, that is either a legitimate "user deleted everything" or a
+    # missing/unreachable root (remote project_root wrong/unmounted; local wrong cwd).
+    # The two are indistinguishable by emptiness alone — only root existence tells
+    # them apart — so we probe it *only* in this rare case (no extra round-trip on the
+    # normal path). If the root is gone, refuse: otherwise compare_manifests would
+    # classify every still-present file on the other side as a known deletion and
+    # mirror it, gutting a real tree. (An existing-but-empty root is treated as a
+    # genuine wipe and allowed, so a one-file project deleting its last file still
+    # works.) Let the caller abort (exit 2).
+    have_prev = prev_local is not None and prev_remote is not None
+    if have_prev:
+        vanished = None
+        if prev_remote and not remote_manifest and not _remote_root_present(transport, remote_root):
+            vanished = ("remote", "remote root missing/unreachable but the prior baseline "
+                        "had files — refusing to mirror wholesale deletions")
+        elif prev_local and not local_manifest and not local_root.exists():
+            vanished = ("local", "local project root missing but the prior baseline had "
+                        "files (wrong cwd?) — refusing to mirror wholesale deletions")
+        if vanished:
+            side, reason = vanished
+            result.conflicts = [ClassifiedPath(f"<{side} root>", f"{side}-vanished",
+                                               ABORT_CONFLICT, reason)]
+            result.local_manifest = local_manifest
+            result.remote_manifest = remote_manifest
+            return result
+
+    plan = compare_manifests(local_manifest, remote_manifest, prev_local, prev_remote)
+
+    if plan.has_conflicts:
+        # Do not mutate either side; report and let the caller abort (exit 2).
+        result.conflicts = plan.conflicts()
+        result.local_manifest = local_manifest
+        result.remote_manifest = remote_manifest
+        return result
+
+    # Case-fold collision guard (APFS/NTFS): two distinct paths that fold to the same name collapse
+    # into one file on a case-insensitive TARGET (silent data loss). Abort before any mutation.
+    collisions: dict[str, list[str]] = {}
+    pulls = [p.path for p in plan.paths if p.action == PULL]
+    pushes = [p.path for p in plan.paths if p.action == PUSH]
+    if case_insensitive(current_os_key()):                     # local is the pull target
+        collisions.update(casefold_collisions(list(local_manifest) + pulls))
+    if case_insensitive(device_os_key(transport.device)):      # remote is the push target
+        collisions.update(casefold_collisions(list(remote_manifest) + pushes))
+    if collisions:
+        result.conflicts = [
+            ClassifiedPath(" | ".join(paths), "casefold-collision", ABORT_CONFLICT,
+                           "would collapse on a case-insensitive target: " + ", ".join(paths))
+            for paths in collisions.values()]
+        result.local_manifest = local_manifest
+        result.remote_manifest = remote_manifest
+        return result
+
+    transport.ensure_remote_dir(remote_root)
+
+    for item in plan.paths:
+        remote_path = transport.remote_join(remote_root, item.path)
+        local_path = local_root / item.path
+        if item.action == PULL:
+            # Snapshot the prior local version before overwriting it, so a wrong pull
+            # is recoverable (no-op when the file is new or over the backup size cap).
+            _backup_local(local_root, item.path, backup_root, backup_below_bytes)
+            transport.pull_file(remote_path, local_path)
+            result.pulled.append(item.path)
+        elif item.action == PUSH:
+            transport.push_file(local_path, remote_path)
+            result.pushed.append(item.path)
+        elif item.action == DELETE_REMOTE:
+            transport.delete_remote(remote_path)
+            result.deleted_remote.append(item.path)
+        elif item.action == DELETE_LOCAL:
+            _backup_local(local_root, item.path, backup_root, backup_below_bytes)
+            local_path.unlink(missing_ok=True)
+            result.deleted_local.append(item.path)
+        # NONE: nothing to do.
+
+    # Rebuild converged manifests to use as pre-run baselines.
+    result.local_manifest = build_manifest(
+        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+    )
+    result.remote_manifest = transport.manifest(remote_root, excludes, hash_below_bytes)
+    return result
+
+
+def postrun_pullback(
+    *,
+    transport: BaseTransport,
+    local_root: Path,
+    remote_root: str,
+    excludes: list[str],
+    hash_below_bytes: int,
+    pre_remote_manifest: Manifest,
+    pre_local_manifest: Manifest,
+    backup_root: Path,
+    conflict_remote_root: Path,
+    backup_below_bytes: int = 0,
+    write_scope_paths: list[str] | tuple[str, ...] | None = None,
+) -> PullbackResult:
+    """Pull command-caused remote changes back to local project paths.
+
+    A path is only overwritten locally if the local copy did not independently
+    change during the run; otherwise the remote version is saved outside the
+    project tree and the path is flagged as a conflict. Command-caused remote
+    deletions are mirrored locally (with backup) only when the local copy is
+    unchanged.
+    """
+    result = PullbackResult()
+
+    post_remote = transport.manifest(remote_root, excludes, hash_below_bytes)
+    changed, deleted = diff_remote_changes(pre_remote_manifest, post_remote)
+    cur_local = build_manifest(local_root, excludes, hash_below_bytes=hash_below_bytes or None)
+
+    if write_scope_paths:
+        escaped = [
+            rel for rel in [*changed, *deleted]
+            if not _matches_any_scope_path(rel, write_scope_paths)
+        ]
+        if escaped:
+            for rel in escaped:
+                if rel in post_remote:
+                    dest = conflict_remote_root / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    transport.pull_file(transport.remote_join(remote_root, rel), dest)
+            result.conflicts.extend(escaped)
+            result.post_remote_manifest = post_remote
+            result.local_manifest_after = cur_local
+            return result
+
+    # Case-fold collision guard for the local pull target (APFS/NTFS): an incoming output whose name
+    # folds onto an existing/other local path would collapse into one file — flag it, don't collapse.
+    collide: set[str] = set()
+    if case_insensitive(current_os_key()):
+        groups = casefold_collisions(list(cur_local) + list(changed))
+        collide = {p for ps in groups.values() for p in ps if p in set(changed)}
+
+    for rel in changed:
+        if rel in collide:
+            result.conflicts.append(rel)   # would collapse on a case-insensitive local FS — skip
+            continue
+        remote_entry = post_remote.get(rel)
+        remote_path = transport.remote_join(remote_root, rel)
+        local_path = local_root / rel
+
+        # Strong remote hash for the candidate: the manifest caps hashing at hash_below_bytes, so
+        # a >64 MB output has sha256=None. Hash it now so the idempotent skip below is content-based
+        # for large outputs too (a best-effort failure just falls back to size/mtime).
+        if remote_entry is not None and remote_entry.sha256 is None:
+            try:
+                remote_entry = replace(remote_entry, sha256=transport.hash_file(remote_path))
+            except TransportError:
+                pass
+
+        # Re-check the local file RIGHT BEFORE writing (not the stale cur_local): Syncthing may have
+        # delivered the identical bytes during/after the run. If local already == the remote output,
+        # SKIP the pull — that avoids an unnecessary overwrite that races Syncthing's own delivery
+        # (the temp-orphan / sync-conflict source). Idempotent external-writer behavior.
+        local_now = _fresh_local_entry(
+            local_path, hash_if_size=(remote_entry.size if remote_entry is not None else None))
+        if remote_entry is not None and entries_same(local_now, remote_entry):
+            result.skipped_identical.append(rel)
+            continue
+
+        local_changed_during_run = _changed_since(pre_local_manifest.get(rel), local_now)
+        if local_changed_during_run:
+            # Local edited during the run and differs from the remote output -> preserve both.
+            dest = conflict_remote_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            transport.pull_file(remote_path, dest)
+            result.conflicts.append(rel)
+            continue
+
+        _backup_local(local_root, rel, backup_root, backup_below_bytes)  # rollback snapshot
+        transport.pull_file(remote_path, local_path)
+        # Verify the pull landed the expected bytes (cheap integrity guard when we know the hash).
+        if remote_entry is not None and remote_entry.sha256 is not None:
+            verify = _fresh_local_entry(local_path, hash_if_size=remote_entry.size)
+            if verify is None or not entries_same(verify, remote_entry):
+                raise TransportError(f"pull verification failed for {rel}")
+        result.pulled.append(rel)
+
+    for rel in deleted:
+        local_path = local_root / rel
+        if not local_path.exists():
+            continue
+        local_changed_during_run = _changed_since(
+            pre_local_manifest.get(rel), cur_local.get(rel)
+        )
+        if local_changed_during_run:
+            # Remote deleted it but local changed it during the run -> keep local.
+            result.conflicts.append(rel)
+            continue
+        _backup_local(local_root, rel, backup_root, backup_below_bytes)
+        local_path.unlink(missing_ok=True)
+        result.deleted_local.append(rel)
+
+    result.post_remote_manifest = post_remote
+    result.local_manifest_after = build_manifest(
+        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+    )
+    return result
+
+
+# Re-exported so callers can catch transfer failures distinctly.
+__all__ = [
+    "ReconcileResult",
+    "PullbackResult",
+    "preflight_reconcile",
+    "postrun_pullback",
+    "TransportError",
+]

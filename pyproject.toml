@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remrun"
+version = "0.0.1"
+description = "Transparent remote execution for synced project trees"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Remrun contributors"}]
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+metrics = ["psutil>=5.9"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+remrun = "remrun.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

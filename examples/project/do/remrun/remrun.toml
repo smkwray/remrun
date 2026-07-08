@@ -1,0 +1,55 @@
+# Optional per-project remrun hints. This file is intentionally small.
+# A project without this file should still work.
+
+[placement]
+primary = "macbox"
+fallback = ["winbox"]
+
+[git_sync]
+# Optional peers for `remrun git-sync --install-hook`. The post-commit hook pushes
+# committed history to these devices in the background; `.git/` is never synced as files.
+peers = ["macbox", "winbox"]
+
+[[placement.rules]]
+match_command = "stata|\\.do$"
+prefer = "winbox"
+
+[[placement.rules]]
+match_command = "bootstrap|simulation|monte|mc_"
+prefer = "macbox"
+min_memory_gb = 64
+
+[transfer]
+exclude = [
+  "scratch/**",
+  "tmp/**",
+  "results/cache/**",
+  "data/cache/**",
+  "logs/huge/**"
+]
+
+[parallel.scopes.spec_a]
+# `remrun run --scope spec_a --auto -- <cmd>` validates that writes stay inside
+# these paths; project writers still serialize.
+paths = ["results/spec_a/**", "logs/spec_a/**"]
+
+[run]
+# Use this project's Python virtualenv. By default use_venv activates a
+# project-local .venv on each device (<project>/.venv), puts its bin/ (Scripts\ on
+# Windows) first on PATH, and exports VIRTUAL_ENV. The .venv is device-local and
+# never synced (it's excluded from transfer).
+use_venv = true
+# venv_layout = "external"          # instead use <device.venv_root>/<leaf> (~/venvs/<proj>, C:\venvs\<proj>)
+# venv_name = "myproj"              # external layout only: override the venv dir name (default: project leaf)
+# [run.venv]                        # or pin explicit paths per device:
+# macbox = "~/venvs/myproj"
+# winbox = "C:\\venvs\\myproj"
+
+[env]
+# Environment variables exported for every command in this project (all devices):
+# PYTHONUNBUFFERED = "1"
+# OMP_NUM_THREADS = "4"
+
+[resources.default]
+cores = 4
+memory_gb = 16

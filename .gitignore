@@ -1,0 +1,40 @@
+# User/deployment-specific remrun configuration. Public releases ship examples only.
+/config/devices.toml
+/config/fleet_costs.toml
+/config/private_release_patterns.txt
+
+# Private continuity / orchestration notes. Public releases ship reusable docs only.
+/AGENTS.md
+/HANDOFF.md
+/PLAN.md
+/FLEET-*.md
+/GIT-SYNC-PLAN.md
+/OFFLOAD-*.md
+/SYNC-PLAN.md
+/docs/*_HANDOFF.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local remrun state must not be synced/committed here
+state/
+cache/
+logs/
+run-state/
+*.local.toml
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
