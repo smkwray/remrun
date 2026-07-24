@@ -10,11 +10,22 @@ global_exclude = [
   "venv/**",
   "renv/library/**",
   "__pycache__/**",
+  "**/__pycache__/**",
+  "*.pyc",
+  "**/*.pyc",
+  "*.pyo",
+  "**/*.pyo",
+  "**/*.egg-info/**",
   ".ipynb_checkpoints/**",
   ".Rproj.user/**",
   "node_modules/**",
+  "**/node_modules/**",
   ".pytest_cache/**",
+  "**/.pytest_cache/**",
   ".mypy_cache/**",
+  "**/.mypy_cache/**",
+  ".ruff_cache/**",
+  "**/.ruff_cache/**",
   ".DS_Store",
   "**/.DS_Store",
   "Thumbs.db",
@@ -30,13 +41,23 @@ global_exclude = [
   ".stversions/**",
   "~syncthing~*",
   "**/~syncthing~*",
-  # Build/compile artifacts: generated, can be huge, must not be dragged back on
-  # pullback (e.g. Rust target/, frontend dist/, Tauri gen/). Matched at any depth.
-  "**/build/**",
+  # remrun's own transfer scratch: atomic-write temp + backup files and tar staging
+  # (.remrun-tmp-*, .remrun-backup-*, .remrun-tar-*). Private to a single transfer;
+  # must never be treated as project data — e.g. an orphaned Windows .remrun-backup-*.bak
+  # left behind by an interrupted push (audit F4).
+  ".remrun-*",
+  "**/.remrun-*",
+  # Build/compile caches: generated and potentially huge. Keep conventional cache
+  # trees out globally, but leave build/ in-surface because commands commonly put
+  # their requested retained product there (for example build/bin/app.exe).
   "**/dist/**",
   "**/target/**",
   "**/.svelte-kit/**",
-  "src-tauri/gen/**"
+  "src-tauri/gen/**",
+  # Git worktrees created inside a project (e.g. by parallel-agent tooling): a nested
+  # worktree is a near-duplicate checkout and must never be swept into the parent's
+  # surface. (Running remrun from *inside* a worktree is refused separately.)
+  "**/.worktrees/**"
 ]
 large_file_warn_above_mb = 2048
 hash_small_files_below_mb = 64

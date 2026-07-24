@@ -7,6 +7,9 @@
 /AGENTS.md
 /HANDOFF.md
 /PLAN.md
+# Private field notes (issues/fixes flagged while using remrun). Never published.
+# Leading slash = repo-root only, so examples/project/do/ stays committed.
+/do/
 /FLEET-*.md
 /GIT-SYNC-PLAN.md
 /OFFLOAD-*.md

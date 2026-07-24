@@ -463,12 +463,41 @@ def test_sync_batches_multi_file_push(tmp_path: Path, monkeypatch):
     (local / "sub" / "b.txt").write_text("B")
     transport = _BatchingLocalTransport(remote)
     monkeypatch.setattr("remrun.sync.make_transport", lambda d: transport)
-    rc = run_sync(_config(), arg=str(local), device_name="LOCAL_SIM",
-                  remote_override=str(remote), direction="push", state_root=tmp_path / "st")
-    assert rc == EXIT_OK
+    result = run_sync_result(
+        _config(), arg=str(local), device_name="LOCAL_SIM",
+        remote_override=str(remote), direction="push", state_root=tmp_path / "st",
+    )
+    assert result.exit_code == EXIT_OK
+    assert sorted(result.verified_pushed) == ["a.txt", "sub/b.txt"]
     assert sorted(transport.pushed_batches[0]) == ["a.txt", "sub/b.txt"]
     assert (remote / "a.txt").read_text() == "A"
     assert (remote / "sub" / "b.txt").read_text() == "B"
+
+
+def test_sync_push_fails_when_remote_verification_cannot_see_file(
+    tmp_path: Path, monkeypatch, capsys
+):
+    local, remote = tmp_path / "L", tmp_path / "R"
+    local.mkdir()
+    remote.mkdir()
+    (local / "a.txt").write_text("A")
+    transport = _BatchingLocalTransport(remote)
+
+    def discard_push(_local_root, _remote_root, rel_paths):
+        transport.pushed_batches.append(list(rel_paths))
+
+    transport.push_files = discard_push
+    monkeypatch.setattr("remrun.sync.make_transport", lambda d: transport)
+    result = run_sync_result(
+        _config(), arg=str(local), device_name="LOCAL_SIM",
+        remote_override=str(remote), direction="push", state_root=tmp_path / "st",
+    )
+
+    assert result.exit_code == 3
+    assert result.pushed == []
+    assert result.verified_pushed == []
+    assert not (remote / "a.txt").exists()
+    assert "transfer_error phase=verify_push" in capsys.readouterr().err
 
 
 def test_vanished_local_root_refuses_to_delete_remote(tmp_path: Path):

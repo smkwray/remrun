@@ -54,6 +54,24 @@ def test_run_is_failed():
     assert run_is_failed({"error": "boom"})
 
 
+def test_prune_exempts_active_run_conflict_from_budget(tmp_path: Path):
+    # WHY (audit B7): the in-flight run's just-saved recovery copy must survive the size
+    # budget, or the summary prints a saved= path that no longer exists. Two equal-size
+    # conflict dirs over a tiny budget: the exempt (current) one must survive, the other not.
+    conflicts = tmp_path / "conflicts"
+    old_id = (NOW - timedelta(days=1)).strftime("%Y%m%dT%H%M%SZ") + "-MACBOX-proj"
+    cur_id = NOW.strftime("%Y%m%dT%H%M%SZ") + "-MACBOX-proj"
+    for rid in (old_id, cur_id):
+        d = conflicts / rid / "backup"
+        d.mkdir(parents=True)
+        (d / "big.bin").write_bytes(b"x" * 500)
+    policy = RetentionPolicy(full_log_days=30, failed_log_days=90, summary_days=365,
+                             max_log_bytes=1000, backup_days=3, max_backup_bytes=100)
+    prune_state(policy, now=NOW, state_root=tmp_path, exempt_run_id=cur_id)
+    assert (conflicts / cur_id).exists()       # exempt: survives even over budget
+    assert not (conflicts / old_id).exists()   # non-exempt over-budget copy is pruned
+
+
 # --- tiered policy ------------------------------------------------------------
 
 def test_policy_keeps_recent(tmp_path: Path):

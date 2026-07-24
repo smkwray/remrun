@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import subprocess
 import tarfile
@@ -47,6 +48,14 @@ class Recorder:
     @property
     def scripts(self):
         return [c["argv"][-1] for c in self.calls]
+
+
+def test_ssh_opts_expand_controller_home():
+    t = SSHPosixTransport(device(ssh_opts=["-o", "IdentitiesOnly=yes", "-i",
+                                                  "~/.ssh/id_mesh"]))
+    argv = t._ssh_base("macbox")
+    assert str(Path("~/.ssh/id_mesh").expanduser()) in argv
+    assert "~/.ssh/id_mesh" not in argv
 
 
 def test_kill_workers_pkills_workers_and_releases_lock(monkeypatch):
@@ -124,16 +133,75 @@ def test_probe_unreachable(monkeypatch):
     assert "no route" in probe.detail
 
 
+def test_run_maps_ssh_timeout_to_transport_error(monkeypatch):
+    # A hung ssh (subprocess timeout) must become a typed TransportError, not a raw
+    # TimeoutExpired that escapes probe()/sample_load() and crashes --auto failover.
+    t = SSHPosixTransport(device())
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ssh", timeout=8)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(TransportError):
+        t._run(["ssh", "host", "echo hi"], timeout=8)
+
+
+def test_probe_fails_over_when_first_candidate_blackholes(monkeypatch):
+    # WHY: on a flaky network the first address can blackhole (probe times out).
+    # That MUST NOT abort failover — probe must try the next candidate and land on
+    # it. Before the fix the timeout propagated out of probe() and killed the run.
+    t = SSHPosixTransport(device())  # candidates: macbox.local, then macbox
+
+    def responder(argv, _inp):
+        if "macbox.local" in " ".join(argv):
+            raise TransportError("ssh timed out after 20s")  # what _run now raises
+        return cp(0, b"remrun-ok\nDarwin\n")
+
+    monkeypatch.setattr(t, "_run", Recorder(responder))
+    probe = t.probe()
+    assert probe.reachable
+    assert probe.address == "macbox"  # fell over to the second candidate
+
+
+def test_probe_all_candidates_timeout_returns_unreachable_not_raise(monkeypatch):
+    # WHY: if every candidate blackholes, probe() must report unreachable so the
+    # scheduler can fail over to the next DEVICE — not raise and abort the run.
+    t = SSHPosixTransport(device())
+
+    def boom(argv, _inp):
+        raise TransportError("ssh timed out after 20s")
+
+    monkeypatch.setattr(t, "_run", Recorder(boom))
+    probe = t.probe()  # must not raise
+    assert not probe.reachable
+    assert probe.address is None
+    assert "timed out" in probe.detail
+
+
+def test_sample_load_returns_none_on_timeout(monkeypatch):
+    # WHY: load_balance is on by default, so --auto samples each candidate's load.
+    # A hung load probe must degrade to unknown (None), which pick_by_load tolerates,
+    # rather than aborting placement.
+    t = SSHPosixTransport(device())
+    t._address = "macbox.local"  # skip reachability resolve
+
+    def boom(argv, _inp):
+        raise TransportError("ssh timed out after 20s")
+
+    monkeypatch.setattr(t, "_run", Recorder(boom))
+    assert t.sample_load() is None
+
+
 def test_exec_builds_cd_and_command(monkeypatch):
     t = SSHPosixTransport(device(user="user", login_shell=False))
     t._address = "macbox.local"
     rec = Recorder(lambda a, i: cp(0, b"hi\n", b""))
     monkeypatch.setattr(t, "_run", rec)
-    res = t.exec(["Rscript", "do/tmp/test.R"], cwd="/Users/user/workspace/proj/p/analysis")
+    res = t.exec(["Rscript", "do/tmp/test.R"], cwd="/srv/user/workspace/proj/p/analysis")
     assert res.exit_code == 0
     assert res.stdout == "hi\n"
     script = rec.scripts[-1]
-    assert script == "cd /Users/user/workspace/proj/p/analysis && Rscript do/tmp/test.R"
+    assert script == "cd /srv/user/workspace/proj/p/analysis && Rscript do/tmp/test.R"
     # user@host target present.
     assert "user@macbox.local" in rec.calls[-1]["argv"]
 
@@ -220,6 +288,24 @@ def test_manifest_pipes_runner_and_parses(monkeypatch):
     assert " - " in rec.scripts[-1]  # python3 - <b64>
 
 
+def test_versioned_runner_install_and_rpc_use_framed_stdin(monkeypatch):
+    t = SSHPosixTransport(device())
+    t._address = "h"
+    rec = Recorder(lambda a, i: cp(0, b"response-frame"))
+    monkeypatch.setattr(t, "_run", rec)
+    source = b"print('runner')\n"
+    digest = hashlib.sha256(source).hexdigest()
+
+    t.install_versioned_runner(source, "/state/runner.py", digest)
+    assert rec.calls[-1]["input"].startswith(b"RRFRAME2 ")
+    assert "/state/runner.py" in rec.scripts[-1]
+    assert digest in rec.scripts[-1]
+
+    assert t.runner_rpc("/state/runner.py", "/state", b"request-frame") == b"response-frame"
+    assert rec.calls[-1]["input"] == b"request-frame"
+    assert rec.scripts[-1] == "python3 /state/runner.py rpc /state"
+
+
 def test_push_builds_mkdir_cat_and_mtime(monkeypatch, tmp_path: Path):
     t = SSHPosixTransport(device())
     t._address = "h"
@@ -303,7 +389,7 @@ def test_delete_and_mkdir(monkeypatch):
 def test_probe_captures_home_and_expands_tilde(monkeypatch):
     t = SSHPosixTransport(device(project_root="~/workspace/proj"))
     monkeypatch.setattr(t, "_run",
-                        Recorder(lambda a, i: cp(0, b"remrun-ok\nDarwin\n/Users/user")))
+                        Recorder(lambda a, i: cp(0, b"remrun-ok\nDarwin\n/srv/user")))
     assert t.probe().reachable
 
     class P:
@@ -311,18 +397,18 @@ def test_probe_captures_home_and_expands_tilde(monkeypatch):
         relative_cwd = "."
 
     # ~ expanded to the captured remote home so shlex-quoting stays correct.
-    assert t.remote_project_path(P()) == "/Users/user/workspace/proj/paper1"
+    assert t.remote_project_path(P()) == "/srv/user/workspace/proj/paper1"
 
 
 def test_remote_project_path_and_join():
-    t = SSHPosixTransport(device(project_root="/Users/user/workspace/proj"))
+    t = SSHPosixTransport(device(project_root="/srv/user/workspace/proj"))
 
     class P:
         project_id = "client/foo"
         relative_cwd = "analysis"
 
-    assert t.remote_project_path(P()) == "/Users/user/workspace/proj/client/foo"
+    assert t.remote_project_path(P()) == "/srv/user/workspace/proj/client/foo"
     rp = t.remote_project_path(P())
     assert t.remote_join(rp, "analysis/run.R") == \
-        "/Users/user/workspace/proj/client/foo/analysis/run.R"
-    assert t.remote_join(rp, ".") == "/Users/user/workspace/proj/client/foo"
+        "/srv/user/workspace/proj/client/foo/analysis/run.R"
+    assert t.remote_join(rp, ".") == "/srv/user/workspace/proj/client/foo"

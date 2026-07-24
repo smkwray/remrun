@@ -1,6 +1,7 @@
 # Public release checklist
 
-`remrun` can eventually become public, but separate public code from private environment details.
+Use this checklist before publishing or updating a release. Keep reusable code and
+documentation separate from private environment details.
 
 ## Remove or generalize
 

@@ -7,14 +7,17 @@ later live validation on a Windows runner has a precise contract to check.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import subprocess
 import tarfile
 from pathlib import Path
 
+import pytest
+
 from remrun.models import Device
-from remrun.transport import SSHPowerShellTransport, _ps_encode, _ps_squote
+from remrun.transport import SSHPowerShellTransport, TransportError, _ps_encode, _ps_squote
 
 
 def device(**over) -> Device:
@@ -65,6 +68,62 @@ def test_ps_squote_escapes_quotes():
 
 def test_ps_encode_roundtrip():
     assert base64.b64decode(_ps_encode("Write-Output 1")).decode("utf-16-le") == "Write-Output 1"
+
+
+# --- probe / --auto failover (Windows path; not live-tested here) -------------
+
+def test_probe_fails_over_when_first_candidate_blackholes(monkeypatch):
+    # WHY: a blackholed first address (probe times out -> TransportError) must not
+    # abort --auto failover; probe() must try the next candidate and land on it.
+    t = SSHPowerShellTransport(device())  # candidates: winbox, then WINBOX.local
+
+    def responder(argv, _inp):
+        if "WINBOX.local" not in " ".join(argv):
+            raise TransportError("ssh timed out after 30s")  # first candidate blackholes
+        return cp(0, b"remrun-ok\nWin32NT\nC:\\Users\\you\n")
+
+    monkeypatch.setattr(t, "_run", Recorder(responder))
+    probe = t.probe()
+    assert probe.reachable
+    assert probe.address == "WINBOX.local"
+    assert probe.remote_os == "windows"
+
+
+def test_probe_all_candidates_timeout_returns_unreachable_not_raise(monkeypatch):
+    t = SSHPowerShellTransport(device())
+
+    def boom(argv, _inp):
+        raise TransportError("ssh timed out after 30s")
+
+    monkeypatch.setattr(t, "_run", Recorder(boom))
+    probe = t.probe()  # must not raise
+    assert not probe.reachable
+    assert probe.address is None
+    assert "timed out" in probe.detail
+
+
+def test_delete_remote_verifies_absence_and_fails_loud(monkeypatch):
+    # WHY: the old delete used -ErrorAction SilentlyContinue and only treated ssh-255 as
+    # failure, so a locked / ACL-denied remote file was reported deleted while it still
+    # existed (and the run continued against a stale file).
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    seen = {}
+
+    def responder(argv, _inp):
+        seen["cmd"] = argv[-1]
+        return cp(0)
+
+    monkeypatch.setattr(t, "_run", Recorder(responder))
+    t.delete_remote("C:\\proj\\out.rds")
+    script = decoded(seen["cmd"])
+    assert "SilentlyContinue" not in script   # no longer swallows the error
+    assert "Test-Path" in script              # verifies the path is actually gone
+
+    # A non-zero result (still present / access denied) must raise, not silently pass.
+    monkeypatch.setattr(t, "_run", Recorder(lambda a, i: cp(1, stderr=b"still present")))
+    with pytest.raises(TransportError):
+        t.delete_remote("C:\\proj\\out.rds")
 
 
 # --- path mapping -------------------------------------------------------------
@@ -185,6 +244,10 @@ def test_push_streams_base64_and_sets_mtime(monkeypatch, tmp_path: Path):
     assert "$p = 'C:\\proj\\sub\\f.bin'" in script
     assert "FromBase64String" in script
     assert "SetLastWriteTimeUtc" in script
+    assert "[IO.File]::Replace($tmp,$p,$backup,$true)" in script
+    assert "$null" not in script
+    assert ".remrun-backup-" in script
+    assert "Remove-Item -LiteralPath $backup" in script
 
 
 def test_push_files_streams_tar_archive(monkeypatch, tmp_path: Path):
@@ -235,7 +298,11 @@ def test_delete_and_mkdir(monkeypatch):
     monkeypatch.setattr(t, "_run", rec)
     t.delete_remote("C:\\proj\\old.txt")
     t.ensure_remote_dir("C:\\proj\\sub")
-    assert "Remove-Item -LiteralPath 'C:\\proj\\old.txt' -Force" in decoded(rec.commands[-2])
+    del_script = decoded(rec.commands[-2])
+    assert "$p = 'C:\\proj\\old.txt'" in del_script
+    assert "Remove-Item -LiteralPath $p -Force" in del_script
+    assert "Test-Path -LiteralPath $p" in del_script      # verifies absence
+    assert "SilentlyContinue" not in del_script           # no longer swallows errors
     assert "New-Item -ItemType Directory -Force -Path 'C:\\proj\\sub'" in decoded(rec.commands[-1])
 
 
@@ -253,3 +320,25 @@ def test_manifest_pipes_runner_and_parses(monkeypatch):
     cmd = rec.commands[-1]
     assert cmd.startswith("python - ")
     assert rec.calls[-1]["input"].startswith(b"#!/usr/bin/env python3")
+
+
+def test_versioned_runner_install_and_rpc_use_framed_stdin(monkeypatch):
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    rec = Recorder(lambda a, i: cp(0, b"response-frame"))
+    monkeypatch.setattr(t, "_run", rec)
+    source = b"print('runner')\n"
+    digest = hashlib.sha256(source).hexdigest()
+
+    t.install_versioned_runner(source, "D:\\remrun\\state\\runner.py", digest)
+    install_script = decoded(rec.commands[-1])
+    assert rec.calls[-1]["input"].startswith(b"RRFRAME2 ")
+    assert "D:\\remrun\\state\\runner.py" in install_script
+    assert digest in install_script
+
+    assert t.runner_rpc(
+        "D:\\remrun\\state\\runner.py", "D:\\remrun\\state", b"request-frame"
+    ) == b"response-frame"
+    rpc_script = decoded(rec.commands[-1])
+    assert rec.calls[-1]["input"] == b"request-frame"
+    assert "'rpc'" in rpc_script and "D:\\remrun\\state" in rpc_script

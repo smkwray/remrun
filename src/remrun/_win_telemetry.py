@@ -36,6 +36,7 @@ LARGE_INTEGER = ctypes.c_int64
 
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 CREATE_SUSPENDED = 0x00000004
+CREATE_NO_WINDOW = 0x08000000
 STARTF_USESTDHANDLES = 0x00000100
 STD_INPUT_HANDLE = DWORD(-10).value
 STD_OUTPUT_HANDLE = DWORD(-11).value
@@ -45,6 +46,11 @@ INFINITE = 0xFFFFFFFF
 WAIT_OBJECT_0 = 0x00000000
 WAIT_FAILED = 0xFFFFFFFF
 DWORD_MINUS_ONE = 0xFFFFFFFF
+
+# Optional telemetry must not redefine command completion. Give descendants a
+# short grace period to finish and contribute their final accounting, then
+# return the direct command's exit code even if a daemon/helper remains alive.
+JOB_DRAIN_GRACE_S = 1.0
 
 JobObjectBasicAccountingInformation = 1
 JobObjectExtendedLimitInformation = 9
@@ -287,7 +293,7 @@ def _create_suspended(argv: list[str]) -> PROCESS_INFORMATION:
         None,
         None,
         bool(inherit_handles),
-        CREATE_SUSPENDED,
+        CREATE_SUSPENDED | CREATE_NO_WINDOW,
         None,
         None,
         ctypes.byref(si),
@@ -347,19 +353,27 @@ def _query_extended(h_job) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
     return info
 
 
-def _wait_job_empty(h_job) -> None:
+def _wait_job_empty(h_job, timeout_s: float = JOB_DRAIN_GRACE_S) -> tuple[bool, int]:
     # A job object is not signaled merely because all processes exited. Poll the
-    # kernel-maintained ActiveProcesses accounting counter instead.
+    # kernel-maintained ActiveProcesses accounting counter instead. This wait is
+    # deliberately bounded: a command that successfully starts a detached helper
+    # must retain the same completion semantics with telemetry on or off.
+    deadline = time.monotonic() + max(0.0, timeout_s)
     delay = 0.01
     while True:
-        if int(_query_basic(h_job).ActiveProcesses) == 0:
-            return
-        time.sleep(delay)
+        active = int(_query_basic(h_job).ActiveProcesses)
+        if active == 0:
+            return True, 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, active
+        time.sleep(min(delay, remaining))
         if delay < 0.25:
             delay *= 2
 
 
-def _emit_telemetry(h_job, wall: float) -> None:
+def _emit_telemetry(h_job, wall: float, *, process_tree_drained: bool = True,
+                    active_processes_at_cutoff: int = 0) -> None:
     basic = _query_basic(h_job)
     extended = _query_extended(h_job)
 
@@ -372,7 +386,10 @@ def _emit_telemetry(h_job, wall: float) -> None:
         "avg_cpu_pct": avg,
         "cpu_sec": round(cpu, 3),
         "wall_sec": round(wall, 3),
+        "process_tree_drained": process_tree_drained,
     }
+    if not process_tree_drained:
+        payload["active_processes_at_cutoff"] = active_processes_at_cutoff
 
     # Write bytes so Windows text-mode newline translation cannot turn the
     # sentinel into CRLF. remrun's parser looks for "\n__REMRUN_TELEMETRY__ ".
@@ -439,10 +456,15 @@ def _job_run(argv: list[str]) -> int:
         # Include descendants that outlive the direct child. If this query path
         # fails, the outer handler returns the direct child's exit code without a
         # sentinel rather than risking the run.
-        _wait_job_empty(job)
+        drained, active = _wait_job_empty(job)
 
         wall = time.time() - t0
-        _emit_telemetry(job, wall)
+        _emit_telemetry(
+            job,
+            wall,
+            process_tree_drained=drained,
+            active_processes_at_cutoff=active,
+        )
         return child_rc
 
     except Exception:

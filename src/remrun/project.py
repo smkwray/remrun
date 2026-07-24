@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from .config import RemrunConfig, current_os_key, expand_path
@@ -89,6 +90,18 @@ def detect_project(cwd: Path, config: RemrunConfig) -> ProjectContext:
     cwd = cwd.resolve()
     base = project_root_base(config)
     project_root = find_project_root(cwd, base)
+
+    # A linked git worktree (or submodule) has a `.git` *file* (a `gitdir:` pointer),
+    # not a repo directory. remrun maps a project by its path, so a worktree would push
+    # to a DIFFERENT remote location than the main checkout and take a separate lock —
+    # the two could then write overlapping remote files with nothing serializing them.
+    # Refuse rather than risk that; the main checkout is the safe place to run.
+    if (project_root / ".git").is_file() and os.environ.get("REMRUN_ALLOW_WORKTREE") != "1":
+        raise ProjectDetectionError(
+            f"{project_root} looks like a git worktree (its .git is a file, not a repo "
+            "directory). remrun can't safely run from a linked worktree — run it from the "
+            "project's main checkout instead. (Set REMRUN_ALLOW_WORKTREE=1 to override.)"
+        )
 
     project_id = project_root.relative_to(base).as_posix()
     rel_cwd = cwd.relative_to(project_root)

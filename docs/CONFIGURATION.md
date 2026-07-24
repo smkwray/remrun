@@ -118,7 +118,7 @@ Examples:
 ```text
 ~/projects/paper1                -> paper1
 ~/projects/client/foo            -> client/foo
-C:\Users\you\projects\paper1     -> paper1
+C:\projects\paper1               -> paper1
 ```
 
 Equivalent remote path is:

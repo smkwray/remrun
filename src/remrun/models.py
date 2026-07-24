@@ -37,6 +37,11 @@ class Device:
     # this device is an idle fleet candidate that a queued job would otherwise not fit in host RAM
     # (see fleet.dispatcher._reclaim_marginal_devices). Empty = never reclaim (no behavior change).
     reclaim: dict[str, Any] = field(default_factory=dict)
+    # Named target-side actions. Each action is an allowlisted argv plus a persistent
+    # inbox; `remrun action` stages explicit files there and records a target-side
+    # receipt before invoking it. Keeping this data on the device avoids turning the
+    # CLI into another unrestricted remote-shell surface.
+    actions: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Hardware classification (informs --auto load balancing). Defaults 0 = unknown.
     perf_cores: int = 0
     eff_cores: int = 0
@@ -69,6 +74,8 @@ class Device:
             venv_root=str(data.get("venv_root", "")),
             cancel=dict(data.get("cancel", {}) or {}),
             reclaim=dict(data.get("reclaim", {}) or {}),
+            actions={str(k): dict(v) for k, v in dict(data.get("actions", {}) or {}).items()
+                     if isinstance(v, dict)},
             perf_cores=int(data.get("perf_cores", 0) or 0),
             eff_cores=int(data.get("eff_cores", 0) or 0),
             ram_gb=float(data.get("ram_gb", 0) or 0),

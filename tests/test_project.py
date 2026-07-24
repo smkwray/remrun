@@ -45,6 +45,32 @@ def test_nested_project_id_via_marker(tmp_path: Path):
     assert ctx.relative_cwd == "analysis"
 
 
+def test_git_worktree_is_refused(tmp_path: Path):
+    # WHY: a linked worktree has a `.git` FILE (a gitdir pointer), not a repo dir. remrun
+    # maps a project by its path, so running from a worktree would push to a different
+    # remote location than the main checkout AND take a separate lock — two writers over
+    # overlapping remote files with nothing serializing them. Refuse it.
+    base = tmp_path / "proj"
+    wt = base / "statera" / ".worktrees" / "agent1"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: /somewhere/.git/worktrees/agent1\n")
+    cfg = make_config(base)
+    with pytest.raises(ProjectDetectionError, match="worktree"):
+        detect_project(wt, cfg)
+
+
+def test_git_worktree_override_env_allows(tmp_path: Path, monkeypatch):
+    # Escape hatch so an advanced user is never hard-blocked.
+    base = tmp_path / "proj"
+    wt = base / "statera" / ".worktrees" / "agent1"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: /somewhere/.git/worktrees/agent1\n")
+    cfg = make_config(base)
+    monkeypatch.setenv("REMRUN_ALLOW_WORKTREE", "1")
+    ctx = detect_project(wt, cfg)  # must not raise
+    assert ctx.project_id == "statera/.worktrees/agent1"
+
+
 def test_marker_closest_to_cwd_wins(tmp_path: Path):
     base = tmp_path / "proj"
     foo = base / "client" / "foo"

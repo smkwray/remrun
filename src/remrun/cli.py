@@ -50,7 +50,7 @@ from .transport import TransportError, make_transport
 
 KNOWN_COMMANDS = {
     "devices", "doctor", "plan", "run", "status", "logs", "clean", "bench", "sync",
-    "git-sync",
+    "git-sync", "runner", "action",
 }
 
 # Exit codes (see docs/AGENT_OUTPUT_SPEC.md).
@@ -125,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_sync(args, reporter)
         if args.command_name == "git-sync":
             return cmd_git_sync(args, reporter)
+        if args.command_name == "runner":
+            return cmd_runner(args, reporter)
+        if args.command_name == "action":
+            return cmd_action(args, reporter)
         parser.print_help()
         return EXIT_INTERNAL
     except Exception as exc:  # Keep agent-visible error concise.
@@ -158,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-telemetry", action="store_true", help="Skip resource telemetry")
 
     p = sub.add_parser("status", help="Show recent remrun status")
+    p.add_argument("device", nargs="?", help="show only runs targeting this device")
     p.add_argument("--json", action="store_true")
     p.add_argument("--limit", type=int, default=10)
 
@@ -200,6 +205,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(direction="both")
 
+    p = sub.add_parser("action", help="Stage files and run an allowlisted target-side action")
+    p.add_argument("device", help="configured target device")
+    p.add_argument("action", help="action name configured under [devices.<name>.actions]")
+    p.add_argument("--input", action="append", default=[], metavar="FILE",
+                   help="file to place in the action inbox (repeatable)")
+    p.add_argument("--key", help="idempotency key; required when there are no inputs")
+    p.add_argument("--dry-run", action="store_true", help="validate and print the action plan")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("git-sync", help="Sync Git commits with a device without syncing .git/")
     p.add_argument("device", nargs="?", help="configured device to exchange git history with")
     p.add_argument("--pull", dest="direction", action="store_const", const="pull",
@@ -225,7 +239,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(direction="both")
 
+    p = sub.add_parser("runner", help="Install or probe the inert versioned remote runner")
+    runner_sub = p.add_subparsers(dest="runner_command", required=True)
+    for action in ("install", "probe"):
+        rp = runner_sub.add_parser(action)
+        rp.add_argument("device")
+        rp.add_argument("--json", action="store_true")
+
     return parser
+
+
+def cmd_action(args: argparse.Namespace, reporter: Reporter) -> int:
+    from .action import run_action
+
+    result = run_action(load_config(), args.device, args.action, args.input,
+                        key=args.key, dry_run=args.dry_run)
+    reporter.event("action_result", **result.as_dict())
+    return result.exit_code
 
 
 def _store_costs_in_project(config) -> bool:
@@ -377,6 +407,9 @@ def cmd_doctor(args: argparse.Namespace, reporter: Reporter) -> int:
     reporter.event("config_root", path=str(config.repo_root))
     reporter.event("devices_loaded", count=len(config.devices), names=sorted(config.devices))
     reporter.event("project_roots", roots=config.project_roots)
+    reporter.event("coordination", mode=str(config.coordination.get("mode", "legacy")),
+                   device=config.coordination.get("device"),
+                   protocol=config.coordination.get("protocol"))
     reporter.event("state_root", path=str(state_root))
     host = socket.gethostname()
     policy = offload_policy(config)
@@ -402,11 +435,38 @@ def cmd_doctor(args: argparse.Namespace, reporter: Reporter) -> int:
         if git_hook and git_hook.exists():
             text = git_hook.read_text(encoding="utf-8", errors="replace")
             installed = HOOK_BEGIN in text
-        peers = (project_config.get("git_sync", {}) or {}).get("peers", [])
+        peers = (project_config.get("git_sync", {}) or {}).get(
+            "peers", (config.git_sync or {}).get("peers", []))
         reporter.event("git_sync_hook", project_id=project.project_id,
                        installed=installed,
                        path=str(git_hook) if git_hook else None,
                        peers=peers if isinstance(peers, list) else [peers])
+    return EXIT_OK
+
+
+def cmd_runner(args: argparse.Namespace, reporter: Reporter) -> int:
+    from .runner_client import RunnerClientError, ensure_versioned_runner
+
+    config = load_config()
+    try:
+        info = ensure_versioned_runner(
+            config, args.device, install=args.runner_command == "install")
+    except (RunnerClientError, TransportError) as exc:
+        reporter.event("runner_error", device=args.device, message=str(exc), exit_code=EXIT_INFRA)
+        return EXIT_INFRA
+    reporter.event(
+        "runner_ready",
+        device=info.device,
+        installed_path=info.installed_path,
+        source_sha256=info.source_sha256,
+        reused=info.reused,
+        schema_version=info.probe.get("schema_version"),
+        device_id=info.probe.get("device_id"),
+        filesystem=info.probe.get("filesystem"),
+        sqlite_version=info.probe.get("sqlite_version"),
+    )
+    if args.json:
+        print(json.dumps(info.as_dict(), indent=2, sort_keys=True))
     return EXIT_OK
 
 
@@ -611,7 +671,9 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         # Prune even when a run errors out early (preflight/exec/pullback may already have
         # written backups), so repeated failures can't grow the state unbounded.
         try:
-            prune_state(policy)
+            # Exempt THIS run's conflict/backup dir: a just-saved recovery copy must not be
+            # pruned by the size-budget pass before the summary reports its path (audit B7).
+            prune_state(policy, exempt_run_id=run_id)
         except Exception:  # noqa: BLE001
             pass
 
@@ -636,6 +698,16 @@ def _run_locked(
     backup_root = conflict_dir(run_id) / "backup"
 
     # --- preflight reconcile -------------------------------------------------
+    def report_preflight_progress(
+        completed: int, total: int, action_totals: dict[str, int]
+    ) -> None:
+        reporter.event(
+            "preflight_progress",
+            completed=completed,
+            total=total,
+            **action_totals,
+        )
+
     try:
         pre = preflight_reconcile(
             transport=transport,
@@ -647,6 +719,7 @@ def _run_locked(
             prev_remote=prev_remote,
             backup_root=backup_root,
             backup_below_bytes=policy.backup_below_bytes,
+            progress=report_preflight_progress,
         )
     except TransportError as exc:
         reporter.event("transfer_error", phase="preflight", message=str(exc))
@@ -696,8 +769,22 @@ def _run_locked(
                                 telemetry=telemetry_on)
     except TransportError as exc:
         reporter.event("exec_error", message=str(exc))
-        write_json(summary_path, {"run_id": run_id, "error": str(exc), "phase": "exec",
-                                  "plan": plan.as_dict()})
+        guidance = (
+            "remote start/completion is unknown; do not retry or remove the live project lock "
+            "until a read-only process/artifact probe shows the prior command ended"
+        )
+        reporter.event("completion_unknown", guidance=guidance)
+        write_json(
+            summary_path,
+            {
+                "run_id": run_id,
+                "error": str(exc),
+                "phase": "exec",
+                "completion_state": "unknown",
+                "guidance": guidance,
+                "plan": plan.as_dict(),
+            },
+        )
         return EXIT_INFRA
 
     (rdir / "stdout.log").write_text(cap_text(result.stdout, policy.max_log_bytes), encoding="utf-8")
@@ -1009,15 +1096,22 @@ def cmd_status(args: argparse.Namespace, reporter: Reporter) -> int:
             return EXIT_OK
         reporter.event("no_runs", path=str(runs_root))
         return EXIT_OK
-    run_ids = sorted((d.name for d in runs_root.iterdir() if d.is_dir()), reverse=True)
-    run_ids = run_ids[: max(0, args.limit)]
     summaries = []
+    run_ids = sorted((d.name for d in runs_root.iterdir() if d.is_dir()), reverse=True)
+    limit = max(0, args.limit)
     for rid in run_ids:
+        if len(summaries) >= limit:
+            break
         s = read_json(runs_root / rid / "summary.json") or {"run_id": rid}
+        target = s.get("target") or ((s.get("plan") or {}).get("target") or {}).get("name")
+        if args.device and target != args.device:
+            continue
         summaries.append(s)
     if args.json:
         print(json.dumps({"runs": summaries, "fleet_state": fleet_state}, indent=2, sort_keys=True))
     else:
+        if not summaries:
+            reporter.event("no_runs", path=str(runs_root), device=args.device)
         for s in summaries:
             print(f"{s.get('run_id')}\texit={s.get('exit_code', '?')}\t"
                   f"pushed={s.get('files_pushed', '?')}\tpulled_post={s.get('files_pulled_post', '?')}\t"

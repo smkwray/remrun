@@ -86,6 +86,7 @@ class SyncResult:
     authority: str = "remote"
     pulled: list[str] = field(default_factory=list)
     pushed: list[str] = field(default_factory=list)
+    verified_pushed: list[str] = field(default_factory=list)
     deleted_local: list[str] = field(default_factory=list)
     deleted_remote: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
@@ -442,7 +443,36 @@ def run_sync_result(config: RemrunConfig, *, arg: str, device_name: str,
             if pushes:
                 transport.ensure_remote_dir(remote_root)
                 transport.push_files(mapping.local_root, remote_root, [p.path for p in pushes])
-                result.pushed.extend(p.path for p in pushes)
+                try:
+                    verified_remote = transport.manifest(remote_root, excludes, _HASH_ALL)
+                    mismatches = [
+                        item.path
+                        for item in pushes
+                        if (
+                            item.path not in verified_remote
+                            or not _same_content(local_m[item.path], verified_remote[item.path])
+                        )
+                    ]
+                    if mismatches:
+                        raise TransportError(
+                            "pushed files not remotely visible with expected size/hash: "
+                            + ", ".join(mismatches)
+                        )
+                except (TransportError, NotImplementedError, ValueError) as exc:
+                    reporter.event("transfer_error", phase="verify_push", message=str(exc))
+                    result.exit_code = EXIT_TRANSFER
+                    return result
+                result.pushed.extend(item.path for item in pushes)
+                result.verified_pushed.extend(item.path for item in pushes)
+                remote_m = verified_remote
+                result.remote_files = len(remote_m)
+                result.remote_paths = list(remote_m)
+                reporter.event(
+                    "push_verified",
+                    files=len(pushes),
+                    bytes=sum(local_m[item.path].size for item in pushes),
+                    identity="size+sha256",
+                )
         except TransportError as exc:
             reporter.event("transfer_error", phase="apply", message=str(exc))
             result.exit_code = EXIT_TRANSFER
@@ -459,6 +489,7 @@ def run_sync_result(config: RemrunConfig, *, arg: str, device_name: str,
         for rel in result.conflicts:
             reporter.event("conflict", path=rel, saved=str((conflict_root or Path()) / rel))
         reporter.event("synced", pulled=len(result.pulled), pushed=len(result.pushed),
+                       verified_pushed=len(result.verified_pushed),
                        deleted_local=len(result.deleted_local),
                        deleted_remote=len(result.deleted_remote),
                        conflicts=len(result.conflicts), skipped=len(result.skipped),
@@ -524,6 +555,7 @@ def _print_json(result: SyncResult, planned: list[ClassifiedPath] | None = None)
         "remote_root": result.remote_root, "direction": result.direction,
         "authority": result.authority, "used_baseline": result.used_baseline,
         "dry_run": result.dry_run, "pulled": result.pulled, "pushed": result.pushed,
+        "verified_pushed": result.verified_pushed,
         "deleted_local": result.deleted_local, "deleted_remote": result.deleted_remote,
         "conflicts": result.conflicts, "skipped": result.skipped,
         "backup_dir": result.backup_dir, "exit_code": result.exit_code,

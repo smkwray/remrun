@@ -4,13 +4,30 @@
 
 [project_roots]
 macos = "~/projects"
-windows = 'C:\Users\you\projects'
+windows = 'C:\projects'
 default = "~/projects"
+
+# Optional: use a broader root for Git history only. This supports repositories
+# beside the normal project directory without broadening remrun run/plan transfers.
+# [git_sync]
+# peers = ["macbox"]
+# advance_dirty_worktree = false  # opt-in history-hub mode; preserves worktree bytes
+# [git_sync.project_roots]
+# macos = "~/work"
+# windows = 'C:\work'
+# default = "~/work"
+
+# Keep legacy until every controller/runner is upgraded and the coordination GO
+# gates pass. `remrun runner install <device>` is inert Step-3 preparation.
+[coordination]
+mode = "legacy"
+# device = "macbox"
+protocol = 1
 
 # Optional named output trees for `remrun sync <tree>/<subpath> <device>`.
 [sync_roots.outputs]
 macos = "~/remrun-outputs"
-windows = 'C:\Users\you\remrun-outputs'
+windows = 'C:\remrun-outputs'
 default = "~/remrun-outputs"
 
 [offload]
@@ -55,9 +72,9 @@ enabled = false
 kind = "ssh-powershell"
 os = "windows"
 address_candidates = ["winbox.local"]
-project_root = 'C:\Users\you\projects'
-state_root = 'C:\Users\you\AppData\Local\remrun'
-cache_root = 'C:\Users\you\AppData\Local\remrun\cache'
+project_root = 'C:\projects'
+state_root = 'C:\remrun-state'
+cache_root = 'C:\remrun-cache'
 remote_python = "python"
 shell = "powershell"
 login_shell = false
@@ -70,7 +87,7 @@ vram_gb = 12
 # are matched against CommandLine via PowerShell regex. WSL lists are optional.
 [devices.winbox.cancel]
 process_patterns = ["your-worker-process-regex"]
-lock_paths = ['C:\Users\you\AppData\Local\remrun\your-worker.lock']
+lock_paths = ['C:\remrun-state\your-worker.lock']
 wsl_process_patterns = ["your-wsl-worker-regex"]
 wsl_lock_paths = ["/tmp/your-worker.lock"]
 
@@ -101,11 +118,11 @@ cmd = ["~/bin/example-tts-worker", "{stage}"]
 
 [fleet.adapters.ocr.winbox]
 engine = "example-ocr-remote"
-output_root = 'C:\Users\you\remrun-outputs\ocr'
+output_root = 'C:\remrun-outputs\ocr'
 output_in_cmd = true
 pool = "gpu"
 memory_kind = "gpu"
-capability = ['C:\Users\you\bin\example-ocr-worker.ps1']
+capability = ['C:\tools\example-ocr-worker.ps1']
 cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-       'C:\Users\you\bin\example-ocr-worker.ps1', "-InputDir", "{stage}",
+       'C:\tools\example-ocr-worker.ps1', "-InputDir", "{stage}",
        "-OutputRoot", "{output_root}"]

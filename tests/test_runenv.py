@@ -115,7 +115,7 @@ def test_ssh_posix_exec_exports_env_and_path(monkeypatch):
 
     t = SSHPosixTransport(dev(login_shell=False))
     t._address = "h"
-    t._remote_home = "/Users/alice"
+    t._remote_home = "/srv/alice"
     calls = {}
 
     def fake_run(argv, input_bytes=None, timeout=None):
@@ -127,6 +127,6 @@ def test_ssh_posix_exec_exports_env_and_path(monkeypatch):
            env={"VIRTUAL_ENV": "~/venvs/foo"}, path_prepend=["~/venvs/foo/bin"])
     script = calls["script"]
     # ~ expanded to remote home, venv bin prepended before $PATH.
-    assert "export VIRTUAL_ENV=/Users/alice/venvs/foo" in script
-    assert 'export PATH=/Users/alice/venvs/foo/bin:"$PATH"' in script
+    assert "export VIRTUAL_ENV=/srv/alice/venvs/foo" in script
+    assert 'export PATH=/srv/alice/venvs/foo/bin:"$PATH"' in script
     assert script.endswith("cd /p && python x.py")

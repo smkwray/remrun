@@ -37,7 +37,7 @@ Default runs happen in the real remote project tree:
 
 ```text
 macbox: ~/projects/<project>/<relative-cwd>
-winbox: C:\Users\you\projects\<project>\<relative-cwd>
+winbox: C:\projects\<project>\<relative-cwd>
 ```
 
 This is intentional. If a command writes `tables/main.tex`, that output belongs in `tables/main.tex`.

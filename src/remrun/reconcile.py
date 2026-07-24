@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 from .config import case_insensitive, casefold_collisions, current_os_key, device_os_key
 from .manifest import FileEntry, Manifest, build_manifest, sha256_file, should_exclude
@@ -10,6 +11,7 @@ from .transfer_plan import (
     ABORT_CONFLICT,
     DELETE_LOCAL,
     DELETE_REMOTE,
+    NONE,
     PULL,
     PUSH,
     ClassifiedPath,
@@ -105,6 +107,7 @@ def preflight_reconcile(
     prev_remote: Manifest | None,
     backup_root: Path,
     backup_below_bytes: int = 0,
+    progress: Callable[[int, int, dict[str, int]], None] | None = None,
 ) -> ReconcileResult:
     """Reconcile the active run surface before running the command (Mode 1/safe).
 
@@ -174,7 +177,18 @@ def preflight_reconcile(
 
     transport.ensure_remote_dir(remote_root)
 
-    for item in plan.paths:
+    actions = [item for item in plan.paths if item.action != NONE]
+    action_totals = {
+        "pulls": sum(item.action == PULL for item in actions),
+        "pushes": sum(item.action == PUSH for item in actions),
+        "deletes_local": sum(item.action == DELETE_LOCAL for item in actions),
+        "deletes_remote": sum(item.action == DELETE_REMOTE for item in actions),
+    }
+    total = len(actions)
+    if progress:
+        progress(0, total, action_totals)
+
+    for completed, item in enumerate(actions, start=1):
         remote_path = transport.remote_join(remote_root, item.path)
         local_path = local_root / item.path
         if item.action == PULL:
@@ -193,7 +207,8 @@ def preflight_reconcile(
             _backup_local(local_root, item.path, backup_root, backup_below_bytes)
             local_path.unlink(missing_ok=True)
             result.deleted_local.append(item.path)
-        # NONE: nothing to do.
+        if progress and (completed == total or completed % 25 == 0):
+            progress(completed, total, action_totals)
 
     # Rebuild converged manifests to use as pre-run baselines.
     result.local_manifest = build_manifest(
@@ -264,12 +279,23 @@ def postrun_pullback(
 
         # Strong remote hash for the candidate: the manifest caps hashing at hash_below_bytes, so
         # a >64 MB output has sha256=None. Hash it now so the idempotent skip below is content-based
-        # for large outputs too (a best-effort failure just falls back to size/mtime).
+        # for large outputs too. If the hash cannot be obtained, preserve the remote candidate as a
+        # conflict instead of silently degrading equality to size/mtime.
         if remote_entry is not None and remote_entry.sha256 is None:
             try:
-                remote_entry = replace(remote_entry, sha256=transport.hash_file(remote_path))
-            except TransportError:
-                pass
+                digest = transport.hash_file(remote_path)
+                if (
+                    len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest.lower())
+                ):
+                    raise TransportError(f"hash {remote_path} returned an invalid SHA-256")
+                remote_entry = replace(remote_entry, sha256=digest.lower())
+            except (TransportError, NotImplementedError, ValueError):
+                dest = conflict_remote_root / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                transport.pull_file(remote_path, dest)
+                result.conflicts.append(rel)
+                continue
 
         # Re-check the local file RIGHT BEFORE writing (not the stale cur_local): Syncthing may have
         # delivered the identical bytes during/after the run. If local already == the remote output,

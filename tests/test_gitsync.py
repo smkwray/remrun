@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from remrun.config import RemrunConfig
+import remrun.gitsync as gitsync_module
+from remrun.config import RemrunConfig, current_os_key
 from remrun.gitsync import (
     EXIT_DIVERGED,
     EXIT_INFRA,
     EXIT_OK,
+    _parse_dirty_summary,
     git_sync_status_result,
     install_git_sync_hook,
     run_git_sync,
@@ -19,6 +22,7 @@ from remrun.gitsync import (
 )
 from remrun.models import Device
 from remrun.output import Reporter
+from remrun.transport import LocalSimTransport
 
 
 def posix(p: Path) -> str:
@@ -80,6 +84,49 @@ def repos(tmp_path: Path, monkeypatch):
 
 def sync(cfg: RemrunConfig, **kwargs) -> int:
     return run_git_sync(cfg, device_name="LOCAL_SIM", reporter=Reporter(), **kwargs)
+
+
+def test_git_sync_can_use_broader_roots_for_a_sibling_repository(tmp_path, monkeypatch):
+    local_base = tmp_path / "local"
+    remote_base = tmp_path / "remote"
+    local = local_base / "remrun"
+    remote = remote_base / "remrun"
+    local.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(local), check=True,
+                   capture_output=True, text=True)
+    git(local, "config", "user.email", "remrun-test@example.invalid")
+    git(local, "config", "user.name", "remrun Test")
+    commit(local, "base.txt", "base")
+    subprocess.run(["git", "clone", str(local), str(remote)], check=True,
+                   capture_output=True, text=True)
+
+    remote_os = "remote-test"
+    device = Device.from_mapping("LOCAL_SIM", {
+        "kind": "local-sim",
+        "os": remote_os,
+        "project_root": posix(remote_base / "proj"),
+        "cache_root": posix(tmp_path / "cache"),
+    })
+    cfg = RemrunConfig(
+        repo_root=tmp_path / "tool",
+        defaults={},
+        devices={"LOCAL_SIM": device},
+        project_roots={"default": posix(local_base / "proj")},
+        git_sync={
+            "project_roots": {
+                current_os_key(): posix(local_base),
+                remote_os: posix(remote_base),
+                "default": posix(local_base),
+            },
+        },
+    )
+    monkeypatch.chdir(local)
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="pull", dry_run=True, reporter=Reporter())
+
+    assert result.local_project == str(local)
+    assert Path(result.remote_project) == remote
 
 
 @pytest.fixture()
@@ -236,6 +283,49 @@ def test_bootstrap_empty_peer_reports_cleanly(tmp_path, monkeypatch):
     assert not (local / ".git").exists()  # no half-initialized repo left behind
 
 
+def test_bootstrap_recovers_existing_unborn_repo(bootstrap_repos):
+    cfg, local, _remote, peer_head = bootstrap_repos
+    subprocess.run(["git", "init", "-b", "master"], cwd=str(local), check=True,
+                   capture_output=True, text=True)
+
+    rc = run_git_sync(cfg, device_name="LOCAL_SIM", direction="pull", reporter=Reporter())
+
+    assert rc == EXIT_OK
+    assert git(local, "rev-parse", "HEAD") == peer_head
+    assert git(local, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert git(local, "rev-list", "--count", "HEAD") == "2"
+    assert (local / "base.txt").read_text(encoding="utf-8") == "LOCAL UNCOMMITTED EDIT"
+
+
+def test_bootstrap_missing_bundle_cannot_report_success(bootstrap_repos, monkeypatch):
+    cfg, local, _remote, _peer_head = bootstrap_repos
+
+    def omit_bundle(_self, _remote_path, _local_path):
+        return None
+
+    monkeypatch.setattr(LocalSimTransport, "pull_file", omit_bundle)
+
+    rc = run_git_sync(cfg, device_name="LOCAL_SIM", direction="pull", reporter=Reporter())
+
+    assert rc != EXIT_OK
+    assert not (local / ".git").exists()
+
+
+def test_interrupted_bootstrap_removes_git_dir_it_created(bootstrap_repos, monkeypatch):
+    cfg, local, _remote, _peer_head = bootstrap_repos
+
+    def interrupt_pull(_self, _remote_path, _local_path):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(LocalSimTransport, "pull_file", interrupt_pull)
+
+    with pytest.raises(KeyboardInterrupt):
+        gitsync_module.run_git_sync_result(
+            cfg, device_name="LOCAL_SIM", direction="pull", reporter=Reporter())
+
+    assert not (local / ".git").exists()
+
+
 def test_pull_fast_forwards_current_branch(repos):
     cfg, local, remote = repos
     remote_head = commit(remote, "remote.txt", "from remote")
@@ -293,6 +383,28 @@ def test_dirty_current_branch_fetches_but_does_not_advance(repos):
     assert not (local / "remote.txt").exists()
 
 
+def test_synced_controller_advances_dirty_pull_without_touching_worktree(repos):
+    cfg, local, remote = repos
+    cfg = replace(cfg, git_sync={"advance_dirty_worktree": True})
+    remote_head = commit(remote, "remote.txt", "remote")
+    (local / "base.txt").write_text("dirty local edit", encoding="utf-8")
+    before = {path.relative_to(local).as_posix(): path.read_bytes()
+              for path in local.rglob("*") if path.is_file() and ".git" not in path.parts}
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="pull", reporter=Reporter())
+    assert result.exit_code == EXIT_OK
+
+    after = {path.relative_to(local).as_posix(): path.read_bytes()
+             for path in local.rglob("*") if path.is_file() and ".git" not in path.parts}
+    assert git(local, "rev-parse", "HEAD") == remote_head
+    assert after == before
+    assert (local / "base.txt").read_text(encoding="utf-8") == "dirty local edit"
+    assert not (local / "remote.txt").exists()
+    assert "local worktree remains dirty" in result.pulled[0].detail
+    assert "do not treat it as a clean checkout" in result.pulled[0].detail
+
+
 def test_untracked_litter_does_not_block_fast_forward(repos):
     cfg, local, remote = repos
     local_head = commit(local, "local.txt", "from local")
@@ -302,6 +414,41 @@ def test_untracked_litter_does_not_block_fast_forward(repos):
 
     assert git(remote, "rev-parse", "HEAD") == local_head
     assert (remote / ".DS_Store").read_text(encoding="utf-8") == "platform litter"
+
+
+def test_push_dirty_remote_is_skipped_by_default(repos):
+    cfg, local, remote = repos
+    old_remote = git(remote, "rev-parse", "HEAD")
+    local_head = commit(local, "local.txt", "from local")
+    (remote / "base.txt").write_text("remote uncommitted edit", encoding="utf-8")
+
+    assert sync(cfg, direction="push") == EXIT_OK
+
+    assert git(remote, "rev-parse", "HEAD") == old_remote
+    assert git(remote, "cat-file", "-t", local_head) == "commit"  # fetch completed
+    assert (remote / "base.txt").read_text(encoding="utf-8") == "remote uncommitted edit"
+
+
+def test_history_hub_advances_dirty_remote_without_touching_worktree(repos):
+    cfg, local, remote = repos
+    cfg = replace(cfg, git_sync={"advance_dirty_worktree": True})
+    local_head = commit(local, "local.txt", "from local")
+    (remote / "base.txt").write_text("remote uncommitted edit", encoding="utf-8")
+    before = {path.relative_to(remote).as_posix(): path.read_bytes()
+              for path in remote.rglob("*") if path.is_file() and ".git" not in path.parts}
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="push", reporter=Reporter())
+    assert result.exit_code == EXIT_OK
+
+    after = {path.relative_to(remote).as_posix(): path.read_bytes()
+             for path in remote.rglob("*") if path.is_file() and ".git" not in path.parts}
+    assert git(remote, "rev-parse", "HEAD") == local_head
+    assert after == before  # reset --mixed changed HEAD/index only
+    assert (remote / "base.txt").read_text(encoding="utf-8") == "remote uncommitted edit"
+    assert not (remote / "local.txt").exists()  # Syncthing may deliver it later
+    assert "remote worktree remains dirty" in result.pushed[0].detail
+    assert "do not treat it as a clean checkout" in result.pushed[0].detail
 
 
 def test_dry_run_does_not_fetch_or_fast_forward(repos):
@@ -327,8 +474,39 @@ def test_status_reports_peer_state_without_mutating_refs(repos):
     assert status.branches[0].branch == "main"
     assert status.branches[0].state == "would_fast_forward"
     assert status.branches[0].new == remote_head
+    assert status.local_history_present is True
+    assert status.local_dirty_summary.as_dict() == {
+        "tracked": 0, "content": 0, "mode_only": 0, "untracked": 0,
+    }
     assert subprocess.run(["git", "rev-parse", "--verify", "refs/remotes/LOCAL_SIM/main"],
                           cwd=str(local), capture_output=True, text=True).returncode != 0
+
+
+def test_status_reports_repoless_peer_without_creating_git_metadata(bootstrap_repos):
+    cfg, local, _remote, peer_head = bootstrap_repos
+    assert not (local / ".git").exists()
+
+    status = git_sync_status_result(cfg, device_name="LOCAL_SIM", reporter=Reporter())
+
+    assert status.exit_code == EXIT_OK
+    assert status.local_history_present is False
+    assert status.local_dirty is False
+    assert status.hook_installed is False
+    assert [(a.branch, a.state, a.new) for a in status.branches] == [
+        ("main", "bootstrap_available", peer_head),
+    ]
+    assert not (local / ".git").exists()
+
+
+def test_dirty_summary_distinguishes_content_mode_and_untracked():
+    summary = _parse_dirty_summary(
+        " M content.py\n M mode.py\n?? scratch.txt\n",
+        "2\t1\tcontent.py\n0\t0\tmode.py\n",
+        " mode change 100644 => 100755 mode.py\n",
+    )
+    assert summary.as_dict() == {
+        "tracked": 2, "content": 1, "mode_only": 1, "untracked": 1,
+    }
 
 
 def test_status_reports_divergence_exit_two(repos):
@@ -372,6 +550,16 @@ def test_install_hook_uses_project_config_peers(repos):
     assert "git-sync LOCAL_SIM --push --quiet" in text
     assert "gitsync-hook/demo.log" in text.replace("\\", "/")
     assert "tail -c 65536" in text
+
+
+def test_install_hook_uses_global_git_sync_peers(repos):
+    cfg, local, _remote = repos
+    cfg = replace(cfg, git_sync={"peers": ["LOCAL_SIM"]})
+
+    assert install_git_sync_hook(cfg, reporter=Reporter()) == EXIT_OK
+
+    hook = local / ".git" / "hooks" / "post-commit"
+    assert "git-sync LOCAL_SIM --push --quiet" in hook.read_text(encoding="utf-8")
 
 
 def test_install_hook_backs_up_and_uninstall_restores_existing_hook(repos):

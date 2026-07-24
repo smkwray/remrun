@@ -13,18 +13,21 @@ from pathlib import Path
 
 
 PUBLIC_INCLUDE_GLOBS = [
+    ".gitattributes",
+    ".gitignore",
     "LICENSE",
     "README.md",
     "pyproject.toml",
+    "uv.lock",
     "bin/*",
     "config/*.example.toml",
     "config/defaults.toml",
-    "docs/**",
-    "examples/**",
-    "schemas/**",
-    "scripts/**",
-    "src/**",
-    "tests/**",
+    "docs/**/*",
+    "examples/**/*",
+    "schemas/**/*",
+    "scripts/**/*",
+    "src/**/*",
+    "tests/**/*",
 ]
 
 PUBLIC_EXCLUDE_GLOBS = [

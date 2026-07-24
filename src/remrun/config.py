@@ -28,6 +28,13 @@ class RemrunConfig:
     # engine/worker-command/output-root mapping. Core ships NONE; the workflow is entirely user
     # config so nothing deployment-specific lives in the published code. {task: {device: spec}}.
     fleet_adapters: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # git-sync may intentionally cover a broader tree than command execution. For
+    # example, normal projects live under ~/work/projects while remrun itself lives at
+    # ~/work/remrun. Keeping this separate preserves the narrow run/transfer root.
+    git_sync: dict[str, Any] = field(default_factory=dict)
+    # Parsed now for the inert Step-3 runner rollout. Legacy remains the default;
+    # later steps are responsible for enforcing runner-v1 coordination.
+    coordination: dict[str, Any] = field(default_factory=dict)
 
 
 def find_remrun_root(start: Path | None = None) -> Path:
@@ -83,9 +90,12 @@ def load_config(remrun_root: Path | None = None) -> RemrunConfig:
         for task, devmap in devices_doc.get("fleet", {}).get("adapters", {}).items()
         if isinstance(devmap, dict)
     }
+    git_sync = dict(devices_doc.get("git_sync", {}) or {})
+    coordination = dict(devices_doc.get("coordination", {}) or {})
     return RemrunConfig(repo_root=root, defaults=defaults, devices=devices,
                         project_roots=project_roots, offload=offload, sync_roots=sync_roots,
-                        fleet_adapters=fleet_adapters)
+                        fleet_adapters=fleet_adapters, git_sync=git_sync,
+                        coordination=coordination)
 
 
 # Conservative workstation defaults when a controller defines no explicit threshold

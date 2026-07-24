@@ -9,7 +9,7 @@ import socket
 import subprocess
 import tempfile
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .config import RemrunConfig, load_project_config
@@ -40,6 +40,32 @@ class BranchAction:
     old: str | None = None
     new: str | None = None
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class WorktreeDirtySummary:
+    """Small, agent-facing classification of a Git working tree."""
+
+    tracked: int = 0
+    content: int = 0
+    mode_only: int = 0
+    untracked: int = 0
+
+    @property
+    def dirty(self) -> bool:
+        return self.tracked > 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "tracked": self.tracked,
+            "content": self.content,
+            "mode_only": self.mode_only,
+            "untracked": self.untracked,
+        }
+
+    def describe(self) -> str:
+        return (f"{self.tracked} tracked ({self.content} content, "
+                f"{self.mode_only} mode-only), {self.untracked} untracked")
 
 
 @dataclass
@@ -117,8 +143,11 @@ class GitSyncStatus:
     local_project: str
     remote_project: str
     branches: list[BranchAction]
+    local_history_present: bool
     local_dirty: bool
     remote_dirty: bool
+    local_dirty_summary: WorktreeDirtySummary
+    remote_dirty_summary: WorktreeDirtySummary
     hook_installed: bool
     hook_log: str | None
     line_endings_ok: bool
@@ -133,8 +162,11 @@ class GitSyncStatus:
             "local_project": self.local_project,
             "remote_project": self.remote_project,
             "branches": [a.__dict__ for a in self.branches],
+            "local_history_present": self.local_history_present,
             "local_dirty": self.local_dirty,
             "remote_dirty": self.remote_dirty,
+            "local_dirty_summary": self.local_dirty_summary.as_dict(),
+            "remote_dirty_summary": self.remote_dirty_summary.as_dict(),
             "hook_installed": self.hook_installed,
             "hook_log": self.hook_log,
             "line_endings_ok": self.line_endings_ok,
@@ -207,6 +239,7 @@ def install_git_sync_hook(
 ) -> int:
     reporter = reporter or Reporter()
     try:
+        config = _git_sync_config(config)
         project, project_config = _detect_git_project(config)
         peers = _resolve_hook_peers(config, project_config, device_name)
         hook_path = _hook_path(project.local_project_root)
@@ -240,6 +273,7 @@ def uninstall_git_sync_hook(
 ) -> int:
     reporter = reporter or Reporter()
     try:
+        config = _git_sync_config(config)
         project, _project_config = _detect_git_project(config)
         hook_path = _hook_path(project.local_project_root)
         backup_path = hook_path.with_name(hook_path.name + ".remrun-backup")
@@ -271,6 +305,7 @@ def run_git_sync_result(
     reporter: Reporter | None = None,
 ) -> GitSyncResult:
     reporter = reporter or Reporter()
+    config = _git_sync_config(config)
     direction = direction.lower()
     if direction not in {"pull", "push", "both"}:
         raise GitSyncError(f"invalid git-sync direction: {direction}", EXIT_INTERNAL)
@@ -280,12 +315,17 @@ def run_git_sync_result(
     if not device.enabled:
         raise GitSyncError(f"device disabled: {device_name}", EXIT_INFRA)
 
-    project, _project_config = _detect_git_project(config, require_git=False)
+    project, project_config = _detect_git_project(config, require_git=False)
     local_root = project.local_project_root
 
-    if not _is_git_repo(local_root):
-        # Repo-less project: the norm for a Syncthing-synced tree that arrives on
-        # a fresh device with `.git` excluded. Bootstrap from the peer's history.
+    local_is_repo = _is_git_repo(local_root)
+    local_has_head = (
+        local_is_repo
+        and _local_git(local_root, ["rev-parse", "--verify", "--quiet", "HEAD"]).returncode == 0
+    )
+    if not local_has_head:
+        # Repo-less project—or an empty/unborn `.git` left by an interrupted
+        # bootstrap. Seed/recover it from the peer's authoritative history.
         if bootstrap or direction in {"pull", "both"}:
             return _bootstrap_from_peer(
                 config, device_name, project, dry_run=dry_run, reporter=reporter)
@@ -322,19 +362,26 @@ def run_git_sync_result(
         reporter.event("git_sync_dry_run", action="verified repos; no fetch or fast-forward")
         return result
 
+    project_git_sync = project_config.get("git_sync", {}) or {}
+    advance_dirty = bool(project_git_sync.get(
+        "advance_dirty_worktree",
+        (config.git_sync or {}).get("advance_dirty_worktree", False),
+    ))
     if direction in {"pull", "both"}:
         result.pulled.extend(_pull_from_peer(
-            transport, remote_root, local_root, peer_ns, branch, reporter))
+            transport, remote_root, local_root, peer_ns, branch, reporter,
+            advance_dirty_worktree=advance_dirty))
     if direction in {"push", "both"}:
         peer_actions = _push_to_peer(
-            transport, remote_root, local_root, local_ns, branch, reporter)
+            transport, remote_root, local_root, local_ns, branch, reporter,
+            advance_dirty_worktree=advance_dirty)
         result.pushed.extend(peer_actions)
 
     result.diverged.extend([a for a in result.pulled + result.pushed if a.state == "diverged"])
     result.skipped.extend([a for a in result.pulled + result.pushed if a.state.startswith("skipped")])
     reporter.event("git_sync_summary", exit_code=result.exit_code,
                    fast_forwarded=len([a for a in result.pulled + result.pushed
-                                        if a.state == "fast_forwarded"]),
+                                        if a.state.startswith("fast_forwarded")]),
                    diverged=len(result.diverged),
                    skipped=len(result.skipped))
     return result
@@ -348,14 +395,19 @@ def git_sync_status_result(
     reporter: Reporter | None = None,
 ) -> GitSyncStatus:
     reporter = reporter or Reporter()
+    config = _git_sync_config(config)
     if device_name not in config.devices:
         raise GitSyncError(f"unknown device: {device_name}", EXIT_INTERNAL)
     device = config.devices[device_name]
     if not device.enabled:
         raise GitSyncError(f"device disabled: {device_name}", EXIT_INFRA)
 
-    project, _project_config = _detect_git_project(config)
+    project, _project_config = _detect_git_project(config, require_git=False)
     local_root = project.local_project_root
+    local_history_present = (
+        _is_git_repo(local_root)
+        and _local_git(local_root, ["rev-parse", "--verify", "--quiet", "HEAD"]).returncode == 0
+    )
     transport = make_transport(device)
     probe = transport.probe()
     if not probe.reachable:
@@ -366,7 +418,10 @@ def git_sync_status_result(
     peer_ns = _ref_namespace(device_name)
     with tempfile.TemporaryDirectory(prefix="remrun-gitsync-status-") as td:
         tmp_repo = Path(td) / "local.git"
-        _local_git_ok(Path.cwd(), ["clone", "--bare", str(local_root), str(tmp_repo)])
+        if local_history_present:
+            _local_git_ok(Path.cwd(), ["clone", "--bare", str(local_root), str(tmp_repo)])
+        else:
+            _local_git_ok(Path.cwd(), ["init", "--bare", str(tmp_repo)])
         local_bundle = Path(td) / "peer.bundle"
         remote_tmp = transport.remote_temp_dir("remrun-gitsync-status")
         remote_bundle = transport.native_join(remote_tmp, "peer.bundle")
@@ -378,20 +433,36 @@ def git_sync_status_result(
             transport.remove_remote_tree(remote_tmp)
         _local_git_ok(tmp_repo, ["fetch", "--tags", str(local_bundle),
                                  f"+refs/heads/*:refs/remotes/{peer_ns}/*"])
-        branches = _status_branches(tmp_repo, peer_ns, branch)
+        branches = (
+            _status_branches(tmp_repo, peer_ns, branch)
+            if local_history_present
+            else _bootstrap_status_branches(tmp_repo, peer_ns, branch)
+        )
 
-    local_dirty = _dirty_local(local_root)
-    remote_dirty = _dirty_remote(transport, remote_root)
-    hook = _hook_path(local_root)
-    hook_installed = hook.exists() and HOOK_BEGIN in hook.read_text(encoding="utf-8",
-                                                                    errors="replace")
+    local_summary = (
+        _dirty_summary_local(local_root)
+        if local_history_present
+        else WorktreeDirtySummary()
+    )
+    remote_summary = _dirty_summary_remote(transport, remote_root)
+    local_dirty = local_summary.dirty
+    remote_dirty = remote_summary.dirty
+    hook_installed = False
+    if local_history_present:
+        hook = _hook_path(local_root)
+        hook_installed = hook.exists() and HOOK_BEGIN in hook.read_text(
+            encoding="utf-8", errors="replace"
+        )
     log_path = _hook_log_path(config, project.project_id)
     line_endings_ok = _line_endings_ok(local_root)
     for action in branches:
         reporter.event("git_sync_status", branch=action.branch, state=action.state,
                        old=action.old, new=action.new, detail=action.detail)
-    reporter.event("git_sync_status_summary", device=device_name, local_dirty=local_dirty,
+    reporter.event("git_sync_status_summary", device=device_name,
+                   local_history_present=local_history_present, local_dirty=local_dirty,
                    remote_dirty=remote_dirty, hook_installed=hook_installed,
+                   local_dirty_summary=local_summary.as_dict(),
+                   remote_dirty_summary=remote_summary.as_dict(),
                    hook_log=str(log_path) if log_path.exists() else None,
                    line_endings_ok=line_endings_ok, exit_code=EXIT_DIVERGED
                    if any(a.state == "diverged" for a in branches) else EXIT_OK)
@@ -402,8 +473,11 @@ def git_sync_status_result(
         local_project=str(local_root),
         remote_project=remote_root,
         branches=branches,
+        local_history_present=local_history_present,
         local_dirty=local_dirty,
         remote_dirty=remote_dirty,
+        local_dirty_summary=local_summary,
+        remote_dirty_summary=remote_summary,
         hook_installed=hook_installed,
         hook_log=str(log_path) if log_path.exists() else None,
         line_endings_ok=line_endings_ok,
@@ -421,12 +495,51 @@ def _detect_git_project(config: RemrunConfig, *, require_git: bool = True):
     return project, project_config
 
 
+def _git_sync_config(config: RemrunConfig) -> RemrunConfig:
+    """Apply the optional broader project mapping used only by git-sync.
+
+    Command execution keeps using ``[project_roots]`` and each device's
+    ``project_root``. A configured ``[git_sync.project_roots]`` replaces both sides
+    for Git history exchange, so sibling repositories such as ``work/remrun`` and
+    ordinary ``work/projects/foo`` share one stable relative project id without
+    broadening remrun's arbitrary-file transfer surface.
+    """
+    roots = (config.git_sync or {}).get("project_roots", {})
+    if not isinstance(roots, dict) or not roots:
+        return config
+    normalized = {str(key): str(value) for key, value in roots.items()}
+    devices = dict(config.devices)
+    for name, device in devices.items():
+        root = _root_for_device_os(normalized, device.os)
+        if root:
+            devices[name] = replace(device, project_root=root)
+    return replace(config, project_roots=normalized, devices=devices)
+
+
+def _root_for_device_os(roots: dict[str, str], os_name: str) -> str | None:
+    raw = os_name.lower()
+    keys = [raw]
+    if raw.startswith("win"):
+        keys.append("windows")
+    elif raw.startswith("mac") or raw.startswith("darwin"):
+        keys.append("macos")
+    elif raw.startswith("linux") or raw.startswith("posix"):
+        keys.extend(["linux", "posix"])
+    keys.append("default")
+    for key in keys:
+        value = roots.get(key)
+        if value:
+            return value
+    return None
+
+
 def _resolve_hook_peers(
     config: RemrunConfig,
     project_config: dict,
     device_name: str | None,
 ) -> list[str]:
-    raw_peers = (project_config.get("git_sync", {}) or {}).get("peers", [])
+    global_peers = (config.git_sync or {}).get("peers", [])
+    raw_peers = (project_config.get("git_sync", {}) or {}).get("peers", global_peers)
     if isinstance(raw_peers, str):
         raw_peers = [raw_peers]
     peers: list[str] = []
@@ -542,6 +655,31 @@ def _status_branches(repo: Path, peer_ns: str, branch: str | None) -> list[Branc
     return actions
 
 
+def _bootstrap_status_branches(
+    repo: Path,
+    peer_ns: str,
+    branch: str | None,
+) -> list[BranchAction]:
+    prefix = f"refs/remotes/{peer_ns}/"
+    result = _local_git_ok(
+        repo,
+        ["for-each-ref", "--format=%(refname) %(objectname)", prefix],
+    )
+    actions: list[BranchAction] = []
+    for line in result.stdout.splitlines():
+        ref, head = line.split(" ", 1)
+        name = ref.removeprefix(prefix)
+        if branch and name != branch:
+            continue
+        actions.append(BranchAction(
+            name,
+            "bootstrap_available",
+            new=head,
+            detail="local project has no Git history; --pull would bootstrap from this peer",
+        ))
+    return actions
+
+
 def _pull_from_peer(
     transport: BaseTransport,
     remote_root: str,
@@ -549,6 +687,8 @@ def _pull_from_peer(
     peer_ns: str,
     branch: str | None,
     reporter: Reporter,
+    *,
+    advance_dirty_worktree: bool = False,
 ) -> list[BranchAction]:
     with tempfile.TemporaryDirectory(prefix="remrun-gitsync-") as td:
         local_bundle = Path(td) / "peer.bundle"
@@ -562,7 +702,9 @@ def _pull_from_peer(
             transport.remove_remote_tree(remote_tmp)
         _local_git_ok(local_root, ["fetch", "--tags", str(local_bundle),
                                    f"+refs/heads/*:refs/remotes/{peer_ns}/*"])
-    actions = _fast_forward_local(local_root, peer_ns, branch)
+    actions = _fast_forward_local(
+        local_root, peer_ns, branch,
+        advance_dirty_worktree=advance_dirty_worktree)
     _emit_actions(reporter, "git_sync_pull", actions)
     return actions
 
@@ -574,6 +716,8 @@ def _push_to_peer(
     local_ns: str,
     branch: str | None,
     reporter: Reporter,
+    *,
+    advance_dirty_worktree: bool = False,
 ) -> list[BranchAction]:
     with tempfile.TemporaryDirectory(prefix="remrun-gitsync-") as td:
         local_bundle = Path(td) / "local.bundle"
@@ -584,7 +728,9 @@ def _push_to_peer(
             transport.push_file(local_bundle, remote_bundle)
             _remote_git_ok(transport, remote_root, ["fetch", "--tags", remote_bundle,
                                                    f"+refs/heads/*:refs/remotes/{local_ns}/*"])
-            actions = _fast_forward_remote(transport, remote_root, local_ns, branch)
+            actions = _fast_forward_remote(
+                transport, remote_root, local_ns, branch,
+                advance_dirty_worktree=advance_dirty_worktree)
         finally:
             transport.remove_remote_tree(remote_tmp)
     _emit_actions(reporter, "git_sync_push", actions)
@@ -648,9 +794,16 @@ def _bootstrap_from_peer(
     peer_branch = _current_branch_remote(transport, remote_root) or "main"
     peer_ns = _ref_namespace(device_name)
 
-    reporter.event("git_sync_bootstrap", device=device_name, local_project=str(local_root),
-                   remote_project=remote_root, branch=peer_branch, head=peer_head,
-                   dry_run=dry_run)
+    reporter.event(
+        "git_sync_bootstrap_start",
+        device=device_name,
+        local_project=str(local_root),
+        remote_project=remote_root,
+        branch=peer_branch,
+        head=peer_head,
+        dry_run=dry_run,
+        message="peer discovered; bootstrap has not completed yet",
+    )
     if dry_run:
         reporter.event("git_sync_bootstrap_dry_run",
                        action=f"would init {local_root} and fetch {peer_branch}@{peer_head[:12]} "
@@ -663,6 +816,7 @@ def _bootstrap_from_peer(
                 branch=peer_branch, head=peer_head, commits_fetched=0, modified=0, untracked=0))
 
     git_dir = local_root / ".git"
+    created_git_dir = not git_dir.exists()
     _local_git_ok(local_root, ["init", "-q"])
     try:
         _local_git_ok(local_root, ["config", "core.autocrlf", "false"])
@@ -681,8 +835,27 @@ def _bootstrap_from_peer(
                 transport.pull_file(remote_bundle, local_bundle)
             finally:
                 transport.remove_remote_tree(remote_tmp)
+            if not local_bundle.is_file() or local_bundle.stat().st_size == 0:
+                raise GitSyncError(
+                    "peer bundle pull completed without a non-empty local bundle",
+                    EXIT_TRANSFER,
+                )
+            _local_git_ok(local_root, ["bundle", "verify", str(local_bundle)])
             _local_git_ok(local_root, ["fetch", "--tags", str(local_bundle),
                                        f"+refs/heads/*:refs/remotes/{peer_ns}/*"])
+
+        # Do not trust the fetch exit code alone: require the discovered peer
+        # commit and checked-out branch ref to have arrived before creating heads.
+        _local_git_ok(local_root, ["cat-file", "-e", f"{peer_head}^{{commit}}"])
+        peer_branch_ref = f"refs/remotes/{peer_ns}/{peer_branch}"
+        fetched_peer_head = _local_git_ok(
+            local_root, ["rev-parse", "--verify", peer_branch_ref]).stdout.strip()
+        if fetched_peer_head != peer_head:
+            raise GitSyncError(
+                f"peer branch verification failed: {peer_branch_ref} is "
+                f"{fetched_peer_head or '<missing>'}, expected {peer_head}",
+                EXIT_TRANSFER,
+            )
 
         # Recreate a local head for every peer branch (a clone-like layout) so
         # `git branch`/`git log` work, then point HEAD at the peer's checked-out
@@ -704,6 +877,16 @@ def _bootstrap_from_peer(
         _local_git_ok(local_root, ["symbolic-ref", "HEAD", f"refs/heads/{peer_branch}"])
         # --mixed refreshes the index to match HEAD; the working tree is left as-is.
         _local_git_ok(local_root, ["reset", "--mixed", "-q"])
+        installed_head = _local_git_ok(local_root, ["rev-parse", "HEAD"]).stdout.strip()
+        installed_branch = _local_git_ok(
+            local_root, ["symbolic-ref", "--short", "HEAD"]).stdout.strip()
+        if installed_head != peer_head or installed_branch != peer_branch:
+            raise GitSyncError(
+                "bootstrap postcondition failed: "
+                f"HEAD={installed_head or '<missing>'} branch={installed_branch or '<missing>'}; "
+                f"expected {peer_head} on {peer_branch}",
+                EXIT_TRANSFER,
+            )
 
         hooks_path_set = False
         if (local_root / ".githooks").is_dir():
@@ -712,10 +895,18 @@ def _bootstrap_from_peer(
 
         commits_fetched = int(_local_git_ok(
             local_root, ["rev-list", "--count", "--all"]).stdout.strip() or "0")
+        if commits_fetched < 1:
+            raise GitSyncError(
+                "bootstrap postcondition failed: no local commits were installed",
+                EXIT_TRANSFER,
+            )
         modified, untracked = _worktree_counts(local_root)
-    except Exception:
-        # Leave no half-initialized repo behind on failure.
-        shutil.rmtree(git_dir, ignore_errors=True)
+    except BaseException:
+        # Leave no half-initialized repo behind when this invocation created it,
+        # including on Ctrl-C. Preserve a pre-existing empty repo so recovery is
+        # retryable without deleting metadata that remrun did not create.
+        if created_git_dir:
+            shutil.rmtree(git_dir, ignore_errors=True)
         raise
 
     boot = GitSyncBootstrap(
@@ -797,9 +988,16 @@ def _branches_remote(transport: BaseTransport, remote_root: str, branch: str | N
     return [b for b in res.stdout.splitlines() if b]
 
 
-def _fast_forward_local(repo: Path, peer_ns: str, branch: str | None) -> list[BranchAction]:
+def _fast_forward_local(
+    repo: Path,
+    peer_ns: str,
+    branch: str | None,
+    *,
+    advance_dirty_worktree: bool = False,
+) -> list[BranchAction]:
     current = _current_branch_local(repo)
-    dirty = _dirty_local(repo)
+    dirty_summary = _dirty_summary_local(repo)
+    dirty = dirty_summary.dirty
     actions: list[BranchAction] = []
     for name in _branches_local(repo, branch):
         local_ref = f"refs/heads/{name}"
@@ -813,6 +1011,17 @@ def _fast_forward_local(repo: Path, peer_ns: str, branch: str | None) -> list[Br
             continue
         if name == current:
             if dirty:
+                if advance_dirty_worktree:
+                    # Synced-worktree mode: move HEAD+index to the proved fast-forward
+                    # target while preserving every worktree byte. Any edits or bytes
+                    # not yet delivered by Syncthing remain visible as dirty.
+                    _local_git_ok(repo, ["reset", "--mixed", "-q", peer_ref])
+                    actions.append(BranchAction(
+                        name, "fast_forwarded_worktree_preserved", action.old, action.new,
+                        "history advanced; index refreshed; worktree bytes untouched; "
+                        f"local worktree remains dirty: {dirty_summary.describe()}; "
+                        "do not treat it as a clean checkout"))
+                    continue
                 actions.append(BranchAction(name, "skipped_dirty_worktree",
                                             action.old, action.new,
                                             "fetch completed; merge manually after cleaning tree"))
@@ -829,9 +1038,12 @@ def _fast_forward_remote(
     remote_root: str,
     peer_ns: str,
     branch: str | None,
+    *,
+    advance_dirty_worktree: bool = False,
 ) -> list[BranchAction]:
     current = _current_branch_remote(transport, remote_root)
-    dirty = _dirty_remote(transport, remote_root)
+    dirty_summary = _dirty_summary_remote(transport, remote_root)
+    dirty = dirty_summary.dirty
     actions: list[BranchAction] = []
     for name in _branches_remote(transport, remote_root, branch):
         local_ref = f"refs/heads/{name}"
@@ -846,6 +1058,19 @@ def _fast_forward_remote(
             continue
         if name == current:
             if dirty:
+                if advance_dirty_worktree:
+                    # Hub mode: move HEAD+index to the already-proved fast-forward target
+                    # while preserving every worktree byte. This is intentionally `--mixed`,
+                    # never checkout/reset-hard/clean. Syncthing-delivered bytes can converge
+                    # later; any genuine edit stays visible as dirty rather than being lost.
+                    _remote_git_ok(transport, remote_root,
+                                   ["reset", "--mixed", "-q", peer_ref])
+                    actions.append(BranchAction(
+                        name, "fast_forwarded_worktree_preserved", action.old, action.new,
+                        "history advanced; index refreshed; worktree bytes untouched; "
+                        f"remote worktree remains dirty: {dirty_summary.describe()}; "
+                        "do not treat it as a clean checkout"))
+                    continue
                 actions.append(BranchAction(name, "skipped_dirty_worktree",
                                             action.old, action.new,
                                             "fetch completed; merge manually after cleaning tree"))
@@ -909,6 +1134,57 @@ def _dirty_local(repo: Path) -> bool:
 
 def _dirty_remote(transport: BaseTransport, remote_root: str) -> bool:
     return _remote_git(transport, remote_root, ["diff", "--quiet", "HEAD", "--"]).exit_code != 0
+
+
+def _parse_dirty_summary(status: str, numstat: str, diff_summary: str) -> WorktreeDirtySummary:
+    tracked = untracked = 0
+    for line in status.splitlines():
+        if not line:
+            continue
+        if line.startswith("??"):
+            untracked += 1
+        else:
+            tracked += 1
+
+    # A pure mode change appears as 0/0 in --numstat and as a mode-change line in
+    # --summary. Requiring both avoids misclassifying a newly added empty file.
+    zero_line_diffs = 0
+    for line in numstat.splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) >= 2 and fields[0] == "0" and fields[1] == "0":
+            zero_line_diffs += 1
+    mode_changes = sum(1 for line in diff_summary.splitlines()
+                       if line.strip().startswith("mode change "))
+    mode_only = min(tracked, zero_line_diffs, mode_changes)
+    return WorktreeDirtySummary(
+        tracked=tracked,
+        content=max(0, tracked - mode_only),
+        mode_only=mode_only,
+        untracked=untracked,
+    )
+
+
+def _dirty_summary_local(repo: Path) -> WorktreeDirtySummary:
+    status = _local_git_ok(repo, ["status", "--porcelain", "--untracked-files=all"]).stdout
+    numstat = _local_git_ok(repo, ["diff", "--numstat", "HEAD", "--"]).stdout
+    summary = _local_git_ok(repo, ["diff", "--summary", "HEAD", "--"]).stdout
+    return _parse_dirty_summary(status, numstat, summary)
+
+
+def _dirty_summary_remote(
+    transport: BaseTransport,
+    remote_root: str,
+) -> WorktreeDirtySummary:
+    status = _remote_git_ok(
+        transport, remote_root, ["status", "--porcelain", "--untracked-files=all"]
+    ).stdout
+    numstat = _remote_git_ok(
+        transport, remote_root, ["diff", "--numstat", "HEAD", "--"]
+    ).stdout
+    summary = _remote_git_ok(
+        transport, remote_root, ["diff", "--summary", "HEAD", "--"]
+    ).stdout
+    return _parse_dirty_summary(status, numstat, summary)
 
 
 def _ref_namespace(value: str) -> str:

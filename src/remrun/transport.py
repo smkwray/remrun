@@ -8,6 +8,7 @@ import posixpath
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import uuid
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .frame import decode_file_frame, encode_file_frame
 from .manifest import Manifest, build_manifest, sha256_file
 from .models import Device, ProjectContext
 from .state import manifest_from_json
@@ -195,6 +197,24 @@ class BaseTransport:
         """
         return None
 
+    # --- versioned runner groundwork (coordination design Step 3) --------
+    def install_versioned_runner(
+        self, source: bytes, remote_path: str, expected_sha256: str
+    ) -> None:
+        """Install a content-addressed self-contained runner from an RRFRAME2 payload."""
+        raise NotImplementedError
+
+    def runner_rpc(self, runner_path: str, state_root: str, request_frame: bytes) -> bytes:
+        """Invoke one short-lived versioned-runner RPC and return its framed response."""
+        raise NotImplementedError
+
+    def runner_stream_argv(
+        self, runner_path: str, state_root: str, operation: str,
+        arguments: list[str] | None = None,
+    ) -> list[str]:
+        """Build a no-shell argv for directly piping one runner process to another."""
+        raise NotImplementedError
+
     # --- project-less helpers (fleet mode) --------------------------------
     def native_join(self, *parts: str) -> str:
         """Join path parts in the remote's native form (default POSIX).
@@ -331,6 +351,48 @@ class LocalSimTransport(BaseTransport):
     def probe(self) -> ProbeResult:
         return ProbeResult(reachable=True, address="localhost", detail="local-sim", remote_os="posix")
 
+    def install_versioned_runner(
+        self, source: bytes, remote_path: str, expected_sha256: str
+    ) -> None:
+        header, payload = decode_file_frame(encode_file_frame(
+            source, transfer_id=f"runner-{expected_sha256}", mode=0o700))
+        if header["sha256"] != expected_sha256:
+            raise TransportError("versioned runner source digest mismatch")
+        dest = Path(remote_path)
+        if dest.is_symlink():
+            raise TransportError(f"refusing symlinked runner destination: {dest}")
+        if dest.exists() and sha256_file(dest) == expected_sha256:
+            return
+
+        def fill(tmp: Path) -> None:
+            tmp.write_bytes(payload)
+            try:
+                tmp.chmod(0o700)
+            except OSError:
+                pass
+
+        _atomic_write_local(dest, fill)
+
+    def runner_rpc(self, runner_path: str, state_root: str, request_frame: bytes) -> bytes:
+        proc = subprocess.run(
+            [sys.executable, runner_path, "rpc", state_root],
+            input=request_frame,
+            capture_output=True,
+            check=False,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            raise TransportError(
+                f"versioned runner RPC failed: {proc.stderr.decode('utf-8', 'replace').strip()}"
+            )
+        return proc.stdout
+
+    def runner_stream_argv(
+        self, runner_path: str, state_root: str, operation: str,
+        arguments: list[str] | None = None,
+    ) -> list[str]:
+        return [sys.executable, runner_path, operation, state_root, *(arguments or [])]
+
     def native_join(self, *parts: str) -> str:
         cleaned = [str(p) for p in parts if p]
         return str(Path(*cleaned)) if cleaned else ""
@@ -458,7 +520,11 @@ class _SSHCommon(BaseTransport):
         ]
         if connect_timeout:
             opts += ["-o", f"ConnectTimeout={connect_timeout}"]
-        opts += list(self.device.ssh_opts)
+        # subprocess argv bypasses shell tilde expansion. Device config is synced
+        # across controllers, so keep identity paths portable instead of pinning a
+        # controller's absolute home directory.
+        opts += [str(Path(opt).expanduser()) if opt.startswith(("~/", "~\\")) else opt
+                 for opt in self.device.ssh_opts]
         target = f"{self.device.user}@{address}" if self.device.user else address
         return ["ssh", *opts, target]
 
@@ -480,6 +546,12 @@ class _SSHCommon(BaseTransport):
             )
         except FileNotFoundError as exc:
             raise TransportError(f"ssh executable not found: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            # A blackholed / very slow candidate must not abort --auto failover:
+            # surface the timeout as a typed transport error so probe() and
+            # sample_load() can treat this candidate as unreachable/unknown and
+            # move on to the next one instead of letting the run crash.
+            raise TransportError(f"ssh timed out after {exc.timeout}s") from exc
 
     def _address_or_resolve(self) -> str:
         if self._address is None:
@@ -719,6 +791,58 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as tf:
 """
 
 
+# Bootstrap only: verify a complete RRFRAME2 file payload before atomically installing the
+# content-addressed remote helper. Kept self-contained because no remrun package exists remotely.
+_INSTALL_RUNNER_PROG = r"""
+import base64,binascii,hashlib,json,os,sys,tempfile
+dest,expected=sys.argv[1],sys.argv[2]
+data=sys.stdin.buffer.read()
+nl=data.find(b"\n")
+if nl<0: raise ValueError("no frame header line")
+parts=data[:nl].split(b" ")
+if len(parts)!=3 or parts[0]!=b"RRFRAME2": raise ValueError("bad frame header")
+hlen,blen=int(parts[1]),int(parts[2])
+rest=data[nl+1:]
+if hlen<0 or blen<0 or hlen>1048576 or len(rest)!=hlen+blen:
+    raise ValueError("frame size mismatch")
+header=json.loads(rest[:hlen].decode("utf-8"))
+body=base64.b64decode(rest[hlen:],validate=True)
+digest=hashlib.sha256(body).hexdigest()
+if header.get("kind")!="file" or header.get("v")!=2:
+    raise ValueError("not a v2 file frame")
+if len(body)!=header.get("decoded_length") or digest!=header.get("sha256"):
+    raise ValueError("payload integrity mismatch")
+if digest!=expected: raise ValueError("source digest mismatch")
+parent=os.path.dirname(dest) or "."
+os.makedirs(parent,exist_ok=True)
+if os.path.islink(dest): raise ValueError("runner destination is a symlink")
+reused=False
+if os.path.isfile(dest):
+    h=hashlib.sha256()
+    with open(dest,"rb") as f:
+        for chunk in iter(lambda:f.read(1048576),b""): h.update(chunk)
+    reused=h.hexdigest()==expected
+if not reused:
+    fd,tmp=tempfile.mkstemp(prefix=".remrun-runner-",suffix=".tmp",dir=parent)
+    try:
+        with os.fdopen(fd,"wb") as f:
+            f.write(body);f.flush();os.fsync(f.fileno())
+        try: os.chmod(tmp,0o700)
+        except OSError: pass
+        os.replace(tmp,dest)
+        try:
+            d=os.open(parent,os.O_RDONLY)
+            try: os.fsync(d)
+            finally: os.close(d)
+        except OSError: pass
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+sys.stdout.write(json.dumps({"path":dest,"sha256":digest,"reused":reused}))
+"""
+
+
 class SSHPosixTransport(_SSHCommon):
     """POSIX backend over OpenSSH.
 
@@ -752,11 +876,15 @@ class SSHPosixTransport(_SSHCommon):
     def probe(self) -> ProbeResult:
         last_detail = "no address candidates configured"
         for address in self.device.all_addresses():
-            proc = self._run(
-                [*self._ssh_base(address, connect_timeout=8),
-                 'echo remrun-ok && uname -s && printf %s "$HOME"'],
-                timeout=20,
-            )
+            try:
+                proc = self._run(
+                    [*self._ssh_base(address, connect_timeout=8),
+                     'echo remrun-ok && uname -s && printf %s "$HOME"'],
+                    timeout=20,
+                )
+            except TransportError as exc:
+                last_detail = str(exc)
+                continue
             if proc.returncode == 0 and b"remrun-ok" in proc.stdout:
                 lines = proc.stdout.decode("utf-8", "replace").splitlines()
                 remote_os = lines[1].strip().lower() if len(lines) > 1 else None
@@ -779,8 +907,11 @@ class SSHPosixTransport(_SSHCommon):
             address = self._address_or_resolve()
         except TransportError:
             return None
-        proc = self._run([*self._ssh_base(address, connect_timeout=8),
-                          "top -l 2 -n 0 | grep -i 'CPU usage' | tail -1"], timeout=20)
+        try:
+            proc = self._run([*self._ssh_base(address, connect_timeout=8),
+                              "top -l 2 -n 0 | grep -i 'CPU usage' | tail -1"], timeout=20)
+        except TransportError:
+            return None
         if proc.returncode == 0:
             parts = proc.stdout.decode("utf-8", "replace").replace("%", "").split()
             if "idle" in parts:
@@ -790,14 +921,61 @@ class SSHPosixTransport(_SSHCommon):
                     pass
         py = self.device.remote_python or "python3"
         prog = "import os;print(round(os.getloadavg()[0]/(os.cpu_count() or 1)*100,1))"
-        proc = self._run([*self._ssh_base(address, connect_timeout=6),
-                          f"{shlex.quote(py)} -c {shlex.quote(prog)}"], timeout=15)
+        try:
+            proc = self._run([*self._ssh_base(address, connect_timeout=6),
+                              f"{shlex.quote(py)} -c {shlex.quote(prog)}"], timeout=15)
+        except TransportError:
+            return None
         if proc.returncode != 0:
             return None
         try:
             return float(proc.stdout.decode("utf-8", "replace").strip().split()[-1])
         except (ValueError, IndexError):
             return None
+
+    def install_versioned_runner(
+        self, source: bytes, remote_path: str, expected_sha256: str
+    ) -> None:
+        address = self._address_or_resolve()
+        frame = encode_file_frame(
+            source, transfer_id=f"runner-{expected_sha256}", mode=0o700)
+        script = (
+            f"{shlex.quote(self.device.remote_python)} -c "
+            f"{shlex.quote(_INSTALL_RUNNER_PROG)} {shlex.quote(remote_path)} "
+            f"{shlex.quote(expected_sha256)}"
+        )
+        proc = self._remote(address, script, input_bytes=frame, timeout=60)
+        if proc.returncode != 0:
+            raise TransportError(
+                "versioned runner install failed: "
+                + proc.stderr.decode("utf-8", "replace").strip()
+            )
+
+    def runner_rpc(self, runner_path: str, state_root: str, request_frame: bytes) -> bytes:
+        address = self._address_or_resolve()
+        script = (
+            f"{shlex.quote(self.device.remote_python)} {shlex.quote(runner_path)} "
+            f"rpc {shlex.quote(state_root)}"
+        )
+        proc = self._remote(address, script, input_bytes=request_frame, timeout=60)
+        if proc.returncode != 0:
+            raise TransportError(
+                "versioned runner RPC failed: "
+                + proc.stderr.decode("utf-8", "replace").strip()
+            )
+        return proc.stdout
+
+    def runner_stream_argv(
+        self, runner_path: str, state_root: str, operation: str,
+        arguments: list[str] | None = None,
+    ) -> list[str]:
+        address = self._address_or_resolve()
+        values = [runner_path, operation, state_root, *(arguments or [])]
+        script = " ".join([
+            shlex.quote(self.device.remote_python),
+            *(shlex.quote(value) for value in values),
+        ])
+        return [*self._ssh_base(address), script]
 
     # --- execution --------------------------------------------------------
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
@@ -1041,7 +1219,11 @@ class SSHPowerShellTransport(_SSHCommon):
         encoded = f"{self._ps_exe()} -NoProfile -NonInteractive -EncodedCommand {_ps_encode(script)}"
         last_detail = "no address candidates configured"
         for address in self.device.all_addresses():
-            proc = self._run([*self._ssh_base(address, connect_timeout=8), encoded], timeout=30)
+            try:
+                proc = self._run([*self._ssh_base(address, connect_timeout=8), encoded], timeout=30)
+            except TransportError as exc:
+                last_detail = str(exc)
+                continue
             if proc.returncode == 0 and b"remrun-ok" in proc.stdout:
                 lines = [ln.strip() for ln in proc.stdout.decode("utf-8", "replace").splitlines()
                          if ln.strip()]
@@ -1067,13 +1249,70 @@ class SSHPowerShellTransport(_SSHCommon):
             "Measure-Object -Property LoadPercentage -Average).Average }; "
             "Write-Output ([math]::Round([double]$v,1))"
         )
-        proc = self._ps_remote(address, script, timeout=20)
+        try:
+            proc = self._ps_remote(address, script, timeout=20)
+        except TransportError:
+            return None
         if proc.returncode != 0:
             return None
         try:
             return float(proc.stdout.decode("utf-8", "replace").strip().split()[-1])
         except (ValueError, IndexError):
             return None
+
+    def install_versioned_runner(
+        self, source: bytes, remote_path: str, expected_sha256: str
+    ) -> None:
+        address = self._address_or_resolve()
+        frame = encode_file_frame(
+            source, transfer_id=f"runner-{expected_sha256}", mode=0o700)
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            f"& {_ps_squote(self.device.remote_python)} '-c' "
+            f"{_ps_squote(_INSTALL_RUNNER_PROG)} {_ps_squote(remote_path)} "
+            f"{_ps_squote(expected_sha256)}\n"
+            "exit $LASTEXITCODE"
+        )
+        proc = self._ps_remote(address, script, input_bytes=frame, timeout=60)
+        if proc.returncode != 0:
+            raise TransportError(
+                "versioned runner install failed: "
+                + proc.stderr.decode("utf-8", "replace").strip()
+            )
+
+    def runner_rpc(self, runner_path: str, state_root: str, request_frame: bytes) -> bytes:
+        address = self._address_or_resolve()
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            f"& {_ps_squote(self.device.remote_python)} {_ps_squote(runner_path)} "
+            f"'rpc' {_ps_squote(state_root)}\n"
+            "exit $LASTEXITCODE"
+        )
+        proc = self._ps_remote(address, script, input_bytes=request_frame, timeout=60)
+        if proc.returncode != 0:
+            raise TransportError(
+                "versioned runner RPC failed: "
+                + proc.stderr.decode("utf-8", "replace").strip()
+            )
+        return proc.stdout
+
+    def runner_stream_argv(
+        self, runner_path: str, state_root: str, operation: str,
+        arguments: list[str] | None = None,
+    ) -> list[str]:
+        address = self._address_or_resolve()
+        values = [runner_path, operation, state_root, *(arguments or [])]
+        command = " ".join(
+            [_ps_squote(self.device.remote_python),
+             *(_ps_squote(value) for value in values)]
+        )
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            f"& {command}\n"
+            "exit $LASTEXITCODE"
+        )
+        remote = f"{self._ps_exe()} -NoProfile -NonInteractive -EncodedCommand {_ps_encode(script)}"
+        return [*self._ssh_base(address), remote]
 
     # --- execution --------------------------------------------------------
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
@@ -1146,6 +1385,8 @@ class SSHPowerShellTransport(_SSHCommon):
         mtime_ticks = local_path.stat().st_mtime_ns // 100
         # Write to a temp beside the final path (Flush($true) = durable), then atomically
         # File.Replace/Move it — an interrupted write never leaves a partial destination.
+        # Some Windows/.NET combinations reject a null File.Replace backup path, so use
+        # a same-directory temporary backup and delete it after a successful replacement.
         script = (
             "$ErrorActionPreference='Stop'\n"
             f"$p = {_ps_squote(remote_path)}\n"
@@ -1153,6 +1394,8 @@ class SSHPowerShellTransport(_SSHCommon):
             "if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }\n"
             "$tmp = [IO.Path]::Combine($dir, '.remrun-tmp-' + [IO.Path]::GetFileName($p) + "
             "'-' + [guid]::NewGuid().ToString('N') + '.tmp')\n"
+            "$backup = [IO.Path]::Combine($dir, '.remrun-backup-' + [IO.Path]::GetFileName($p) + "
+            "'-' + [guid]::NewGuid().ToString('N') + '.bak')\n"
             "try {\n"
             "  $bytes = [Convert]::FromBase64String(([Console]::In.ReadToEnd()).Trim())\n"
             "  $fs = [IO.File]::Open($tmp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,"
@@ -1160,9 +1403,13 @@ class SSHPowerShellTransport(_SSHCommon):
             "  try { $fs.Write($bytes,0,$bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }\n"
             "  $epoch = [DateTime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc)\n"
             f"  [IO.File]::SetLastWriteTimeUtc($tmp, $epoch.AddTicks([int64]{mtime_ticks}))\n"
-            "  if ([IO.File]::Exists($p)) { [IO.File]::Replace($tmp,$p,$null,$true) } "
+            "  if ([IO.File]::Exists($p)) { "
+            "[IO.File]::Replace($tmp,$p,$backup,$true); "
+            "Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue } "
             "else { [IO.File]::Move($tmp,$p) }\n"
-            "} catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }\n"
+            "} catch { "
+            "Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; "
+            "Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue; throw }\n"
         )
         proc = self._ps_remote(address, script, input_bytes=b64.encode("ascii"))
         if proc.returncode != 0:
@@ -1237,15 +1484,20 @@ class SSHPowerShellTransport(_SSHCommon):
 
     def delete_remote(self, remote_path: str) -> None:
         address = self._address_or_resolve()
+        # Fail LOUD: the old form used -ErrorAction SilentlyContinue and only treated an
+        # ssh-255 as failure, so a locked / ACL-denied remote file was reported deleted
+        # while it still existed (and the run continued against a stale file). Make the
+        # delete terminating and VERIFY the path is gone before reporting success.
         script = (
-            f"Remove-Item -LiteralPath {_ps_squote(remote_path)} -Force "
-            "-ErrorAction SilentlyContinue"
+            "$ErrorActionPreference='Stop'\n"
+            f"$p = {_ps_squote(remote_path)}\n"
+            "if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }\n"
+            "if (Test-Path -LiteralPath $p) { throw ('still present after delete: ' + $p) }\n"
         )
         proc = self._ps_remote(address, script)
-        if proc.returncode == 255:
-            raise TransportError(
-                f"delete {remote_path} failed (ssh): {proc.stderr.decode('utf-8', 'replace')}"
-            )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip() or f"exit {proc.returncode}"
+            raise TransportError(f"delete {remote_path} failed: {detail}")
 
     def remote_path_exists(self, remote_path: str) -> bool:
         address = self._address_or_resolve()

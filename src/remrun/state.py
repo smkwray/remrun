@@ -214,7 +214,9 @@ class ProjectLock:
                 return
             except FileExistsError:
                 if time.time() >= deadline:
-                    raise LockError(f"project {self.project_id} lock table is busy")
+                    raise LockError(
+                        f"project {self.project_id} lock table is busy at {self.guard}"
+                    )
                 time.sleep(0.05)
 
     def _release_guard(self) -> None:
@@ -224,10 +226,24 @@ class ProjectLock:
             pass
 
     def _lock_info(self, path: Path) -> dict[str, object]:
-        return read_json(path / "info.json") or {}
+        info_path = path / "info.json"
+        if not info_path.exists():
+            return {"metadata_state": "missing"}
+        try:
+            return read_json(info_path) or {"metadata_state": "missing"}
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+            return {
+                "metadata_state": "invalid",
+                "metadata_error": type(exc).__name__,
+            }
 
     def _describe_holder(self, path: Path) -> str:
         info = self._lock_info(path)
+        metadata_state = info.get("metadata_state")
+        if metadata_state == "missing":
+            return "metadata=missing"
+        if metadata_state == "invalid":
+            return f"metadata=invalid error={info.get('metadata_error')}"
         scope = info.get("scope") or "project"
         return (
             f"scope={scope} target={info.get('target')} "
@@ -251,7 +267,7 @@ class ProjectLock:
                 conflicts.extend(self._conflicting_scope_locks())
                 if conflicts:
                     raise LockError(
-                        f"project {self.project_id} already locked "
+                        f"project {self.project_id} already locked at {conflicts[0]} "
                         f"({self._describe_holder(conflicts[0])})"
                     )
             else:
@@ -261,7 +277,7 @@ class ProjectLock:
                 conflicts.extend(self._conflicting_scope_locks())
                 if conflicts:
                     raise LockError(
-                        f"project {self.project_id} already locked "
+                        f"project {self.project_id} already locked at {conflicts[0]} "
                         f"({self._describe_holder(conflicts[0])})"
                     )
 
@@ -270,7 +286,7 @@ class ProjectLock:
                 self.path.mkdir()
             except FileExistsError as exc:
                 raise LockError(
-                    f"project {self.project_id} already locked "
+                    f"project {self.project_id} already locked at {self.path} "
                     f"({self._describe_holder(self.path)})"
                 ) from exc
             write_json(
@@ -353,6 +369,7 @@ def prune_state(
     dry_run: bool = False,
     older_than_days: int | None = None,
     keep: int | None = None,
+    exempt_run_id: str | None = None,
 ) -> PruneReport:
     """Prune the run journal under the state root.
 
@@ -419,6 +436,8 @@ def prune_state(
         for d in sorted(conflicts_root.iterdir()):
             if not d.is_dir():
                 continue
+            if exempt_run_id and d.name == exempt_run_id:
+                continue  # never prune the in-flight run's own recovery copy before it's reported
             ts = parse_run_timestamp(d.name)
             age_days = (now - ts).days if ts else None
             if age_days is not None and age_days > cutoff:
@@ -432,7 +451,8 @@ def prune_state(
         budget = policy.max_backup_bytes
         if budget and older_than_days is None:
             remaining = [d for d in sorted(conflicts_root.iterdir())
-                         if d.is_dir() and d not in pruned]
+                         if d.is_dir() and d not in pruned
+                         and not (exempt_run_id and d.name == exempt_run_id)]
             sizes = {d: _dir_size(d) for d in remaining}
             total = sum(sizes.values())
             # Delete oldest-first (run-id names sort chronologically) until under budget.

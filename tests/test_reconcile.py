@@ -1,12 +1,15 @@
 """End-to-end reconcile-engine tests against the LOCAL_SIM transport."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from remrun.manifest import build_manifest
 from remrun.models import Device
 from remrun.reconcile import postrun_pullback, preflight_reconcile
-from remrun.transport import LocalSimTransport
+from remrun.transport import LocalSimTransport, TransportError
 
 
 def make_transport(remote_base: Path) -> LocalSimTransport:
@@ -65,6 +68,40 @@ def test_remote_only_pulled(tmp_path: Path):
     assert (local / "gen.txt").read_text() == "generated"
 
 
+def test_preflight_reports_planned_counts_and_bounded_progress(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    remote.mkdir(parents=True)
+    for index in range(26):
+        (remote / f"remote-{index:02}.txt").write_text("remote")
+    for index in range(2):
+        (local / f"local-{index:02}.txt").write_text("local")
+
+    events: list[tuple[int, int, dict[str, int]]] = []
+    result = preflight_reconcile(
+        transport=t,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["node_modules/**"],
+        hash_below_bytes=1_000_000,
+        prev_local=None,
+        prev_remote=None,
+        backup_root=backup,
+        progress=lambda completed, total, counts: events.append(
+            (completed, total, counts.copy())
+        ),
+    )
+
+    assert not result.has_conflicts
+    assert [completed for completed, _total, _counts in events] == [0, 25, 28]
+    assert all(total == 28 for _completed, total, _counts in events)
+    assert all(
+        counts
+        == {"pulls": 26, "pushes": 2, "deletes_local": 0, "deletes_remote": 0}
+        for _completed, _total, counts in events
+    )
+
+
 def test_postrun_pullback_of_command_output(tmp_path: Path):
     local, remote_root, t, backup = setup(tmp_path)
     (local / "run.txt").write_text("input")
@@ -116,6 +153,55 @@ def test_hash_file_matches_sha256_file(tmp_path: Path):
     f.write_bytes(b"x" * 5000)
     t = make_transport(base)
     assert t.hash_file(str(f)) == sha256_file(f)
+
+
+@pytest.mark.parametrize(
+    "hash_result",
+    [
+        TransportError("injected hash failure"),
+        NotImplementedError("hash unsupported"),
+        ValueError("malformed hash response"),
+        "not-a-sha256",
+        "",
+    ],
+)
+def test_postrun_unverifiable_hash_cannot_silently_skip_large_equal_metadata(
+    tmp_path: Path,
+    monkeypatch,
+    hash_result,
+):
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "run.txt").write_text("input")
+    pre = reconcile(local, remote_root, t, backup)
+
+    size = 1_000_001  # Above this test's manifest hashing threshold.
+    remote_output = Path(remote_root) / "out.bin"
+    local_output = local / "out.bin"
+    remote_output.write_bytes(b"R" * size)
+    local_output.write_bytes(b"L" * size)
+    same_ns = 1_700_000_000_000_000_000
+    os.utime(remote_output, ns=(same_ns, same_ns))
+    os.utime(local_output, ns=(same_ns, same_ns))
+
+    def unverifiable_hash(_remote_path: str) -> str:
+        if isinstance(hash_result, Exception):
+            raise hash_result
+        return hash_result
+
+    monkeypatch.setattr(t, "hash_file", unverifiable_hash)
+    conflict_remote = tmp_path / "state" / "remote"
+    post = postrun_pullback(
+        transport=t, local_root=local, remote_root=remote_root,
+        excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+        pre_remote_manifest=pre.remote_manifest, pre_local_manifest=pre.local_manifest,
+        backup_root=backup, conflict_remote_root=conflict_remote,
+    )
+
+    assert post.conflicts == ["out.bin"]
+    assert not post.skipped_identical
+    assert not post.pulled
+    assert local_output.read_bytes() == b"L" * size
+    assert (conflict_remote / "out.bin").read_bytes() == b"R" * size
 
 
 def test_postrun_local_change_during_run_is_conflict(tmp_path: Path):

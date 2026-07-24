@@ -1,6 +1,7 @@
 """Integration tests driving remrun.cli.main end-to-end via LOCAL_SIM."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from remrun.cli import (
     EXIT_CONFLICT, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, _best_remote_verdict, main,
 )
 from remrun.profile import LOCAL_DEVICE, command_key, device_profile, load_profiles
+from remrun.transport import LocalSimTransport, TransportError
 
 
 def posix(p: Path) -> str:
@@ -64,11 +66,36 @@ def test_run_happy_path_pulls_output(env, capsys):
     # Output created remotely is pulled back to the local project path.
     assert (env["proj"] / "result.txt").read_text() == "ok"
     assert (env["remote_proj"] / "input.txt").read_text() == "in"
+    err = capsys.readouterr().err
+    assert "preflight_progress completed=0 total=1 pulls=0 pushes=1" in err
+    assert "preflight_progress completed=1 total=1 pulls=0 pushes=1" in err
 
 
 def test_run_passes_through_nonzero_exit(env):
     code = main(["run", "LOCAL_SIM", "--", "python", "-c", "import sys; sys.exit(7)"])
     assert code == 7
+
+
+def test_exec_transport_failure_records_unknown_completion_guidance(
+    env, monkeypatch, capsys
+):
+    def disconnect_after_start(*_args, **_kwargs):
+        raise TransportError("injected connection reset")
+
+    monkeypatch.setattr(LocalSimTransport, "exec", disconnect_after_start)
+    code = main(["run", "LOCAL_SIM", "--", "python", "-c", "print('maybe ran')"])
+
+    assert code == EXIT_INFRA
+    err = capsys.readouterr().err
+    assert "completion_unknown" in err
+    assert "do not retry" in err
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["phase"] == "exec"
+    assert summary["completion_state"] == "unknown"
+    assert "read-only process/artifact probe" in summary["guidance"]
+    assert not list((env["state"] / "locks").glob("**/*.lock"))
 
 
 def test_auto_resolves_target(env):
@@ -156,6 +183,30 @@ def test_status_json_includes_fleet_state(env, capsys):
     payload = capsys.readouterr().out
     assert '"fleet_state"' in payload
     assert '"runs"' in payload
+
+
+def test_status_device_filter_applies_before_limit(env, capsys):
+    runs = env["state"] / "runs"
+    for run_id, target in (
+        ("20260724T030000Z-WINBOX-demo-3", "WINBOX"),
+        ("20260724T020000Z-MACBOX-demo-2", "MACBOX"),
+        ("20260724T010000Z-WINBOX-demo-1", "WINBOX"),
+    ):
+        run = runs / run_id
+        run.mkdir(parents=True)
+        (run / "summary.json").write_text(
+            json.dumps({"run_id": run_id, "target": target, "exit_code": 0}),
+            encoding="utf-8",
+        )
+
+    assert main(["status", "WINBOX", "--limit", "2", "--json"]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert [run["run_id"] for run in payload["runs"]] == [
+        "20260724T030000Z-WINBOX-demo-3",
+        "20260724T010000Z-WINBOX-demo-1",
+    ]
+    assert main(["status", "WINBOX", "--limit", "0", "--json"]) == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["runs"] == []
 
 
 def test_bench_records_local_and_remote_rows(env, capsys):

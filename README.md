@@ -8,43 +8,18 @@ not a correctness dependency.
 
 > **New here? Start with this file.** This is a working tool, not a seed.
 
-## Status (2026-07-01)
+## Status
 
-Steps 1–9 are implemented and **live-validated on real POSIX and Windows SSH runners** (step 9 = the
-`--auto` scheduler: reachability failover, CPU/perf-core load balancing, job-cost
-profiles). Step 1–8 coverage:
-project/path mapping, manifest + conflict matrix, Mode 1 reconcile + post-run
-pullback, the POSIX SSH backend, per-device/per-project environment + venv
-resolution, state retention + `remrun clean`, and resource telemetry.
+The core runner is implemented and tested on POSIX/macOS and Windows SSH targets:
+safe project reconciliation and pullback, conflict preservation, target scheduling,
+resource telemetry, external-tree `sync`, commit-only `git-sync`, allowlisted target
+actions, and optional fleet dispatch.
 
-- **POSIX/macOS runner (`ssh-posix`):** working, exercised end-to-end (R + Python venv jobs).
-- **Windows runner (`ssh-powershell`):** **live-validated 2026-06-28** — ran a real
-  scenario end-to-end with resource telemetry. (Found+fixed in the process: a
-  `Split-Path` push bug and a cp1252 stdout-encoding crash.)
-- **`--auto`:** honors `[scheduler]` (project `[placement]` hints → primary →
-  fallback), probes candidates, **fails over** to the next reachable one, and
-  **load-balances** by CPU utilization weighted by per-device perf-core capacity.
-  Learned job-cost profiles add RAM-headroom placement and a skip-probe shortcut
-  for trivial jobs. Explicit `run <DEV>` never fails over.
-- **Portable job costs:** a job's measured resource costs (peak RAM / CPU% / remote
-  exec time per command×device) are a property of the job and the device, not the
-  controller — so they're written to **`<project>/do/remrun/job_costs.json`** and travel
-  with the project (synced like the rest of `do/`). Any controller is RAM-headroom/cost
-  aware from the first run, with no re-learning. The controller-specific timing
-  (round-trip/overhead + the LOCAL offload baseline) stays in local state. Toggle with
-  `[profile] store_in_project` (default on).
-- **Offload decision (measured):** `remrun bench <cmd> [targets]` times the job
-  locally and via the full remrun round-trip to each target, learns per-device
-  `trip_s`/`overhead_s`, and recommends local-vs-remote (responsiveness bias,
-  advisory). `remrun plan <cmd>` surfaces that recommendation, or the host's static
-  `[offload]` policy when there's no measured data yet. Validated end-to-end
-  Windows→POSIX (real SSH round-trip records `overhead_s` + live telemetry); run a bench on
-  one representative heavy workload before trusting the recommendation for that project.
-  Nothing auto-switches — it sets the default only.
-- **Step 10 write scopes:** opt-in `[parallel.scopes.<name>]` hints are built.
-  `remrun run --scope <name>` verifies that the remote command only changed declared
-  paths before pullback. Runs still serialize per project until baseline attribution
-  becomes scope-aware. Richer data-policy verbs remain future polish.
+The default coordination mode remains `legacy`: one controller may write a project at
+a time. Versioned-runner, lease/fencing, and snapshot components are experimental,
+disabled groundwork and are not a supported multi-controller execution path. A network
+disconnect after a remote command starts can leave completion unknown; remrun reports
+that state and requires a read-only process or artifact check before retrying.
 
 ## How to run it
 
@@ -72,7 +47,7 @@ remrun plan macbox -- <cmd>         # show what a run would do; mutates nothing
 remrun run macbox -- <cmd>          # reconcile -> run remotely -> pull outputs back
 remrun run --auto -- <cmd>          # auto-pick target (see Status caveat above)
 remrun run --scope spec_a --auto -- <cmd>  # opt-in declared write scope
-remrun status [--limit N]           # recent runs (exit code, files moved, peak RSS)
+remrun status [DEVICE] [--limit N]  # recent runs, optionally filtered by target
 remrun logs [last|<run_id>] [--json]
 remrun clean [--older-than 30d] [--keep N] [--dry-run]   # prune state folder
 remrun bench <cmd> [targets]        # time local vs. full remrun round-trip; recommend offload
@@ -86,11 +61,13 @@ remrun git-sync winbox --bootstrap  # same, explicit (working tree left untouche
 remrun git-sync macbox --status     # non-mutating branch/dirty/hook diagnostics
 remrun git-sync --install-hook      # post-commit best-effort push to [git_sync].peers
 remrun git-sync --uninstall-hook    # remove remrun's hook and restore any prior hook
+remrun runner install macbox        # install + probe the inert versioned helper
+remrun runner probe macbox          # verify the exact pinned helper and SQLite store
 ```
 
 ### Agent gotchas (learned in production — read before your first `run`)
 
-Five things bite first-time callers; all have one-line fixes:
+Nine things bite first-time callers; all have one-line fixes:
 
 1. **Windows controller: invoke from PowerShell or cmd, not Git Bash.** Git Bash
    mangles quoted argv after `--` (a `-c "a; b"` payload gets split on spaces).
@@ -115,13 +92,33 @@ Five things bite first-time callers; all have one-line fixes:
    `%LOCALAPPDATA%\remrun\locks\project\<hash>\whole.lock` (or
    `~/.local/state/remrun/locks/...`), confirm the recorded holder PID is dead,
    then delete the lock directory.
-5. **A Syncthing-delivered project usually has NO `.git` — that is normal, not
+5. **A yielded command-runner session is still a live remrun process.** A command
+   runner may return a session ID after its output wait expires (often 30 s);
+   that is not the command's exit. Keep polling that same session until it reports a
+   terminal exit before starting another run for the project. A lock whose recorded PID
+   is still alive is correct and must not be deleted.
+6. **An SSH reset after `command_started` means completion is unknown.** The remote
+   command may still be running even though the controller exits `4`. Do not immediately
+   retry a mutating command. Read the persisted `completion_state=unknown` guidance and
+   probe the runner's process/artifact state first.
+7. **A Syncthing-delivered project usually has NO `.git` — that is normal, not
    broken.** `.git` is excluded from Syncthing, so a project arriving on a new device
    is a full working tree with no history. Do not `git clone` over it (that would fight
    the tree). Run `remrun git-sync <peer-with-history> --pull` once: it bootstraps the
    repo in place (`git init` + full-history fetch + HEAD set to the peer's tip) and
    leaves the working tree byte-for-byte untouched, so your uncommitted local work
    survives and shows up as modified/untracked vs the fetched HEAD.
+8. **Default excludes drop `*.lock`, `dist/`, and `target/` — outputs written there are
+   neither pushed nor pulled back.** These remain excluded as conventional generated/cache
+   surfaces, so a lockfile a command regenerates (`uv.lock`, `renv.lock`) or a retained
+   product written under `dist/`/`target/` will not return. `build/` is intentionally
+   included because real build commands commonly put their requested product there.
+   Project `[transfer] exclude` only adds patterns; sanity-check unusual output paths with
+   `remrun plan`.
+9. **Quote compound remote shell commands.** In
+   `remrun run macbox -- cmd1 && cmd2`, the controller shell consumes `&&` and runs `cmd2`
+   locally. Either issue two remrun calls or pass one remote shell argument, for example
+   `remrun run macbox -- sh -lc '<cmd1> && <cmd2>'`.
 
 `sync` converges a folder that lives **outside** the project tree (the fleet OCR/TTS
 output trees) with a device. It is **pull-biased**: the remote is usually the producer
@@ -130,7 +127,32 @@ local-newer pushes, and genuinely-ambiguous conflicts are saved aside under the 
 root without ever clobbering a newer remote. Stateless (no baseline) → additive, never
 deletes. Trees are named in `[sync_roots]` (`config/devices.toml`); `--remote <path>` is
 an escape hatch for any folder. Flags: `--pull`/`--push`/`--both` (default), `--exclude`,
-`--dry-run`, `--json`.
+`--dry-run`, `--json`. A push reports `push_verified` only after a fresh remote manifest
+confirms every pushed path is visible with the expected size and SHA-256; missing or
+mismatched paths fail with exit `3`.
+
+`action` places explicit files in a persistent target inbox and runs one named,
+allowlisted target-side command from `[devices.<NAME>.actions.<action>]`. It is the
+small reverse-control seam for operations such as delivering a prepared download to a
+travel Mac and invoking an existing local trigger; it is not a second arbitrary-shell
+interface. Inputs are never silently overwritten. A content-derived idempotency receipt
+prevents a completed action from running twice and refuses ambiguous retries after a
+disconnect. An action with no inputs requires an explicit `--key`.
+
+```bash
+remrun action macbox ingest --input ~/Downloads/input.zip
+remrun action macbox ingest --input ~/Downloads/input.zip --dry-run
+```
+
+If the action consumes a prepared folder, sync that folder first:
+
+```bash
+remrun sync ~/Downloads/ready-batch macbox \
+  --remote '~/Downloads/ready-batch' --push
+```
+
+The configured action determines what happens after staging; keep its command narrow
+and allowlisted in the private device configuration.
 
 `bench` targets default to the configured scheduler order. It records measured
 profiles and prints a recommendation; it changes no run behavior. The local leg runs
@@ -145,9 +167,13 @@ branches are fetched into device-namespaced refs like `refs/remotes/winbox/main`
 or peer branches advance only by clean fast-forward. Divergence exits `2` and leaves both
 branches untouched. A dirty checked-out branch is fetched but not advanced; clean it up
 and merge/fast-forward manually. `git-sync` moves committed history, not uncommitted
-worktree edits. `--status` is non-mutating: it uses a temporary bare clone plus a peer
+worktree edits. `--status` is non-mutating: it uses a temporary bare repository plus a peer
 bundle to report `up_to_date`, `ahead`, `would_fast_forward`, or `diverged`, along with
-tracked-dirty flags and hook diagnostics.
+tracked-dirty flags, content/mode-only/untracked counts, and hook diagnostics. From a
+repo-less tree it reports each peer branch as `bootstrap_available` and does not create
+local Git metadata. A history-hub
+fast-forward that preserves a dirty tree prints the same counts and explicitly warns that the
+peer is not a clean-checkout build surface.
 
 **Bootstrapping a repo-less project.** A Syncthing-synced tree (with `.git` excluded)
 arrives on a new device as a full working tree with no Git metadata, while a peer holds
@@ -162,8 +188,12 @@ work) and must survive. If the project has a `.githooks/` dir, `core.hooksPath` 
 it. The report states: repo created, N commits fetched, HEAD set to `<sha>`, working tree
 untouched, and M modified / K untracked vs HEAD. Degenerate cases are handled cleanly: an
 unreachable peer, a missing peer repo, or an unborn/empty peer repo all report and leave
-no half-initialized `.git` behind. `--push`-only on a repo-less project refuses (nothing to
-push); `--bootstrap` on an existing repo refuses.
+no half-initialized `.git` behind. Bootstrap verifies the transferred bundle, the peer HEAD
+object/ref, the installed local HEAD/branch, and a nonzero commit count before reporting
+success. A later `--pull` also recovers an existing empty/unborn `.git` (for example, one left
+by an interrupted older bootstrap) without touching worktree bytes. `--push`-only on a
+repo-less or unborn project refuses (nothing to push); `--bootstrap` on a nonempty existing
+repo refuses.
 
 `git-sync --install-hook` installs a marked `.git/hooks/post-commit` wrapper. The hook
 starts best-effort background `git-sync <peer> --push --quiet` jobs for `[git_sync].peers`
@@ -173,11 +203,36 @@ hook and restores it on `--uninstall-hook`. Hook output is appended to a small b
 under the controller state root (`logs/gitsync-hook/<project>.log`) so silent background
 skips are inspectable.
 
+The safe default refuses to advance a dirty checked-out branch. For a dedicated Git-history
+hub—or an arriving controller—whose worktree bytes travel independently through Syncthing,
+`advance_dirty_worktree = true` may be set in the global `[git_sync]` block (or the project's
+`[git_sync]` hints). A proved fast-forward in either direction then uses `git reset --mixed`:
+HEAD and the index advance, but no worktree file is created, changed, or deleted. Missing or
+differing Syncthing bytes remain visibly dirty until they converge.
+
+For repositories that sit beside the normal project tree, configure
+`[git_sync.project_roots]` with a broader common parent. The broader mapping applies only
+to Git history exchange; `run`, `plan`, and `bench` keep the narrower `[project_roots]`
+transfer boundary. A repository at `work/remrun` can then exchange with a peer alongside
+ordinary `work/proj/foo` repositories without a one-off config override.
+
 For cross-platform synced working trees, prefer a project `.gitattributes` such as
 `* text eol=lf`. Otherwise Windows `core.autocrlf` can rewrite checked-out file line
 endings, and a background file sync can make the Mac checkout look like it has tracked
 local edits. `git-sync` will correctly refuse to advance a tracked-dirty checkout in
 that case.
+
+`runner install` is rollout groundwork for crash-safe multi-controller coordination. It
+installs a content-addressed self-contained helper through an RRFRAME2 payload, verifies
+the installed source hash, initializes the runner's local SQLite participant store, and
+checks protocol/filesystem/`sqlite3` prerequisites. It does **not** change `run` behavior;
+`[coordination] mode = "legacy"` remains the default until the later authority, execution,
+and transactional-reconcile production gates pass.
+
+The shadow authority store is disposable only as a whole coordination identity. If it is
+reset, initialize a **new `cluster_id`** and re-enroll targets. Recreating epoch 1 under an
+existing cluster is intentionally rejected by participants when its key differs; do not
+delete participant enrollment state to make an old cluster identity reusable.
 
 Target forms for `run`/`plan`: an explicit device (`macbox`, `winbox`, `LOCAL_SIM`),
 `--auto`, the literal `auto`, or omit it (defaults to auto). Run flags:
@@ -209,6 +264,29 @@ Per device: `kind` (`ssh-posix` / `ssh-powershell` / `local-sim`),
   project sets `[run] venv_layout = "external"` (the default is project-local `.venv`)
 - `path` (list, prepended to PATH) and `[devices.<NAME>.env]` (env vars) — declare
   per-device tool locations here, especially on Windows where there's no login shell
+
+`config/devices.toml` may also declare a Git-only common parent:
+
+```toml
+[git_sync]
+peers = ["macbox"]
+# Optional history-hub behavior; advances HEAD+index while preserving worktree bytes.
+advance_dirty_worktree = true
+
+[git_sync.project_roots]
+macos = "~/work"
+windows = 'C:\work'
+default = "~/work"
+```
+
+The versioned-runner rollout is explicitly gated:
+
+```toml
+[coordination]
+mode = "legacy"       # runner-v1 is not enabled by Step 3
+device = "macbox"     # future pinned coordination runner
+protocol = 1
+```
 
 ### Project hints — `<project>/do/remrun/remrun.toml` (optional)
 
@@ -297,10 +375,12 @@ with `--no-telemetry` or `[telemetry] enabled = false`.
 
 ## Developing / testing
 
-Run tests from a virtualenv **outside** the synced tree (so it isn't replicated to
-the other devices), then point `PYTHONPATH` at `src` and the repo root:
+Clone the repository, then run tests from a virtualenv **outside** the synced tree
+(so it isn't replicated to other devices):
 
 ```bash
+git clone https://github.com/smkwray/remrun.git
+cd remrun
 python -m venv /tmp/remrun-venv          # NOT inside this repo
 /tmp/remrun-venv/bin/pip install pytest ruff
 PYTHONPATH=src:. /tmp/remrun-venv/bin/pytest
@@ -313,5 +393,4 @@ Do not leave `.venv` / `__pycache__` / `.pytest_cache` in the synced tree.
 
 - `docs/ARCHITECTURE.md`, `TRANSFER_MODEL.md`, `REMOTE_PROTOCOL.md`,
   `CONFIGURATION.md`, `PROJECT_CONFIG.md`, `AGENT_OUTPUT_SPEC.md` — design contracts.
-- `docs/PUBLIC_RELEASE.md` — what to scrub before any public release.
-```
+- `docs/PUBLIC_RELEASE.md` — publication/update checklist.
