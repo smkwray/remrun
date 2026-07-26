@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve this script through any symlinks before deriving the repo root. Putting
+# remrun on PATH means symlinking this launcher into ~/.local/bin (or similar), and
+# a bare `dirname "${BASH_SOURCE[0]}"` would then resolve to the symlink's directory
+# — making REMRUN_ROOT ~/.local, which has no src/, so `python -m remrun.cli` fails
+# with ModuleNotFoundError. Walk the link chain instead. (No `readlink -f`: BSD/macOS
+# readlink lacks it.)
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  LINK_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  # A relative link target is relative to the directory holding the link.
+  case "$SELF" in /*) ;; *) SELF="$LINK_DIR/$SELF" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 REMRUN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export REMRUN_ROOT
 export PYTHONPATH="$REMRUN_ROOT/src:${PYTHONPATH:-}"

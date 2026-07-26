@@ -492,6 +492,137 @@ def cmd_cancel(args, reporter: Reporter) -> int:
     return EXIT_OK
 
 
+def cmd_resources(args, reporter: Reporter) -> int:
+    """Live hardware for the fleet: CPU / RAM / GPU per device.
+
+    Distinct from `fleet status`, which reports the job QUEUE. This probes the
+    devices themselves and is safe to run at any time: it never mutates state,
+    never stages files, and never touches the queue.
+    """
+    from . import local_resources, resources
+    from .resources_render import render_table, to_dict
+
+    config = load_config()
+    wanted = {d.upper() for d in (getattr(args, "device", None) or [])}
+
+    # Visibility is not placement. `enabled = false` keeps a device out of run
+    # scheduling; it does not mean "don't tell me how much RAM it has". A box
+    # you never dispatch to (a file server, a paused laptop) still belongs in
+    # the picture when you are deciding where work should go.
+    targets = []
+    for name, dev in config.devices.items():
+        if dev.kind == "local-sim":
+            continue                      # a simulation target has no hardware to report
+        if wanted and name.upper() not in wanted:
+            continue
+        if getattr(args, "enabled_only", False) and not dev.enabled:
+            continue
+        targets.append(dev)
+
+    unknown = wanted - {d.name.upper() for d in targets}
+    if unknown:
+        reporter.event("unknown_devices", names=",".join(sorted(unknown)))
+
+    # Progress to stderr: a fleet probe takes seconds per device, and a blank
+    # terminal is indistinguishable from a hang. Suppressed for --json (which
+    # must stay machine-parseable) and when stderr is not a TTY.
+    quiet = getattr(args, "json", False) or getattr(args, "no_progress", False)
+    show = not quiet and sys.stderr.isatty()
+    pending: set[str] = set()
+    # Width of the last status line written, so it can be erased exactly. A `\r`
+    # alone only moves the cursor: without overwriting, a shorter line leaves the
+    # tail of the longer one behind, which renders as garbage like
+    # "ok DEV1ing DEV1, DEV2".
+    last_width = 0
+
+    def on_event(kind: str, name: str, view) -> None:  # noqa: ANN001
+        nonlocal last_width
+        if not show:
+            return
+        if last_width:
+            print("\r" + " " * last_width + "\r", end="", file=sys.stderr, flush=True)
+            last_width = 0
+        if kind == "start":
+            pending.add(name)
+        else:
+            pending.discard(name)
+            mark = "ok" if (view is not None and view.reachable) else "--"
+            print(f"  {mark} {name}", file=sys.stderr, flush=True)
+        if pending:
+            line = f"  .. probing {', '.join(sorted(pending))}"
+            last_width = len(line)
+            print(line, end="\r", file=sys.stderr, flush=True)
+
+    if show:
+        print(f"probing {len(targets)} device(s)...", file=sys.stderr, flush=True)
+    views = resources.probe_fleet(targets, timeout=getattr(args, "timeout", 45.0),
+                                  on_event=on_event)
+    if show and last_width:
+        print("\r" + " " * last_width + "\r", end="", file=sys.stderr, flush=True)
+    if not getattr(args, "no_local", False) and not wanted:
+        local = local_resources.local_view()
+        # The controller is frequently ALSO a configured device (a laptop is both the
+        # box you sit at and a run target for the rest of the mesh). Probing it over SSH
+        # from itself usually fails — it has no authorized key for its own controller —
+        # so leaving both rows in prints the device twice: once measured locally, once
+        # as a spurious "ssh auth refused". Drop the remote row and keep the local
+        # measurement, which is strictly better information about the same machine.
+        local_hostname = (local.hostname or "").split(".")[0].casefold()
+        views = [v for v in views
+                 if not (v.name.casefold() == local.name.casefold()
+                         or (local_hostname
+                             and (v.hostname or "").split(".")[0].casefold() == local_hostname))]
+        views.insert(0, local)
+
+    if getattr(args, "json", False):
+        print(json.dumps({"devices": [to_dict(v) for v in views]},
+                         indent=2, sort_keys=True))
+    else:
+        print(render_table(views))
+
+    # Exit nonzero only if EVERY remote device failed: a single offline laptop
+    # is normal and must not make the command look broken to a caller.
+    remote = [v for v in views if not v.is_local]
+    if remote and not any(v.reachable for v in remote):
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_mesh(args, reporter: Reporter) -> int:
+    """Directed SSH reachability: which devices can log into which.
+
+    Read-only. Every cell is measured, never inferred from config, because SSH
+    trust is asymmetric and config cannot tell you whose key is actually
+    installed where.
+    """
+    import socket
+
+    from . import mesh
+    from .mesh_render import render_matrix, to_dict
+
+    config = load_config()
+    wanted = {d.upper() for d in (getattr(args, "device", None) or [])}
+    devices = [d for name, d in config.devices.items()
+               if d.kind != "local-sim" and (not wanted or name.upper() in wanted)]
+    if not devices:
+        reporter.event("no_devices")
+        return EXIT_ERROR
+
+    try:
+        controller = socket.gethostname().split(".")[0].upper()
+    except OSError:
+        controller = "LOCAL"
+
+    matrix = mesh.build_matrix(devices, controller,
+                               hops=not getattr(args, "no_hops", False),
+                               connect_timeout=int(getattr(args, "connect_timeout", 8)))
+    if getattr(args, "json", False):
+        print(json.dumps(to_dict(matrix), indent=2, sort_keys=True))
+    else:
+        print(render_matrix(matrix, controller))
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="remrun fleet")
     sub = p.add_subparsers(dest="fleet_command", required=True)
@@ -547,6 +678,30 @@ def build_parser() -> argparse.ArgumentParser:
                                        "workers on every device, releasing configured resource locks")
     px.add_argument("--all", action="store_true", help="also wipe done/failed job history")
     px.add_argument("--json", action="store_true")
+    prs = sub.add_parser("resources", help="live CPU / RAM / GPU for every configured device "
+                                           "(hardware, not the job queue)")
+    prs.add_argument("--device", action="append",
+                     help="limit to this device (repeatable; default is all enabled)")
+    prs.add_argument("--no-local", action="store_true",
+                     help="omit this controller's own row")
+    prs.add_argument("--enabled-only", dest="enabled_only", action="store_true",
+                     help="only devices with enabled = true (default shows all, since a "
+                          "device you never dispatch to still has hardware worth seeing)")
+    prs.add_argument("--timeout", type=float, default=45.0,
+                     help="per-device probe timeout in seconds (default 45; a heavily "
+                          "loaded box can take tens of seconds to answer)")
+    prs.add_argument("--no-progress", dest="no_progress", action="store_true",
+                     help="suppress the per-device progress lines on stderr")
+    prs.add_argument("--json", action="store_true")
+    pm = sub.add_parser("mesh", help="who can ssh into whom: directed reachability matrix "
+                                     "across the fleet (read-only, measured not inferred)")
+    pm.add_argument("--device", action="append",
+                    help="limit to this device (repeatable)")
+    pm.add_argument("--no-hops", dest="no_hops", action="store_true",
+                    help="only test edges FROM this controller (fast; leaves other rows blank)")
+    pm.add_argument("--connect-timeout", dest="connect_timeout", type=int, default=8,
+                    help="ssh ConnectTimeout in seconds (default 8)")
+    pm.add_argument("--json", action="store_true")
     return p
 
 
@@ -568,6 +723,10 @@ def main(argv: list[str]) -> int:
             return cmd_clear(args, reporter)
         if args.fleet_command == "cancel":
             return cmd_cancel(args, reporter)
+        if args.fleet_command == "resources":
+            return cmd_resources(args, reporter)
+        if args.fleet_command == "mesh":
+            return cmd_mesh(args, reporter)
     except Exception as exc:  # noqa: BLE001 - keep agent-visible error concise
         reporter.event("error", type=type(exc).__name__, message=str(exc))
         return EXIT_ERROR
