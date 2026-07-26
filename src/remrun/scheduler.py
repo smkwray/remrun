@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import socket
 from typing import Any
 
 from .models import Device
@@ -8,6 +9,23 @@ from .models import Device
 
 class SchedulingError(RuntimeError):
     pass
+
+
+def is_self(device: Device, hostname: str | None = None) -> bool:
+    """Is this device the machine we are running on?
+
+    Matched on the device NAME against the controller's short hostname, the same way
+    `config._offload_entry` already resolves a per-host `[offload]` entry — config keys
+    are device names, and a device's hostname is expected to match its name.
+    `address_candidates` are also checked, since a box is often reachable by an alias
+    that differs in case from its configured name.
+    """
+    host = (hostname or socket.gethostname() or "").split(".")[0].casefold()
+    if not host:
+        return False
+    if device.name.casefold() == host:
+        return True
+    return any(str(a).split(".")[0].casefold() == host for a in device.address_candidates)
 
 
 def _placement_order(project_config: dict[str, Any] | None, command: list[str]) -> list[str]:
@@ -90,6 +108,19 @@ def order_devices(
     if not result:
         # Last resort: any enabled device (excludes nothing, but auto rarely hits this).
         result = list(enabled.values())
+
+    # Never auto-route to the machine we are already on. The controller is frequently ALSO
+    # a configured device, and a device's remote project_root usually resolves to the SAME
+    # absolute path as the local one — so a self-route makes reconcile compare a tree with
+    # itself and transfer files onto the paths it is reading. That is a correctness hazard,
+    # not merely the wasted SSH round trip. Explicit `run <DEVICE>` is untouched: naming your
+    # own box is a deliberate act (and the local-sim backend exists for that), while `--auto`
+    # picking it is never what the caller meant. Dropped only when something else remains.
+    if len(result) > 1:
+        others = [d for d in result if not is_self(d)]
+        if others:
+            result = others
+
     if not result:
         raise SchedulingError("No enabled devices configured")
     return result

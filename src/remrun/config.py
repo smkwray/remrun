@@ -35,6 +35,11 @@ class RemrunConfig:
     # Parsed now for the inert Step-3 runner rollout. Legacy remains the default;
     # later steps are responsible for enforcing runner-v1 coordination.
     coordination: dict[str, Any] = field(default_factory=dict)
+    # Optional [scheduler] overrides from devices.toml. The `--auto` preference order is
+    # deployment-specific (it names real devices), so it belongs in the private device
+    # registry rather than the published defaults.toml. Merged OVER defaults.toml by
+    # scheduler_config(); tuning knobs stay in defaults where they are device-agnostic.
+    device_scheduler: dict[str, Any] = field(default_factory=dict)
 
 
 def find_remrun_root(start: Path | None = None) -> Path:
@@ -92,10 +97,11 @@ def load_config(remrun_root: Path | None = None) -> RemrunConfig:
     }
     git_sync = dict(devices_doc.get("git_sync", {}) or {})
     coordination = dict(devices_doc.get("coordination", {}) or {})
+    device_scheduler = dict(devices_doc.get("scheduler", {}) or {})
     return RemrunConfig(repo_root=root, defaults=defaults, devices=devices,
                         project_roots=project_roots, offload=offload, sync_roots=sync_roots,
                         fleet_adapters=fleet_adapters, git_sync=git_sync,
-                        coordination=coordination)
+                        coordination=coordination, device_scheduler=device_scheduler)
 
 
 # Conservative workstation defaults when a controller defines no explicit threshold
@@ -204,12 +210,19 @@ def _enabled_device_names(config: RemrunConfig) -> list[str]:
 
 
 def scheduler_config(config: RemrunConfig) -> dict[str, Any]:
-    """Resolve the [scheduler] block from defaults.toml with generic fallbacks.
+    """Resolve the [scheduler] block, with generic fallbacks.
 
-    When no scheduler order is configured, derive it from the enabled devices in
-    devices.toml so the published core never embeds a private fleet name.
+    Sources, later winning: defaults.toml `[scheduler]` (device-agnostic tuning knobs),
+    then devices.toml `[scheduler]` (the `--auto` preference order, which names real
+    devices and is therefore deployment-specific). Keeping the order in the private
+    device registry is what lets the published core ship no private fleet name.
+
+    When no order is configured in either, derive it from the enabled devices in
+    devices.toml — but note that follows file insertion order, which is an accident of
+    editing history and can put a laptop ahead of a dedicated compute box.
     """
     s = dict(config.defaults.get("scheduler", {}))
+    s.update(config.device_scheduler)
     enabled = _enabled_device_names(config)
     if "primary" not in s:
         s["primary"] = enabled[0] if enabled else None

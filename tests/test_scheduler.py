@@ -42,6 +42,64 @@ def test_auto_uses_scheduler_order_and_excludes_local_sim():
     assert names == ["MACBOX", "WINBOX"]  # LOCAL_SIM is not in primary/fallback
 
 
+def test_devices_toml_scheduler_order_overrides_defaults(tmp_path):
+    # The --auto preference order names real devices, so it belongs in the private
+    # devices.toml, not the published defaults.toml. Prove devices.toml wins, and that
+    # device-agnostic tuning knobs from defaults.toml still survive the merge.
+    from remrun.config import load_config, scheduler_config
+
+    cfgdir = tmp_path / "config"
+    cfgdir.mkdir()
+    (cfgdir / "defaults.toml").write_text(
+        '[scheduler]\nprimary = "FROM_DEFAULTS"\nbusy_floor_pct = 55\n', encoding="utf-8")
+    (cfgdir / "devices.toml").write_text(
+        '[scheduler]\nprimary = "FROM_DEVICES"\nfallback = ["SECOND"]\n'
+        '[devices.FROM_DEVICES]\nkind = "ssh-posix"\nproject_root = "/x"\n'
+        '[devices.SECOND]\nkind = "ssh-posix"\nproject_root = "/x"\n', encoding="utf-8")
+
+    s = scheduler_config(load_config(tmp_path))
+    assert s["primary"] == "FROM_DEVICES"       # devices.toml wins the order
+    assert s["fallback"] == ["SECOND"]
+    assert s["busy_floor_pct"] == 55            # defaults.toml keeps the tuning knobs
+
+
+def test_auto_never_routes_to_the_controller_itself(monkeypatch):
+    # The controller is frequently also a configured device, and its remote project_root
+    # usually resolves to the SAME absolute path as the local one — so a self-route makes
+    # reconcile compare a tree with itself and write to paths it is reading. --auto must
+    # drop the local machine.
+    monkeypatch.setattr("socket.gethostname", lambda: "MACBOX.local")
+    names = [d.name for d in order_devices(_devices(), "auto", scheduler_cfg=SCHED)]
+    assert names == ["WINBOX"]
+
+
+def test_auto_matches_self_by_address_alias_not_only_device_name(monkeypatch):
+    # A box is often reachable by an alias whose case differs from the configured name.
+    devices = _devices()
+    devices["MACBOX"] = _dev("MACBOX", perf_cores=16, eff_cores=4,
+                             address_candidates=["macbox.local", "macbox"])
+    monkeypatch.setattr("socket.gethostname", lambda: "macbox")
+    names = [d.name for d in order_devices(devices, "auto", scheduler_cfg=SCHED)]
+    assert names == ["WINBOX"]
+
+
+def test_auto_keeps_the_local_device_when_it_is_the_only_candidate(monkeypatch):
+    # Dropping the self-device must never leave --auto with nothing to run on: a
+    # single-device deployment still has to work, self-route overhead and all.
+    monkeypatch.setattr("socket.gethostname", lambda: "MACBOX")
+    only = {"MACBOX": _dev("MACBOX", perf_cores=16, eff_cores=4)}
+    names = [d.name for d in order_devices(
+        only, "auto", scheduler_cfg={"primary": "MACBOX", "fallback": []})]
+    assert names == ["MACBOX"]
+
+
+def test_explicit_target_may_still_be_the_controller_itself(monkeypatch):
+    # Naming your own box is a deliberate act; only --auto picking it is wrong.
+    monkeypatch.setattr("socket.gethostname", lambda: "MACBOX")
+    names = [d.name for d in order_devices(_devices(), "MACBOX", scheduler_cfg=SCHED)]
+    assert names == ["MACBOX"]
+
+
 def test_auto_placement_command_rule_wins():
     pc = {"placement": {"primary": "MACBOX", "fallback": ["WINBOX"],
                         "rules": [{"match_command": r"\.do$", "prefer": "WINBOX"}]}}

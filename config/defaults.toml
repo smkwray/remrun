@@ -78,6 +78,10 @@ propagate_remote_deletions = "known-only-with-backup"
 default_target = "auto"
 # Static preference order for `--auto` (project [placement] hints win first, then
 # this scheduler order). Leave primary/fallback unset to derive from devices.toml.
+# Setting them explicitly is worthwhile: derived order follows devices.toml insertion
+# order, which is an accident of editing history, and can easily put a laptop ahead of
+# a dedicated compute box. Prefer dedicated compute first, then shared machines. These
+# are deployment-specific device names, so set them in devices.toml, not here.
 # Availability: when the preferred device is unreachable, fail over to the next
 # reachable candidate instead of erroring. (Explicit `run <DEV>` never fails over.)
 prefer_reachable_primary = true
