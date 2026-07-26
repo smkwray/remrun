@@ -100,12 +100,32 @@ def iter_public_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
-def _load_private_patterns(root: Path, pattern_file: Path | None) -> list[str]:
+class MissingPatternFile(RuntimeError):
+    """The deployment-specific denylist is absent, so this check cannot be trusted."""
+
+
+def _load_private_patterns(root: Path, pattern_file: Path | None,
+                           *, generic_only: bool = False) -> list[str]:
+    """Load the deployment-specific regex denylist.
+
+    Raises when the file is missing. It is deliberately gitignored, so a fresh clone or a
+    different release machine has no copy — and silently returning [] there left only the
+    four generic patterns while still printing "ok", which is the most dangerous possible
+    result for a check whose whole job is catching private strings before publication.
+    Callers who genuinely want the generic-only scan must say so explicitly.
+    """
     if pattern_file is None:
         pattern_file = DEFAULT_PRIVATE_PATTERN_FILE
     path = pattern_file if pattern_file.is_absolute() else root / pattern_file
     if not path.exists():
-        return []
+        if generic_only:
+            return []
+        raise MissingPatternFile(
+            f"private pattern file not found: {path}\n"
+            "It is gitignored by design, so it does not travel with a clone — restore it on "
+            "this machine, pass --patterns PATH, or re-run with --generic-only to accept a "
+            "weaker scan that checks only the built-in patterns."
+        )
     patterns: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         text = line.strip()
@@ -114,8 +134,10 @@ def _load_private_patterns(root: Path, pattern_file: Path | None) -> list[str]:
     return patterns
 
 
-def scan(root: Path, *, pattern_file: Path | None = None) -> list[tuple[Path, int, str, str]]:
-    patterns = [*GENERIC_PRIVATE_PATTERNS, *_load_private_patterns(root, pattern_file)]
+def scan(root: Path, *, pattern_file: Path | None = None,
+         generic_only: bool = False) -> list[tuple[Path, int, str, str]]:
+    patterns = [*GENERIC_PRIVATE_PATTERNS,
+                *_load_private_patterns(root, pattern_file, generic_only=generic_only)]
     compiled = [(pat, re.compile(pat, re.IGNORECASE)) for pat in patterns]
     hits: list[tuple[Path, int, str, str]] = []
     for path in iter_public_files(root):
@@ -137,19 +159,27 @@ def main(argv: list[str] | None = None) -> int:
                         help="ignored local regex denylist, relative to --root by default")
     parser.add_argument("--list-files", action="store_true",
                         help="print the public files being scanned")
+    parser.add_argument("--generic-only", action="store_true",
+                        help="proceed without the deployment-specific denylist (weaker scan; "
+                             "not sufficient for a release)")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     files = iter_public_files(root)
     if args.list_files:
         for path in files:
             print(path.relative_to(root).as_posix())
-    hits = scan(root, pattern_file=args.patterns)
+    try:
+        hits = scan(root, pattern_file=args.patterns, generic_only=args.generic_only)
+    except MissingPatternFile as exc:
+        print(f"public release check FAILED: {exc}")
+        return 2
     if hits:
         for path, lineno, pattern, line in hits:
             rel = path.relative_to(root).as_posix()
             print(f"{rel}:{lineno}: {pattern}: {line}")
         return 1
-    print(f"public release check ok ({len(files)} files)")
+    scope = "generic patterns only" if args.generic_only else "generic + deployment patterns"
+    print(f"public release check ok ({len(files)} files, {scope})")
     return 0
 
 

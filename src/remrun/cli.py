@@ -150,6 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", nargs="?", default="auto")
     p.add_argument("--auto", action="store_true", help="Pick the target device automatically")
     p.add_argument("--scope", help="declared [parallel.scopes.<name>] write scope for this run")
+    p.add_argument("--probe", action="store_true",
+                   help="probe each candidate for reachability and live CPU load "
+                        "(costs a round-trip per device; off by default)")
+    p.add_argument("--check-git", action="store_true",
+                   help="also compare each candidate's project checkout against this one "
+                        "(implies --probe; excluded paths are NOT reconciled, so a diverged "
+                        "device can hold stale inputs)")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("run", help="Run a command remotely")
@@ -470,6 +477,98 @@ def cmd_runner(args: argparse.Namespace, reporter: Reporter) -> int:
     return EXIT_OK
 
 
+def _probe_candidates(plan: RunPlan, config, *, check_git: bool) -> list[dict]:
+    """Live per-candidate readiness for an orchestrator choosing a device.
+
+    OPT-IN and never on the run path: probing costs a round-trip per device (the POSIX
+    load sample runs `top -l 2`, ~2 s), which is why `plan` stays probe-free by default.
+
+    Reports, per candidate: reachability, live CPU busy %, static capacity, and the
+    derived spare perf-core-equivalents that `pick_by_load` actually ranks on — so the
+    caller sees the same number the scheduler would use, not a raw percentage it would
+    have to re-derive. Optionally adds git divergence.
+
+    Every field is independently nullable: an unreachable device, a backend that cannot
+    sample load, and a project with no git all degrade to `null` on that field alone
+    rather than dropping the candidate. `null` means UNKNOWN, never "fine".
+    """
+    sched = scheduler_config(config)
+    eff_w = float(sched.get("eff_core_weight", 1.0))
+    out: list[dict] = []
+    for device in plan.candidates:
+        entry: dict = {
+            "name": device.name,
+            "perf_cores": device.perf_cores,
+            "eff_cores": device.eff_cores,
+            "ram_gb": device.ram_gb,
+            "capacity_perf_core_equiv": round(device.cpu_capacity(eff_w), 2) or None,
+            "reachable": None, "cpu_busy_pct": None, "spare_perf_core_equiv": None,
+            "max_jobs": device.max_jobs,
+        }
+        try:
+            transport = make_transport(device)
+            probe = transport.probe()
+            entry["reachable"] = bool(probe.reachable)
+            if not probe.reachable:
+                entry["detail"] = probe.detail
+            else:
+                busy = transport.sample_load()
+                entry["cpu_busy_pct"] = busy
+                cap = device.cpu_capacity(eff_w)
+                if busy is not None and cap:
+                    entry["spare_perf_core_equiv"] = round(
+                        cap * (1.0 - min(max(busy, 0.0), 100.0) / 100.0), 2)
+                if check_git:
+                    entry["git"] = _candidate_git_state(transport, device, plan)
+        except (TransportError, OSError) as exc:
+            entry["reachable"] = False
+            entry["detail"] = str(exc)
+        out.append(entry)
+    return out
+
+
+def _candidate_git_state(transport, device, plan: RunPlan) -> dict:
+    """Whether this device's checkout of the project agrees with the controller's.
+
+    Motivating hazard: remrun excludes `.git/**`, so it reconciles WORKING FILES and
+    never history. That is normally the right call — but it only guarantees agreement
+    for paths inside the transfer surface. A device whose checkout is behind can hold
+    stale copies of EXCLUDED paths (bulk `data/**`, say) that no reconcile will fix and
+    nothing currently warns about. Surfacing the head comparison lets an orchestrator
+    refuse to route work to a diverged device.
+
+    Advisory only: any failure returns `status: "unknown"` — never a bare False that
+    would read as "in sync". Not a substitute for `remrun git-sync <device> --status`,
+    which does the real branch comparison; this is the cheap head check an orchestrator
+    can afford per routing decision.
+    """
+    from .gitsync import _local_git, _remote_git
+    rev = ["rev-parse", "--verify", "--quiet", "HEAD"]
+    try:
+        local_proc = _local_git(plan.project.local_project_root, rev)
+        mine = local_proc.stdout.strip() if local_proc.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": "unknown", "detail": f"local git failed: {exc}"}
+    try:
+        remote_root = transport.remote_project_path(plan.project)
+        remote_proc = _remote_git(transport, remote_root, rev)
+        theirs = remote_proc.stdout.strip() if remote_proc.exit_code == 0 else ""
+    except (TransportError, OSError) as exc:
+        return {"status": "unknown", "local": mine or None,
+                "detail": f"remote git failed: {exc}"}
+    if not mine or not theirs:
+        return {"status": "unknown", "local": mine or None, "remote": theirs or None,
+                "detail": "one or both checkouts have no resolvable HEAD "
+                          "(not a git repo, or an unborn branch)"}
+    if mine == theirs:
+        return {"status": "same", "local": mine, "remote": theirs}
+    return {"status": "diverged", "local": mine, "remote": theirs,
+            "detail": "device checkout differs from this one. remrun excludes .git/** and "
+                      "reconciles WORKING FILES, so tracked in-surface paths still converge "
+                      "— but EXCLUDED paths (bulk data, artifacts) are never reconciled and "
+                      "may be stale here. Run `remrun git-sync <device> --status`."}
+
+
 def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
     config = load_config()
     command = normalize_cmd(args.cmd)
@@ -481,8 +580,13 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         scope_name=args.scope,
         json_events=args.json,
     )
+    candidates = (_probe_candidates(plan, config, check_git=args.check_git)
+                  if (args.probe or args.check_git) else None)
     if args.json:
-        print(json.dumps(plan.as_dict(), indent=2, sort_keys=True))
+        payload = plan.as_dict()
+        if candidates is not None:
+            payload["candidates_probed"] = candidates
+        print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         reporter.event("project", project_id=plan.project.project_id, relative_cwd=plan.project.relative_cwd)
         reporter.event("target", name=plan.target.name, kind=plan.target.kind)
@@ -491,6 +595,8 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("write_scope", name=plan.write_scope or "project",
                        paths=plan.write_scope_paths)
         reporter.event("active_surface", excludes=len(plan.excludes), hash_below_bytes=plan.hash_below_bytes)
+        for entry in (candidates or []):
+            reporter.event("candidate_probe", **entry)
         reporter.event("project_config", path=str(plan.project_config_path) if plan.project_config_path else None)
         rec = recommend_offload(
             load_profiles(default_state_root()), plan.project.project_id,
@@ -749,7 +855,8 @@ def _run_locked(
     write_manifest(rdir / "pre_remote_manifest.json", pre.remote_manifest)
     reporter.event("preflight_summary", pulled=len(pre.pulled), pushed=len(pre.pushed),
                    deleted_remote=len(pre.deleted_remote), deleted_local=len(pre.deleted_local),
-                   conflicts=0)
+                   skipped_identical=len(pre.skipped_identical),
+                   converged_conflicts=len(pre.converged_conflicts), conflicts=0)
 
     # --- execute -------------------------------------------------------------
     runenv = resolve_run_env(
@@ -890,6 +997,8 @@ def _run_locked(
         "files_pulled_pre": len(pre.pulled),
         "files_deleted_remote_pre": len(pre.deleted_remote),
         "files_deleted_local_pre": len(pre.deleted_local),
+        "files_skipped_identical_pre": len(pre.skipped_identical),
+        "files_converged_conflicts_pre": len(pre.converged_conflicts),
         "files_pulled_post": len(post.pulled) if post else 0,
         "files_deleted_local_post": len(post.deleted_local) if post else 0,
         "preflight_conflicts": 0,

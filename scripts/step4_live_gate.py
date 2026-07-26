@@ -438,13 +438,36 @@ def run_gate(coordinator_name: str, target_name: str, lease_seconds: int) -> dic
             _RPC_TRANSPORTS.pop((id(config), target_name), None)
 
 
+def _default_coordinator(config) -> str | None:
+    """The configured coordinator: `[coordination].device`, else the first enabled real
+    device. Derived rather than hardcoded so the gate cannot ship a device name that does
+    not exist in this deployment's config — and so sanitizing the public tree never leaves
+    a placeholder default that raises KeyError on the first bare invocation."""
+    named = (config.coordination or {}).get("device")
+    if named:
+        for name in config.devices:
+            if name.lower() == str(named).lower():
+                return name
+    for name, device in config.devices.items():
+        if device.enabled and device.kind != "local-sim":
+            return name
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--coordinator", default="MACBOX")
-    parser.add_argument("--target", default="WINBOX")
+    parser.add_argument("--coordinator", default=None,
+                        help="defaults to [coordination].device, else the first enabled device")
+    parser.add_argument("--target", required=True,
+                        help="device to fence against; must differ from the coordinator")
     parser.add_argument("--lease-seconds", type=int, default=10)
     args = parser.parse_args()
-    result = run_gate(args.coordinator, args.target, args.lease_seconds)
+    coordinator = args.coordinator or _default_coordinator(load_config())
+    if not coordinator:
+        parser.error("no coordinator configured; set [coordination].device or pass --coordinator")
+    if coordinator == args.target:
+        parser.error("--target must differ from the coordinator")
+    result = run_gate(coordinator, args.target, args.lease_seconds)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 

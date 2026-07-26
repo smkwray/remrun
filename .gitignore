@@ -5,6 +5,7 @@
 
 # Private continuity / orchestration notes. Public releases ship reusable docs only.
 /AGENTS.md
+/CLAUDE.md
 /HANDOFF.md
 /PLAN.md
 # Private field notes (issues/fixes flagged while using remrun). Never published.

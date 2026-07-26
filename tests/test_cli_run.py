@@ -245,6 +245,67 @@ def test_plan_offload_policy_fallback_without_profile(env, capsys):
     assert "offload_policy" in err and "basis=no-measurement" in err
 
 
+def test_plan_is_probe_free_by_default(env, capsys, monkeypatch):
+    # Probing costs a round-trip per device, so `plan` must not do it unless asked.
+    from remrun import transport as transport_mod
+
+    def boom(self):
+        raise AssertionError("plan sampled load without --probe")
+
+    monkeypatch.setattr(transport_mod.LocalSimTransport, "sample_load", boom, raising=False)
+    code = main(["plan", "LOCAL_SIM", "--json", "--", "python", "-c", "print('p')"])
+    assert code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert "candidates_probed" not in payload
+
+
+def test_plan_probe_reports_live_load_and_spare_capacity(env, capsys, monkeypatch):
+    # --probe exposes the same `spare` figure pick_by_load ranks on, so an orchestrator
+    # sees the scheduler's own number rather than re-deriving it from a raw percentage.
+    from remrun import transport as transport_mod
+
+    monkeypatch.setattr(transport_mod.LocalSimTransport, "sample_load",
+                        lambda self: 25.0, raising=False)
+    code = main(["plan", "LOCAL_SIM", "--probe", "--json", "--", "python", "-c", "print('p')"])
+    assert code == EXIT_OK
+    probed = json.loads(capsys.readouterr().out)["candidates_probed"]
+    entry = next(e for e in probed if e["name"] == "LOCAL_SIM")
+    assert entry["reachable"] is True
+    assert entry["cpu_busy_pct"] == 25.0
+    # Nothing was asked about git, so the key is absent rather than a misleading default.
+    assert "git" not in entry
+
+
+def test_plan_probe_reports_unknown_load_as_null_not_zero(env, capsys, monkeypatch):
+    # A backend that cannot measure must yield null. Zero would read as "totally idle"
+    # and attract every routing decision to the device we know least about.
+    from remrun import transport as transport_mod
+
+    monkeypatch.setattr(transport_mod.LocalSimTransport, "sample_load",
+                        lambda self: None, raising=False)
+    code = main(["plan", "LOCAL_SIM", "--probe", "--json", "--", "python", "-c", "print('p')"])
+    assert code == EXIT_OK
+    entry = json.loads(capsys.readouterr().out)["candidates_probed"][0]
+    assert entry["cpu_busy_pct"] is None
+    assert entry["spare_perf_core_equiv"] is None
+
+
+def test_plan_check_git_reports_unknown_for_a_non_git_checkout(env, capsys, monkeypatch):
+    # The live-observed case: a Syncthing-delivered working tree with no .git at all.
+    # It must report `unknown`, never `same` — remrun excludes .git/**, so EXCLUDED
+    # paths on such a device are unreconciled and may be stale.
+    from remrun import transport as transport_mod
+
+    monkeypatch.setattr(transport_mod.LocalSimTransport, "sample_load",
+                        lambda self: 10.0, raising=False)
+    code = main(["plan", "LOCAL_SIM", "--check-git", "--json", "--",
+                 "python", "-c", "print('p')"])
+    assert code == EXIT_OK
+    entry = json.loads(capsys.readouterr().out)["candidates_probed"][0]
+    assert entry["git"]["status"] == "unknown"
+    assert entry["reachable"] is True          # unknown git != unreachable device
+
+
 def test_doctor_reports_project_scopes_and_fleet_state(env, capsys):
     cfgdir = env["proj"] / "do" / "remrun"
     cfgdir.mkdir(parents=True)

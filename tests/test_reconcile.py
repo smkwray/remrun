@@ -145,6 +145,111 @@ def test_postrun_skips_pull_when_syncthing_already_delivered_identical(tmp_path:
     assert (local / "out.txt").read_text() == "RESULT-DATA"
 
 
+def _converge_after_manifest(transport, write_side):
+    """Make the transport's remote manifest call also perform ``write_side()`` once.
+
+    That lands the converging write in the exact gap the guard exists for: after the plan
+    is built from both manifests, before the transfer applies. Restores the real method
+    immediately so the manifests rebuilt at the end of preflight are truthful.
+    """
+    real = transport.manifest
+
+    def once(*args, **kwargs):
+        result = real(*args, **kwargs)
+        transport.manifest = real
+        write_side()
+        return result
+
+    transport.manifest = once
+
+
+def test_preflight_skips_pull_when_local_converged_between_plan_and_apply(tmp_path: Path):
+    # Preflight counterpart of the postrun guard above. A pull is PLANNED from a manifest
+    # snapshot, then Syncthing delivers those exact bytes locally before the transfer runs.
+    # Rewriting the file would re-touch a path Syncthing is watching — the race remrun is
+    # supposed to stay clear of. The transport fails loudly if the pull is attempted.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    remote.mkdir(parents=True)
+    (remote / "delivered.txt").write_text("SAME-BYTES")
+
+    _converge_after_manifest(t, lambda: (local / "delivered.txt").write_text("SAME-BYTES"))
+
+    def fail_pull(*args, **kwargs):
+        raise AssertionError("preflight pulled a file that was already byte-identical")
+
+    t.pull_file = fail_pull
+
+    res = reconcile(local, remote_root, t, backup)
+    assert res.skipped_identical == ["delivered.txt"]
+    assert res.pulled == []
+    assert (local / "delivered.txt").read_text() == "SAME-BYTES"
+
+
+def test_preflight_skips_push_when_local_reverts_to_remote_bytes_before_apply(tmp_path: Path):
+    # Same guard, push direction. A PUSH is planned because local changed; then Syncthing
+    # delivers the remote's copy over the local file before the transfer runs, so local now
+    # holds exactly what the remote already has and there is nothing to send.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    (local / "shared.txt").write_text("ORIGINAL")
+    first = reconcile(local, remote_root, t, backup)
+    assert first.pushed == ["shared.txt"]
+
+    (local / "shared.txt").write_text("LOCAL-EDIT")     # local changed -> PUSH planned
+    # ...then the remote's copy lands back on top of the local edit, mid-reconcile.
+    _converge_after_manifest(t, lambda: (local / "shared.txt").write_text("ORIGINAL"))
+
+    def fail_push(*args, **kwargs):
+        raise AssertionError("preflight pushed a file the remote already had")
+
+    t.push_file = fail_push
+
+    res = reconcile(local, remote_root, t, backup,
+                    prev_local=first.local_manifest, prev_remote=first.remote_manifest)
+    assert res.skipped_identical == ["shared.txt"]
+    assert res.pushed == []
+    assert (remote / "shared.txt").read_text() == "ORIGINAL"
+
+
+def test_preflight_still_transfers_when_content_genuinely_differs(tmp_path: Path):
+    # The guard must not swallow real work: differing bytes still move, in both directions.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    remote.mkdir(parents=True)
+    (remote / "pull-me.txt").write_text("REMOTE-ONLY")
+    (local / "push-me.txt").write_text("LOCAL-ONLY")
+
+    res = reconcile(local, remote_root, t, backup)
+    assert res.pulled == ["pull-me.txt"]
+    assert res.pushed == ["push-me.txt"]
+    assert res.skipped_identical == []
+    assert (local / "pull-me.txt").read_text() == "REMOTE-ONLY"
+    assert (remote / "push-me.txt").read_text() == "LOCAL-ONLY"
+
+
+def test_preflight_guard_fails_closed_when_remote_hash_is_unavailable(tmp_path: Path):
+    # No remote hash (file above the hashing threshold) means no positive proof of equality,
+    # so the transfer MUST still happen. Absence of evidence never becomes a skip.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    remote.mkdir(parents=True)
+    (remote / "big.bin").write_bytes(b"R" * 2048)
+
+    res = preflight_reconcile(
+        transport=t,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["node_modules/**"],
+        hash_below_bytes=1024,          # below the file size => manifests carry no sha256
+        prev_local=None,
+        prev_remote=None,
+        backup_root=backup,
+    )
+    assert res.pulled == ["big.bin"]
+    assert res.skipped_identical == []
+
+
 def test_hash_file_matches_sha256_file(tmp_path: Path):
     from remrun.manifest import sha256_file
     base = tmp_path / "remote"
@@ -292,6 +397,123 @@ def test_empty_but_present_remote_still_mirrors_last_deletion(tmp_path: Path):
     assert not res.has_conflicts
     assert res.deleted_local == ["only.txt"]
     assert not (local / "only.txt").exists()
+
+
+def _reconcile_unhashed(local, remote_root, transport, backup, prev_local, prev_remote):
+    """Reconcile with hashing effectively disabled, so manifests carry size+mtime only.
+
+    That is what a real run looks like for any file above `hash_small_files_below_mb`.
+    """
+    return preflight_reconcile(
+        transport=transport, local_root=local, remote_root=remote_root,
+        excludes=["node_modules/**"], hash_below_bytes=0,
+        prev_local=prev_local, prev_remote=prev_remote, backup_root=backup,
+    )
+
+
+def test_identical_bytes_are_not_a_conflict_even_when_manifests_carry_no_hash(tmp_path: Path):
+    # FIELD-REPORTED (2026-07-25, three lanes, one lost ~54 min): Syncthing delivers the same
+    # edit to both devices. Each side therefore differs from its own baseline, and with no
+    # hash in the manifest the equality test falls back to mtime — which differs — so the run
+    # aborted `both-changed` with nothing actually to reconcile. Identical content must never
+    # be a conflict, whatever the metadata says.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    (local / "shared.txt").write_text("base")
+    first = reconcile(local, remote_root, t, backup)
+
+    # The same edit lands on both sides, with deliberately different mtimes.
+    (local / "shared.txt").write_text("SAME-EDIT")
+    (remote / "shared.txt").write_text("SAME-EDIT")
+    os.utime(local / "shared.txt", ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    os.utime(remote / "shared.txt", ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000))
+
+    res = _reconcile_unhashed(local, remote_root, t, backup,
+                              first.local_manifest, first.remote_manifest)
+
+    assert not res.has_conflicts
+    assert res.converged_conflicts == ["shared.txt"]
+    assert not res.pushed and not res.pulled
+    assert (local / "shared.txt").read_text() == "SAME-EDIT"
+    assert (remote / "shared.txt").read_text() == "SAME-EDIT"
+
+
+def test_converged_conflict_does_not_stall_unrelated_work(tmp_path: Path):
+    # The reported cost was not just the false alarm: one converged path blocked every other
+    # lane in the same run. Once disproved, the rest of the tree must still reconcile.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    (local / "shared.txt").write_text("base")
+    first = reconcile(local, remote_root, t, backup)
+
+    (local / "shared.txt").write_text("SAME-EDIT")
+    (remote / "shared.txt").write_text("SAME-EDIT")
+    os.utime(local / "shared.txt", ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    os.utime(remote / "shared.txt", ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000))
+    (local / "unrelated.txt").write_text("NEW-LOCAL-WORK")
+
+    res = _reconcile_unhashed(local, remote_root, t, backup,
+                              first.local_manifest, first.remote_manifest)
+
+    assert not res.has_conflicts
+    assert res.converged_conflicts == ["shared.txt"]
+    assert res.pushed == ["unrelated.txt"]
+    assert (remote / "unrelated.txt").read_text() == "NEW-LOCAL-WORK"
+
+
+def test_genuinely_divergent_bytes_still_conflict_without_hashes(tmp_path: Path):
+    # The guard must not weaken the real protection: different bytes still abort, and
+    # neither side is mutated.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    (local / "shared.txt").write_text("base")
+    first = reconcile(local, remote_root, t, backup)
+
+    (local / "shared.txt").write_text("LOCAL-EDIT")
+    (remote / "shared.txt").write_text("OTHER-EDIT")   # same length, different content
+
+    res = _reconcile_unhashed(local, remote_root, t, backup,
+                              first.local_manifest, first.remote_manifest)
+
+    assert res.has_conflicts
+    assert [c.path for c in res.conflicts] == ["shared.txt"]
+    assert not res.converged_conflicts
+    assert (local / "shared.txt").read_text() == "LOCAL-EDIT"
+    assert (remote / "shared.txt").read_text() == "OTHER-EDIT"
+
+
+@pytest.mark.parametrize(
+    "hash_result",
+    [
+        TransportError("injected hash failure"),
+        NotImplementedError("hash unsupported"),
+        "not-a-sha256",
+        "",
+    ],
+)
+def test_unverifiable_remote_hash_keeps_the_conflict(tmp_path: Path, monkeypatch, hash_result):
+    # Fail CLOSED: if the remote hash cannot be obtained or is malformed, equality is
+    # UNPROVEN, so the conflict must stand. Absence of evidence is never convergence.
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    (local / "shared.txt").write_text("base")
+    first = reconcile(local, remote_root, t, backup)
+
+    (local / "shared.txt").write_text("SAME-EDIT")
+    (remote / "shared.txt").write_text("SAME-EDIT")
+
+    def unverifiable(_remote_path: str) -> str:
+        if isinstance(hash_result, Exception):
+            raise hash_result
+        return hash_result
+
+    monkeypatch.setattr(t, "hash_file", unverifiable)
+
+    res = _reconcile_unhashed(local, remote_root, t, backup,
+                              first.local_manifest, first.remote_manifest)
+
+    assert res.has_conflicts
+    assert not res.converged_conflicts
 
 
 def test_both_changed_aborts_without_mutation(tmp_path: Path):

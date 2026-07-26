@@ -139,6 +139,39 @@ def test_job_costs_written_to_project_do_remrun(tmp_path):
     assert "trip_s" not in e and "overhead_s" not in e
 
 
+def test_update_job_costs_preserves_a_malformed_file_instead_of_resetting_it(tmp_path):
+    # A torn/half-delivered cost file must NOT be rebuilt from scratch: doing so writes a
+    # valid one-row replacement over the whole learned history, and the file most likely to
+    # be torn is one an external writer is mid-delivery on. Preserve the bytes, record nothing.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    update_job_costs(proj, "Rscript:model.R", "MACBOX", rss_mb=8000, exec_s=42, now="t1")
+    p = job_costs_path(proj)
+    torn = '{"version": 1, "costs": {"Rscript:model.R": {"MAC'      # truncated mid-write
+    p.write_text(torn, encoding="utf-8")
+
+    update_job_costs(proj, "Rscript:other.R", "MACBOX", rss_mb=100, exec_s=1, now="t2")
+
+    assert p.read_text(encoding="utf-8") == torn      # untouched, not replaced
+    # And a malformed file is skipped on read rather than poisoning the merge.
+    assert load_job_costs(proj) == {}
+
+
+def test_update_job_costs_preserves_a_valid_file_of_foreign_schema(tmp_path):
+    # Parses as JSON but is not ours (e.g. another tool's file, or a conflict copy of a
+    # different format). Same rule: do not overwrite bytes we did not write.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    update_job_costs(proj, "Rscript:model.R", "MACBOX", rss_mb=8000, exec_s=42, now="t1")
+    p = job_costs_path(proj)
+    foreign = '{"something": "else"}'
+    p.write_text(foreign, encoding="utf-8")
+
+    update_job_costs(proj, "Rscript:other.R", "MACBOX", rss_mb=100, exec_s=1, now="t2")
+
+    assert p.read_text(encoding="utf-8") == foreign
+
+
 def test_load_job_costs_merges_per_controller_files(tmp_path):
     # Multiple controllers each write their own job_costs.<id>.json (no shared-writer conflict);
     # a reader merges them all (union of (command,device) rows, newest `updated` wins on overlap).

@@ -37,10 +37,13 @@ def fleet_config(config: RemrunConfig) -> dict[str, Any]:
     f.setdefault("transfer_mbps", 200.0)      # pessimistic default throughput (LAN/Tailscale)
     f.setdefault("per_file_overhead_s", 0.05)
     f.setdefault("ssh_setup_s", 0.6)          # ~stage/exec/fetch connection overhead (no reconcile)
-    f.setdefault("hysteresis_s", 1.0)         # legacy fixed margin (superseded by the adaptive one)
     # Adaptive split hysteresis (Phase 3c): margin a split must beat one batch by =
     # max(min_hysteresis_s, hysteresis_finish_frac*best_finish, OCR page-count uncertainty).
-    f.setdefault("min_hysteresis_s", 5.0)
+    # The legacy fixed `hysteresis_s` default was dropped on 2026-07-25. Seeding it here made
+    # `min_hysteresis_s` always present, so placement's `get("min_hysteresis_s",
+    # get("hysteresis_s", ...))` fallback could never reach a configured `hysteresis_s` — the
+    # documented knob was dead. A config that still sets it now genuinely falls back below.
+    f.setdefault("min_hysteresis_s", float(f.get("hysteresis_s", 5.0)))
     f.setdefault("hysteresis_finish_frac", 0.05)
     f.setdefault("page_uncertainty_frac", 0.25)
     # Confidence penalty for placement estimates. Priors/shared seeds carry n=0, so they get the

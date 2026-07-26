@@ -149,7 +149,13 @@ safety_fraction = 0.90     # usable share of free RAM/VRAM when checking if a jo
 transfer_mbps = 200.0      # pessimistic input-transfer throughput (LAN/Tailscale); refined by measurement
 per_file_overhead_s = 0.05
 ssh_setup_s = 0.6          # ~stage/exec/fetch connection overhead (fleet skips project reconcile)
-hysteresis_s = 1.0         # prefer one batched device over a split unless the split wins by this much
+# Split hysteresis: prefer one batched device over a split unless the split wins by this
+# much. The margin is max(min_hysteresis_s, hysteresis_finish_frac * best_finish, and for
+# OCR a page-count uncertainty term). The old fixed `hysteresis_s = 1.0` was removed on
+# 2026-07-25: it had been superseded by these two and could never take effect, so editing
+# it silently did nothing.
+min_hysteresis_s = 5.0        # floor, in seconds
+hysteresis_finish_frac = 0.05 # ...or this fraction of the better finish time, whichever is larger
 [fleet.pools]
 # One model-heavy job per device. Rename or add pools to match your adapter `pool`
 # fields. Raise only if measured safe for your devices.
@@ -179,12 +185,21 @@ ocr = "vision"
 
 # Learned job-cost profiles. The PORTABLE resource costs of a project's jobs (peak RAM /
 # CPU% / remote exec time per command+device) are a property of the job and the device,
-# not of the controller — so they're written to the PROJECT's `do/remrun/job_costs.json`
-# (synced with the project) and any controller reads them as the base for `--auto`
-# placement. The controller-specific bits (round-trip/overhead timing + the LOCAL offload
-# baseline) stay in local state. Set false to keep everything controller-local instead.
+# not of the controller, so in principle they belong with the project.
+#
+# DEFAULT OFF (2026-07-25). Writing them to `<project>/do/remrun/job_costs.<controller>.json`
+# means a read-modify-write inside a Syncthing-replicated tree on EVERY run. Measured in
+# production: 442 runs of one project in three days, peaking at 48/hour, which produced 11
+# sync-conflict copies of that one file plus a stranded `.syncthing.*.tmp`. Two of those
+# copies, created one second apart, were byte-identical — that is one file being rewritten
+# faster than Syncthing can settle a version, not a genuine two-writer divergence.
+#
+# The data is advisory only (it feeds `--auto` placement and the offload hint), and costs
+# still accumulate per-controller in local state either way, so losing cross-controller
+# portability costs far less than churning the synced tree. Set true to restore the
+# portable project-local file — but only for a project tree that is NOT continuously synced.
 [profile]
-store_in_project = true
+store_in_project = false
 
 [telemetry]
 # Record peak RSS and average CPU% for the remote command (whole process tree):

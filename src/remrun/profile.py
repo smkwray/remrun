@@ -222,16 +222,26 @@ def update_job_costs(project_root: Path, key: str, device: str, *, rss_mb=None,
                      max_entries: int = DEFAULT_MAX_ENTRIES) -> None:
     """Fold one run's PORTABLE costs (rss/cpu/exec) for (command, device) into the
     project's job_costs.json (EWMA, atomic). Skips the LOCAL baseline (controller-
-    specific). Best-effort; never raises (a read-only project just isn't recorded)."""
+    specific). Best-effort; never raises (a read-only project just isn't recorded).
+
+    A file that EXISTS but does not parse is left completely alone. Rebuilding it from
+    ``{}`` would write a valid one-row replacement over the whole learned history — and
+    the file most likely to be torn is one an external writer (Syncthing) is mid-delivery
+    on, so the loss would land exactly where it is hardest to notice. Absent is fine to
+    create; malformed is somebody else's bytes.
+    """
     if device == LOCAL_DEVICE:
         return
     p = job_costs_path(project_root)
-    try:
-        existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-    except (json.JSONDecodeError, OSError, ValueError):
-        existing = {}
-    costs = existing.get("costs") if isinstance(existing, dict) else None
-    if not isinstance(costs, dict):
+    if p.exists():
+        try:
+            existing = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, ValueError):
+            return          # unreadable/unparsable: preserve it, record nothing
+        if not isinstance(existing, dict) or not isinstance(existing.get("costs"), dict):
+            return          # parses but is not our schema: same rule
+        costs = existing["costs"]
+    else:
         costs = {}
     devmap = costs.get(key)
     if not isinstance(devmap, dict):

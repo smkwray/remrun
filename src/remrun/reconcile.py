@@ -30,6 +30,14 @@ class ReconcileResult:
     deleted_local: list[str] = field(default_factory=list)
     deleted_remote: list[str] = field(default_factory=list)
     conflicts: list[ClassifiedPath] = field(default_factory=list)
+    # Planned transfers dropped at apply time because the two sides had already converged
+    # (an external writer delivered the same bytes between manifesting and applying).
+    # Reported so a skipped transfer stays visible instead of looking like it was never
+    # planned.
+    skipped_identical: list[str] = field(default_factory=list)
+    # Paths classified `both-changed` from metadata alone, then proved byte-identical by
+    # hashing both sides. Not conflicts — recorded so the run can show it examined them.
+    converged_conflicts: list[str] = field(default_factory=list)
     # Converged manifests after reconcile == pre-run baselines.
     local_manifest: Manifest = field(default_factory=dict)
     remote_manifest: Manifest = field(default_factory=dict)
@@ -62,6 +70,78 @@ def _fresh_local_entry(path: Path, *, hash_if_size: int | None) -> FileEntry | N
         return None
     digest = sha256_file(path) if (hash_if_size is not None and st.st_size == hash_if_size) else None
     return FileEntry(path=path.name, kind="file", size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=digest)
+
+
+def _already_converged(local_path: Path, remote_entry: FileEntry | None) -> bool:
+    """Has the local file become byte-identical to the remote candidate since planning?
+
+    Fails CLOSED: a missing remote entry, a remote entry with no hash, or an unreadable
+    local file all return False, so the planned transfer still happens. A skip is only ever
+    taken on positive proof of equal content, never on absence of evidence. Costs one stat,
+    plus one local hash when the sizes match (a size mismatch already proves they differ).
+
+    Scope: this re-reads the LOCAL side only. ``remote_entry`` is still the value from the
+    manifest fetched during planning, so a change made on the REMOTE inside the same window
+    is not visible here — catching that would need a per-file round-trip on every transfer.
+    That is the right trade: the observed churn comes from an external writer delivering to
+    the controller mid-reconcile, which this does catch, in both the pull and push
+    directions (a push is skipped when local reverts to the bytes the remote already holds).
+    """
+    if remote_entry is None or remote_entry.kind != "file" or remote_entry.sha256 is None:
+        return False
+    local_now = _fresh_local_entry(local_path, hash_if_size=remote_entry.size)
+    if local_now is None or local_now.sha256 is None:
+        return False
+    return local_now.sha256 == remote_entry.sha256
+
+
+def _drop_identical_conflicts(
+    conflicts: list[ClassifiedPath],
+    *,
+    transport: BaseTransport,
+    local_root: Path,
+    remote_root: str,
+    local_manifest: Manifest,
+    remote_manifest: Manifest,
+) -> list[ClassifiedPath]:
+    """Return the conflicts that survive a real content comparison.
+
+    Only `both-changed` is re-examined: it is the one classification that means "both sides
+    hold bytes we could not prove equal", and the proof is cheap to obtain. Deletion
+    conflicts and the vanished-root guard are about intent, not content, so they pass
+    through untouched.
+
+    Fails CLOSED in every uncertain case — a missing manifest entry, a hash the transport
+    cannot supply, a mismatched size, an unreadable local file, or any transport error all
+    keep the conflict. A conflict is dropped only on two hashes that exist and match.
+    """
+    survivors: list[ClassifiedPath] = []
+    for item in conflicts:
+        if item.state != "both-changed":
+            survivors.append(item)
+            continue
+        le = local_manifest.get(item.path)
+        re_ = remote_manifest.get(item.path)
+        if le is None or re_ is None or le.kind != "file" or re_.kind != "file":
+            survivors.append(item)
+            continue
+        if le.size != re_.size:      # different sizes already prove divergence
+            survivors.append(item)
+            continue
+        try:
+            local_hash = le.sha256 or sha256_file(local_root / item.path)
+            remote_hash = re_.sha256 or transport.hash_file(
+                transport.remote_join(remote_root, item.path)
+            )
+        except (TransportError, NotImplementedError, OSError, ValueError):
+            survivors.append(item)
+            continue
+        if not local_hash or not remote_hash or len(str(remote_hash).strip()) != 64:
+            survivors.append(item)
+            continue
+        if str(local_hash).strip().lower() != str(remote_hash).strip().lower():
+            survivors.append(item)
+    return survivors
 
 
 def _remote_root_present(transport: BaseTransport, remote_root: str) -> bool:
@@ -151,11 +231,31 @@ def preflight_reconcile(
     plan = compare_manifests(local_manifest, remote_manifest, prev_local, prev_remote)
 
     if plan.has_conflicts:
-        # Do not mutate either side; report and let the caller abort (exit 2).
-        result.conflicts = plan.conflicts()
-        result.local_manifest = local_manifest
-        result.remote_manifest = remote_manifest
-        return result
+        # Before refusing, PROVE the disputed paths actually differ. compare_manifests can
+        # only use what the manifests carry, and a file above `hash_small_files_below_mb`
+        # carries no hash — so its equality test degrades to mtime, and two devices holding
+        # identical bytes with different mtimes get classified `both-changed`. In a synced
+        # tree that is the common case, not the rare one: Syncthing delivers the same edit to
+        # both sides, remrun sees each side differ from its own baseline, and the run aborts
+        # with nothing to reconcile. Field-reported three times; one lane lost ~54 minutes.
+        # Hashing only the disputed paths keeps this off the normal path entirely.
+        resolved = _drop_identical_conflicts(
+            plan.conflicts(), transport=transport, local_root=local_root,
+            remote_root=remote_root, local_manifest=local_manifest,
+            remote_manifest=remote_manifest,
+        )
+        if resolved:
+            # Genuinely divergent bytes: do not mutate either side; let the caller abort
+            # (exit 2). Any conflict we could not disprove stays a conflict — fail closed.
+            result.conflicts = resolved
+            result.local_manifest = local_manifest
+            result.remote_manifest = remote_manifest
+            return result
+        # Every conflict was disproved: both sides already hold identical content, so there
+        # is nothing to transfer for them. Fall through and reconcile the rest of the tree.
+        result.converged_conflicts.extend(item.path for item in plan.conflicts())
+        plan = replace(plan, paths=[item for item in plan.paths
+                                    if item.action != ABORT_CONFLICT])
 
     # Case-fold collision guard (APFS/NTFS): two distinct paths that fold to the same name collapse
     # into one file on a case-insensitive TARGET (silent data loss). Abort before any mutation.
@@ -192,14 +292,30 @@ def preflight_reconcile(
         remote_path = transport.remote_join(remote_root, item.path)
         local_path = local_root / item.path
         if item.action == PULL:
-            # Snapshot the prior local version before overwriting it, so a wrong pull
-            # is recoverable (no-op when the file is new or over the backup size cap).
-            _backup_local(local_root, item.path, backup_root, backup_below_bytes)
-            transport.pull_file(remote_path, local_path)
-            result.pulled.append(item.path)
+            # Re-check the LOCAL file RIGHT BEFORE writing it. The plan above was built from
+            # a manifest snapshot; an external writer (Syncthing) may have delivered the very
+            # bytes we are about to pull in the meantime. Rewriting an already-converged file
+            # is not just wasted work — it re-touches a path Syncthing is actively watching,
+            # which is how remrun ends up racing the delivery it was trying to stay clear of.
+            # This is the same guard postrun_pullback already applies; see below.
+            if _already_converged(local_path, remote_manifest.get(item.path)):
+                result.skipped_identical.append(item.path)
+            else:
+                # Snapshot the prior local version before overwriting it, so a wrong pull
+                # is recoverable (no-op when the file is new or over the backup size cap).
+                _backup_local(local_root, item.path, backup_root, backup_below_bytes)
+                transport.pull_file(remote_path, local_path)
+                result.pulled.append(item.path)
         elif item.action == PUSH:
-            transport.push_file(local_path, remote_path)
-            result.pushed.append(item.path)
+            # The same guard in the other direction: if the remote already holds these exact
+            # bytes there is nothing to send. Compares the freshly-stat'd local file against
+            # the remote entry from the manifest already fetched above, so no extra
+            # round-trip.
+            if _already_converged(local_path, remote_manifest.get(item.path)):
+                result.skipped_identical.append(item.path)
+            else:
+                transport.push_file(local_path, remote_path)
+                result.pushed.append(item.path)
         elif item.action == DELETE_REMOTE:
             transport.delete_remote(remote_path)
             result.deleted_remote.append(item.path)
