@@ -51,9 +51,10 @@ def test_no_prev_diff_hash_is_conflict():
     assert p.action == ABORT_CONFLICT
 
 
-def test_same_is_none():
+def test_same_metadata_without_hash_is_unverified():
     p = only(compare_manifests({"a": e("a", 2)}, {"a": e("a", 2)}))
-    assert p.action == NONE
+    assert p.state == "both-present-unverified"
+    assert p.action == ABORT_CONFLICT
 
 
 def test_equal_mtime_diff_meta_conflict():

@@ -4,14 +4,23 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import os
+import signal
 import subprocess
+import sys
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
 
 from remrun.models import Device
-from remrun.transport import SSHPosixTransport, TransportError, _extract_telemetry
+from remrun.transport import (
+    LocalSimTransport,
+    SSHPosixTransport,
+    TransportError,
+    _extract_telemetry,
+)
 
 
 def device(**over) -> Device:
@@ -41,9 +50,15 @@ class Recorder:
         self.calls = []
         self.responder = responder
 
-    def __call__(self, argv, input_bytes=None, timeout=None):
-        self.calls.append({"argv": argv, "input": input_bytes, "timeout": timeout})
-        return self.responder(argv, input_bytes)
+    def __call__(self, argv, input_bytes=None, timeout=None, on_stdout=None):
+        self.calls.append({"argv": argv, "input": input_bytes, "timeout": timeout,
+                           "on_stdout": on_stdout})
+        result = self.responder(argv, input_bytes)
+        # Mirror the real transport: when the caller asked for live output, feed it
+        # the same bytes the buffered path would have returned at exit.
+        if on_stdout is not None and getattr(result, "stdout", None):
+            on_stdout(result.stdout.decode("utf-8", "replace"))
+        return result
 
     @property
     def scripts(self):
@@ -412,3 +427,245 @@ def test_remote_project_path_and_join():
     assert t.remote_join(rp, "analysis/run.R") == \
         "/srv/user/workspace/proj/client/foo/analysis/run.R"
     assert t.remote_join(rp, ".") == "/srv/user/workspace/proj/client/foo"
+
+
+def test_streaming_exec_keeps_telemetry_sentinel_off_stdout(monkeypatch):
+    """Streaming must not merge stderr into stdout.
+
+    The rusage sampler round-trips a `__REMRUN_TELEMETRY__` sentinel through stderr. A
+    naive streaming implementation (stderr=STDOUT, one pipe) would interleave that
+    sentinel into the command's real output and break both the telemetry parse and the
+    pulled-back stdout. Keeping the streams separate is the contract this pins.
+    """
+    t = SSHPosixTransport(device())
+    t._address = "h"
+
+    def responder(argv, _inp):
+        stderr = (b'warn\n__REMRUN_TELEMETRY__ '
+                  b'{"peak_rss_mb": 42.0, "avg_cpu_pct": 150.0, "cpu_sec": 1.0, "wall_sec": 0.7}\n')
+        return cp(0, b"real-output\n", stderr)
+
+    chunks: list[str] = []
+    monkeypatch.setattr(t, "_run", Recorder(responder))
+    res = t.exec(["Rscript", "a.R"], cwd="/p", telemetry=True, on_stdout=chunks.append)
+
+    # Telemetry still parsed off stderr, and stripped from the logged stderr.
+    assert res.telemetry["peak_rss_mb"] == 42.0
+    assert res.stderr == "warn"
+    # The live stream carries the command's stdout and NOTHING from stderr.
+    streamed = "".join(chunks)
+    assert "real-output" in streamed
+    assert "__REMRUN_TELEMETRY__" not in streamed
+    assert "warn" not in streamed
+    # The buffered return value is unchanged by streaming.
+    assert res.stdout == "real-output\n"
+
+
+def test_stream_process_returns_both_streams_separately():
+    """The shared streamer drains stderr on its own thread.
+
+    Without a dedicated reader, a command that fills the stderr pipe buffer while we
+    block on stdout would deadlock. This runs a real process that writes to both.
+    """
+    from remrun.transport import _stream_process
+
+    chunks: list[str] = []
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys\n"
+         "sys.stdout.write('O' * 200000 + '\\n'); sys.stdout.flush()\n"
+         "sys.stderr.write('E' * 200000 + '\\n'); sys.stderr.flush()\n"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    code, out, err = _stream_process(proc, chunks.append, timeout=60)
+    assert code == 0
+    assert out.strip() == "O" * 200000
+    assert err.strip() == "E" * 200000
+    assert "".join(chunks) == out          # every stdout byte reached the sink
+    assert "E" not in "".join(chunks)      # and no stderr leaked into it
+
+
+def test_stream_process_timeout_covers_silent_child():
+    """The timeout clock starts when streaming starts, not after stdout reaches EOF."""
+    from remrun.transport import _stream_process
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _stream_process(proc, lambda _chunk: None, timeout=0.2)
+    elapsed = time.monotonic() - started
+    assert 0.1 <= elapsed < 1.5
+    assert proc.poll() is not None
+
+
+def test_stream_process_timeout_covers_continuous_output():
+    """A child that keeps stdout open and busy cannot postpone the deadline."""
+    from remrun.transport import _stream_process
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys,time\n"
+         "end=time.monotonic()+5\n"
+         "while time.monotonic()<end:\n"
+         " sys.stdout.write('still-running\\n'); sys.stdout.flush(); time.sleep(0.01)\n"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    chunks: list[str] = []
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _stream_process(proc, chunks.append, timeout=0.2)
+    elapsed = time.monotonic() - started
+    assert 0.1 <= elapsed < 1.5
+    assert chunks
+    assert proc.poll() is not None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group orphan check")
+def test_stream_process_timeout_kills_pipe_inheriting_grandchild_near_deadline(tmp_path: Path):
+    grandchild_pid = tmp_path / "grandchild.pid"
+    script = (
+        "import pathlib,subprocess,sys,time\n"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "\"import sys,time; sys.stderr.write('GRANDCHILD\\\\n'); "
+        "sys.stderr.flush(); time.sleep(10)\"])\n"
+        f"pathlib.Path({str(grandchild_pid)!r}).write_text(str(child.pid))\n"
+        "sys.stderr.write('PARENT\\n'); sys.stderr.flush(); time.sleep(10)\n"
+    )
+    transport = LocalSimTransport(
+        Device.from_mapping("LOCAL_SIM", {"kind": "local-sim", "os": "posix"})
+    )
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        transport.exec(
+            [sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            timeout=0.3,
+            on_stdout=lambda _chunk: None,
+        )
+    elapsed = time.monotonic() - started
+
+    assert 0.2 <= elapsed < 0.9
+    assert "PARENT" in (raised.value.stderr or "")
+    assert "GRANDCHILD" in (raised.value.stderr or "")
+    pid = int(grandchild_pid.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"grandchild process {pid} survived timeout")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group orphan check")
+def test_stream_process_timeout_kills_descendant_after_leader_exits(tmp_path: Path):
+    """A reaped group leader must not spare descendants that still own its pipes."""
+    from remrun.transport import _stream_process
+
+    descendant_pid = tmp_path / "descendant.pid"
+    script = (
+        "import pathlib,subprocess,sys\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(10)'])\n"
+        f"pathlib.Path({str(descendant_pid)!r}).write_text(str(child.pid))\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    pid: int | None = None
+    started = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _stream_process(
+                proc,
+                lambda _chunk: None,
+                timeout=0.3,
+                process_group=True,
+            )
+        elapsed = time.monotonic() - started
+
+        assert 0.2 <= elapsed < 0.9
+        assert proc.poll() == 0
+        pid = int(descendant_pid.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail(f"descendant process {pid} survived timeout")
+    finally:
+        if pid is None and descendant_pid.exists():
+            pid = int(descendant_pid.read_text(encoding="utf-8"))
+        if pid is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows inherited-pipe timeout coverage")
+def test_stream_process_windows_leader_exit_with_inherited_pipe_is_bounded(tmp_path: Path):
+    """Windows cannot recover an exited taskkill root, but timeout return must stay bounded."""
+    from remrun.transport import _stream_process
+
+    descendant_pid = tmp_path / "descendant.pid"
+    script = (
+        "import pathlib,subprocess,sys\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(10)'])\n"
+        f"pathlib.Path({str(descendant_pid)!r}).write_text(str(child.pid))\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _stream_process(
+                proc,
+                lambda _chunk: None,
+                timeout=0.3,
+                process_group=True,
+            )
+        assert 0.2 <= time.monotonic() - started < 0.9
+        assert proc.poll() == 0
+    finally:
+        if descendant_pid.exists():
+            subprocess.run(
+                ["taskkill", "/PID", descendant_pid.read_text(encoding="utf-8"), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            )
+
+
+def test_stream_process_decodes_split_multibyte_stderr():
+    """Arbitrary stderr read boundaries must not corrupt a UTF-8 code point."""
+    from remrun.transport import _stream_process
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys\n"
+         "sys.stderr.buffer.write(b'A' * 65535 + '€'.encode('utf-8'))\n"
+         "sys.stderr.buffer.flush()\n"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    code, out, err = _stream_process(proc, lambda _chunk: None, timeout=5)
+    assert code == 0
+    assert out == ""
+    assert err == "A" * 65535 + "€"
+    assert "�" not in err

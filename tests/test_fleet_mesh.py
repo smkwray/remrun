@@ -69,10 +69,9 @@ def test_hop_command_is_passed_as_tokens_not_one_quoted_word(monkeypatch):
 def test_explicit_ip_is_tried_before_the_bare_alias(monkeypatch):
     """The IP always names the real device; a bare alias is at the mercy of DNS.
 
-    Measured on this network: `mactwo`, `macfs`, and `mactwo.local` ALL resolve to
-    192.168.42.1 — the router, which answers every unknown name with itself.
-    Probing the alias first sent the check at the router and reported healthy
-    devices as "hostname did not resolve" / "host key not trusted".
+    Some routers resolve every unknown local alias to their own gateway address.
+    Probing the alias first then checks the router and reports healthy devices as
+    "hostname did not resolve" / "host key not trusted".
     """
     tried = []
 

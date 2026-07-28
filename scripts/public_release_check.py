@@ -62,6 +62,7 @@ TEXT_SUFFIXES = {
     "",
     ".cmd",
     ".json",
+    ".lock",
     ".md",
     ".ps1",
     ".py",
@@ -72,6 +73,9 @@ TEXT_SUFFIXES = {
 
 GENERIC_PRIVATE_PATTERNS = [
     r"\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+    r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+    r"\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b",
+    r"\b192\.168\.\d{1,3}\.\d{1,3}\b",
     r"\\Users\\[^\\\s]+\\OneDrive\\",
     "Proprietary" + " seed",
     "prepare public license" + " before release",

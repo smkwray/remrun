@@ -341,11 +341,10 @@ def _diagnose(device: Device, fallback: str, timeout: float = 10.0) -> str:
     if best_rank == 0:                      # already the most specific possible
         return best
 
-    # Only trust the device's OWN addresses. A bare alias like `bmni` is
-    # resolved by whatever DNS the controller happens to be using, and a router
-    # that answers every unknown name with its own address (measured here:
-    # `bmni`, `bmni.local`, `bmfs` all -> 192.168.42.1, the gateway) turns this
-    # diagnosis into a report about the ROUTER — "host key not trusted" or
+    # Only trust the device's OWN addresses. A bare alias is resolved by whatever
+    # DNS the controller happens to be using, and a router that answers every
+    # unknown local name with its gateway address turns this diagnosis into a
+    # report about the ROUTER — "host key not trusted" or
     # "hostname did not resolve" for a device that is perfectly reachable on its
     # tailnet IP. Prefer the IP; fall back to aliases only if there is no IP.
     candidates = [device.tailscale_ip] if device.tailscale_ip else device.all_addresses()

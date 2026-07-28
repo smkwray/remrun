@@ -84,11 +84,10 @@ def _login_attempts(target: Device) -> list[str]:
     device. The bare alias is tried second: it can succeed where the IP fails
     (the caller's ~/.ssh/config may bind a specific IdentityFile to that Host,
     with `IdentitiesOnly yes`), but it is resolved by whatever DNS the caller
-    uses — and a router that answers every unknown name with its own address
-    (measured: `bmni`, `bmfs`, `bmni.local` all -> 192.168.42.1, the gateway)
-    would otherwise silently redirect the probe at the ROUTER and report the
-    device as unreachable. Trying the IP first means a working device is never
-    misreported because of a hijacked name.
+    uses — and a router that answers every unknown local name with its own
+    gateway address would otherwise silently redirect the probe at the router
+    and report the device as unreachable. Trying the IP first means a working
+    device is never misreported because of a hijacked name.
     """
     attempts = []
     spec = _target_spec(target)

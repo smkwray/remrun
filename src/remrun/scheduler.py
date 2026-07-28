@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 import socket
 from typing import Any
@@ -11,21 +12,39 @@ class SchedulingError(RuntimeError):
     pass
 
 
+def _is_loopback_alias(value: str) -> bool:
+    candidate = str(value).strip().casefold().rstrip(".")
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if candidate in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        address = ipaddress.ip_address(candidate.split("%", 1)[0])
+        return address.is_loopback or address.is_unspecified
+    except ValueError:
+        return False
+
+
 def is_self(device: Device, hostname: str | None = None) -> bool:
     """Is this device the machine we are running on?
 
     Matched on the device NAME against the controller's short hostname, the same way
     `config._offload_entry` already resolves a per-host `[offload]` entry — config keys
     are device names, and a device's hostname is expected to match its name.
-    `address_candidates` are also checked, since a box is often reachable by an alias
-    that differs in case from its configured name.
+    Address aliases are also checked, since a box is often reachable by a name that
+    differs in case from its configured device key. Any loopback/unspecified-local alias
+    is necessarily the controller for automatic routing, whatever the controller hostname.
     """
+    addresses = device.all_addresses()
+    if _is_loopback_alias(device.name) or any(_is_loopback_alias(a) for a in addresses):
+        return True
+
     host = (hostname or socket.gethostname() or "").split(".")[0].casefold()
     if not host:
         return False
     if device.name.casefold() == host:
         return True
-    return any(str(a).split(".")[0].casefold() == host for a in device.address_candidates)
+    return any(str(a).split(".")[0].casefold() == host for a in addresses)
 
 
 def _placement_order(project_config: dict[str, Any] | None, command: list[str]) -> list[str]:
@@ -78,8 +97,8 @@ def order_devices(
 
     Explicit targets resolve to a single-element list. For ``auto`` the order is:
     project [placement] hints, then the configured ``[scheduler]`` primary and
-    fallback, then any remaining enabled devices as a last resort. Reachability
-    and load are evaluated later by the caller, walking this order.
+    fallback, then any remaining enabled non-controller devices as a last resort.
+    Reachability and load are evaluated later by the caller, walking this order.
     """
     enabled = {name: d for name, d in devices.items() if d.enabled}
     if target and target != "auto":
@@ -106,23 +125,20 @@ def order_devices(
             result.append(enabled[name])
             seen.add(name)
     if not result:
-        # Last resort: any enabled device (excludes nothing, but auto rarely hits this).
+        # Last resort before the controller-safety gate: any enabled device.
         result = list(enabled.values())
-
-    # Never auto-route to the machine we are already on. The controller is frequently ALSO
-    # a configured device, and a device's remote project_root usually resolves to the SAME
-    # absolute path as the local one — so a self-route makes reconcile compare a tree with
-    # itself and transfer files onto the paths it is reading. That is a correctness hazard,
-    # not merely the wasted SSH round trip. Explicit `run <DEVICE>` is untouched: naming your
-    # own box is a deliberate act (and the local-sim backend exists for that), while `--auto`
-    # picking it is never what the caller meant. Dropped only when something else remains.
-    if len(result) > 1:
-        others = [d for d in result if not is_self(d)]
-        if others:
-            result = others
-
     if not result:
         raise SchedulingError("No enabled devices configured")
+
+    # Never auto-route through loopback SSH. Proving that this would be a no-op requires
+    # the detected local project root and the project ID used to resolve device.project_root;
+    # this scheduler has neither. The two roots come from separate configuration surfaces,
+    # so a hostname match alone cannot establish that reconcile would operate on one tree.
+    # An explicit target returned above remains allowed because naming it is deliberate.
+    result = [device for device in result if not is_self(device)]
+
+    if not result:
+        raise SchedulingError("No safe auto-routing candidates configured")
     return result
 
 

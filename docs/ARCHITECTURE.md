@@ -150,7 +150,9 @@ recent failures
 estimated transfer cost
 ```
 
-Initial implementation can choose the configured primary if reachable, otherwise fallback.
+The current scheduler probes and ranks enabled candidates, and `--auto` may continue
+after an unreachable candidate or one with a candidate-local preflight conflict. See
+`SCHEDULING_AND_TELEMETRY.md` for the fallback mutation boundary.
 
 ### 6. Transfer planner
 
@@ -177,7 +179,7 @@ push local-newer files
 push local-only files
 pull remote-only included files
 delete only when known-safe
-abort on both-changed conflicts
+abort the current candidate on both-changed conflicts
 ```
 
 ### 7. Remote executor

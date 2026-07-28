@@ -355,6 +355,19 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _is_directory_link(path: str) -> bool:
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return bool(isjunction(path))
+    if os.name != "nt":
+        return False
+    item = os.lstat(path)
+    mount_point_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+    return getattr(item, "st_reparse_tag", None) == mount_point_tag
+
+
 def build_manifest(root: str, excludes, hash_below_bytes: int, always_hash: bool = False) -> dict:
     files: dict = {}
     if not os.path.isdir(root):
@@ -367,10 +380,18 @@ def build_manifest(root: str, excludes, hash_below_bytes: int, always_hash: bool
         rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
         if rel_dir == ".":
             rel_dir = ""
-        dirnames[:] = [
-            name for name in dirnames
-            if not should_exclude(f"{rel_dir}/{name}" if rel_dir else name, excludes)
-        ]
+        kept_dirs = []
+        for name in dirnames:
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            if should_exclude(rel, excludes):
+                continue
+            try:
+                if _is_directory_link(os.path.join(dirpath, name)):
+                    continue
+            except OSError as exc:
+                raise RunnerError(f"manifest directory inspection failed for {rel}: {exc}") from exc
+            kept_dirs.append(name)
+        dirnames[:] = kept_dirs
         for name in filenames:
             full = os.path.join(dirpath, name)
             rel = f"{rel_dir}/{name}" if rel_dir else name

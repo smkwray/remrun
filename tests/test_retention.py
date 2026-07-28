@@ -44,7 +44,7 @@ def test_cap_text_passthrough_and_truncate():
     big = "y" * 5000
     capped = cap_text(big, 1000)
     assert "truncated" in capped
-    assert len(capped.encode()) < len(big)
+    assert len(capped.encode()) <= 1000
 
 
 def test_run_is_failed():
@@ -70,6 +70,29 @@ def test_prune_exempts_active_run_conflict_from_budget(tmp_path: Path):
     prune_state(policy, now=NOW, state_root=tmp_path, exempt_run_id=cur_id)
     assert (conflicts / cur_id).exists()       # exempt: survives even over budget
     assert not (conflicts / old_id).exists()   # non-exempt over-budget copy is pruned
+
+
+def test_prune_exempts_all_attempted_run_conflicts_from_budget(tmp_path: Path):
+    conflicts = tmp_path / "conflicts"
+    first_id = (NOW - timedelta(minutes=2)).strftime("%Y%m%dT%H%M%SZ") + "-SIM_A-proj"
+    second_id = (NOW - timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ") + "-SIM_B-proj"
+    old_id = (NOW - timedelta(days=1)).strftime("%Y%m%dT%H%M%SZ") + "-OLD-proj"
+    for rid in (old_id, first_id, second_id):
+        d = conflicts / rid
+        d.mkdir(parents=True)
+        (d / "conflicts.json").write_bytes(b"x" * 500)
+    policy = RetentionPolicy(backup_days=3, max_backup_bytes=100)
+
+    prune_state(
+        policy,
+        now=NOW,
+        state_root=tmp_path,
+        exempt_run_ids={first_id, second_id},
+    )
+
+    assert (conflicts / first_id).exists()
+    assert (conflicts / second_id).exists()
+    assert not (conflicts / old_id).exists()
 
 
 # --- tiered policy ------------------------------------------------------------

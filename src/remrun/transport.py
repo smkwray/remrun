@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import io
 import json
 import os
 import posixpath
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .frame import decode_file_frame, encode_file_frame
 from .manifest import Manifest, build_manifest, sha256_file
@@ -24,6 +28,7 @@ from .state import manifest_from_json
 # Suppress the console window that ssh/local subprocesses would otherwise flash on Windows when
 # remrun is launched from a GUI trigger. 0 (no-op) everywhere else.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 _RUNNER_SOURCE: str | None = None
 
@@ -42,6 +47,199 @@ class ExecResult:
     stdout: str
     stderr: str
     telemetry: dict | None = None
+
+
+# Sink for live remote output. `exec(on_stdout=...)` calls it with each decoded chunk
+# as it arrives so the caller can tee to a log; the full text is still returned in
+# ExecResult, so nothing downstream has to change.
+StreamSink = Callable[[str], None]
+
+
+def _stream_spawn_kwargs() -> dict[str, object]:
+    """Spawn streamed commands in a group remrun can terminate as one unit."""
+    if os.name == "posix":
+        return {"creationflags": _NO_WINDOW, "start_new_session": True}
+    return {"creationflags": _NO_WINDOW | _NEW_PROCESS_GROUP}
+
+
+def _kill_stream_process(proc: subprocess.Popen, *, process_group: bool) -> None:
+    """Best-effort bounded termination, including inherited-pipe descendants.
+
+    Known and accepted limit: a descendant that puts ITSELF in a new session/process
+    group (``setsid``, ``start_new_session=True``) leaves this group and survives. That
+    is not fixable here — and for the SSH backends the real work runs on another machine
+    anyway, where no local signal reaches it. What IS guaranteed is that such an escapee
+    cannot hold the call open: the post-kill drain is bounded, so ``_stream_process``
+    still returns/raises near its deadline even while an escaped process holds a pipe
+    (verified: an escaped, SIGTERM-ignoring grandchild still returned in 0.40s against a
+    0.3s deadline). Bounded return is the property callers depend on; universal descendant
+    reaping is not claimed.
+
+    On Windows, ``taskkill /T`` can only discover the process tree while the root
+    PID still exists. If that leader has already exited, descendants may survive;
+    the bounded post-kill drain still preserves the timeout contract.
+    """
+    if process_group and os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    if proc.poll() is not None:
+        return
+    if process_group and os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=0.2,
+                creationflags=_NO_WINDOW,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _stream_process(
+    proc: subprocess.Popen,
+    on_stdout: StreamSink | None,
+    timeout: float | None,
+    *,
+    process_group: bool = False,
+) -> tuple[int, str, str]:
+    """Drain a running process's stdout/stderr concurrently, returning both in full.
+
+    ``subprocess.run(capture_output=True)`` blocks until exit, so nothing could be
+    written to the run log until the command finished — a multi-hour run looked
+    byte-for-byte identical to a hang, and agents either waited on nothing or killed
+    healthy runs. Reading both pipes here lets stdout reach the log as it is produced.
+
+    The streams stay SEPARATE (no ``stderr=STDOUT`` merge): the telemetry samplers
+    round-trip a ``__REMRUN_TELEMETRY__`` sentinel through stderr, and merging would
+    interleave it into stdout and corrupt both the parse and the command's real output.
+    Dedicated readers keep both pipes draining while the caller independently enforces
+    one deadline measured from entry. Incremental decoders preserve UTF-8 characters
+    split across arbitrary pipe reads.
+    """
+    started = time.monotonic()
+    deadline = started + timeout if timeout is not None else None
+    chunks: list[str] = []
+    err_chunks: list[str] = []
+    reader_errors: list[BaseException] = []
+    error_lock = threading.Lock()
+
+    def record_reader_error(exc: BaseException) -> None:
+        with error_lock:
+            reader_errors.append(exc)
+
+    def drain(pipe, target: list[str], sink: StreamSink | None = None) -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        live_sink = sink
+        read = getattr(pipe, "read1", pipe.read)
+        try:
+            while True:
+                block = read(65536)
+                if not block:
+                    break
+                text = decoder.decode(block)
+                if text:
+                    target.append(text)
+                    if live_sink is not None:
+                        try:
+                            live_sink(text)
+                        except BaseException as exc:  # preserve failure, keep draining
+                            record_reader_error(exc)
+                            live_sink = None
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                target.append(tail)
+                if live_sink is not None:
+                    try:
+                        live_sink(tail)
+                    except BaseException as exc:
+                        record_reader_error(exc)
+        except BaseException as exc:
+            record_reader_error(exc)
+            _kill_stream_process(proc, process_group=process_group)
+
+    out_thread = threading.Thread(
+        target=drain,
+        args=(proc.stdout, chunks, on_stdout),
+        name="remrun-stdout-reader",
+        daemon=True,
+    )
+    err_thread = threading.Thread(
+        target=drain,
+        args=(proc.stderr, err_chunks),
+        name="remrun-stderr-reader",
+        daemon=True,
+    )
+    readers = ((out_thread, proc.stdout), (err_thread, proc.stderr))
+    out_thread.start()
+    err_thread.start()
+
+    timed_out = False
+    try:
+        if deadline is None:
+            proc.wait()
+        else:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+
+    # A direct child can exit while a descendant keeps an inherited pipe open. Pipe
+    # draining therefore shares the command deadline instead of starting an unbounded
+    # second wait after proc.wait() succeeds.
+    if not timed_out:
+        for thread, _pipe in readers:
+            if deadline is None:
+                thread.join()
+            else:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        timed_out = deadline is not None and any(thread.is_alive() for thread, _ in readers)
+
+    if timed_out:
+        _kill_stream_process(proc, process_group=process_group)
+        # Give killed processes a small, shared budget to flush already-buffered bytes.
+        # Never wait indefinitely: a descendant outside the group may still own a pipe.
+        drain_budget = min(0.2, max(0.05, float(timeout or 0.2) * 0.25))
+        drain_deadline = time.monotonic() + drain_budget
+        try:
+            proc.wait(timeout=max(0.0, drain_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+        for thread, _pipe in readers:
+            thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+
+    # Closing a buffered pipe while another thread is blocked in read() can itself block
+    # on the stream lock. Close only readers known to have reached EOF; daemon readers are
+    # allowed to finish later on degraded platforms rather than postponing the timeout.
+    for thread, pipe in readers:
+        if thread.is_alive():
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+    stdout = "".join(chunks)
+    stderr = "".join(err_chunks)
+    if timed_out:
+        timeout_error = subprocess.TimeoutExpired(
+            proc.args, timeout, output=stdout, stderr=stderr
+        )
+        if reader_errors:
+            raise timeout_error from reader_errors[0]
+        raise timeout_error
+    if reader_errors:
+        raise reader_errors[0]
+    return proc.returncode, stdout, stderr
 
 
 # Stdlib-only POSIX sampler: runs the wrapped command, then reads
@@ -135,7 +333,14 @@ class BaseTransport:
         timeout: float | None = None,
         path_prepend: list[str] | None = None,
         telemetry: bool = False,
+        on_stdout: StreamSink | None = None,
     ) -> ExecResult:
+        """Run ``command`` remotely and return its full output.
+
+        ``on_stdout`` (optional) receives stdout chunks as they arrive, so a caller can
+        tee a live log. Backends that cannot stream may ignore it; the returned
+        ExecResult is authoritative either way.
+        """
         raise NotImplementedError
 
     # --- filesystem -------------------------------------------------------
@@ -273,6 +478,7 @@ class LocalSimTransport(BaseTransport):
         timeout: float | None = None,
         path_prepend: list[str] | None = None,
         telemetry: bool = False,
+        on_stdout: StreamSink | None = None,
     ) -> ExecResult:
         merged_env = None
         if env or path_prepend:
@@ -284,19 +490,34 @@ class LocalSimTransport(BaseTransport):
                     else os.pathsep.join(expanded)
         Path(cwd).mkdir(parents=True, exist_ok=True)
         try:
-            proc = subprocess.run(
+            if on_stdout is None:
+                proc = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=merged_env,
+                    timeout=timeout,
+                    creationflags=_NO_WINDOW,
+                )
+                return ExecResult(proc.returncode, proc.stdout, proc.stderr)
+            # Binary pipes + the shared streamer, so the sim exercises the same
+            # incremental-output path the SSH backends take.
+            proc = subprocess.Popen(
                 command,
                 cwd=cwd,
-                text=True,
-                capture_output=True,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=merged_env,
-                timeout=timeout,
-                creationflags=_NO_WINDOW,
+                **_stream_spawn_kwargs(),
             )
+            code, out, err = _stream_process(
+                proc, on_stdout, timeout, process_group=True
+            )
+            return ExecResult(code, out, err)
         except FileNotFoundError as exc:
             raise TransportError(f"command not found: {command[0]}: {exc}") from exc
-        return ExecResult(proc.returncode, proc.stdout, proc.stderr)
 
     def ensure_remote_dir(self, remote_path: str) -> None:
         Path(remote_path).mkdir(parents=True, exist_ok=True)
@@ -533,17 +754,40 @@ class _SSHCommon(BaseTransport):
         argv: list[str],
         input_bytes: bytes | None = None,
         timeout: float | None = None,
+        on_stdout: StreamSink | None = None,
     ) -> subprocess.CompletedProcess:
-        """Run an ssh subprocess in binary mode. Mockable in tests."""
+        """Run an ssh subprocess in binary mode. Mockable in tests.
+
+        With ``on_stdout`` the process is streamed (see ``_stream_process``) instead of
+        buffered to exit; the return shape is identical either way, so every caller and
+        existing test mock is unaffected. Transfer calls keep the buffered path — they
+        pass tar payloads through this same seam and have no use for partial output.
+        """
         try:
-            return subprocess.run(
+            if on_stdout is None:
+                return subprocess.run(
+                    argv,
+                    input=input_bytes,
+                    capture_output=True,
+                    timeout=timeout,
+                    check=False,
+                    creationflags=_NO_WINDOW,
+                )
+            proc = subprocess.Popen(
                 argv,
-                input=input_bytes,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-                creationflags=_NO_WINDOW,
+                stdin=subprocess.PIPE if input_bytes is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **_stream_spawn_kwargs(),
             )
+            if input_bytes is not None:
+                proc.stdin.write(input_bytes)
+                proc.stdin.close()
+            code, out, err = _stream_process(
+                proc, on_stdout, timeout, process_group=True
+            )
+            return subprocess.CompletedProcess(argv, code, out.encode("utf-8", "replace"),
+                                               err.encode("utf-8", "replace"))
         except FileNotFoundError as exc:
             raise TransportError(f"ssh executable not found: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -561,8 +805,10 @@ class _SSHCommon(BaseTransport):
         return self._address  # type: ignore[return-value]
 
     def _remote(self, address: str, script: str, input_bytes: bytes | None = None,
-                timeout: float | None = None) -> subprocess.CompletedProcess:
-        return self._run([*self._ssh_base(address), script], input_bytes, timeout)
+                timeout: float | None = None,
+                on_stdout: StreamSink | None = None) -> subprocess.CompletedProcess:
+        return self._run([*self._ssh_base(address), script], input_bytes, timeout,
+                         on_stdout=on_stdout)
 
     def kill_workers(self) -> bool:
         """Best-effort: run this device's configured cancel actions.
@@ -979,7 +1225,7 @@ class SSHPosixTransport(_SSHCommon):
 
     # --- execution --------------------------------------------------------
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
-             telemetry=False) -> ExecResult:
+             telemetry=False, on_stdout=None) -> ExecResult:
         address = self._address_or_resolve()
         parts: list[str] = []
         for key, value in (env or {}).items():
@@ -1005,7 +1251,10 @@ class SSHPosixTransport(_SSHCommon):
         else:
             script = inner
 
-        proc = self._remote(address, script, timeout=timeout)
+        # Streaming leaves the telemetry contract untouched: the sampler's sentinel
+        # travels on stderr, which is drained separately and parsed below exactly as
+        # in the buffered path.
+        proc = self._remote(address, script, timeout=timeout, on_stdout=on_stdout)
         if proc.returncode == 255:
             raise TransportError(
                 f"ssh connection failed (exit 255): "
@@ -1205,9 +1454,11 @@ class SSHPowerShellTransport(_SSHCommon):
         return remote_root.rstrip("\\/") + "\\" + rel_posix.strip("/").replace("/", "\\")
 
     def _ps_remote(self, address: str, script: str, input_bytes: bytes | None = None,
-                   timeout: float | None = None) -> subprocess.CompletedProcess:
+                   timeout: float | None = None,
+                   on_stdout: StreamSink | None = None) -> subprocess.CompletedProcess:
         cmd = f"{self._ps_exe()} -NoProfile -NonInteractive -EncodedCommand {_ps_encode(script)}"
-        return self._remote(address, cmd, input_bytes=input_bytes, timeout=timeout)
+        return self._remote(address, cmd, input_bytes=input_bytes, timeout=timeout,
+                            on_stdout=on_stdout)
 
     # --- diagnostics ------------------------------------------------------
     def probe(self) -> ProbeResult:
@@ -1316,7 +1567,7 @@ class SSHPowerShellTransport(_SSHCommon):
 
     # --- execution --------------------------------------------------------
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
-             telemetry=False) -> ExecResult:
+             telemetry=False, on_stdout=None) -> ExecResult:
         address = self._address_or_resolve()
         lines = [
             "$ErrorActionPreference = 'Stop'",
@@ -1354,7 +1605,9 @@ class SSHPowerShellTransport(_SSHCommon):
         else:
             lines.append("& " + cmd_tokens)
             lines.append("exit $LASTEXITCODE")
-        proc = self._ps_remote(address, "\n".join(lines), timeout=timeout)
+        # As on POSIX: the Job Object sampler's sentinel rides stderr, which streaming
+        # keeps separate from stdout, so the parse below is unchanged.
+        proc = self._ps_remote(address, "\n".join(lines), timeout=timeout, on_stdout=on_stdout)
         if proc.returncode == 255:
             raise TransportError(
                 f"ssh connection failed (exit 255): "

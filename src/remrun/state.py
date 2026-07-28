@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .manifest import FileEntry, Manifest
 
@@ -64,11 +64,31 @@ def cap_text(text: str, max_bytes: int) -> str:
     data = text.encode("utf-8", "replace")
     if len(data) <= max_bytes:
         return text
-    half = max(1, max_bytes // 2)
-    head = data[:half].decode("utf-8", "replace")
-    tail = data[-half:].decode("utf-8", "replace")
-    omitted = len(data) - 2 * half
-    return f"{head}\n...[remrun truncated {omitted} bytes of log output]...\n{tail}"
+
+    marker = b""
+    head_bytes = tail_bytes = 0
+    for _ in range(4):
+        available = max(0, max_bytes - len(marker))
+        head_bytes = available // 2
+        tail_bytes = available - head_bytes
+        omitted = max(0, len(data) - head_bytes - tail_bytes)
+        updated = f"\n...[remrun truncated {omitted} bytes of log output]...\n".encode()
+        if updated == marker:
+            break
+        marker = updated
+    if len(marker) > max_bytes:
+        marker = b"...[remrun truncated]..."[:max_bytes]
+        head_bytes = tail_bytes = 0
+    else:
+        available = max_bytes - len(marker)
+        head_bytes = available // 2
+        tail_bytes = available - head_bytes
+
+    # Ignore an incomplete UTF-8 code point at either cut rather than writing malformed
+    # log bytes; this can only make the result smaller than the configured hard cap.
+    head = data[:head_bytes].decode("utf-8", "ignore")
+    tail = data[-tail_bytes:].decode("utf-8", "ignore") if tail_bytes else ""
+    return head + marker.decode("ascii") + tail
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -370,6 +390,7 @@ def prune_state(
     older_than_days: int | None = None,
     keep: int | None = None,
     exempt_run_id: str | None = None,
+    exempt_run_ids: Iterable[str] = (),
 ) -> PruneReport:
     """Prune the run journal under the state root.
 
@@ -382,6 +403,9 @@ def prune_state(
     now = now or datetime.now(timezone.utc)
     root = state_root or default_state_root()
     report = PruneReport()
+    exemptions = set(exempt_run_ids)
+    if exempt_run_id:
+        exemptions.add(exempt_run_id)
     runs_root = root / "runs"
 
     run_dirs = sorted([d for d in runs_root.iterdir() if d.is_dir()],
@@ -436,7 +460,7 @@ def prune_state(
         for d in sorted(conflicts_root.iterdir()):
             if not d.is_dir():
                 continue
-            if exempt_run_id and d.name == exempt_run_id:
+            if d.name in exemptions:
                 continue  # never prune the in-flight run's own recovery copy before it's reported
             ts = parse_run_timestamp(d.name)
             age_days = (now - ts).days if ts else None
@@ -451,8 +475,7 @@ def prune_state(
         budget = policy.max_backup_bytes
         if budget and older_than_days is None:
             remaining = [d for d in sorted(conflicts_root.iterdir())
-                         if d.is_dir() and d not in pruned
-                         and not (exempt_run_id and d.name == exempt_run_id)]
+                         if d.is_dir() and d not in pruned and d.name not in exemptions]
             sizes = {d: _dir_size(d) for d in remaining}
             total = sum(sizes.values())
             # Delete oldest-first (run-id names sort chronologically) until under budget.

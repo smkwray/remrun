@@ -17,7 +17,7 @@ from remrun.fleet.resources_render import render_table, to_dict
 from remrun.models import Device
 
 # Captured verbatim from MACHUB (Mac Studio, M1 Ultra) on 2026-07-26.
-BMST_OUT = """HOST=MACHUB
+MACOS_RESOURCE_OUT = """HOST=MACHUB
 NCPU=20
 MEMTOTAL=68719476736
 CHIP=Apple M1 Ultra
@@ -31,7 +31,7 @@ AGX:"Device Utilization %"=37
 """
 
 # Captured verbatim from WINBOX (Windows, RTX 5060 Ti) on 2026-07-26.
-BZOT_OUT = """HOST=WINBOX
+WINDOWS_RESOURCE_OUT = """HOST=WINBOX
 MEMTOTAL_KB=33002636
 RAM_AVAIL_MB=14830
 MEMFREE_KB=15184000
@@ -44,7 +44,7 @@ NVIDIA:NVIDIA GeForce RTX 5060 Ti, 3, 14321, 16311
 
 def test_parse_posix_unified_memory_mac():
     view = ResourceView(name="MACHUB", reachable=True)
-    _parse_posix(BMST_OUT, view)
+    _parse_posix(MACOS_RESOURCE_OUT, view)
     assert view.hostname == "MACHUB"
     assert view.chip == "Apple M1 Ultra"
     assert view.cpu_count == 20
@@ -67,7 +67,7 @@ def test_parse_posix_unified_memory_mac():
 
 def test_parse_windows_discrete_gpu():
     view = ResourceView(name="WINBOX", reachable=True)
-    _parse_windows(BZOT_OUT, view)
+    _parse_windows(WINDOWS_RESOURCE_OUT, view)
     assert view.hostname == "WINBOX"
     assert view.cpu_count == 20
     assert view.cpu_busy_pct == pytest.approx(16.0)     # 100 - 84 idle
@@ -147,11 +147,11 @@ def test_timeout_is_retried_before_declaring_a_device_unreachable():
 def test_diagnose_only_probes_the_devices_own_ip(monkeypatch):
     """A hijacking router must not be able to speak for a device.
 
-    Measured on this network: `mactwo`, `mactwo.local`, and `macfs` all resolve to
-    192.168.42.1 (the gateway), which answers SSH with "Host key verification
-    failed". Diagnosing via aliases therefore reported healthy, reachable Macs
-    as "hostname did not resolve" / "host key not trusted" — a fact about the
-    ROUTER, presented as a fact about the device.
+    Some routers resolve every unknown local alias to their gateway address,
+    which answers SSH with "Host key verification failed". Diagnosing via aliases
+    then reports healthy, reachable Macs as "hostname did not resolve" /
+    "host key not trusted" — a fact about the router, presented as a fact about
+    the device.
     """
     tried = []
 
@@ -180,7 +180,7 @@ def test_diagnose_uses_a_shell_portable_probe_command(monkeypatch):
 
     monkeypatch.setattr(resources.subprocess, "run", fake_run)
     device = Device.from_mapping("W", {"kind": "ssh-powershell", "os": "windows",
-                                       "address_candidates": ["w"], "tailscale_ip": "10.0.0.9",
+                                       "address_candidates": ["w"], "tailscale_ip": "192.0.2.9",
                                        "project_root": "C:\\", "state_root": "C:\\",
                                        "cache_root": "C:\\"})
     resources._diagnose(device, "earlier failure")
@@ -269,8 +269,8 @@ def test_render_marks_local_and_reports_unreachable_reason():
     # The failure states the cause, so a broken key is diagnosable from the table.
     assert "ssh key missing" in table
     # An unreachable device reports no invented metrics.
-    bmbp_line = next(ln for ln in table.splitlines() if ln.startswith("MACBOX"))
-    assert "%" not in bmbp_line
+    unreachable_line = next(ln for ln in table.splitlines() if ln.startswith("MACBOX"))
+    assert "%" not in unreachable_line
 
 
 def test_unified_gpu_never_reports_a_vram_figure():

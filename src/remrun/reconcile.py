@@ -23,6 +23,23 @@ from .transfer_plan import (
 from .transport import BaseTransport, TransportError
 
 
+# Positively enumerated candidate-local preflight failures. Any new/unknown state is
+# non-retryable by default so a global controller-side problem cannot silently fail over.
+_CANDIDATE_LOCAL_CONFLICT_STATES = frozenset({
+    "both-present-differ",
+    "both-present-unverified",
+    "both-changed",
+    "unknown-deletion",
+    "casefold-collision",
+    # This candidate's baseline would destroy a path disputed elsewhere. The refusal is
+    # candidate-local: a later candidate may preserve/push the local bytes safely.
+    "fallback-local-mutation",
+    # A missing remote root is broken state on this candidate only; another candidate may
+    # have a healthy checkout. The symmetric local-vanished state is intentionally absent.
+    "remote-vanished",
+})
+
+
 @dataclass
 class ReconcileResult:
     pulled: list[str] = field(default_factory=list)
@@ -35,8 +52,9 @@ class ReconcileResult:
     # Reported so a skipped transfer stays visible instead of looking like it was never
     # planned.
     skipped_identical: list[str] = field(default_factory=list)
-    # Paths classified `both-changed` from metadata alone, then proved byte-identical by
-    # hashing both sides. Not conflicts — recorded so the run can show it examined them.
+    # Paths initially disputed because content identity was absent, then proved
+    # byte-identical by hashing. Not conflicts — recorded so the run can show it
+    # examined them.
     converged_conflicts: list[str] = field(default_factory=list)
     # Converged manifests after reconcile == pre-run baselines.
     local_manifest: Manifest = field(default_factory=dict)
@@ -45,6 +63,14 @@ class ReconcileResult:
     @property
     def has_conflicts(self) -> bool:
         return bool(self.conflicts)
+
+    @property
+    def conflicts_are_candidate_local(self) -> bool:
+        """Whether every conflict is safe to abandon and retry on another candidate."""
+        return bool(self.conflicts) and all(
+            conflict.state in _CANDIDATE_LOCAL_CONFLICT_STATES
+            for conflict in self.conflicts
+        )
 
 
 @dataclass
@@ -106,18 +132,18 @@ def _drop_identical_conflicts(
 ) -> list[ClassifiedPath]:
     """Return the conflicts that survive a real content comparison.
 
-    Only `both-changed` is re-examined: it is the one classification that means "both sides
-    hold bytes we could not prove equal", and the proof is cheap to obtain. Deletion
-    conflicts and the vanished-root guard are about intent, not content, so they pass
-    through untouched.
+    Re-examines both `both-changed` and `both-present-unverified`: each means both
+    sides hold bytes that the manifests could not prove equal. Deletion conflicts
+    and the vanished-root guard are about intent, not content, so they pass through.
 
-    Fails CLOSED in every uncertain case — a missing manifest entry, a hash the transport
-    cannot supply, a mismatched size, an unreadable local file, or any transport error all
-    keep the conflict. A conflict is dropped only on two hashes that exist and match.
+    Fails CLOSED in every uncertain case — a missing manifest entry, a hash the
+    transport cannot supply, a mismatched size, an unreadable local file, or any
+    transport error all keep the conflict. A conflict is dropped only on two hashes
+    that exist and match.
     """
     survivors: list[ClassifiedPath] = []
     for item in conflicts:
-        if item.state != "both-changed":
+        if item.state not in {"both-changed", "both-present-unverified"}:
             survivors.append(item)
             continue
         le = local_manifest.get(item.path)
@@ -188,13 +214,15 @@ def preflight_reconcile(
     backup_root: Path,
     backup_below_bytes: int = 0,
     progress: Callable[[int, int, dict[str, int]], None] | None = None,
+    is_fallback: bool = False,
 ) -> ReconcileResult:
     """Reconcile the active run surface before running the command (Mode 1/safe).
 
     Conflicts abort *before* any mutation. Otherwise pulls remote-newer/-only,
     pushes local-newer/-only, and applies only known-safe deletes (backing up
-    local files before deleting them). Returns converged manifests to serve as
-    pre-run baselines.
+    local files before deleting them). A fallback candidate may push local bytes
+    outward but may not pull or delete anything locally while candidate selection
+    is still in progress. Returns converged manifests to serve as pre-run baselines.
     """
     result = ReconcileResult()
 
@@ -233,12 +261,9 @@ def preflight_reconcile(
     if plan.has_conflicts:
         # Before refusing, PROVE the disputed paths actually differ. compare_manifests can
         # only use what the manifests carry, and a file above `hash_small_files_below_mb`
-        # carries no hash — so its equality test degrades to mtime, and two devices holding
-        # identical bytes with different mtimes get classified `both-changed`. In a synced
-        # tree that is the common case, not the rare one: Syncthing delivers the same edit to
-        # both sides, remrun sees each side differ from its own baseline, and the run aborts
-        # with nothing to reconcile. Field-reported three times; one lane lost ~54 minutes.
-        # Hashing only the disputed paths keeps this off the normal path entirely.
+        # carries no hash. Both a no-history equality decision and a both-changed
+        # convergence decision therefore remain unverified until this narrow seam hashes
+        # the disputed paths. Hashing only conflicts keeps the normal path metadata-fast.
         resolved = _drop_identical_conflicts(
             plan.conflicts(), transport=transport, local_root=local_root,
             remote_root=remote_root, local_manifest=local_manifest,
@@ -257,6 +282,40 @@ def preflight_reconcile(
         plan = replace(plan, paths=[item for item in plan.paths
                                     if item.action != ABORT_CONFLICT])
 
+    # PREFLIGHT candidate-shopping must not mutate the controller. Scope, precisely:
+    # this covers preflight reconciliation on a FALLBACK attempt only. It is deliberately
+    # NOT a claim that a fallback run never writes locally — postrun pullback still returns
+    # the command's own outputs to their local paths (invariant 2, the whole point of the
+    # tool), and the first attempt reconciles normally.
+    #
+    # The rule is blanket rather than per-path on purpose. Tracking WHICH paths an earlier
+    # candidate disputed put safety on the wrong side of string comparison: a case-fold
+    # collision is recorded as the synthetic path "Foo | foo", which never equals "Foo", so
+    # the guard silently missed it — plus normalization and symlink spellings behind that.
+    # Refusing every PULL/DELETE_LOCAL needs no path matching, so that whole bug class is
+    # gone rather than patched. Measured cost: of 714 real runs, 89.9% mutated nothing
+    # locally in preflight, so this almost never changes what a fallback would have done.
+    #
+    # PUSH stays allowed: it sends local bytes outward and cannot destroy them. A candidate
+    # is refused before ensure_remote_dir or any transfer occurs.
+    local_mutations = [
+        item for item in plan.paths
+        if is_fallback and item.action in (PULL, DELETE_LOCAL)
+    ]
+    if local_mutations:
+        result.conflicts = [
+            ClassifiedPath(
+                item.path,
+                "fallback-local-mutation",
+                ABORT_CONFLICT,
+                f"fallback plan would {item.action.lower()} the local tree",
+            )
+            for item in local_mutations
+        ]
+        result.local_manifest = local_manifest
+        result.remote_manifest = remote_manifest
+        return result
+
     # Case-fold collision guard (APFS/NTFS): two distinct paths that fold to the same name collapse
     # into one file on a case-insensitive TARGET (silent data loss). Abort before any mutation.
     collisions: dict[str, list[str]] = {}
@@ -268,9 +327,14 @@ def preflight_reconcile(
         collisions.update(casefold_collisions(list(remote_manifest) + pushes))
     if collisions:
         result.conflicts = [
-            ClassifiedPath(" | ".join(paths), "casefold-collision", ABORT_CONFLICT,
-                           "would collapse on a case-insensitive target: " + ", ".join(paths))
-            for paths in collisions.values()]
+            ClassifiedPath(
+                " | ".join(paths),
+                "casefold-collision",
+                ABORT_CONFLICT,
+                "would collapse on a case-insensitive target: " + ", ".join(paths),
+            )
+            for paths in collisions.values()
+        ]
         result.local_manifest = local_manifest
         result.remote_manifest = remote_manifest
         return result

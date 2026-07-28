@@ -54,6 +54,17 @@ def entries_same(a: FileEntry | None, b: FileEntry | None) -> bool:
     return a.mtime_ns == b.mtime_ns
 
 
+def _entries_content_same(a: FileEntry | None, b: FileEntry | None) -> bool:
+    """Whether cross-side equality is proved by hashes, never inferred from metadata."""
+    if a is None or b is None or a.kind != b.kind or a.size != b.size:
+        return False
+    return (
+        a.sha256 is not None
+        and b.sha256 is not None
+        and a.sha256 == b.sha256
+    )
+
+
 def _changed_since(prev: FileEntry | None, cur: FileEntry | None) -> bool:
     """Did a side change relative to its previous manifest?
 
@@ -123,7 +134,7 @@ def compare_manifests(
                 if local_changed and remote_changed:
                     # Both edited — unless they converged to identical content, in which
                     # case there's nothing to do.
-                    if entries_same(le, re):
+                    if _entries_content_same(le, re):
                         out.append(ClassifiedPath(path, "same", NONE, "both changed to identical content"))
                     else:
                         out.append(ClassifiedPath(path, "both-changed", ABORT_CONFLICT,
@@ -137,8 +148,6 @@ def compare_manifests(
                     # do, even if le/re look different now (a cross-device metadata artifact,
                     # e.g. mtime precision across an NTFS/APFS boundary, not a real edit).
                     out.append(ClassifiedPath(path, "same", NONE, "neither side changed since last run"))
-            elif entries_same(le, re):
-                out.append(ClassifiedPath(path, "same", NONE, "same metadata/hash"))
             else:
                 out.append(_heuristic_diff(path, le, re))
 

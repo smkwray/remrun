@@ -63,17 +63,35 @@ def test_devices_toml_scheduler_order_overrides_defaults(tmp_path):
     assert s["busy_floor_pct"] == 55            # defaults.toml keeps the tuning knobs
 
 
-def test_auto_never_routes_to_the_controller_itself(monkeypatch):
-    # The controller is frequently also a configured device, and its remote project_root
-    # usually resolves to the SAME absolute path as the local one — so a self-route makes
-    # reconcile compare a tree with itself and write to paths it is reading. --auto must
-    # drop the local machine.
+def test_auto_drops_controller_with_a_different_configured_root(monkeypatch, tmp_path):
     monkeypatch.setattr("socket.gethostname", lambda: "MACBOX.local")
-    names = [d.name for d in order_devices(_devices(), "auto", scheduler_cfg=SCHED)]
+    devices = _devices()
+    devices["MACBOX"] = _dev(
+        "MACBOX", project_root=str(tmp_path / "different-projects"),
+        perf_cores=16, eff_cores=4,
+    )
+
+    names = [d.name for d in order_devices(devices, "auto", scheduler_cfg=SCHED)]
+
     assert names == ["WINBOX"]
 
 
-def test_auto_matches_self_by_address_alias_not_only_device_name(monkeypatch):
+def test_auto_drops_controller_even_when_configured_root_looks_matching(monkeypatch, tmp_path):
+    # order_devices has neither the detected local project root nor the project ID needed
+    # to resolve device.project_root for this project. A matching-looking base therefore
+    # cannot prove that loopback SSH would target the same directory.
+    monkeypatch.setattr("socket.gethostname", lambda: "MACBOX")
+    devices = _devices()
+    devices["MACBOX"] = _dev(
+        "MACBOX", project_root=str(tmp_path), perf_cores=16, eff_cores=4,
+    )
+
+    names = [d.name for d in order_devices(devices, "auto", scheduler_cfg=SCHED)]
+
+    assert names == ["WINBOX"]
+
+
+def test_auto_matches_and_drops_self_by_address_alias(monkeypatch):
     # A box is often reachable by an alias whose case differs from the configured name.
     devices = _devices()
     devices["MACBOX"] = _dev("MACBOX", perf_cores=16, eff_cores=4,
@@ -83,20 +101,67 @@ def test_auto_matches_self_by_address_alias_not_only_device_name(monkeypatch):
     assert names == ["WINBOX"]
 
 
-def test_auto_keeps_the_local_device_when_it_is_the_only_candidate(monkeypatch):
-    # Dropping the self-device must never leave --auto with nothing to run on: a
-    # single-device deployment still has to work, self-route overhead and all.
+def test_auto_raises_when_the_controller_is_the_only_candidate(monkeypatch):
     monkeypatch.setattr("socket.gethostname", lambda: "MACBOX")
     only = {"MACBOX": _dev("MACBOX", perf_cores=16, eff_cores=4)}
-    names = [d.name for d in order_devices(
-        only, "auto", scheduler_cfg={"primary": "MACBOX", "fallback": []})]
-    assert names == ["MACBOX"]
+
+    with pytest.raises(SchedulingError, match="No safe auto-routing candidates"):
+        order_devices(only, "auto", scheduler_cfg={"primary": "MACBOX", "fallback": []})
 
 
-def test_explicit_target_may_still_be_the_controller_itself(monkeypatch):
-    # Naming your own box is a deliberate act; only --auto picking it is wrong.
+@pytest.mark.parametrize(
+    "loopback",
+    [
+        "localhost",
+        "localhost.localdomain",
+        "127.0.0.1",
+        "127.42.0.9",
+        "::1",
+        "0.0.0.0",
+        "::",
+        "[::]",
+    ],
+)
+def test_auto_excludes_loopback_alias_but_explicit_target_still_allows_it(
+    monkeypatch, loopback
+):
+    monkeypatch.setattr("socket.gethostname", lambda: "actual-host.example")
+    devices = {
+        "CONTROLLER": _dev("CONTROLLER", address_candidates=[loopback]),
+        "REMOTE": _dev("REMOTE", address_candidates=["remote.example"]),
+    }
+    scheduler = {"primary": "CONTROLLER", "fallback": ["REMOTE"]}
+
+    assert [d.name for d in order_devices(devices, "auto", scheduler_cfg=scheduler)] == [
+        "REMOTE"
+    ]
+    assert [d.name for d in order_devices(devices, "CONTROLLER", scheduler_cfg=scheduler)] == [
+        "CONTROLLER"
+    ]
+
+
+@pytest.mark.parametrize(
+    "remote_ipv6",
+    ["2001:db8::42", "[2001:db8::42]", "fe80::42%en0"],
+)
+def test_auto_keeps_remote_ipv6_candidates(monkeypatch, remote_ipv6):
+    monkeypatch.setattr("socket.gethostname", lambda: "actual-host.example")
+    devices = {
+        "REMOTE": _dev("REMOTE", address_candidates=[remote_ipv6]),
+    }
+
+    assert [d.name for d in order_devices(devices, "auto")] == ["REMOTE"]
+
+
+def test_explicit_target_may_still_be_the_controller_itself_with_any_root(monkeypatch, tmp_path):
+    # Guard, not a regression test: explicit self-targeting was already deliberately allowed.
+    # Naming your own box is deliberate, so explicit routing is not subject to the auto gate.
     monkeypatch.setattr("socket.gethostname", lambda: "MACBOX")
-    names = [d.name for d in order_devices(_devices(), "MACBOX", scheduler_cfg=SCHED)]
+    devices = _devices()
+    devices["MACBOX"] = _dev("MACBOX", project_root=str(tmp_path / "different-projects"))
+
+    names = [d.name for d in order_devices(devices, "MACBOX", scheduler_cfg=SCHED)]
+
     assert names == ["MACBOX"]
 
 

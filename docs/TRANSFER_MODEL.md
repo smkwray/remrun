@@ -11,13 +11,26 @@ remote-newer, no conflict -> pull to local, continue
 remote-only included      -> pull to local, continue
 local-newer               -> push to remote
 local-only                -> push to remote
-both changed same path    -> abort before running
+both changed same path    -> abort this candidate before running
 unknown remote deletion   -> flag; do not propagate destructively by default
 known local deletion      -> delete remote only if manifest proves safe
 excluded                  -> ignore
 ```
 
 This makes `remrun` independent of Syncthing while still friendly to it.
+
+### Automatic candidate shopping
+
+Candidate-local conflict state belongs to one device's project tree and baseline.
+With `--auto`, such a conflict rejects that candidate and remrun may try the next
+reachable device. Global controller-tree conditions, notably `local-vanished`,
+abort the whole run. Explicit targets never fail over.
+
+Candidate shopping cannot use a later device to rewrite the controller's tree:
+a fallback plan that would `PULL` or `DELETE_LOCAL` is ineligible. `PUSH` remains
+allowed because it sends the controller's bytes outward. The first device that
+actually reaches preflight uses the normal reconciliation rules above; an
+unreachable device has read or mutated nothing and does not consume that position.
 
 ## Why remote-newer is pulled by default
 
@@ -138,9 +151,10 @@ Before running:
 
 ```text
 if both local and remote changed the same included file differently:
-  abort
+  abort the current candidate
   save diagnostic metadata outside project tree
   do not mutate either side
+  with --auto, try the next candidate under the fallback rules above
 ```
 
 After running:

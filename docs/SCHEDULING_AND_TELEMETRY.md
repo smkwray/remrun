@@ -1,13 +1,15 @@
 # Scheduling, congestion, telemetry, and learned placement
 
-> **Status (2026-06-28): largely implemented.** `--auto` honors `[scheduler]`
-> order + project `[placement]` hints, fails over to a reachable device, and
-> load-balances by CPU utilization weighted by per-device perf-core capacity.
-> Telemetry (peak RAM + CPU, whole process tree) records on both backends (POSIX
-> `getrusage`, Windows Job Object) and feeds EWMA per-(project, command) job
-> profiles that drive RAM-headroom placement and a skip-probe shortcut for trivial
-> jobs. Still aspirational below: GPU-memory awareness, project data-policy hints,
-> and `bench`. The design notes that follow describe the full intended model.
+> **Status (2026-07-28): largely implemented.** `--auto` honors `[scheduler]`
+> order + project `[placement]` hints, fails over when a device is unreachable or
+> has a candidate-local preflight conflict, and load-balances by CPU utilization weighted by
+> per-device perf-core capacity. A fallback candidate may push controller bytes
+> outward but is rejected if its preflight would pull or delete locally. Telemetry
+> records whole-tree CPU on both backends; Windows reports whole-tree peak RAM,
+> while POSIX reports the largest single child. EWMA per-(project, command)
+> profiles drive RAM-headroom placement and a skip-probe shortcut for trivial jobs.
+> `bench` is implemented. GPU-memory-aware scheduling and project data-policy
+> hints remain incomplete; the design notes below include future extensions.
 
 ## Goal
 
@@ -22,14 +24,18 @@ winbox = Windows runner, fallback
 
 ## Initial scheduler
 
-Phase 1 behavior:
+Current behavior:
 
 ```text
 if explicit target: use it
-if --auto: choose the configured primary if enabled/reachable, else fallback
+if --auto: probe and rank enabled candidates using placement, reachability, and load
+if a candidate has a candidate-local conflict before running: try the next candidate
+for later candidates: refuse any plan that would pull or delete on the controller
 ```
 
-This is enough to start.
+An unreachable candidate performs no preflight and therefore does not consume the
+first-attempt reconciliation semantics. Global controller-tree conflicts such as
+`local-vanished` abort the whole run.
 
 ## Static capabilities
 
@@ -196,21 +202,17 @@ and pullback fails as a conflict if the command wrote outside the declared scope
 
 ## Benchmark mode
 
-`remrun bench` should not mutate canonical project outputs by default.
+`remrun bench` is implemented. It runs the command locally unless `--no-local` is
+set, then runs it through the full remrun round trip on each selected target. Those
+are real executions and can change project outputs, so benchmark only idempotent or
+regenerable commands whose local and remote execution is acceptable.
 
-Safe benchmark semantics:
+It records measured profiles and prints an offload recommendation; it does not
+change routing policy by itself.
 
-```text
-run the same command on multiple devices in sandbox/copy mode
-measure duration/resources
-optionally compare outputs
-then either report winner or rerun winner in-place
-```
-
-Future examples:
+Examples:
 
 ```bash
 remrun bench macbox,winbox -- python do/tmp/profile_model.py
-remrun bench macbox,winbox --winner-rerun -- Rscript do/tmp/model.R
-remrun bench macbox,winbox --compare-outputs -- make estimates-test
+remrun bench macbox,winbox --no-local -- Rscript do/tmp/model.R
 ```

@@ -33,7 +33,7 @@ It intentionally excludes private continuity/work-order notes and ignored local 
 Before publishing, check package and command-name collisions. If `remrun` conflicts with existing software/package names, consider:
 
 ```text
-malus-remrun
+sync-remrun
 remote-runner
 remrunner
 runhome

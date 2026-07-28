@@ -118,7 +118,7 @@ def test_ssh_posix_exec_exports_env_and_path(monkeypatch):
     t._remote_home = "/srv/alice"
     calls = {}
 
-    def fake_run(argv, input_bytes=None, timeout=None):
+    def fake_run(argv, input_bytes=None, timeout=None, on_stdout=None):
         calls["script"] = argv[-1]
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 

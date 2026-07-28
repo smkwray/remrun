@@ -44,9 +44,15 @@ class Recorder:
         self.calls = []
         self.responder = responder
 
-    def __call__(self, argv, input_bytes=None, timeout=None):
-        self.calls.append({"argv": argv, "input": input_bytes, "timeout": timeout})
-        return self.responder(argv, input_bytes)
+    def __call__(self, argv, input_bytes=None, timeout=None, on_stdout=None):
+        self.calls.append({"argv": argv, "input": input_bytes, "timeout": timeout,
+                           "on_stdout": on_stdout})
+        result = self.responder(argv, input_bytes)
+        # Mirror the real transport: when the caller asked for live output, feed it
+        # the same bytes the buffered path would have returned at exit.
+        if on_stdout is not None and getattr(result, "stdout", None):
+            on_stdout(result.stdout.decode("utf-8", "replace"))
+        return result
 
     @property
     def commands(self):

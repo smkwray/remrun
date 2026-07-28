@@ -38,6 +38,25 @@ class ManifestError(RuntimeError):
     """
 
 
+def _is_directory_link(path: Path) -> bool:
+    """Return whether a directory entry can redirect traversal outside its parent tree.
+
+    ``os.walk(..., followlinks=False)`` prunes POSIX symlinks, but Windows junctions are
+    a separate reparse-point type and can still be descended. Python 3.12 added
+    ``os.path.isjunction``; the lstat fallback preserves the same check on Python 3.11.
+    """
+    if path.is_symlink():
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return bool(isjunction(path))
+    if os.name != "nt":
+        return False
+    item = os.lstat(path)
+    mount_point_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+    return getattr(item, "st_reparse_tag", None) == mount_point_tag
+
+
 def should_exclude(rel_posix: str, patterns: Iterable[str]) -> bool:
     rel = rel_posix.strip("/")
     for pattern in patterns:
@@ -85,12 +104,19 @@ def build_manifest(
         if rel_dir == ".":
             rel_dir = ""
 
-        # Prune excluded directories early.
+        # Prune excluded directories and any link-like directory before descent. A
+        # junction can resolve outside ``root`` even though it is not a symlink.
         kept_dirs = []
         for dirname in dirnames:
             rel = f"{rel_dir}/{dirname}" if rel_dir else dirname
-            if not should_exclude(rel, exclude_patterns):
-                kept_dirs.append(dirname)
+            if should_exclude(rel, exclude_patterns):
+                continue
+            try:
+                if _is_directory_link(current / dirname):
+                    continue
+            except OSError as exc:
+                raise ManifestError(f"cannot inspect directory {rel}: {exc}") from exc
+            kept_dirs.append(dirname)
         dirnames[:] = kept_dirs
 
         for filename in filenames:
@@ -100,8 +126,8 @@ def build_manifest(
                 continue
             try:
                 # A symlink would manifest content OUTSIDE the tree, and a later pull
-                # through it could overwrite an external target — skip it. (is_symlink uses
-                # lstat; os.walk already doesn't recurse symlinked dirs by default.)
+                # through it could overwrite an external target — skip it. Directory
+                # symlinks and junctions were already pruned above.
                 if path.is_symlink():
                     continue
                 st = path.stat()

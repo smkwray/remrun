@@ -55,9 +55,15 @@ global_exclude = [
   "**/.svelte-kit/**",
   "src-tauri/gen/**",
   # Git worktrees created inside a project (e.g. by parallel-agent tooling): a nested
-  # worktree is a near-duplicate checkout and must never be swept into the parent's
-  # surface. (Running remrun from *inside* a worktree is refused separately.)
-  "**/.worktrees/**"
+  # checkout is a near-duplicate of the parent and must never be swept into its surface.
+  # (Running remrun from *inside* a worktree is refused separately.) Cover only explicit
+  # worktree conventions. Do NOT exclude `.codex/**`: that tree also holds project-scoped
+  # config, hooks, and rules, and this glob matcher cannot distinguish those from an
+  # arbitrarily named scratch clone. Transparency wins over guessing. Mirror these safe
+  # worktree exclusions in your syncer's ignore rules too.
+  "**/.worktrees/**",
+  "**/.claude/worktrees/**",
+  "**/.delegate-worktrees/**"
 ]
 large_file_warn_above_mb = 2048
 hash_small_files_below_mb = 64
@@ -191,12 +197,9 @@ ocr = "vision"
 # CPU% / remote exec time per command+device) are a property of the job and the device,
 # not of the controller, so in principle they belong with the project.
 #
-# DEFAULT OFF (2026-07-25). Writing them to `<project>/do/remrun/job_costs.<controller>.json`
-# means a read-modify-write inside a Syncthing-replicated tree on EVERY run. Measured in
-# production: 442 runs of one project in three days, peaking at 48/hour, which produced 11
-# sync-conflict copies of that one file plus a stranded `.syncthing.*.tmp`. Two of those
-# copies, created one second apart, were byte-identical — that is one file being rewritten
-# faster than Syncthing can settle a version, not a genuine two-writer divergence.
+# DEFAULT OFF. Writing them to `<project>/do/remrun/job_costs.<controller>.json`
+# performs a read-modify-write inside a synced tree on every run and can create
+# conflict/temp-file churn even when controllers agree.
 #
 # The data is advisory only (it feeds `--auto` placement and the offload hint), and costs
 # still accumulate per-controller in local state either way, so losing cross-controller
@@ -206,8 +209,8 @@ ocr = "vision"
 store_in_project = false
 
 [telemetry]
-# Record peak RSS and average CPU% for the remote command (whole process tree):
-# ssh-posix uses getrusage; ssh-powershell uses a Win32 Job Object sampler. Both
-# stdlib-only, no extra dependencies. Disable per run with
-# `remrun run --no-telemetry`.
+# Record peak RSS and average CPU% for the remote command. CPU% is whole-tree on
+# both backends. Windows Job Objects report whole-tree peak RAM; POSIX getrusage
+# reports the largest single child, so concurrent children can be undercounted.
+# Both are stdlib-only. Disable per run with `remrun run --no-telemetry`.
 enabled = true

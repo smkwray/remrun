@@ -30,19 +30,48 @@ def test_build_manifest_excludes(tmp_path: Path):
     assert "scratch/b.txt" not in manifest
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-symlink coverage; Windows uses junction test")
+def test_build_manifest_prunes_directory_symlinks(tmp_path: Path):
+    # Guard, not a regression test: directory symlinks were already pruned before this fix set.
+    root = tmp_path / "project"
+    external = tmp_path / "external"
+    root.mkdir()
+    external.mkdir()
+    (external / "outside.txt").write_text("must stay outside")
+    (root / "linked").symlink_to(external, target_is_directory=True)
+
+    manifest = build_manifest(root, [], hash_below_bytes=1024)
+
+    assert "linked/outside.txt" not in manifest
+
+
+def test_build_manifest_prunes_directory_reported_as_junction(tmp_path: Path, monkeypatch):
+    root = tmp_path / "project"
+    junction = root / "junction"
+    junction.mkdir(parents=True)
+    (junction / "outside.txt").write_text("simulated external content")
+    monkeypatch.setattr(
+        os.path, "isjunction", lambda path: Path(path).name == "junction", raising=False
+    )
+
+    manifest = build_manifest(root, [], hash_below_bytes=1024)
+
+    assert "junction/outside.txt" not in manifest
+
+
 def test_global_excludes_cover_nested_python_caches_without_hiding_source():
     config = load_config(Path(__file__).resolve().parents[1])
     patterns = global_excludes(config)
 
     generated = (
-        "src/statera/quality/__pycache__/module.cpython-313.pyc",
-        "src/statera/quality/module.pyc",
+        "src/sampleproj/quality/__pycache__/module.cpython-313.pyc",
+        "src/sampleproj/quality/module.pyc",
         "tests/unit/.pytest_cache/v/cache/nodeids",
-        "src/statera/.mypy_cache/3.13/module.meta.json",
-        "src/statera/.ruff_cache/0.12.1/cache-key",
+        "src/sampleproj/.mypy_cache/3.13/module.meta.json",
+        "src/sampleproj/.ruff_cache/0.12.1/cache-key",
     )
     assert all(should_exclude(path, patterns) for path in generated)
-    assert not should_exclude("src/statera/quality/module.py", patterns)
+    assert not should_exclude("src/sampleproj/quality/module.py", patterns)
 
 
 def test_global_excludes_cover_nested_node_modules_without_hiding_source():
@@ -75,6 +104,35 @@ def test_global_excludes_cover_remrun_private_scratch_namespace():
     assert all(should_exclude(path, patterns) for path in scratch)
     # A real output that merely lives beside the scratch files must still transfer.
     assert not should_exclude("results/result.rds", patterns)
+
+
+def test_global_excludes_cover_every_agent_nested_checkout_convention():
+    # A nested worktree is a near-duplicate of the parent tree. Agents place them under
+    # several explicit conventions; those directory names are safe to exclude without
+    # hiding project-scoped configuration.
+    config = load_config(Path(__file__).resolve().parents[1])
+    patterns = global_excludes(config)
+
+    nested = (
+        ".worktrees/agent1/src/app.py",
+        "sub/.worktrees/agent1/src/app.py",
+        ".claude/worktrees/field-fixes/src/remrun/cli.py",
+        "sub/.claude/worktrees/field-fixes/src/remrun/cli.py",
+        ".delegate-worktrees/agent1/src/app.py",
+    )
+    assert all(should_exclude(path, patterns) for path in nested)
+    # Only explicit worktree subtrees are excluded — agent configuration is ordinary
+    # project surface, and `.codex/<name>/` cannot safely be distinguished from rules or
+    # hooks by this glob matcher alone.
+    preserved = (
+        ".claude/settings.json",
+        ".codex/config.toml",
+        ".codex/hooks.json",
+        ".codex/rules/default.rules",
+        ".codex/reseal-bisect/data/big.parquet",
+        "docs/claude-notes.md",
+    )
+    assert all(not should_exclude(path, patterns) for path in preserved)
 
 
 def test_global_excludes_preserve_requested_build_outputs():

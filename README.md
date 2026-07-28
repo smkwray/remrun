@@ -45,13 +45,13 @@ remrun devices                      # list configured devices
 remrun doctor                       # show config root, devices, project roots, state root
 remrun plan macbox -- <cmd>         # show what a run would do; mutates nothing
 remrun run macbox -- <cmd>          # reconcile -> run remotely -> pull outputs back
-remrun run --auto -- <cmd>          # auto-pick target (see Status caveat above)
+remrun run --auto -- <cmd>          # probe/rank targets; conflict-safe failover
 remrun run --scope spec_a --auto -- <cmd>  # opt-in declared write scope
 remrun status [DEVICE] [--limit N]  # recent runs, optionally filtered by target
 remrun logs [last|<run_id>] [--json]
 remrun clean [--older-than 30d] [--keep N] [--dry-run]   # prune state folder
-remrun bench <cmd> [targets]        # time local vs. full remrun round-trip; recommend offload
-remrun bench <cmd> <targets> --no-local   # heavy job: skip local leg, assume offload
+remrun bench [targets] -- <cmd>     # time local vs. full remrun round-trip; recommend offload
+remrun bench [targets] --no-local -- <cmd>   # skip local leg and assume offload
 remrun sync <tree>/<sub> macbox     # project-less folder sync (pull-biased; see below)
 remrun sync outputs/reports macbox --pull --dry-run   # only pull remote-newer; show plan, change nothing
 remrun git-sync macbox              # sync Git commits with a peer without syncing .git/
@@ -90,8 +90,11 @@ Nine things bite first-time callers; all have one-line fixes:
    killed/crashes mid-flight, its lock persists and every later run fails with
    "already locked": check the printed lock path under
    `%LOCALAPPDATA%\remrun\locks\project\<hash>\whole.lock` (or
-   `~/.local/state/remrun/locks/...`), confirm the recorded holder PID is dead,
-   then delete the lock directory.
+   `~/.local/state/remrun/locks/...`) and confirm the recorded holder PID is dead.
+   If the command may have reached `command_started`, a dead controller PID is not
+   enough: first inspect the named remote process and expected artifacts to prove
+   the remote work ended. Only after both checks may the stale lock be moved aside
+   or removed and the command retried.
 5. **A yielded command-runner session is still a live remrun process.** A command
    runner may return a session ID after its output wait expires (often 30 s);
    that is not the command's exit. Keep polling that same session until it reports a

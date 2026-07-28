@@ -61,6 +61,85 @@ EXIT_TRANSFER = 3
 EXIT_INFRA = 4
 
 
+class _PreflightConflict(Exception):
+    """Preflight refused this candidate before mutating either side.
+
+    Internal control flow only: it never escapes ``cmd_run``, which converts it to
+    ``exit_code`` once no candidate is left. Carries the already-written conflict
+    receipt so a skipped candidate stays diagnosable.
+    """
+
+    def __init__(
+        self, *, exit_code: int, conflict_dir: Path, detail: str, retryable: bool,
+    ) -> None:
+        super().__init__(detail)
+        self.exit_code = exit_code
+        self.conflict_dir = conflict_dir
+        self.detail = detail
+        # Whether this conflict is candidate-LOCAL (try the next device) or a GLOBAL
+        # condition like local-vanished, which must abort the whole run.
+        self.retryable = retryable
+
+
+class _LiveStdoutLog:
+    """Best-effort streaming log whose file never exceeds its configured cap."""
+
+    _MARKER = b"\n...[remrun truncated live log output]...\n"
+
+    def __init__(self, path: Path, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.handle = None
+        self.written = 0
+        self.truncated = False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = path.open("w+b")
+        except OSError:
+            self.handle = None
+
+    def append(self, chunk: str) -> None:
+        if self.handle is None or self.truncated:
+            return
+        data = chunk.encode("utf-8", "replace")
+        try:
+            if self.max_bytes <= 0 or self.written + len(data) <= self.max_bytes:
+                self.handle.write(data)
+                self.handle.flush()
+                self.written += len(data)
+                return
+
+            marker = self._MARKER
+            if len(marker) > self.max_bytes:
+                marker = b"...[remrun truncated]..."[:self.max_bytes]
+                head_limit = 0
+            else:
+                head_limit = self.max_bytes - len(marker)
+            self.handle.seek(0)
+            head = self.handle.read(head_limit)
+            if len(head) < head_limit:
+                head += data[:head_limit - len(head)]
+            head = head.decode("utf-8", "ignore").encode("utf-8")
+            self.handle.seek(0)
+            self.handle.write(head)
+            self.handle.write(marker)
+            self.handle.truncate()
+            self.handle.flush()
+            self.written = len(head) + len(marker)
+            self.truncated = True
+        except (OSError, ValueError):
+            self.close()
+
+    def close(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+        finally:
+            self.handle = None
+
+
 def split_command(argv: list[str]) -> tuple[list[str], list[str]]:
     """Split argv at the first standalone ``--`` separator.
 
@@ -268,8 +347,8 @@ def cmd_action(args: argparse.Namespace, reporter: Reporter) -> int:
 def _store_costs_in_project(config) -> bool:
     """Whether to persist a job's PORTABLE resource costs into the project's
     do/remrun/job_costs.json (so they travel with the project, not the controller).
-    Default on; disable with [profile] store_in_project = false in defaults.toml."""
-    return bool(config.defaults.get("profile", {}).get("store_in_project", True))
+    Default off; enable with [profile] store_in_project = true in defaults.toml."""
+    return config.defaults.get("profile", {}).get("store_in_project", False) is True
 
 
 def normalize_cmd(cmd: list[str]) -> list[str]:
@@ -620,15 +699,17 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
     return EXIT_OK
 
 
-def _resolve_target(plan: RunPlan, target_name: str | None, sched: dict, reporter: Reporter,
-                    prediction: dict | None = None):
-    """Probe candidates and pick the run target.
+def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, reporter: Reporter,
+                     prediction: dict | None = None):
+    """Probe candidates and rank the run targets, best first.
 
-    Explicit target → probe it; reachable or fail (never fails over). For --auto,
-    optionally narrow candidates by a job's learned RAM profile, walk them in
-    preference order, probe reachability (and CPU load when load_balance is on),
-    then pick via pick_by_load. Returns ``(device, transport, probe, reason)`` or
-    ``None`` if nothing is reachable.
+    Explicit target → probe it; reachable or fail (never fails over), so the list
+    is at most one long. For --auto, optionally narrow candidates by a job's
+    learned RAM profile, walk them in preference order, probe reachability (and
+    CPU load when load_balance is on), then order via pick_by_load. Returns
+    ``[(device, transport, probe, reason), ...]`` — the caller runs the first and
+    may fall through to the rest when a candidate fails *before mutating anything*
+    (see ``cmd_run``). Empty if nothing is reachable.
     """
     if target_name and target_name != "auto":
         device = plan.target
@@ -636,8 +717,8 @@ def _resolve_target(plan: RunPlan, target_name: str | None, sched: dict, reporte
         probe = transport.probe()
         if not probe.reachable:
             reporter.event("unreachable", target=device.name, detail=probe.detail)
-            return None
-        return device, transport, probe, "explicit"
+            return []
+        return [(device, transport, probe, "explicit")]
 
     prefer_reachable = bool(sched.get("prefer_reachable_primary", True))
     load_balance = bool(sched.get("load_balance", True))
@@ -682,7 +763,7 @@ def _resolve_target(plan: RunPlan, target_name: str | None, sched: dict, reporte
     if not reachable:
         first = plan.candidates[0].name if plan.candidates else "?"
         reporter.event("unreachable", target=first, detail="no candidate reachable")
-        return None
+        return []
 
     ranked = [(d, busy) for (d, _t, _pr, busy) in reachable]
     chosen_device, balance_reason = pick_by_load(ranked, sched)
@@ -690,7 +771,11 @@ def _resolve_target(plan: RunPlan, target_name: str | None, sched: dict, reporte
     reason = balance_reason
     if reason == "auto" and plan.candidates and device is not plan.candidates[0]:
         reason = "auto-failover"  # preferred candidate was unreachable
-    return device, transport, probe, reason
+    # pick_by_load names the winner; the rest stay in preference order behind it as
+    # fallbacks. Their reason is "auto-failover": reaching them means the winner
+    # failed for a candidate-local reason.
+    rest = [(d, t, pr, "auto-failover") for (d, t, pr, _b) in reachable if d is not device]
+    return [(device, transport, probe, reason), *rest]
 
 
 def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
@@ -723,9 +808,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         return EXIT_OK
 
     sched = scheduler_config(config)
-    # Placement reads the local profiles with the project's PORTABLE job costs overlaid,
-    # so --auto is RAM-headroom/cost aware even on a controller that's never run this job
-    # before (the project's do/remrun/job_costs.json travels with it).
+    # When explicitly enabled, placement overlays the project's PORTABLE job costs so
+    # --auto can use prior measurements from another controller.
     profiles = load_profiles(default_state_root())
     if _store_costs_in_project(config):
         profiles = merge_job_costs(profiles, plan.project.project_id,
@@ -735,53 +819,79 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("job_profile", key=command_key(plan.command),
                        predicted_rss_mb=prediction.get("rss_mb"),
                        predicted_dur_s=prediction.get("dur_s"))
-    selection = _resolve_target(plan, target_name, sched, reporter, prediction)
-    if selection is None:
+    selection = _resolve_targets(plan, target_name, sched, reporter, prediction)
+    if not selection:
         run_id = new_run_id(plan.target.name, plan.project.project_id)
         write_json(run_dir(run_id) / "summary.json",
                    {"run_id": run_id, "error": "target unreachable", "plan": plan.as_dict()})
         return EXIT_INFRA
-    chosen, transport, probe, reason = selection
-    plan = replace(plan, target=chosen)
 
-    run_id = new_run_id(plan.target.name, plan.project.project_id)
-    rdir = run_dir(run_id)
-    summary_path = rdir / "summary.json"
+    # Walk the ranked candidates. A preflight conflict is a property of ONE candidate's
+    # tree, not of the job, and it is raised before that candidate mutates either side — so
+    # with --auto we may try the next reachable candidate. Fallback preflight is stricter:
+    # it may push local bytes outward but never pull/delete locally while choosing a device.
+    # Each attempt keeps its own run_id, so skipped conflict evidence is retained rather than
+    # overwritten. Only this pre-mutation case fails over: a transport error may have
+    # already transferred files, and the project lock is keyed by project (not device), so
+    # another candidate would meet the same lock.
+    base_plan = plan
+    last_conflict_exit = EXIT_CONFLICT
+    # Every attempted run_id, so retention can't prune a skipped candidate's receipt.
+    attempted_run_ids: set[str] = set()
+    for attempt, (chosen, transport, probe, reason) in enumerate(selection):
+        plan = replace(base_plan, target=chosen)
+        remaining = len(selection) - attempt - 1
 
-    reporter.event("run_id", run_id=run_id)
-    reporter.event("project", project_id=plan.project.project_id, relative_cwd=plan.project.relative_cwd)
-    reporter.event("target", name=plan.target.name, kind=plan.target.kind, reason=reason)
-    reporter.event("target_reachable", address=probe.address, remote_os=probe.remote_os)
-    reporter.event("write_scope", name=plan.write_scope or "project",
-                   paths=plan.write_scope_paths)
+        run_id = new_run_id(plan.target.name, plan.project.project_id)
+        attempted_run_ids.add(run_id)
+        rdir = run_dir(run_id)
+        summary_path = rdir / "summary.json"
 
-    remote_root = transport.remote_project_path(plan.project)
-    remote_cwd = transport.remote_join(remote_root, plan.project.relative_cwd)
-    reporter.event("remote_cwd", path=remote_cwd)
+        reporter.event("run_id", run_id=run_id)
+        reporter.event("project", project_id=plan.project.project_id,
+                       relative_cwd=plan.project.relative_cwd)
+        reporter.event("target", name=plan.target.name, kind=plan.target.kind, reason=reason)
+        reporter.event("target_reachable", address=probe.address, remote_os=probe.remote_os)
+        reporter.event("write_scope", name=plan.write_scope or "project",
+                       paths=plan.write_scope_paths)
 
-    try:
-        lock = ProjectLock(plan.project.project_id, plan.target.name,
-                           scope=plan.write_scope).acquire()
-    except LockError as exc:
-        reporter.event("locked", message=str(exc))
-        write_json(summary_path, {"run_id": run_id, "error": str(exc), "plan": plan.as_dict()})
-        return EXIT_INTERNAL
+        remote_root = transport.remote_project_path(plan.project)
+        remote_cwd = transport.remote_join(remote_root, plan.project.relative_cwd)
+        reporter.event("remote_cwd", path=remote_cwd)
 
-    started_at = utc_now_iso()
-    t0 = time.monotonic()
-    try:
-        return _run_locked(args, reporter, plan, transport, remote_root, remote_cwd,
-                           run_id, rdir, summary_path, started_at, t0, policy, telemetry_default)
-    finally:
-        lock.release()
-        # Prune even when a run errors out early (preflight/exec/pullback may already have
-        # written backups), so repeated failures can't grow the state unbounded.
         try:
-            # Exempt THIS run's conflict/backup dir: a just-saved recovery copy must not be
-            # pruned by the size-budget pass before the summary reports its path (audit B7).
-            prune_state(policy, exempt_run_id=run_id)
-        except Exception:  # noqa: BLE001
-            pass
+            lock = ProjectLock(plan.project.project_id, plan.target.name,
+                               scope=plan.write_scope).acquire()
+        except LockError as exc:
+            reporter.event("locked", message=str(exc))
+            write_json(summary_path, {"run_id": run_id, "error": str(exc), "plan": plan.as_dict()})
+            return EXIT_INTERNAL
+
+        started_at = utc_now_iso()
+        t0 = time.monotonic()
+        try:
+            return _run_locked(args, reporter, plan, transport, remote_root, remote_cwd,
+                               run_id, rdir, summary_path, started_at, t0, policy,
+                               telemetry_default, attempt > 0, attempted_run_ids)
+        except _PreflightConflict as exc:
+            last_conflict_exit = exc.exit_code
+            # A non-retryable conflict (e.g. local-vanished) is global: stop the whole run.
+            if not exc.retryable or not remaining:
+                return exc.exit_code
+            reporter.event("candidate_skipped", name=plan.target.name,
+                           reason="preflight_conflict", detail=exc.detail,
+                           conflict_state=str(exc.conflict_dir))
+        finally:
+            lock.release()
+            # Prune even when a run errors out early (preflight/exec/pullback may already have
+            # written backups), so repeated failures can't grow the state unbounded.
+            try:
+                # Keep every receipt from this command alive until candidate selection ends.
+                prune_state(policy, exempt_run_ids=attempted_run_ids)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return last_conflict_exit
 
 
 def _run_locked(
@@ -798,6 +908,8 @@ def _run_locked(
     t0: float,
     policy: RetentionPolicy,
     telemetry_default: bool,
+    is_fallback: bool,
+    attempted_run_ids: set[str],
 ) -> int:
     local_root = plan.project.local_project_root
     prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
@@ -826,6 +938,7 @@ def _run_locked(
             backup_root=backup_root,
             backup_below_bytes=policy.backup_below_bytes,
             progress=report_preflight_progress,
+            is_fallback=is_fallback,
         )
     except TransportError as exc:
         reporter.event("transfer_error", phase="preflight", message=str(exc))
@@ -849,7 +962,15 @@ def _run_locked(
             "run_id": run_id, "exit_code": EXIT_CONFLICT, "conflicts": len(pre.conflicts),
             "conflict_state": str(cdir), "plan": plan.as_dict(),
         })
-        return EXIT_CONFLICT
+        # Signal rather than return so `cmd_run` can retry only conflicts positively
+        # classified as candidate-local. Global failures (notably local-vanished) abort.
+        # The receipt is exempted from pruning until the whole candidate loop exits.
+        raise _PreflightConflict(
+            exit_code=EXIT_CONFLICT,
+            conflict_dir=cdir,
+            detail=f"{len(pre.conflicts)} conflicting path(s); first: {pre.conflicts[0].path}",
+            retryable=pre.conflicts_are_candidate_local,
+        )
 
     write_manifest(rdir / "pre_local_manifest.json", pre.local_manifest)
     write_manifest(rdir / "pre_remote_manifest.json", pre.remote_manifest)
@@ -870,10 +991,19 @@ def _run_locked(
     transport.ensure_remote_dir(remote_cwd)
     reporter.event("command_started", run_id=run_id, command=" ".join(plan.command))
     cmd_t0 = time.monotonic()
+    # Tee stdout as it arrives without letting a verbose process exhaust controller
+    # storage. Once the cap is reached, retain a bounded head plus a visible marker; the
+    # completed result below is rewritten with cap_text's head+tail form. All live-log IO
+    # is best-effort and cannot prevent the remote command from running.
+    live_log = _LiveStdoutLog(rdir / "stdout.log", policy.max_log_bytes)
+
+    def tee_stdout(chunk: str) -> None:
+        live_log.append(chunk)
+
     try:
         result = transport.exec(plan.command, cwd=remote_cwd,
                                 env=runenv.env, path_prepend=runenv.path_prepend,
-                                telemetry=telemetry_on)
+                                telemetry=telemetry_on, on_stdout=tee_stdout)
     except TransportError as exc:
         reporter.event("exec_error", message=str(exc))
         guidance = (
@@ -892,10 +1022,19 @@ def _run_locked(
                 "plan": plan.as_dict(),
             },
         )
+        # Whatever the command printed before the transport dropped is the only
+        # evidence of how far it got; it is already capped on disk.
         return EXIT_INFRA
+    finally:
+        live_log.close()
 
-    (rdir / "stdout.log").write_text(cap_text(result.stdout, policy.max_log_bytes), encoding="utf-8")
-    (rdir / "stderr.log").write_text(cap_text(result.stderr, policy.max_log_bytes), encoding="utf-8")
+    for log_name, text in (("stdout.log", result.stdout), ("stderr.log", result.stderr)):
+        try:
+            (rdir / log_name).write_text(
+                cap_text(text, policy.max_log_bytes), encoding="utf-8"
+            )
+        except OSError:
+            pass
     if result.stdout:
         sys.stdout.write(result.stdout)
         sys.stdout.flush()
@@ -967,8 +1106,8 @@ def _run_locked(
     # offload recommendation). exec_s = remote command; trip_s = full round-trip
     # (push+exec+pullback); overhead = trip - exec. The controller-specific timing
     # (trip/overhead) + the LOCAL baseline live in local state; the PORTABLE resource
-    # costs (rss/cpu/exec) also go to the project's do/remrun/job_costs.json so they
-    # travel with the project. Best-effort; never breaks a run.
+    # costs (rss/cpu/exec) may also go to the project's do/remrun job-cost file when
+    # explicitly enabled. Best-effort; never breaks a run.
     try:
         tel = result.telemetry or {}
         ckey = command_key(plan.command)
@@ -1015,7 +1154,7 @@ def _run_locked(
 
     # Self-limiting: apply the retention policy. Never let cleanup break a run.
     try:
-        report = prune_state(policy)
+        report = prune_state(policy, exempt_run_ids=attempted_run_ids)
         if report.runs_deleted or report.runs_trimmed:
             reporter.event("retention", runs_deleted=report.runs_deleted,
                            runs_trimmed=report.runs_trimmed,

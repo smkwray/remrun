@@ -8,7 +8,8 @@ import pytest
 
 from remrun.manifest import build_manifest
 from remrun.models import Device
-from remrun.reconcile import postrun_pullback, preflight_reconcile
+from remrun.reconcile import ReconcileResult, postrun_pullback, preflight_reconcile
+from remrun.transfer_plan import ABORT_CONFLICT, ClassifiedPath
 from remrun.transport import LocalSimTransport, TransportError
 
 
@@ -66,6 +67,65 @@ def test_remote_only_pulled(tmp_path: Path):
     res = reconcile(local, remote_root, t, backup)
     assert res.pulled == ["gen.txt"]
     assert (local / "gen.txt").read_text() == "generated"
+
+
+def test_fallback_preflight_refuses_local_pull_without_mutation(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    remote.mkdir(parents=True)
+    (remote / "remote.txt").write_text("REMOTE")
+
+    result = preflight_reconcile(
+        transport=t,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["node_modules/**"],
+        hash_below_bytes=1_000_000,
+        prev_local=None,
+        prev_remote=None,
+        backup_root=backup,
+        is_fallback=True,
+    )
+
+    assert [conflict.path for conflict in result.conflicts] == ["remote.txt"]
+    assert [conflict.state for conflict in result.conflicts] == ["fallback-local-mutation"]
+    assert not (local / "remote.txt").exists()
+
+
+def test_fallback_preflight_refuses_local_delete_without_mutation(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    local_path = local / "shared.txt"
+    local_path.write_text("LOCAL")
+    first = reconcile(local, remote_root, t, backup)
+    (Path(remote_root) / "shared.txt").unlink()
+
+    result = preflight_reconcile(
+        transport=t,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["node_modules/**"],
+        hash_below_bytes=1_000_000,
+        prev_local=first.local_manifest,
+        prev_remote=first.remote_manifest,
+        backup_root=backup,
+        is_fallback=True,
+    )
+
+    assert [conflict.path for conflict in result.conflicts] == ["shared.txt"]
+    assert [conflict.state for conflict in result.conflicts] == ["fallback-local-mutation"]
+    assert local_path.read_text() == "LOCAL"
+
+
+def test_fallback_local_mutation_is_retryable_only_when_all_conflicts_are_candidate_local():
+    result = ReconcileResult(conflicts=[
+        ClassifiedPath("shared.txt", "fallback-local-mutation", ABORT_CONFLICT, "candidate B"),
+    ])
+    assert result.conflicts_are_candidate_local
+
+    result.conflicts.append(
+        ClassifiedPath("<local root>", "local-vanished", ABORT_CONFLICT, "global")
+    )
+    assert not result.conflicts_are_candidate_local
 
 
 def test_preflight_reports_planned_counts_and_bounded_progress(tmp_path: Path):
@@ -480,6 +540,77 @@ def test_genuinely_divergent_bytes_still_conflict_without_hashes(tmp_path: Path)
     assert not res.converged_conflicts
     assert (local / "shared.txt").read_text() == "LOCAL-EDIT"
     assert (remote / "shared.txt").read_text() == "OTHER-EDIT"
+
+
+def test_same_metadata_cannot_hide_divergent_unhashed_bytes(tmp_path: Path):
+    """A large-file edit may preserve both size and mtime; metadata is not equality proof."""
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    local_path = local / "shared.bin"
+    remote_path = remote / "shared.bin"
+    local_path.write_bytes(b"BASE")
+    first = reconcile(local, remote_root, t, backup)
+
+    local_path.write_bytes(b"LEFT")
+    remote_path.write_bytes(b"RGHT")
+    same_mtime = 1_700_000_000_000_000_000
+    os.utime(local_path, ns=(same_mtime, same_mtime))
+    os.utime(remote_path, ns=(same_mtime, same_mtime))
+
+    res = _reconcile_unhashed(
+        local,
+        remote_root,
+        t,
+        backup,
+        first.local_manifest,
+        first.remote_manifest,
+    )
+
+    assert res.has_conflicts
+    assert [c.path for c in res.conflicts] == ["shared.bin"]
+    assert not res.pushed and not res.pulled
+    assert local_path.read_bytes() == b"LEFT"
+    assert remote_path.read_bytes() == b"RGHT"
+
+
+def test_same_metadata_identical_unhashed_bytes_converge_after_content_proof(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    remote.mkdir(parents=True)
+    local_path = local / "shared.bin"
+    remote_path = remote / "shared.bin"
+    local_path.write_bytes(b"SAME")
+    remote_path.write_bytes(b"SAME")
+    same_mtime = 1_700_000_000_000_000_000
+    os.utime(local_path, ns=(same_mtime, same_mtime))
+    os.utime(remote_path, ns=(same_mtime, same_mtime))
+
+    res = _reconcile_unhashed(local, remote_root, t, backup, None, None)
+
+    assert not res.has_conflicts
+    assert res.converged_conflicts == ["shared.bin"]
+    assert not res.pushed and not res.pulled
+
+
+def test_same_metadata_without_remote_hash_stays_unverified(tmp_path: Path, monkeypatch):
+    local, remote_root, t, backup = setup(tmp_path)
+    remote = Path(remote_root)
+    remote.mkdir(parents=True)
+    (local / "shared.bin").write_bytes(b"SAME")
+    (remote / "shared.bin").write_bytes(b"SAME")
+    same_mtime = 1_700_000_000_000_000_000
+    os.utime(local / "shared.bin", ns=(same_mtime, same_mtime))
+    os.utime(remote / "shared.bin", ns=(same_mtime, same_mtime))
+
+    def unavailable(_remote_path: str) -> str:
+        raise TransportError("injected hash failure")
+
+    monkeypatch.setattr(t, "hash_file", unavailable)
+    res = _reconcile_unhashed(local, remote_root, t, backup, None, None)
+
+    assert res.has_conflicts
+    assert [item.state for item in res.conflicts] == ["both-present-unverified"]
+    assert not res.converged_conflicts
 
 
 @pytest.mark.parametrize(

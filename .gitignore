@@ -3,6 +3,16 @@
 /config/fleet_costs.toml
 /config/private_release_patterns.txt
 
+# Agent worktrees and session config. Nested checkouts must never be committed as gitlinks.
+/.worktrees/
+/.claude/
+/.delegate-worktrees/
+/.codex/
+
+# Local environment files may contain device-specific paths or credentials.
+/.env
+/.env.*
+
 # Private continuity / orchestration notes. Public releases ship reusable docs only.
 /AGENTS.md
 /CLAUDE.md
