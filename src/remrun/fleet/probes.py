@@ -5,91 +5,28 @@ and nothing here ever raises.
 from __future__ import annotations
 
 from ..models import Device
+from ..resource_envelope import MIB, Metric
+from ..resource_probe import GPUResourceSnapshot, ResourceSnapshot, probe_target_resources
 from ..transport import BaseTransport, TransportError
 from .adapters import ADAPTERS
 from .models import DeviceSnapshot
 
-
-def _root_cwd(device: Device) -> str:
-    return "C:\\" if device.is_windows else "/"
+_RESOURCE_PROBE_TIMEOUT_SEC = 20.0
 
 
-def _exec_text(transport: BaseTransport, device: Device, tokens: list[str]) -> str | None:
-    try:
-        r = transport.exec(tokens, cwd=_root_cwd(device), telemetry=False, timeout=20)
-    except (TransportError, Exception):  # noqa: BLE001 - probes must never raise
+def _metric_mb(metric: Metric) -> float | None:
+    if metric.value is None:
         return None
-    if r.exit_code != 0:
+    return float(metric.value) / MIB
+
+
+def _first_discrete_gpu(snapshot: ResourceSnapshot) -> GPUResourceSnapshot | None:
+    if snapshot.gpu_kind != "discrete" or not snapshot.gpus:
         return None
-    return (r.stdout or "").strip()
-
-
-def _probe_vram(transport: BaseTransport, device: Device) -> tuple[float | None, float | None]:
-    """(free_mb, total_mb) via nvidia-smi on a CUDA device; None on Macs / no GPU."""
-    if not device.is_windows or device.vram_gb <= 0:
-        return None, None
-    out = _exec_text(transport, device,
-                     ["nvidia-smi", "--query-gpu=memory.free,memory.total",
-                      "--format=csv,noheader,nounits"])
-    if not out:
-        return None, None
-    line = out.splitlines()[0]
-    try:
-        free, total = (float(x.strip()) for x in line.split(",")[:2])
-        return free, total
-    except (ValueError, IndexError):
-        return None, None
-
-
-def _probe_ram(transport: BaseTransport, device: Device) -> float | None:
-    """AVAILABLE physical RAM in MB, best-effort, per OS.
-
-    "Available" means what a new (model) process can claim WITHOUT paging out live memory — i.e.
-    truly-free plus the instantly-reclaimable file cache. The two OS branches must agree on that
-    definition or the same job is gated inconsistently across the fleet:
-      * Windows: ``AvailableMBytes`` (free + standby/cache), NOT ``FreePhysicalMemory`` alone —
-        the latter excludes the standby cache, so a box merely caching files reports far less RAM
-        than it can actually hand out and gets wrongly RAM-skipped. Falls back to
-        ``FreePhysicalMemory`` only if the perf class is unavailable.
-      * macOS: ``free + inactive`` pages (below), inactive being the reclaimable half.
-    """
-    if device.is_windows:
-        # Win32_PerfFormattedData_PerfOS_Memory.AvailableMBytes is language-neutral (unlike the
-        # localized `\Memory\Available MBytes` Get-Counter path) and already in MB.
-        out = _exec_text(transport, device,
-                         ["powershell", "-NoProfile", "-Command",
-                          "(Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory).AvailableMBytes"])
-        if out and out.strip():
-            try:
-                return float(out.split()[-1])            # already MB
-            except (ValueError, IndexError):
-                pass
-        out = _exec_text(transport, device,
-                         ["powershell", "-NoProfile", "-Command",
-                          "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"])
-        if out:
-            try:
-                return float(out.split()[-1]) / 1024.0   # KB -> MB
-            except (ValueError, IndexError):
-                return None
-        return None
-    # POSIX (macOS): parse vm_stat (page size + free + inactive pages).
-    out = _exec_text(transport, device, ["vm_stat"])
-    if not out:
-        return None
-    try:
-        page = 4096
-        free_pages = inactive = 0
-        for ln in out.splitlines():
-            if "page size of" in ln:
-                page = int("".join(c for c in ln if c.isdigit()))
-            elif ln.startswith("Pages free:"):
-                free_pages = int(ln.split(":")[1].strip().rstrip("."))
-            elif ln.startswith("Pages inactive:"):
-                inactive = int(ln.split(":")[1].strip().rstrip("."))
-        return (free_pages + inactive) * page / (1024.0 * 1024.0)
-    except (ValueError, IndexError):
-        return None
+    # DeviceSnapshot is intentionally a legacy single-GPU view. Preserve its
+    # established first-device behavior while the normalized snapshot retains
+    # every GPU (with stable IDs) for newer consumers.
+    return snapshot.gpus[0]
 
 
 def _capability_engines(transport: BaseTransport, device: Device) -> frozenset[str]:
@@ -120,11 +57,40 @@ def build_snapshot(device: Device, transport: BaseTransport, fleet_cfg: dict, *,
         return DeviceSnapshot(name=device.name, reachable=False, detail=pr.detail)
 
     try:
-        cpu = transport.sample_load()
-    except (TransportError, Exception):  # noqa: BLE001
-        cpu = None
-    vram_free, vram_total = _probe_vram(transport, device)
-    ram_free = _probe_ram(transport, device)
+        resources = probe_target_resources(
+            transport,
+            device,
+            timeout_sec=_RESOURCE_PROBE_TIMEOUT_SEC,
+        )
+    except Exception:  # noqa: BLE001 - keep the placement probe no-throw
+        resources = None
+
+    cpu = (
+        float(resources.cpu_busy_pct.value)
+        if resources is not None and resources.cpu_busy_pct.value is not None
+        else None
+    )
+    ram_free = (
+        _metric_mb(resources.ram_available_bytes)
+        if resources is not None
+        else None
+    )
+    measured_ram_total = (
+        _metric_mb(resources.ram_total_bytes)
+        if resources is not None
+        else None
+    )
+    gpu = _first_discrete_gpu(resources) if resources is not None else None
+    vram_free = (
+        float(gpu.vram_free_bytes.value) / MIB
+        if gpu is not None and gpu.vram_free_bytes.value is not None
+        else None
+    )
+    vram_total = (
+        float(gpu.vram_total_bytes.value) / MIB
+        if gpu is not None and gpu.vram_total_bytes.value is not None
+        else None
+    )
     engines = _capability_engines(transport, device) if probe_capability else frozenset()
 
     caps = dict(fleet_cfg.get("pools", {}))
@@ -133,7 +99,8 @@ def build_snapshot(device: Device, transport: BaseTransport, fleet_cfg: dict, *,
 
     return DeviceSnapshot(
         name=device.name, reachable=True, cpu_busy_pct=cpu,
-        ram_free_mb=ram_free, ram_total_mb=(device.ram_gb * 1024.0 if device.ram_gb else None),
+        ram_free_mb=ram_free,
+        ram_total_mb=(device.ram_gb * 1024.0 if device.ram_gb else measured_ram_total),
         vram_free_mb=vram_free,
         vram_total_mb=(vram_total if vram_total is not None
                        else (device.vram_gb * 1024.0 if device.vram_gb else None)),

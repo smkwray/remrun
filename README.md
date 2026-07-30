@@ -13,7 +13,12 @@ not a correctness dependency.
 The core runner is implemented and tested on POSIX/macOS and Windows SSH targets:
 safe project reconciliation and pullback, conflict preservation, target scheduling,
 resource telemetry, external-tree `sync`, commit-only `git-sync`, allowlisted target
-actions, and optional fleet dispatch.
+actions, and optional fleet dispatch. The Windows `ssh-powershell` command surface
+requires `pwsh` 7.3+ and supports native executables, cmdlets, aliases, and `.ps1`
+scripts. Top-level `.cmd`/`.bat` commands, including bare names resolved through
+`PATH`/`PATHEXT`, are rejected because the current PowerShell-to-`cmd.exe` path is
+proved to corrupt some argv. This restriction means Windows is not full
+arbitrary-command parity with POSIX.
 
 The default coordination mode remains `legacy`: one controller may write a project at
 a time. Versioned-runner, lease/fencing, and snapshot components are experimental,
@@ -262,7 +267,9 @@ Per device: `kind` (`ssh-posix` / `ssh-powershell` / `local-sim`),
 
 - `user`, `remote_python`, `ssh_opts`, `tailscale_ip`
 - `login_shell` / `shell` (POSIX: default `bash -lc` so the remote PATH matches
-  your normal environment — needed to find e.g. Homebrew's `Rscript`)
+  your normal environment — needed to find e.g. Homebrew's `Rscript`; Windows
+  `ssh-powershell` targets require `shell = "pwsh"` with PowerShell 7.3 or newer,
+  and reject top-level `.cmd`/`.bat` commands)
 - `venv_root` — base dir for external per-project virtualenvs, used only when a
   project sets `[run] venv_layout = "external"` (the default is project-local `.venv`)
 - `path` (list, prepended to PATH) and `[devices.<NAME>.env]` (env vars) — declare
@@ -359,7 +366,9 @@ Each run records `peak_rss_mb` and `avg_cpu_pct` in the summary and `status`
 `getrusage(RUSAGE_CHILDREN).ru_maxrss`, which is the peak of the **largest single
 child**, not the sum of a multi-process tree — so a job that fans out into many
 concurrent processes is under-reported on POSIX. CPU% is whole-tree on both. Disable
-with `--no-telemetry` or `[telemetry] enabled = false`.
+with `--no-telemetry` or `[telemetry] enabled = false`. On a device with a
+configured `memory_guard`, those controls suppress optional metrics only; the hard
+preflight, command ceiling, host reserve, and fail-safe cleanup remain active.
 
 ## Operational gotchas (learned the hard way)
 

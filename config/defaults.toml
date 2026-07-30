@@ -166,6 +166,10 @@ ssh_setup_s = 0.6          # ~stage/exec/fetch connection overhead (fleet skips 
 # it silently did nothing.
 min_hysteresis_s = 5.0        # floor, in seconds
 hysteresis_finish_frac = 0.05 # ...or this fraction of the better finish time, whichever is larger
+# Compact capacity cells by default. Set to "amounts" for used/total GB in the
+# RAM, VRAM, and DISK columns. JSON always includes both exact amounts and %.
+[fleet.resources]
+usage_display = "percent"
 [fleet.pools]
 # One model-heavy job per device. Rename or add pools to match your adapter `pool`
 # fields. Raise only if measured safe for your devices.
@@ -192,21 +196,6 @@ gpu = 1
 [fleet.default_variants]
 tts = "norm"
 ocr = "vision"
-
-# Learned job-cost profiles. The PORTABLE resource costs of a project's jobs (peak RAM /
-# CPU% / remote exec time per command+device) are a property of the job and the device,
-# not of the controller, so in principle they belong with the project.
-#
-# DEFAULT OFF. Writing them to `<project>/do/remrun/job_costs.<controller>.json`
-# performs a read-modify-write inside a synced tree on every run and can create
-# conflict/temp-file churn even when controllers agree.
-#
-# The data is advisory only (it feeds `--auto` placement and the offload hint), and costs
-# still accumulate per-controller in local state either way, so losing cross-controller
-# portability costs far less than churning the synced tree. Set true to restore the
-# portable project-local file — but only for a project tree that is NOT continuously synced.
-[profile]
-store_in_project = false
 
 [telemetry]
 # Record peak RSS and average CPU% for the remote command. CPU% is whole-tree on

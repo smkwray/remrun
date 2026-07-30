@@ -14,12 +14,15 @@ from pathlib import Path
 
 import pytest
 
+from remrun.memory_guard import MemoryAdmissionResult, MemoryReservation
 from remrun.models import Device
 from remrun.transport import (
     LocalSimTransport,
     SSHPosixTransport,
+    TelemetryRequest,
     TransportError,
     _extract_telemetry,
+    _guarded_helper_args,
 )
 
 
@@ -123,6 +126,41 @@ def test_push_file_handles_spaces_and_commas_in_path(tmp_path, monkeypatch):
     assert "trap 'rm -f '" not in script                   # the broken nested-quote form is gone
 
 
+def test_read_small_file_caps_remotely_and_returns_binary(monkeypatch):
+    payload = b"\x00receipt\xff"
+    t = SSHPosixTransport(device())
+    t._address = "h"
+    rec = Recorder(lambda argv, inp: cp(0, payload))
+    monkeypatch.setattr(t, "_run", rec)
+
+    assert t.read_small_file("/state/run receipt.json", 64) == payload
+    script = rec.scripts[-1]
+    assert "__REMRUN_SMALL_FILE_MISSING__" in script
+    assert "__REMRUN_SMALL_FILE_OVERSIZE__" in script
+    assert "read(limit+1)" in script
+    assert "'/state/run receipt.json'" in script
+
+
+@pytest.mark.parametrize(
+    ("returncode", "marker", "message"),
+    [
+        (44, "__REMRUN_SMALL_FILE_MISSING__", "missing"),
+        (45, "__REMRUN_SMALL_FILE_OVERSIZE__", "exceeds 64 byte limit"),
+    ],
+)
+def test_read_small_file_reports_missing_and_oversize(
+    monkeypatch, returncode, marker, message
+):
+    t = SSHPosixTransport(device())
+    t._address = "h"
+    monkeypatch.setattr(
+        t, "_run", Recorder(lambda argv, inp: cp(returncode, stderr=marker.encode()))
+    )
+
+    with pytest.raises(TransportError, match=message):
+        t.read_small_file("/state/receipt.json", 64)
+
+
 def test_probe_resolves_first_reachable(monkeypatch):
     t = SSHPosixTransport(device())
 
@@ -207,6 +245,28 @@ def test_sample_load_returns_none_on_timeout(monkeypatch):
     assert t.sample_load() is None
 
 
+def test_sample_load_uses_interval_cpu_and_never_load_average(monkeypatch):
+    t = SSHPosixTransport(device())
+    t._address = "macbox.local"
+    recorder = Recorder(lambda argv, inp: cp(0, b"20.0\n"))
+    monkeypatch.setattr(t, "_run", recorder)
+
+    assert t.sample_load() == 20.0
+    script = recorder.scripts[-1]
+    assert "iostat" in script
+    assert "/proc/stat" in script
+    assert "getloadavg" not in script
+    assert "top -l" not in script
+
+
+def test_sample_load_keeps_unavailable_utilization_unknown(monkeypatch):
+    t = SSHPosixTransport(device())
+    t._address = "macbox.local"
+    monkeypatch.setattr(t, "_run", Recorder(lambda argv, inp: cp(0, b"")))
+
+    assert t.sample_load() is None
+
+
 def test_exec_builds_cd_and_command(monkeypatch):
     t = SSHPosixTransport(device(user="user", login_shell=False))
     t._address = "macbox.local"
@@ -246,6 +306,19 @@ def test_extract_telemetry_absent():
     assert cleaned == "just normal stderr\n"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    ["[]", "1", '"text"', "null", '{"schema":1,"value":NaN}'],
+)
+def test_extract_telemetry_rejects_non_object_json_and_preserves_stderr(payload):
+    stderr = f"warning\n__REMRUN_TELEMETRY__ {payload}\n"
+
+    cleaned, telem = _extract_telemetry(stderr)
+
+    assert telem is None
+    assert cleaned == stderr
+
+
 def test_exec_telemetry_wraps_sampler_and_parses(monkeypatch):
     t = SSHPosixTransport(device())
     t._address = "h"
@@ -268,6 +341,79 @@ def test_exec_telemetry_wraps_sampler_and_parses(monkeypatch):
     assert script.startswith("python3 -c ")
     assert " -- bash -lc " in script
     assert "RUSAGE_CHILDREN" in script
+
+
+def test_exec_detailed_telemetry_stages_helper_outside_project_and_preserves_command(monkeypatch):
+    t = SSHPosixTransport(device())
+    t._address = "h"
+    remote_home = "/" + "Users/test"
+    t._remote_home = remote_home
+    staged = {}
+    monkeypatch.setattr(
+        t,
+        "push_file",
+        lambda local, remote: staged.update(local=local, remote=remote),
+    )
+    payload = {
+        "schema": 1,
+        "memory": {"metric": "rss_sum_sampled", "peak_bytes": 10},
+        "peak_rss_mb": 0.0,
+        "avg_cpu_pct": 1.0,
+    }
+    rec = Recorder(
+        lambda argv, inp: cp(
+            7,
+            b"out\n",
+            ("\n__REMRUN_TELEMETRY__ " + json.dumps(payload) + "\n").encode(),
+        )
+    )
+    monkeypatch.setattr(t, "_run", rec)
+
+    result = t.exec(
+        ["python3", "worker.py", "--jobs", "8"],
+        cwd="/project/run",
+        telemetry_request=TelemetryRequest(),
+    )
+
+    assert result.exit_code == 7
+    assert result.telemetry == payload
+    assert staged["local"].name == "_posix_telemetry.py"
+    assert staged["remote"] == (
+        f"{remote_home}/.local/state/remrun/helpers/remrun_posix_telemetry_v1.py"
+    )
+    assert not staged["remote"].startswith("/project/")
+    script = rec.scripts[-1]
+    assert "--detailed -- bash -lc" in script
+    assert "python3 worker.py --jobs 8" in script
+
+
+def test_exec_detailed_staging_failure_runs_plain_command_with_explicit_unknown(monkeypatch):
+    t = SSHPosixTransport(device(login_shell=False))
+    t._address = "h"
+    monkeypatch.setattr(
+        t,
+        "push_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no write")),
+    )
+    spoof = (
+        b"warning\n__REMRUN_TELEMETRY__ "
+        b'{"schema":1,"status":"ok","memory":{"peak_bytes":1}}\n'
+    )
+    rec = Recorder(lambda argv, inp: cp(3, b"out", spoof))
+    monkeypatch.setattr(t, "_run", rec)
+
+    result = t.exec(
+        ["python3", "worker.py"],
+        cwd="/project",
+        telemetry_request=TelemetryRequest(),
+    )
+
+    assert result.exit_code == 3
+    assert rec.scripts[-1] == "cd /project && python3 worker.py"
+    assert result.stderr == spoof.decode()
+    assert result.telemetry["status"] == "unavailable"
+    assert result.telemetry["memory"]["coverage"] == "sampler_failed"
+    assert result.telemetry["peak_rss_mb"] is None
 
 
 def test_exec_ssh_255_is_infra_error(monkeypatch):
@@ -669,3 +815,168 @@ def test_stream_process_decodes_split_multibyte_stderr():
     assert out == ""
     assert err == "A" * 65535 + "€"
     assert "�" not in err
+
+
+def test_protected_posix_staging_failure_is_a_known_refusal_not_plain_fallback(
+    monkeypatch
+):
+    t = SSHPosixTransport(
+        device(
+            ram_gb=64,
+            memory_guard={
+                "schema": 2,
+                "command_limit_fraction": 0.25,
+                "host_reserve_fraction": 0.25,
+            },
+        )
+    )
+    t._address = "macbox"
+    remote_home = "/" + "Users/test"
+    t._remote_home = remote_home
+    reservation = MemoryReservation(
+        lease_id="a" * 32,
+        lease_token="b" * 32,
+        state_root=f"{remote_home}/.local/state/remrun",
+        allowance_bytes=8 * 1024**3,
+        control_overhead_bytes=256 * 1024**2,
+        capacity_bytes=8 * 1024**3 + 256 * 1024**2,
+        max_command_bytes=16 * 1024**3,
+        min_available_bytes=16 * 1024**3,
+        host_total_bytes=64 * 1024**3,
+        safe_concurrency=3,
+        expires_at=time.time() + 60,
+    )
+    monkeypatch.setattr(
+        t,
+        "push_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        t,
+        "release_memory_guard",
+        lambda *_args, **_kwargs: MemoryAdmissionResult.refused(
+            "release_deferred", "test"
+        ),
+    )
+    monkeypatch.setattr(
+        t,
+        "_remote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unguarded user command must not be attempted")
+        ),
+    )
+
+    result = t.exec(
+        ["python3", "-c", "print('unsafe')"],
+        cwd="/tmp",
+        telemetry=False,
+        memory_reservation=reservation,
+    )
+
+    assert result.exit_code == 125
+    assert result.memory_guard["status"] == "refused"
+    assert result.memory_guard["reason"] == "helper_unavailable"
+    assert result.memory_guard["command_started"] is False
+
+
+def _ssh_admitted_payload(request: dict[str, object]) -> dict[str, object]:
+    allowance = 2 * 1024**3
+    control = 256 * 1024**2
+    return {
+        "schema": 1,
+        "status": "admitted",
+        "reason": "reserved" if request["op"] == "reserve" else "renewed",
+        "detail": "test",
+        "active_leases": 1,
+        "stale_reaped": 0,
+        "lease": {
+            "lease_id": request["lease_id"],
+            "lease_token": request["lease_token"],
+            "state_root": request["state_root"],
+            "allowance_bytes": request.get("allowance_bytes", allowance),
+            "control_overhead_bytes": request.get("control_overhead_bytes", control),
+            "capacity_bytes": request.get("capacity_bytes", allowance + control),
+            "max_command_bytes": 16 * 1024**3,
+            "min_available_bytes": 16 * 1024**3,
+            "host_total_bytes": 64 * 1024**3,
+            "safe_concurrency": 3,
+            "expires_at": time.time() + 60,
+        },
+    }
+
+
+def test_ssh_posix_reserve_renew_and_guard_args_preserve_lease_capacity(
+    monkeypatch
+):
+    t = SSHPosixTransport(
+        device(
+            max_jobs=3,
+            memory_guard={
+                "schema": 2,
+                "command_limit_fraction": 0.25,
+                "host_reserve_fraction": 0.25,
+            },
+        )
+    )
+    t._remote_home = "/" + "Users/test"
+    requests: list[dict[str, object]] = []
+
+    def invoke(request):
+        requests.append(dict(request))
+        return _ssh_admitted_payload(request)
+
+    monkeypatch.setattr(t, "_invoke_memory_admission", invoke)
+    reserved = t.reserve_memory_guard(predicted_rss_mb=128)
+    assert reserved.admitted
+    reservation = reserved.reservation
+    assert reservation is not None
+    renewed = t.renew_memory_guard(reservation)
+    assert renewed.admitted
+    assert requests[0]["op"] == "reserve"
+    assert requests[0]["predicted_rss_bytes"] == 128 * 1024**2
+    assert requests[1]["op"] == "renew"
+    assert requests[1]["control_overhead_bytes"] == reservation.control_overhead_bytes
+    assert requests[1]["capacity_bytes"] == reservation.capacity_bytes
+
+    args = _guarded_helper_args(
+        "/state/helper.py", t.memory_guard, reservation, "c" * 32,
+        detailed=False, telemetry=False,
+    )
+    encoded = args[args.index("--guard-lease-b64") + 1]
+    import base64
+    decoded = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    assert decoded["lease_id"] == reservation.lease_id
+    assert decoded["allowance_bytes"] == reservation.allowance_bytes
+    assert decoded["control_overhead_bytes"] == reservation.control_overhead_bytes
+    assert decoded["capacity_bytes"] == reservation.capacity_bytes
+
+
+def test_ssh_posix_reservation_refusal_is_structured(monkeypatch):
+    t = SSHPosixTransport(
+        device(
+            memory_guard={
+                "schema": 2,
+                "command_limit_fraction": 0.25,
+                "host_reserve_fraction": 0.25,
+            },
+        )
+    )
+    t._remote_home = "/" + "Users/test"
+    monkeypatch.setattr(
+        t,
+        "_invoke_memory_admission",
+        lambda request: {
+            "schema": 1,
+            "status": "refused",
+            "reason": "insufficient_live_memory",
+            "detail": "test refusal",
+            "active_leases": 1,
+            "stale_reaped": 0,
+        },
+    )
+
+    result = t.reserve_memory_guard()
+
+    assert result.status == "refused"
+    assert result.reason == "insufficient_live_memory"
+    assert result.reservation is None

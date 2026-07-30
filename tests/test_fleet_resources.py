@@ -11,12 +11,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from remrun.fleet import resources
-from remrun.fleet.resources import ResourceView, _parse_posix, _parse_windows, probe_fleet
+from remrun.fleet import probes, resources
+from remrun.fleet.models import DeviceSnapshot
+from remrun.fleet.resources import (
+    PrimaryDiskView,
+    ResourceView,
+    _parse_posix,
+    _parse_windows,
+    probe_fleet,
+)
 from remrun.fleet.resources_render import render_table, to_dict
 from remrun.models import Device
+from remrun.resource_envelope import MIB, Metric
+from remrun.resource_probe import GPUResourceSnapshot, ResourceSnapshot
 
-# Captured verbatim from MACHUB (Mac Studio, M1 Ultra) on 2026-07-26.
+# Captured from MACHUB (Mac Studio, M1 Ultra). The CPUUSAGE line is the
+# normalized rendering of iostat's interval fields: `us sy id`.
 MACOS_RESOURCE_OUT = """HOST=MACHUB
 NCPU=20
 MEMTOTAL=68719476736
@@ -28,6 +38,7 @@ VMSTAT:Pages free:                               580325.
 VMSTAT:Pages active:                            1639430.
 VMSTAT:Pages inactive:                          1588829.
 AGX:"Device Utilization %"=37
+DISK_JSON={"mount":"/","total_bytes":"994662584320","available_bytes":"460475989216","semantics":"effective-used","source":"Foundation important-usage capacity"}
 """
 
 # Captured verbatim from WINBOX (Windows, RTX 5060 Ti) on 2026-07-26.
@@ -39,6 +50,7 @@ CPU_IDLE=84
 NCPU=20
 CHIP=Intel(R) Core(TM) Ultra 7 255HX
 NVIDIA:NVIDIA GeForce RTX 5060 Ti, 3, 14321, 16311
+DISK_JSON={"mount":"C:","total_bytes":"1000000000000","available_bytes":"400000000000","semantics":"allocated-used","source":"Win32_LogicalDisk"}
 """
 
 
@@ -51,18 +63,52 @@ def test_parse_posix_unified_memory_mac():
     assert view.ram_total_mb == pytest.approx(65536.0)
     # (580325 + 1588829) pages * 16384 B = ~33.9 GB available.
     assert view.ram_free_mb == pytest.approx(33908.7, rel=1e-3)
-    # REAL utilization from top (100 - 85.71 idle), NOT load/cores. Load average
-    # counts blocked threads, so it overstates busy-ness: measured on MACBOX, load
-    # 10.84/14 cores implied "77% busy" while top reported 66% idle.
+    # REAL interval utilization (100 - 85.71 idle), NOT load/cores. A one-minute
+    # demand average can remain high while current CPU utilization is low.
     assert view.cpu_busy_pct == pytest.approx(14.29, rel=1e-2)
-    # Load is kept separately as the queueing/oversubscription signal.
+    # Load is retained separately as the raw one-minute demand ratio.
     assert view.load1 == pytest.approx(4.35)
     assert view.load_per_core == pytest.approx(0.2175)
-    assert view.oversubscribed is False
     # Apple GPU: utilization is real, but VRAM is not a separate pool.
     assert view.gpu_unified is True
     assert view.gpu_util_pct == 37.0
     assert view.vram_total_mb is None
+    assert view.primary_disk.used_bytes == 534186595104
+    assert view.primary_disk.used_pct == pytest.approx(53.7043, rel=1e-4)
+    assert view.primary_disk.semantics == "effective-used"
+
+
+def test_macos_resource_script_avoids_process_walking_top():
+    """A reachable busy Mac must not be called offline because `top` is slow.
+
+    A live macOS runner's `top -l 2 -n 0` took 43.79 seconds after a reboot;
+    SSH setup pushed the combined probe past its 45-second timeout. The macOS
+    branch must use the bounded interval counters from built-in `iostat`.
+    """
+    script = resources._POSIX_SCRIPT
+    darwin_branch = script.split(
+        'if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then',
+        1,
+    )[1].split("else", 1)[0]
+    assert "iostat -c 2 -w 1" in darwin_branch
+    assert "top " not in darwin_branch
+
+
+def test_linux_resource_script_uses_interval_proc_stat_not_macos_top():
+    assert "/proc/stat" in resources._POSIX_SCRIPT
+    assert "sleep 0.5" in resources._POSIX_SCRIPT
+    view = ResourceView(name="L", reachable=True)
+    _parse_posix("CPUUSAGE:CPU usage: 25.00% busy, 75.00% idle\n", view)
+    assert view.cpu_busy_pct == pytest.approx(25.0)
+
+
+def test_disk_probe_reads_capacity_metadata_without_scanning_files():
+    assert "NSURLVolumeAvailableCapacityForImportantUsageKey" in resources._POSIX_SCRIPT
+    assert "df -B1 -P /" in resources._POSIX_SCRIPT
+    assert "Win32_LogicalDisk" in resources._WINDOWS_SCRIPT
+    for recursive_scan in ("du ", "find /", "Get-ChildItem", "os.walk"):
+        assert recursive_scan not in resources._POSIX_SCRIPT
+        assert recursive_scan not in resources._WINDOWS_SCRIPT
 
 
 def test_parse_windows_discrete_gpu():
@@ -78,6 +124,8 @@ def test_parse_windows_discrete_gpu():
     assert view.gpu_util_pct == 3.0
     assert view.vram_free_mb == 14321.0
     assert view.vram_total_mb == 16311.0
+    assert view.primary_disk.used_bytes == 600_000_000_000
+    assert view.primary_disk.used_pct == pytest.approx(60.0)
 
 
 def test_load_average_is_not_used_as_cpu_busy():
@@ -93,27 +141,22 @@ def test_load_average_is_not_used_as_cpu_busy():
     assert view.load_per_core == pytest.approx(0.774, rel=1e-2)
 
 
-def test_oversubscription_detected_independently_of_cpu_busy():
-    """A box can be oversubscribed while CPU looks modest — that is contention
-    (threads waiting on each other or on I/O), and it is exactly the state that
-    makes a device a bad place to send more work."""
+def test_high_load_ratio_is_not_rendered_as_cpu_oversubscription():
+    """One-minute demand may be high while interval CPU usage is low."""
     view = ResourceView(name="X", reachable=True)
     _parse_posix("NCPU=4\nLOADAVG= 9.60 9.0 8.5\n"
                  "CPUUSAGE:CPU usage: 20.0% user, 5.0% sys, 75.0% idle\n", view)
     assert view.cpu_busy_pct == pytest.approx(25.0)
-    assert view.oversubscribed is True
-    assert "OVERSUB" in view.load_label
-    # Unmeasured load is unknown, not "fine".
-    assert ResourceView(name="Y", reachable=True).oversubscribed is None
+    assert view.load_label == "2.4x"
+    assert "OVERSUB" not in view.load_label
+    assert "busy" not in view.load_label
 
 
-def test_loadavg_fallback_is_labelled_when_top_is_unavailable():
-    """Linux boxes without `top -l` still get a CPU figure, but the note says the
-    number came from load average so it is not mistaken for real utilization."""
+def test_load_average_never_becomes_plausible_cpu_utilization():
     view = ResourceView(name="L", reachable=True)
     _parse_posix("NCPU=8\nLOADAVG= 4.00 3.0 2.0\n", view)
-    assert view.cpu_busy_pct == pytest.approx(50.0)
-    assert any("loadavg" in n for n in view.notes)
+    assert view.cpu_busy_pct is None
+    assert view.load_per_core == pytest.approx(0.5)
 
 
 def test_timeout_is_retried_before_declaring_a_device_unreachable():
@@ -142,6 +185,51 @@ def test_timeout_is_retried_before_declaring_a_device_unreachable():
     assert calls["n"] == 2                       # retried once
     assert view.reachable is True
     assert any("retried" in n for n in view.notes)
+
+
+def test_guarded_device_uses_unguarded_fixed_resource_probe(monkeypatch):
+    """The fixed metadata script is not an unknown arbitrary-command workload."""
+    constructed = []
+
+    class FixedProbe:
+        def probe(self):
+            return SimpleNamespace(reachable=True, detail="ssh ok")
+
+        def exec(self, *a, **k):
+            return SimpleNamespace(
+                stdout="HOST=MACHUB\nNCPU=20\nMEMTOTAL=68719476736\n",
+                exit_code=0,
+            )
+
+    def fake_make_transport(candidate):
+        constructed.append(candidate)
+        return FixedProbe()
+
+    monkeypatch.setattr(resources, "make_transport", fake_make_transport)
+    device = Device.from_mapping(
+        "MACHUB",
+        {
+            "kind": "ssh-posix",
+            "os": "macos",
+            "address_candidates": ["machub"],
+            "project_root": "/tmp",
+            "state_root": "/tmp",
+            "cache_root": "/tmp",
+            "ram_gb": 64,
+            "max_jobs": 2,
+            "memory_guard": {
+                "schema": 2,
+                "command_limit_fraction": 0.3125,
+                "host_reserve_fraction": 0.25,
+            },
+        },
+    )
+
+    view = resources.probe_device(device)
+
+    assert view.reachable is True
+    assert len(constructed) == 1
+    assert constructed[0].memory_guard is None
 
 
 def test_diagnose_only_probes_the_devices_own_ip(monkeypatch):
@@ -266,19 +354,106 @@ def test_render_marks_local_and_reports_unreachable_reason():
     ]
     table = render_table(views)
     assert "WINTWO*" in table and "* this controller" in table
-    # The failure states the cause, so a broken key is diagnosable from the table.
-    assert "ssh key missing" in table
+    # The compact failure still states the actionable cause.
+    assert "key missing" in table
+    assert "id_ed25519_mesh" not in table
     # An unreachable device reports no invented metrics.
     unreachable_line = next(ln for ln in table.splitlines() if ln.startswith("MACBOX"))
     assert "%" not in unreachable_line
 
 
-def test_unified_gpu_never_reports_a_vram_figure():
+def test_render_shortens_common_status_messages():
+    views = [
+        ResourceView(name="SLOW", reachable=False, detail="timeout (offline/busy)"),
+        ResourceView(name="AUTH", reachable=False, detail="ssh auth refused"),
+        ResourceView(name="SSHD", reachable=False,
+                     detail="connection refused (sshd not running / not enabled)"),
+    ]
+    table = render_table(views)
+    assert "timeout (offline/busy)" not in table
+    assert "ssh auth refused" not in table
+    assert "sshd not running" not in table
+    assert "timeout" in table
+    assert "auth refused" in table
+    assert "sshd off" in table
+
+
+def test_render_uses_compact_load_footnote():
+    table = render_table([
+        ResourceView(name="X", reachable=True, cpu_count=4, load1=2.0, load_per_core=0.5),
+    ])
+    assert "LOAD = 1-min demand/core; not CPU%" in table
+
+
+def test_unified_gpu_never_reports_a_vram_figure_or_long_label():
     """Apple silicon shares system RAM; a VRAM number there would be fiction."""
     view = ResourceView(name="MACHUB", reachable=True, gpu_unified=True, gpu_util_pct=37.0)
-    cell = render_table([view])
-    assert "unified" in cell
-    assert "GB" not in cell.split("unified")[0].split("MACHUB")[-1]
+    table = render_table([view])
+    row = next(line for line in table.splitlines() if line.startswith("MACHUB"))
+    assert "unified" not in row
+    assert "37%" in row
+
+
+def test_percent_display_is_compact_default_and_amounts_are_configurable():
+    view = ResourceView(
+        name="WINBOX",
+        reachable=True,
+        ram_free_mb=8 * 1024,
+        ram_total_mb=32 * 1024,
+        gpu_util_pct=3.0,
+        vram_free_mb=12 * 1024,
+        vram_total_mb=16 * 1024,
+        primary_disk=PrimaryDiskView(
+            mount="C:",
+            total_bytes=1_000_000_000_000,
+            available_bytes=400_000_000_000,
+            status="ok",
+        ),
+    )
+    compact = render_table([view])
+    row = next(line for line in compact.splitlines() if line.startswith("WINBOX"))
+    assert "75%" in row
+    assert "25%" in row
+    assert "60%" in row
+    assert "GB" not in row
+
+    amounts = render_table([view], usage_display="amounts")
+    row = next(line for line in amounts.splitlines() if line.startswith("WINBOX"))
+    assert "24/32 GB" in row
+    assert "4/16 GB" in row
+    assert "600/1000 GB" in row
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        (None, "unavailable"),
+        ('{"total_bytes":"100","available_bytes":"0"}', "ok"),
+        ('{"total_bytes":"100","available_bytes":"101"}', "invalid"),
+        ('{"total_bytes":"bad","available_bytes":"20"}', "invalid"),
+        ('{"total_bytes":true,"available_bytes":"20"}', "invalid"),
+        ("not-json", "invalid"),
+    ],
+)
+def test_disk_parser_rejects_missing_or_malformed_capacity(payload, status):
+    view = ResourceView(name="X", reachable=True)
+    out = "" if payload is None else f"DISK_JSON={payload}\n"
+    _parse_posix(out, view)
+    assert view.primary_disk.status == status
+    if status != "ok":
+        assert view.primary_disk.used_pct is None
+
+
+def test_disk_parser_preserves_integers_above_javascript_exact_range():
+    view = ResourceView(name="X", reachable=True)
+    _parse_posix(
+        'DISK_JSON={"total_bytes":"9007199254740993",'
+        '"available_bytes":"9007199254740000"}\n',
+        view,
+    )
+    assert view.primary_disk.total_bytes == 9_007_199_254_740_993
+    assert view.primary_disk.available_bytes == 9_007_199_254_740_000
+    assert view.primary_disk.used_bytes == 993
 
 
 def test_ram_used_pct_derived_from_free_and_total():
@@ -340,17 +515,177 @@ def test_probe_device_never_raises_on_transport_failure():
     assert "auth refused" in view.detail
 
 
+def _metric(value, *, status="measured", source="test") -> Metric:
+    return Metric(
+        value=value,
+        status=status,
+        source=source,
+        confidence="test",
+    )
+
+
+def _resource_snapshot(
+    *,
+    cpu=17.5,
+    ram_available=12_000 * MIB,
+    ram_total=32_000 * MIB,
+    gpus=(),
+    gpu_kind="none",
+) -> ResourceSnapshot:
+    return ResourceSnapshot(
+        status="ok",
+        platform="windows",
+        machine="amd64",
+        logical_cores=_metric(20),
+        effective_cores=_metric(20),
+        cpu_busy_pct=_metric(cpu),
+        cpu_sample_interval_ms=500,
+        ram_total_bytes=_metric(ram_total),
+        ram_available_bytes=_metric(ram_available),
+        gpu_kind=gpu_kind,
+        gpus=gpus,
+    )
+
+
+def test_placement_snapshot_consumes_normalized_resources_and_preserves_fleet_state(
+    monkeypatch,
+):
+    """One normalized probe replaces legacy CPU/RAM/VRAM probes without changing
+    the queue, pool, capability, or configured-capacity parts of DeviceSnapshot.
+    """
+    first = GPUResourceSnapshot(
+        id="0",
+        name="GPU 0",
+        util_pct=_metric(12),
+        vram_free_bytes=_metric(6_000 * MIB),
+        vram_total_bytes=_metric(16_000 * MIB),
+    )
+    second = GPUResourceSnapshot(
+        id="1",
+        name="GPU 1",
+        util_pct=_metric(4),
+        vram_free_bytes=_metric(20_000 * MIB),
+        vram_total_bytes=_metric(24_000 * MIB),
+    )
+    seen = {}
+
+    def normalized(transport, device, *, timeout_sec):
+        seen["args"] = (transport, device.name, timeout_sec)
+        return _resource_snapshot(gpus=(first, second), gpu_kind="discrete")
+
+    monkeypatch.setattr(probes, "probe_target_resources", normalized)
+    monkeypatch.setattr(
+        probes,
+        "_capability_engines",
+        lambda transport, device: frozenset({"ocr"}),
+    )
+
+    class Transport:
+        def probe(self):
+            return SimpleNamespace(reachable=True, detail="ssh ok")
+
+        def sample_load(self):
+            raise AssertionError("legacy CPU probe must not run")
+
+        def exec(self, *args, **kwargs):
+            raise AssertionError("legacy RAM/VRAM probes must not run")
+
+    transport = Transport()
+    device = Device.from_mapping(
+        "WINBOX",
+        {
+            "kind": "ssh-powershell",
+            "os": "windows",
+            "address_candidates": ["winbox"],
+            "project_root": "C:\\",
+            "state_root": "C:\\",
+            "cache_root": "C:\\",
+            "max_jobs": 3,
+            "ram_gb": 64,
+            "vram_gb": 16,
+        },
+    )
+    snapshot = probes.build_snapshot(
+        device,
+        transport,
+        {"pools": {"gpu": 2, "cpu": 4}},
+        active_jobs=2,
+        pool_used={"gpu": 1, "cpu": 3},
+    )
+
+    assert isinstance(snapshot, DeviceSnapshot)
+    assert seen["args"] == (transport, "WINBOX", 20.0)
+    assert snapshot.cpu_busy_pct == 17.5
+    assert snapshot.ram_free_mb == 12_000
+    # Preserve the established configured RAM capacity and measured-first VRAM
+    # capacity. The legacy single-GPU view continues to select device 0.
+    assert snapshot.ram_total_mb == 64 * 1024
+    assert snapshot.vram_free_mb == 6_000
+    assert snapshot.vram_total_mb == 16_000
+    assert snapshot.active_jobs == 2
+    assert snapshot.max_jobs == 3
+    assert snapshot.pool_free == {"gpu": 1, "cpu": 1}
+    assert snapshot.engines_available == frozenset({"ocr"})
+    assert snapshot.detail == "ssh ok"
+
+
+def test_placement_snapshot_uses_measured_ram_total_without_config(monkeypatch):
+    monkeypatch.setattr(
+        probes,
+        "probe_target_resources",
+        lambda *args, **kwargs: _resource_snapshot(ram_total=48_000 * MIB),
+    )
+
+    class Transport:
+        def probe(self):
+            return SimpleNamespace(reachable=True, detail="")
+
+    snapshot = probes.build_snapshot(
+        _device("LINUX"),
+        Transport(),
+        {"pools": {}},
+        probe_capability=False,
+    )
+    assert snapshot.ram_total_mb == 48_000
+
+
+def test_placement_snapshot_stays_no_throw_when_normalized_probe_raises(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected parser failure")
+
+    monkeypatch.setattr(probes, "probe_target_resources", boom)
+
+    class Transport:
+        def probe(self):
+            return SimpleNamespace(reachable=True, detail="ssh ok")
+
+    snapshot = probes.build_snapshot(
+        _device("X"),
+        Transport(),
+        {"pools": {"cpu": 2}},
+        active_jobs=1,
+        pool_used={"cpu": 1},
+        probe_capability=False,
+    )
+    assert snapshot.reachable is True
+    assert snapshot.cpu_busy_pct is None
+    assert snapshot.ram_free_mb is None
+    assert snapshot.vram_free_mb is None
+    assert snapshot.active_jobs == 1
+    assert snapshot.pool_free == {"cpu": 1}
+
+
 def test_friendly_errors_name_the_actual_fix():
     from remrun.fleet.resources import _friendly_error
-    assert "auth refused" in _friendly_error("user@host: Permission denied (publickey,password)")
+    assert _friendly_error("user@host: Permission denied (publickey,password)") == "ssh auth refused"
     assert "key missing" in _friendly_error(
-        "Warning: Identity file /c/Users/x/.ssh/id_ed25519_mesh not accessible: No such file")
+        "Warning: Identity file /c/"
+        "Users/x/.ssh/id_ed25519_mesh not accessible: No such file")
     assert "host key not trusted" in _friendly_error("Host key verification failed.")
     assert "sshd not running" in _friendly_error("ssh: connect to host x port 22: Connection refused")
     # A timeout must NOT assert "offline": a healthy but loaded box times out too.
     timed_out = _friendly_error("ssh timed out after 8s")
-    assert "no answer within timeout" in timed_out
-    assert "too loaded" in timed_out
+    assert timed_out == "timeout (offline/busy)"
 
 
 def test_auth_failure_is_not_masked_by_a_later_dns_failure():
@@ -362,7 +697,7 @@ def test_auth_failure_is_not_masked_by_a_later_dns_failure():
     from remrun.fleet.resources import _friendly_error
     combined = ("user@192.0.2.11: Permission denied (publickey,password).\n"
                 "ssh: Could not resolve hostname macbox.example-net.ts.net: Name or service not known")
-    assert _friendly_error(combined) == "ssh auth refused (no authorized key for this controller)"
+    assert _friendly_error(combined) == "ssh auth refused"
 
 
 def test_pure_dns_failure_still_reports_dns():
@@ -375,12 +710,18 @@ def test_pure_dns_failure_still_reports_dns():
 def test_json_payload_is_complete_and_serializable():
     view = ResourceView(name="WINBOX", reachable=True, cpu_busy_pct=12.0, ram_free_mb=14608.0,
                         ram_total_mb=32229.0, gpu_util_pct=3.0, vram_free_mb=14321.0,
-                        vram_total_mb=16311.0, gpu_name="RTX 5060 Ti")
+                        vram_total_mb=16311.0, gpu_name="RTX 5060 Ti",
+                        primary_disk=PrimaryDiskView(
+                            mount="C:", total_bytes=1_000_000_000_000,
+                            available_bytes=400_000_000_000, status="ok"))
     payload = to_dict(view)
     json.dumps(payload)                     # must not raise
     assert payload["gpu_util_pct"] == 3.0
     assert payload["vram_free_mb"] == 14321.0
     assert payload["ram_used_pct"] == pytest.approx(54.68, rel=1e-3)
+    assert payload["vram_used_pct"] == pytest.approx(12.2, rel=1e-2)
+    assert payload["disk"]["used_bytes"] == 600_000_000_000
+    assert payload["disk"]["used_pct"] == pytest.approx(60.0)
 
 
 def test_resources_command_shows_disabled_devices_by_default(monkeypatch, capsys):

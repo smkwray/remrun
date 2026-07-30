@@ -37,7 +37,8 @@ With `--json`, emit newline-delimited JSON events to stderr:
 {"event":"target_selected","device":"macbox","reason":"explicit"}
 {"event":"preflight_summary","pulled":2,"pushed":1,"conflicts":0}
 {"event":"command_started","run_id":"..."}
-{"event":"command_finished","exit_code":0,"duration_sec":123.4}
+{"event":"memory_guard","status":"ok","command_started":true}
+{"event":"command_finished","exit_code":0,"command_exit_code":0,"duration_sec":123.4}
 {"event":"summary","run_id":"...","exit_code":0,"files_pushed":1,"files_pulled_post":7}
 ```
 
@@ -60,10 +61,24 @@ The process exit code should be:
       own code is preserved as command_exit_code in the run summary.
 3     transfer failure
 4     remote execution infrastructure failure
+5     configured memory policy refused, terminated, or failed safe. A
+      pre-mutation capacity refusal has phase="memory_admission" and a
+      structured memory_admission record. Runtime enforcement has a structured
+      memory_guard record with whether user code started, the command exit (if
+      any), observed thresholds, and cleanup status
 N     remote command's exit code, when command ran and remrun could collect status
 ```
 
 If the remote command exits nonzero, `remrun` should still try to pull logs and changed files unless configured not to.
+
+For a guarded device, remrun emits `command_dispatch` before the protected helper
+is contacted and emits `command_started` only when the helper confirms that all
+required enforcement was initialized and user code was launched. `--no-telemetry`
+suppresses optional telemetry only; it never suppresses the memory guard. Exit 5
+can collide numerically with a command that itself exits 5. Automation must use
+`phase = "memory_admission"` plus `memory_admission` for a pre-mutation refusal,
+or `memory_guard` plus `command_exit_code` for runtime enforcement, to
+distinguish those cases.
 
 ## Avoiding agent confusion
 

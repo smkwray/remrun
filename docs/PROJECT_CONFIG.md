@@ -36,19 +36,41 @@ prefer = "macbox"
 min_memory_gb = 64
 ```
 
-## Resource hints
+## Opt-in resource workloads
 
 ```toml
-[resources.default]
-cores = 4
-memory_gb = 16
-expected_duration = "30m"
+[resources]
+schema = 1
+# default_workload = "example.analysis"  # optional explicit project-wide opt-in
 
-[resources.heavy]
-match_command = "bootstrap|simulate"
-cores = 12
-memory_gb = 64
+[resources.workloads."example.analysis"]
+protocol = 1
+adapter_id = "example.resource-policy"
+adapter_version = 1
+work_unit = "case"
+require_envelope = false
+require_receipt = true
 ```
+
+Select the declaration explicitly with:
+
+```bash
+remrun run --workload example.analysis --auto -- python analysis.py
+```
+
+With neither `--workload` nor `default_workload`, resource adaptation is inert:
+there is no extra probe, environment variable, context file, or receipt. When a
+workload is selected, remrun probes only the chosen target, writes
+`run-context.v1.json` beneath that target's configured
+`<state_root>/runs/<run_id>/`, and exports one variable,
+`REMRUN_RUN_CONTEXT`, containing its target-native path. Remrun never rewrites
+the command or its worker flags. The project reads the context, chooses its own
+settings, and atomically writes the requested receipt beside the context. Both
+versioned JSON documents are limited to 64 KiB.
+
+The context reports unavailable measurements as `null`, not zero. Unified-memory
+GPUs never receive fabricated VRAM totals, free-memory figures, or VRAM budgets;
+system available RAM remains the shared memory constraint.
 
 ## Transfer/data policies
 

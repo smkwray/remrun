@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import codecs
 import io
 import json
+import math
 import os
 import posixpath
 import shlex
@@ -17,11 +19,18 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable
 
 from .frame import decode_file_frame, encode_file_frame
 from .manifest import Manifest, build_manifest, sha256_file
+from .memory_guard import (
+    RESERVATION_TTL_SECONDS,
+    MemoryAdmissionResult,
+    MemoryGuard,
+    MemoryReservation,
+    parse_memory_guard,
+)
 from .models import Device, ProjectContext
 from .state import manifest_from_json
 
@@ -47,12 +56,56 @@ class ExecResult:
     stdout: str
     stderr: str
     telemetry: dict | None = None
+    memory_guard: dict | None = None
+
+
+@dataclass(frozen=True)
+class TelemetryRequest:
+    """Opt-in normalized telemetry request for a workload-aware run.
+
+    The existing ``telemetry: bool`` parameter remains the legacy profile
+    sampler.  This orthogonal marker selects version-1 detailed telemetry
+    without making the fixed 200 ms sampling interval a public tuning knob.
+    """
+
+    schema: int = 1
+
+    def __post_init__(self) -> None:
+        if isinstance(self.schema, bool) or self.schema != 1:
+            raise ValueError("telemetry request schema must be 1")
 
 
 # Sink for live remote output. `exec(on_stdout=...)` calls it with each decoded chunk
 # as it arrives so the caller can tee to a log; the full text is still returned in
 # ExecResult, so nothing downstream has to change.
 StreamSink = Callable[[str], None]
+
+_SMALL_FILE_MISSING = "__REMRUN_SMALL_FILE_MISSING__"
+_SMALL_FILE_OVERSIZE = "__REMRUN_SMALL_FILE_OVERSIZE__"
+
+
+def _validate_small_file_limit(max_bytes: int) -> int:
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise ValueError("max_bytes must be a non-negative integer")
+    return max_bytes
+
+
+def _small_file_remote_error(
+    remote_path: str,
+    max_bytes: int,
+    returncode: int,
+    stderr: bytes,
+) -> TransportError:
+    detail = stderr.decode("utf-8", "replace").strip()
+    if returncode == 44 or _SMALL_FILE_MISSING in detail:
+        return TransportError(f"small file missing: {remote_path}")
+    if returncode == 45 or _SMALL_FILE_OVERSIZE in detail:
+        return TransportError(
+            f"small file exceeds {max_bytes} byte limit: {remote_path}"
+        )
+    return TransportError(
+        f"read small file {remote_path} failed: {detail or f'exit {returncode}'}"
+    )
 
 
 def _stream_spawn_kwargs() -> dict[str, object]:
@@ -262,7 +315,68 @@ _POSIX_TELEMETRY_SAMPLER = (
     "sys.exit(rc)\n"
 )
 
+# One typed utilization sample for ordinary ``--auto``. Load average is
+# intentionally absent: scheduler demand is not current CPU busy percentage.
+_POSIX_CPU_BUSY_PROBE = r"""
+import platform
+import subprocess
+import time
+
+def darwin():
+    result = subprocess.run(
+        ["iostat", "-c", "2", "-w", "1"],
+        text=True,
+        capture_output=True,
+        timeout=3,
+        check=False,
+    )
+    lines = result.stdout.splitlines()
+    for index, line in enumerate(lines):
+        header = line.lower().split()
+        if not {"us", "sy", "id"}.issubset(header):
+            continue
+        idle_index = header.index("id")
+        for data in reversed(lines[index + 1:]):
+            values = data.split()
+            if len(values) <= idle_index:
+                continue
+            try:
+                return 100.0 - float(values[idle_index])
+            except ValueError:
+                continue
+    return None
+
+def linux():
+    def read():
+        fields = open("/proc/stat", encoding="ascii").readline().split()[1:]
+        values = [int(value) for value in fields]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return sum(values), idle
+    first_total, first_idle = read()
+    time.sleep(0.5)
+    second_total, second_idle = read()
+    delta = second_total - first_total
+    return None if delta <= 0 else 100.0 * (
+        1.0 - (second_idle - first_idle) / delta
+    )
+
+try:
+    system = platform.system().lower()
+    busy = darwin() if system == "darwin" else linux() if system == "linux" else None
+except Exception:
+    busy = None
+if busy is not None and 0.0 <= busy <= 100.0:
+    print(round(busy, 1))
+""".strip()
+
 _TELEMETRY_MARKER = "\n__REMRUN_TELEMETRY__ "
+_MEMORY_ADMISSION_MARKER = "__REMRUN_MEMORY_ADMISSION__ "
+_GUARD_HELPER_EXIT = 125
+_GUARD_STATUSES = frozenset({"ok", "refused", "terminated", "failed_safe"})
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def _extract_telemetry(stderr: str) -> tuple[str, dict | None]:
@@ -270,12 +384,279 @@ def _extract_telemetry(stderr: str) -> tuple[str, dict | None]:
     idx = stderr.rfind(_TELEMETRY_MARKER)
     if idx == -1:
         return stderr, None
-    payload = stderr[idx + len(_TELEMETRY_MARKER):].split("\n", 1)[0].strip()
+    start = idx + len(_TELEMETRY_MARKER)
+    end = stderr.find("\n", start)
+    if end == -1:
+        end = len(stderr)
+    payload = stderr[start:end].strip()
     try:
-        data = json.loads(payload)
+        data = json.loads(payload, parse_constant=_reject_nonstandard_json_constant)
     except (json.JSONDecodeError, ValueError):
         return stderr, None
-    return stderr[:idx], data
+    if not isinstance(data, dict):
+        return stderr, None
+    suffix = stderr[end + 1:] if end < len(stderr) else ""
+    return stderr[:idx] + suffix, data
+
+
+def _guard_markers(token: str) -> tuple[str, str]:
+    return (
+        f"\n__REMRUN_GUARD_READY_{token}__\n",
+        f"\n__REMRUN_GUARD_RESULT_{token}__ ",
+    )
+
+
+def _extract_memory_guard(
+    stderr: str, token: str
+) -> tuple[str, dict | None, bool]:
+    """Remove one private ready/result record and validate its minimum schema."""
+    ready_marker, result_marker = _guard_markers(token)
+    ready = ready_marker in stderr
+    cleaned = stderr.replace(ready_marker, "")
+    idx = cleaned.rfind(result_marker)
+    if idx == -1:
+        return cleaned, None, ready
+    payload = cleaned[idx + len(result_marker):].split("\n", 1)[0].strip()
+    try:
+        data = json.loads(payload, parse_constant=_reject_nonstandard_json_constant)
+    except (json.JSONDecodeError, ValueError):
+        return cleaned, None, ready
+    if (
+        not isinstance(data, dict)
+        or data.get("schema") != 1
+        or data.get("status") not in _GUARD_STATUSES
+        or not isinstance(data.get("command_started"), bool)
+    ):
+        return cleaned, None, ready
+    return cleaned[:idx] + cleaned[idx + len(result_marker) + len(payload):], data, ready
+
+
+def _encode_memory_admission_request(payload: dict[str, object]) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _extract_memory_admission(stdout: str) -> dict[str, object] | None:
+    idx = stdout.rfind(_MEMORY_ADMISSION_MARKER)
+    if idx == -1:
+        return None
+    payload = stdout[idx + len(_MEMORY_ADMISSION_MARKER):].split("\n", 1)[0].strip()
+    try:
+        data = json.loads(payload, parse_constant=_reject_nonstandard_json_constant)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _lease_request(guard: MemoryGuard, reservation: MemoryReservation) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "state_root": reservation.state_root,
+        "lease_id": reservation.lease_id,
+        "lease_token": reservation.lease_token,
+        "allowance_bytes": reservation.allowance_bytes,
+        "control_overhead_bytes": reservation.control_overhead_bytes,
+        "capacity_bytes": reservation.capacity_bytes,
+        "command_limit_fraction": guard.command_limit_fraction,
+        "host_reserve_fraction": guard.host_reserve_fraction,
+        "max_jobs": guard.max_jobs,
+        "reservation_ttl_seconds": RESERVATION_TTL_SECONDS,
+    }
+
+
+def _controller_guard_refusal(
+    guard: MemoryGuard,
+    reason: str,
+    detail: str,
+    reservation: MemoryReservation | None = None,
+) -> dict:
+    return {
+        "schema": 1,
+        "status": "refused",
+        "reason": reason,
+        "detail": detail,
+        "command_started": False,
+        "command_exit_code": None,
+        "helper_exit_code": _GUARD_HELPER_EXIT,
+        "max_command_bytes": reservation.allowance_bytes if reservation else None,
+        "min_available_bytes": reservation.min_available_bytes if reservation else None,
+        "command_limit_fraction": guard.command_limit_fraction,
+        "host_reserve_fraction": guard.host_reserve_fraction,
+        "peak_command_bytes": None,
+        "min_host_available_bytes": None,
+        "sample_count": 0,
+        "platform": "controller",
+    }
+
+
+def _admission_exec_refusal(
+    guard: MemoryGuard,
+    result: MemoryAdmissionResult,
+    reservation: MemoryReservation | None = None,
+) -> ExecResult:
+    payload = _controller_guard_refusal(
+        guard, result.reason, result.detail, reservation
+    )
+    payload["memory_admission"] = result.payload
+    return ExecResult(
+        _GUARD_HELPER_EXIT,
+        "",
+        f"memory admission refused: {result.reason}: {result.detail}\n",
+        None,
+        payload,
+    )
+
+
+def _guarded_helper_args(
+    helper: str,
+    guard: MemoryGuard,
+    reservation: MemoryReservation,
+    token: str,
+    *,
+    detailed: bool,
+    telemetry: bool,
+) -> list[str]:
+    args = [
+        helper,
+        "--guard-max-bytes",
+        str(reservation.allowance_bytes),
+        "--guard-min-available-bytes",
+        str(reservation.min_available_bytes),
+        "--guard-token",
+        token,
+        "--guard-lease-b64",
+        _encode_memory_admission_request(_lease_request(guard, reservation)),
+    ]
+    if detailed:
+        args.append("--detailed")
+    elif telemetry:
+        args.append("--telemetry")
+    args.append("--")
+    return args
+
+
+def _finalize_guarded_result(
+    *,
+    helper_exit_code: int,
+    stdout: str,
+    stderr: str,
+    token: str,
+    reservation: MemoryReservation,
+    telemetry: dict | None,
+    platform_name: str,
+) -> ExecResult:
+    stderr, guard_result, ready = _extract_memory_guard(stderr, token)
+    if guard_result is None:
+        if ready:
+            raise TransportError(
+                f"{platform_name} memory guard result missing after guard initialization; "
+                "command completion is unknown"
+            )
+        raise TransportError(
+            f"{platform_name} memory guard did not initialize; user command was not confirmed safe"
+        )
+    if (
+        guard_result.get("max_command_bytes") != reservation.allowance_bytes
+        or guard_result.get("min_available_bytes") != reservation.min_available_bytes
+    ):
+        raise TransportError(
+            f"{platform_name} memory guard result thresholds do not match the reservation"
+        )
+    status = guard_result["status"]
+    if status == "ok":
+        command_code = guard_result.get("command_exit_code")
+        if isinstance(command_code, bool) or not isinstance(command_code, int):
+            raise TransportError(f"{platform_name} memory guard omitted command exit code")
+        if helper_exit_code != command_code:
+            raise TransportError(
+                f"{platform_name} memory guard helper exit disagrees with command exit"
+            )
+        return ExecResult(command_code, stdout, stderr, telemetry, guard_result)
+    if helper_exit_code != _GUARD_HELPER_EXIT:
+        raise TransportError(
+            f"{platform_name} memory guard classified a safety stop but helper exited "
+            f"{helper_exit_code}"
+        )
+    # Refusal/termination/fail-safe are deliberate, classified outcomes. The
+    # CLI maps them to its distinct guard exit instead of exposing helper 125 as
+    # the user's command code.
+    return ExecResult(_GUARD_HELPER_EXIT, stdout, stderr, telemetry, guard_result)
+
+
+def _extract_windows_exit_marker(
+    stderr: str,
+    marker: str,
+) -> tuple[str, int | None]:
+    """Remove one private, terminated exit record without changing user stderr."""
+    idx = stderr.rfind(marker)
+    if idx == -1:
+        return stderr, None
+    start = idx + len(marker)
+    end = start
+    if end < len(stderr) and stderr[end] == "-":
+        end += 1
+    digit_start = end
+    while end < len(stderr) and stderr[end].isdigit():
+        end += 1
+    # The terminator prevents later user stderr beginning with digits from being
+    # consumed as part of the private exit status.
+    if end == digit_start or end >= len(stderr) or stderr[end] != ";":
+        return stderr, None
+    try:
+        exit_code = int(stderr[start:end])
+    except ValueError:
+        return stderr, None
+    return stderr[:idx] + stderr[end + 1 :], exit_code
+
+
+def _unavailable_detailed_telemetry(platform_name: str, detail: str) -> dict:
+    """Explicit unknown result when optional detailed sampling could not run."""
+    memory_metric = "job_memory_peak" if platform_name == "windows" else "rss_sum_sampled"
+    shared_pages = "not_applicable" if platform_name == "windows" else "may_double_count"
+    return {
+        "schema": 1,
+        "status": "unavailable",
+        "cpu": {
+            "cpu_sec": None,
+            "avg_cpu_pct": None,
+            "coverage": "sampler_failed",
+            "whole_device": {
+                "scope": "whole_device",
+                "avg_busy_pct": None,
+                "max_busy_pct": None,
+                "status": "unavailable",
+            },
+        },
+        "memory": {
+            "peak_bytes": None,
+            "metric": memory_metric,
+            "sample_interval_ms": 200,
+            "sample_count": 0,
+            "coverage": "sampler_failed",
+            "shared_page_semantics": shared_pages,
+            "whole_device": {
+                "scope": "whole_device",
+                "total_bytes": None,
+                "min_available_bytes": None,
+                "max_used_pct": None,
+                "status": "unavailable",
+            },
+        },
+        "gpu": {
+            "scope": "whole_device",
+            "kind": "unknown",
+            "max_util_pct": None,
+            "min_vram_free_bytes": None,
+            "status": "unavailable",
+            "devices": [],
+        },
+        "peak_rss_mb": None,
+        "avg_cpu_pct": None,
+        "cpu_sec": None,
+        "wall_sec": None,
+        "process_tree_drained": None,
+        "detail": detail,
+    }
 
 
 @dataclass(frozen=True)
@@ -300,6 +681,125 @@ class BaseTransport:
 
     def __init__(self, device: Device) -> None:
         self.device = device
+        self.memory_guard = parse_memory_guard(
+            device.memory_guard,
+            ram_gb=device.ram_gb,
+            device_name=device.name,
+            max_jobs=device.max_jobs,
+            device_kind=device.kind,
+            device_os=device.os,
+        )
+
+    def _invoke_memory_admission(
+        self, request: dict[str, object]
+    ) -> dict[str, object]:
+        raise NotImplementedError
+
+    def reserve_memory_guard(
+        self, *, predicted_rss_mb: object = None
+    ) -> MemoryAdmissionResult:
+        if self.memory_guard is None:
+            return MemoryAdmissionResult.refused(
+                "guard_not_configured", "device has no memory guard"
+            )
+        predicted_bytes: int | None = None
+        if isinstance(predicted_rss_mb, (int, float)) and not isinstance(
+            predicted_rss_mb, bool
+        ):
+            value = float(predicted_rss_mb)
+            if value > 0:
+                predicted_bytes = int(math.ceil(value * 1024 * 1024))
+        try:
+            request: dict[str, object] = {
+                "schema": 1,
+                "op": "reserve",
+                "state_root": self._memory_guard_state_root(),
+                "lease_id": uuid.uuid4().hex,
+                "lease_token": uuid.uuid4().hex,
+                "predicted_rss_bytes": predicted_bytes,
+                "command_limit_fraction": self.memory_guard.command_limit_fraction,
+                "host_reserve_fraction": self.memory_guard.host_reserve_fraction,
+                "max_jobs": self.memory_guard.max_jobs,
+                "reservation_ttl_seconds": RESERVATION_TTL_SECONDS,
+            }
+            result = MemoryAdmissionResult.from_payload(
+                self._invoke_memory_admission(request)
+            )
+        except Exception as exc:
+            return MemoryAdmissionResult.refused(
+                "admission_unavailable", f"{type(exc).__name__}: {exc}"
+            )
+        if result.admitted:
+            reservation = result.reservation
+            assert reservation is not None
+            if (
+                reservation.lease_id != request["lease_id"]
+                or reservation.lease_token != request["lease_token"]
+                or reservation.state_root != request["state_root"]
+            ):
+                return MemoryAdmissionResult.refused(
+                    "admission_mismatch", "target returned a different reservation"
+                )
+        return result
+
+    def renew_memory_guard(
+        self, reservation: MemoryReservation
+    ) -> MemoryAdmissionResult:
+        if self.memory_guard is None:
+            return MemoryAdmissionResult.refused(
+                "guard_not_configured", "device has no memory guard"
+            )
+        request = {
+            **_lease_request(self.memory_guard, reservation),
+            "op": "renew",
+        }
+        try:
+            result = MemoryAdmissionResult.from_payload(
+                self._invoke_memory_admission(request)
+            )
+        except Exception as exc:
+            return MemoryAdmissionResult.refused(
+                "admission_unavailable", f"{type(exc).__name__}: {exc}"
+            )
+        if result.admitted:
+            renewed = result.reservation
+            assert renewed is not None
+            if (
+                renewed.lease_id != reservation.lease_id
+                or renewed.lease_token != reservation.lease_token
+                or renewed.allowance_bytes != reservation.allowance_bytes
+                or renewed.control_overhead_bytes
+                != reservation.control_overhead_bytes
+                or renewed.capacity_bytes != reservation.capacity_bytes
+            ):
+                return MemoryAdmissionResult.refused(
+                    "admission_mismatch", "target renewed a different reservation"
+                )
+        return result
+
+    def release_memory_guard(
+        self, reservation: MemoryReservation, *, reserved_only: bool = True
+    ) -> MemoryAdmissionResult:
+        if self.memory_guard is None:
+            return MemoryAdmissionResult.refused(
+                "guard_not_configured", "device has no memory guard"
+            )
+        request = {
+            **_lease_request(self.memory_guard, reservation),
+            "op": "release",
+            "reserved_only": reserved_only,
+        }
+        try:
+            return MemoryAdmissionResult.from_payload(
+                self._invoke_memory_admission(request)
+            )
+        except Exception as exc:
+            return MemoryAdmissionResult.refused(
+                "release_deferred", f"{type(exc).__name__}: {exc}"
+            )
+
+    def _memory_guard_state_root(self) -> str:
+        raise NotImplementedError
 
     def kill_workers(self) -> bool:
         """Stop configured in-flight workers for `fleet cancel`.
@@ -334,6 +834,8 @@ class BaseTransport:
         path_prepend: list[str] | None = None,
         telemetry: bool = False,
         on_stdout: StreamSink | None = None,
+        telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
     ) -> ExecResult:
         """Run ``command`` remotely and return its full output.
 
@@ -351,6 +853,15 @@ class BaseTransport:
         raise NotImplementedError
 
     def pull_file(self, remote_path: str, local_path: Path) -> None:
+        raise NotImplementedError
+
+    def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
+        """Read one bounded remote file without transferring an oversized payload.
+
+        Backends check the remote size before emitting bytes and also cap the read
+        itself so a file that grows after the metadata check cannot bypass the limit.
+        Missing and oversized files raise ``TransportError``.
+        """
         raise NotImplementedError
 
     def push_files(self, local_root: Path, remote_root: str, rel_paths: list[str]) -> None:
@@ -461,6 +972,43 @@ class LocalSimTransport(BaseTransport):
     reconciliation engine without SSH.
     """
 
+    def _memory_guard_state_root(self) -> str:
+        raw = str(self.device.state_root)
+        if not raw.strip():
+            raise TransportError("target state root is empty")
+        root = Path(raw).expanduser()
+        if not root.is_absolute():
+            raise TransportError("target state root must be an absolute path")
+        return str(root)
+
+    def _invoke_memory_admission(
+        self, request: dict[str, object]
+    ) -> dict[str, object]:
+        helper = Path(__file__).resolve().parent / "_posix_telemetry.py"
+        if os.name != "posix" or not helper.is_file():
+            raise TransportError("POSIX memory-admission helper is unavailable")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(helper),
+                "--memory-admission",
+                _encode_memory_admission_request(request),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            raise TransportError(
+                "local memory admission helper failed: "
+                + (proc.stderr.strip() or f"exit {proc.returncode}")
+            )
+        payload = _extract_memory_admission(proc.stdout)
+        if payload is None:
+            raise TransportError("local memory admission helper emitted no result")
+        return payload
+
     def remote_project_path(self, project: ProjectContext) -> str:
         root = Path(self.device.project_root).expanduser()
         return str(root / Path(project.project_id))
@@ -479,7 +1027,17 @@ class LocalSimTransport(BaseTransport):
         path_prepend: list[str] | None = None,
         telemetry: bool = False,
         on_stdout: StreamSink | None = None,
+        telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
     ) -> ExecResult:
+        reservation = memory_reservation
+        if self.memory_guard is not None and reservation is None:
+            admission = self.reserve_memory_guard()
+            if not admission.admitted:
+                return _admission_exec_refusal(self.memory_guard, admission)
+            reservation = admission.reservation
+        elif self.memory_guard is None and reservation is not None:
+            raise TransportError("memory reservation supplied for an unguarded target")
         merged_env = None
         if env or path_prepend:
             merged_env = {**os.environ, **(env or {})}
@@ -489,10 +1047,51 @@ class LocalSimTransport(BaseTransport):
                 merged_env["PATH"] = os.pathsep.join([*expanded, existing]) if existing \
                     else os.pathsep.join(expanded)
         Path(cwd).mkdir(parents=True, exist_ok=True)
+        detailed = telemetry_request is not None
+        detailed_error = ""
+        run_command = command
+        guard_token: str | None = None
+        if self.memory_guard is not None:
+            helper = Path(__file__).resolve().parent / "_posix_telemetry.py"
+            if not helper.is_file():
+                detail = f"required memory guard helper missing: {helper}"
+                guard = _controller_guard_refusal(
+                    self.memory_guard, "helper_unavailable", detail, reservation
+                )
+                if reservation is not None:
+                    self.release_memory_guard(reservation, reserved_only=True)
+                return ExecResult(_GUARD_HELPER_EXIT, "", detail + "\n", None, guard)
+            assert reservation is not None
+            renewal = self.renew_memory_guard(reservation)
+            if not renewal.admitted:
+                self.release_memory_guard(reservation, reserved_only=True)
+                return _admission_exec_refusal(self.memory_guard, renewal, reservation)
+            reservation = renewal.reservation
+            assert reservation is not None
+            guard_token = uuid.uuid4().hex
+            run_command = [
+                sys.executable,
+                *_guarded_helper_args(
+                    str(helper),
+                    self.memory_guard,
+                    reservation,
+                    guard_token,
+                    detailed=detailed,
+                    telemetry=telemetry,
+                ),
+                *command,
+            ]
+        elif detailed:
+            helper_name = "_win_telemetry.py" if os.name == "nt" else "_posix_telemetry.py"
+            helper = Path(__file__).resolve().parent / helper_name
+            if helper.is_file():
+                run_command = [sys.executable, str(helper), "--detailed", "--", *command]
+            else:
+                detailed_error = f"detailed telemetry helper missing: {helper}"
         try:
             if on_stdout is None:
                 proc = subprocess.run(
-                    command,
+                    run_command,
                     cwd=cwd,
                     text=True,
                     capture_output=True,
@@ -501,23 +1100,54 @@ class LocalSimTransport(BaseTransport):
                     timeout=timeout,
                     creationflags=_NO_WINDOW,
                 )
-                return ExecResult(proc.returncode, proc.stdout, proc.stderr)
-            # Binary pipes + the shared streamer, so the sim exercises the same
-            # incremental-output path the SSH backends take.
-            proc = subprocess.Popen(
-                command,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=merged_env,
-                **_stream_spawn_kwargs(),
-            )
-            code, out, err = _stream_process(
-                proc, on_stdout, timeout, process_group=True
-            )
-            return ExecResult(code, out, err)
+                code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+            else:
+                # Binary pipes + the shared streamer, so the sim exercises the same
+                # incremental-output path the SSH backends take.
+                proc = subprocess.Popen(
+                    run_command,
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=merged_env,
+                    **_stream_spawn_kwargs(),
+                )
+                code, stdout, stderr = _stream_process(
+                    proc, on_stdout, timeout, process_group=True
+                )
+
+            telem = None
+            if detailed:
+                if detailed_error:
+                    telem = _unavailable_detailed_telemetry(
+                        "windows" if os.name == "nt" else "posix", detailed_error
+                    )
+                else:
+                    stderr, telem = _extract_telemetry(stderr)
+                    if telem is None:
+                        telem = _unavailable_detailed_telemetry(
+                            "windows" if os.name == "nt" else "posix",
+                            "detailed telemetry helper emitted no result",
+                        )
+            elif telemetry and self.memory_guard is not None:
+                stderr, telem = _extract_telemetry(stderr)
+
+            if guard_token is not None:
+                return _finalize_guarded_result(
+                    helper_exit_code=code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    token=guard_token,
+                    reservation=reservation,
+                    telemetry=telem,
+                    platform_name="local",
+                )
+            return ExecResult(code, stdout, stderr, telem)
         except FileNotFoundError as exc:
             raise TransportError(f"command not found: {command[0]}: {exc}") from exc
+        finally:
+            if self.memory_guard is not None and reservation is not None:
+                self.release_memory_guard(reservation, reserved_only=True)
 
     def ensure_remote_dir(self, remote_path: str) -> None:
         Path(remote_path).mkdir(parents=True, exist_ok=True)
@@ -535,6 +1165,34 @@ class LocalSimTransport(BaseTransport):
             shutil.copyfile(src, tmp)
             shutil.copystat(src, tmp)
         _atomic_write_local(local_path, fill)
+
+    def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
+        limit = _validate_small_file_limit(max_bytes)
+        path = Path(remote_path)
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError as exc:
+            raise TransportError(f"small file missing: {remote_path}") from exc
+        except OSError as exc:
+            raise TransportError(f"cannot stat small file {remote_path}: {exc}") from exc
+        if not path.is_file():
+            raise TransportError(f"small file is not a regular file: {remote_path}")
+        if size > limit:
+            raise TransportError(
+                f"small file exceeds {limit} byte limit: {remote_path}"
+            )
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(limit + 1)
+        except FileNotFoundError as exc:
+            raise TransportError(f"small file missing: {remote_path}") from exc
+        except OSError as exc:
+            raise TransportError(f"cannot read small file {remote_path}: {exc}") from exc
+        if len(data) > limit:
+            raise TransportError(
+                f"small file exceeds {limit} byte limit: {remote_path}"
+            )
+        return data
 
     def push_files(self, local_root: Path, remote_root: str, rel_paths: list[str]) -> None:
         if len(rel_paths) < 2:
@@ -856,6 +1514,25 @@ class _SSHCommon(BaseTransport):
 
 _SET_MTIME_PROG = "import os,sys;t=float(sys.argv[2]);os.utime(sys.argv[1],(t,t))"
 _GET_MTIME_PROG = "import os,sys;print(os.stat(sys.argv[1]).st_mtime_ns)"
+_READ_SMALL_FILE_PROG = (
+    "import os,stat,sys\n"
+    "path,limit=sys.argv[1],int(sys.argv[2])\n"
+    "try:\n"
+    " info=os.stat(path)\n"
+    "except FileNotFoundError:\n"
+    f" sys.stderr.write('{_SMALL_FILE_MISSING}\\n');raise SystemExit(44)\n"
+    "if not stat.S_ISREG(info.st_mode):\n"
+    " sys.stderr.write('not a regular file\\n');raise SystemExit(46)\n"
+    "if info.st_size>limit:\n"
+    f" sys.stderr.write('{_SMALL_FILE_OVERSIZE}\\n');raise SystemExit(45)\n"
+    "try:\n"
+    " with open(path,'rb') as handle:data=handle.read(limit+1)\n"
+    "except FileNotFoundError:\n"
+    f" sys.stderr.write('{_SMALL_FILE_MISSING}\\n');raise SystemExit(44)\n"
+    "if len(data)>limit:\n"
+    f" sys.stderr.write('{_SMALL_FILE_OVERSIZE}\\n');raise SystemExit(45)\n"
+    "sys.stdout.buffer.write(data)\n"
+)
 
 # Remote-side atomic commit (POSIX): set mtime on the temp, fsync it, atomically replace
 # the destination, then best-effort fsync the parent dir. Run as `python -c PROG tmp dest ns`.
@@ -917,6 +1594,117 @@ def _ps_squote(value: str) -> str:
 def _ps_encode(script: str) -> str:
     """Encode a PowerShell script for `-EncodedCommand` (base64 UTF-16LE)."""
     return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
+_WINDOWS_REMOTE_COMMAND_LINE_LIMIT = 8_191
+_WINDOWS_BATCH_EXTENSIONS = frozenset({".bat", ".cmd"})
+_WINDOWS_BATCH_UNSUPPORTED = (
+    "unsupported ssh-powershell command: top-level .cmd/.bat files are "
+    "unsupported because the current PowerShell-to-cmd.exe seam does not "
+    "preserve remrun's exact argv contract; use a native "
+    "executable or .ps1 wrapper"
+)
+_WINDOWS_POWERSHELL_UNSUPPORTED = (
+    "unsupported ssh-powershell configuration: shell='powershell' uses the "
+    "Windows PowerShell 5.1 invocation seam, which cannot preserve arbitrary "
+    "native and batch argv; configure shell='pwsh' or disable this device"
+)
+
+
+def _windows_command_extension(command_name: str) -> str:
+    """Return the case-folded suffix using Windows path rules."""
+    return PureWindowsPath(command_name).suffix.lower()
+
+
+def _reject_explicit_windows_batch(command: list[str]) -> None:
+    """Reject an explicit batch target before address resolution or staging."""
+    if command and _windows_command_extension(command[0]) in _WINDOWS_BATCH_EXTENSIONS:
+        raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+
+
+def _ps_batch_resolution_guard(command_name: str, marker: str) -> list[str]:
+    """Reject a bare/aliased command that PowerShell resolves to batch.
+
+    The lookup uses PowerShell's own command-discovery API in the already-running
+    process, so it adds neither an SSH round trip nor a child process. Explicit
+    ``.cmd``/``.bat`` tokens are rejected locally before this guard is needed.
+    """
+    command = _ps_squote(command_name)
+    return [
+        (
+            "$remrunBatch = $ExecutionContext.InvokeCommand.GetCommand("
+            f"{command}, [System.Management.Automation.CommandTypes]::All)"
+        ),
+        (
+            "if ($remrunBatch.CommandType -eq 'Alias') { "
+            "$remrunBatch = $remrunBatch.ResolvedCommand }"
+        ),
+        (
+            "if ($remrunBatch.Path -match '\\.(cmd|bat)$') { "
+            f"[Console]::Error.Write({_ps_squote(marker)}); exit 126 }}"
+        ),
+        "Remove-Variable -Name remrunBatch",
+    ]
+
+
+def _ps_remote_command(shell: str, script: str) -> str:
+    return f"{shell} -NoProfile -NonInteractive -EncodedCommand {_ps_encode(script)}"
+
+
+def _ps_remote_command_fits(shell: str, script: str) -> bool:
+    # Windows OpenSSH can execute the remote string through cmd.exe, whose
+    # documented command-line limit is lower than CreateProcessW's limit.
+    return len(_ps_remote_command(shell, script)) <= _WINDOWS_REMOTE_COMMAND_LINE_LIMIT
+
+
+def _ps_command_argv(
+    shell: str,
+    command: list[str],
+    *,
+    inherited_path_var: str | None = None,
+) -> list[str]:
+    """Run ``command`` through the same PowerShell ``&`` seam as the transport.
+
+    The Windows Job Object helper can launch only native application images.
+    Passing the user's tokens to it directly therefore breaks cmdlets, aliases,
+    and ``.ps1`` files. A nested encoded PowerShell process is a native image the
+    Job Object can track while PowerShell remains the sole interpreter of the
+    original token list. Top-level batch files are rejected before this seam.
+    """
+    if not command:
+        raise ValueError("PowerShell command must not be empty")
+    invocation = "& " + " ".join(_ps_squote(token) for token in command)
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        "$PSNativeCommandUseErrorActionPreference = $false",
+    ]
+    if inherited_path_var is not None:
+        if not inherited_path_var.isidentifier():
+            raise ValueError("inherited PATH variable must be an identifier")
+        lines.extend(
+            [
+                f"$env:PATH = $env:{inherited_path_var}",
+                f"$env:{inherited_path_var} = $null",
+            ]
+        )
+    lines.extend(
+        [
+            invocation,
+            "$remrunCommandSucceeded = $?",
+            "$remrunCommandExitCode = $LASTEXITCODE",
+            "if ($null -ne $remrunCommandExitCode) { exit $remrunCommandExitCode }",
+            "if ($remrunCommandSucceeded) { exit 0 }",
+            "exit 1",
+        ]
+    )
+    script = "\n".join(lines)
+    return [
+        shell,
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        _ps_encode(script),
+    ]
 
 
 def _safe_rel(rel: str) -> str:
@@ -1109,6 +1897,51 @@ class SSHPosixTransport(_SSHCommon):
             return self._remote_home.rstrip("/") + path[1:]
         return path
 
+    def _memory_guard_state_root(self) -> str:
+        root = self._expand_remote(self.device.state_root).rstrip("/")
+        if not root:
+            raise TransportError("target state root is empty")
+        if root == "~" or root.startswith("~/"):
+            raise TransportError("remote home unknown")
+        return root
+
+    def _memory_guard_helper_path(self) -> str:
+        return posixpath.join(
+            self._memory_guard_state_root(),
+            "helpers",
+            "remrun_posix_memory_guard_v2.py",
+        )
+
+    def _ensure_memory_guard_helper(self) -> str:
+        helper = self._memory_guard_helper_path()
+        self.push_file(Path(__file__).parent / "_posix_telemetry.py", helper)
+        return helper
+
+    def _invoke_memory_admission(
+        self, request: dict[str, object]
+    ) -> dict[str, object]:
+        address = self._address_or_resolve()
+        helper = self._ensure_memory_guard_helper()
+        script = shlex.join(
+            [
+                self.device.remote_python or "python3",
+                helper,
+                "--memory-admission",
+                _encode_memory_admission_request(request),
+            ]
+        )
+        proc = self._remote(address, script, timeout=60)
+        if proc.returncode != 0:
+            raise TransportError(
+                "POSIX memory admission helper failed: "
+                + (proc.stderr.decode("utf-8", "replace").strip()
+                   or f"exit {proc.returncode}")
+            )
+        payload = _extract_memory_admission(proc.stdout.decode("utf-8", "replace"))
+        if payload is None:
+            raise TransportError("POSIX memory admission helper emitted no result")
+        return payload
+
     def remote_project_path(self, project: ProjectContext) -> str:
         root = self._expand_remote(self.device.project_root).rstrip("/")
         return f"{root}/{project.project_id}"
@@ -1143,41 +1976,33 @@ class SSHPosixTransport(_SSHCommon):
         return ProbeResult(reachable=False, address=None, detail=last_detail)
 
     def sample_load(self) -> float | None:
-        """Current CPU utilization % (busy = 100 - idle).
+        """Current interval CPU utilization %, or unknown.
 
-        macOS: `top -l 2 -n 0` (the 2nd sample is an accurate interval reading).
-        Falls back to 1-min load-average-per-core on systems without that `top`
-        (e.g. Linux) — coarser, since load average is demand, not utilization.
+        Never substitute load-average/core: that is scheduler demand, not a
+        utilization percentage suitable for ``--auto`` ranking.
         """
         try:
             address = self._address_or_resolve()
         except TransportError:
             return None
-        try:
-            proc = self._run([*self._ssh_base(address, connect_timeout=8),
-                              "top -l 2 -n 0 | grep -i 'CPU usage' | tail -1"], timeout=20)
-        except TransportError:
-            return None
-        if proc.returncode == 0:
-            parts = proc.stdout.decode("utf-8", "replace").replace("%", "").split()
-            if "idle" in parts:
-                try:
-                    return round(100.0 - float(parts[parts.index("idle") - 1]), 1)
-                except (ValueError, IndexError):
-                    pass
         py = self.device.remote_python or "python3"
-        prog = "import os;print(round(os.getloadavg()[0]/(os.cpu_count() or 1)*100,1))"
         try:
-            proc = self._run([*self._ssh_base(address, connect_timeout=6),
-                              f"{shlex.quote(py)} -c {shlex.quote(prog)}"], timeout=15)
+            proc = self._run(
+                [
+                    *self._ssh_base(address, connect_timeout=8),
+                    f"{shlex.quote(py)} -c {shlex.quote(_POSIX_CPU_BUSY_PROBE)}",
+                ],
+                timeout=8,
+            )
         except TransportError:
             return None
         if proc.returncode != 0:
             return None
         try:
-            return float(proc.stdout.decode("utf-8", "replace").strip().split()[-1])
+            value = float(proc.stdout.decode("utf-8", "replace").strip())
         except (ValueError, IndexError):
             return None
+        return value if 0.0 <= value <= 100.0 else None
 
     def install_versioned_runner(
         self, source: bytes, remote_path: str, expected_sha256: str
@@ -1225,8 +2050,28 @@ class SSHPosixTransport(_SSHCommon):
 
     # --- execution --------------------------------------------------------
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
-             telemetry=False, on_stdout=None) -> ExecResult:
-        address = self._address_or_resolve()
+             telemetry=False, on_stdout=None,
+             telemetry_request: TelemetryRequest | None = None,
+             memory_reservation: MemoryReservation | None = None) -> ExecResult:
+        try:
+            address = self._address_or_resolve()
+        except TransportError as exc:
+            if self.memory_guard is None:
+                raise
+            guard = _controller_guard_refusal(
+                self.memory_guard, "transport_unavailable", str(exc), memory_reservation
+            )
+            return ExecResult(_GUARD_HELPER_EXIT, "", str(exc) + "\n", None, guard)
+
+        reservation = memory_reservation
+        if self.memory_guard is not None and reservation is None:
+            admission = self.reserve_memory_guard()
+            if not admission.admitted:
+                return _admission_exec_refusal(self.memory_guard, admission)
+            reservation = admission.reservation
+        elif self.memory_guard is None and reservation is not None:
+            raise TransportError("memory reservation supplied for an unguarded target")
+
         parts: list[str] = []
         for key, value in (env or {}).items():
             parts.append(f"export {key}={shlex.quote(self._expand_remote(str(value)))}")
@@ -1239,7 +2084,81 @@ class SSHPosixTransport(_SSHCommon):
         # A login shell makes the remote PATH match the user's normal environment
         # (e.g. Homebrew's Rscript), which a bare non-interactive ssh shell omits.
         shell_flag = "-lc" if self.device.login_shell else "-c"
-        if telemetry:
+        detailed = telemetry_request is not None
+        detailed_error = ""
+        guard_token: str | None = None
+
+        if self.memory_guard is not None:
+            guard_token = uuid.uuid4().hex
+            try:
+                wrapper_remote = self._ensure_memory_guard_helper()
+                assert reservation is not None
+                renewal = self.renew_memory_guard(reservation)
+                if not renewal.admitted:
+                    self.release_memory_guard(reservation, reserved_only=True)
+                    return _admission_exec_refusal(
+                        self.memory_guard, renewal, reservation
+                    )
+                reservation = renewal.reservation
+                assert reservation is not None
+                helper_args = _guarded_helper_args(
+                    wrapper_remote,
+                    self.memory_guard,
+                    reservation,
+                    guard_token,
+                    detailed=detailed,
+                    telemetry=telemetry,
+                )
+                script = shlex.join(
+                    [
+                        self.device.remote_python or "python3",
+                        *helper_args,
+                        self.device.shell,
+                        shell_flag,
+                        inner,
+                    ]
+                )
+            except Exception as exc:
+                if reservation is not None:
+                    self.release_memory_guard(reservation, reserved_only=True)
+                detail = f"required memory guard staging failed: {type(exc).__name__}: {exc}"
+                guard = _controller_guard_refusal(
+                    self.memory_guard, "helper_unavailable", detail, reservation
+                )
+                return ExecResult(
+                    _GUARD_HELPER_EXIT, "", detail + "\n", None, guard
+                )
+        elif detailed:
+            try:
+                state_root = self._expand_remote(self.device.state_root).rstrip("/")
+                if not state_root:
+                    raise TransportError("target state root is empty")
+                if state_root == "~" or state_root.startswith("~/"):
+                    raise TransportError("remote home unknown")
+                wrapper_remote = posixpath.join(
+                    state_root,
+                    "helpers",
+                    "remrun_posix_telemetry_v1.py",
+                )
+                self.push_file(Path(__file__).parent / "_posix_telemetry.py", wrapper_remote)
+                script = shlex.join(
+                    [
+                        self.device.remote_python or "python3",
+                        wrapper_remote,
+                        "--detailed",
+                        "--",
+                        self.device.shell,
+                        shell_flag,
+                        inner,
+                    ]
+                )
+            except Exception as exc:
+                detailed_error = f"detailed telemetry staging failed: {type(exc).__name__}: {exc}"
+                if self.device.login_shell:
+                    script = f"{self.device.shell} -lc {shlex.quote(inner)}"
+                else:
+                    script = inner
+        elif telemetry:
             # Wrap the (unchanged) shell invocation in the stdlib rusage sampler.
             measured = " ".join(shlex.quote(a) for a in (self.device.shell, shell_flag, inner))
             script = (
@@ -1251,20 +2170,43 @@ class SSHPosixTransport(_SSHCommon):
         else:
             script = inner
 
-        # Streaming leaves the telemetry contract untouched: the sampler's sentinel
-        # travels on stderr, which is drained separately and parsed below exactly as
-        # in the buffered path.
-        proc = self._remote(address, script, timeout=timeout, on_stdout=on_stdout)
+        try:
+            proc = self._remote(address, script, timeout=timeout, on_stdout=on_stdout)
+        finally:
+            if self.memory_guard is not None and reservation is not None:
+                self.release_memory_guard(reservation, reserved_only=True)
+        stderr = proc.stderr.decode("utf-8", "replace")
+        stdout = proc.stdout.decode("utf-8", "replace")
+        telem = None
+        if detailed:
+            if detailed_error:
+                telem = _unavailable_detailed_telemetry("posix", detailed_error)
+            else:
+                stderr, telem = _extract_telemetry(stderr)
+                if telem is None:
+                    telem = _unavailable_detailed_telemetry(
+                        "posix", "detailed telemetry helper emitted no result"
+                    )
+        elif telemetry:
+            stderr, telem = _extract_telemetry(stderr)
+
+        if guard_token is not None:
+            # A valid private guard result distinguishes a real command exit 255
+            # from OpenSSH's connection-failure status.
+            return _finalize_guarded_result(
+                helper_exit_code=proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                token=guard_token,
+                reservation=reservation,
+                telemetry=telem,
+                platform_name="POSIX",
+            )
         if proc.returncode == 255:
             raise TransportError(
-                f"ssh connection failed (exit 255): "
-                f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+                f"ssh connection failed (exit 255): {stderr.strip()}"
             )
-        stderr = proc.stderr.decode("utf-8", "replace")
-        telem = None
-        if telemetry:
-            stderr, telem = _extract_telemetry(stderr)
-        return ExecResult(proc.returncode, proc.stdout.decode("utf-8", "replace"), stderr, telem)
+        return ExecResult(proc.returncode, stdout, stderr, telem)
 
     # --- filesystem -------------------------------------------------------
     def ensure_remote_dir(self, remote_path: str) -> None:
@@ -1346,6 +2288,26 @@ class SSHPosixTransport(_SSHCommon):
                     pass
         _atomic_write_local(local_path, fill)
 
+    def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
+        limit = _validate_small_file_limit(max_bytes)
+        address = self._address_or_resolve()
+        script = (
+            f"{shlex.quote(self.device.remote_python)} -c "
+            f"{shlex.quote(_READ_SMALL_FILE_PROG)} "
+            f"{shlex.quote(remote_path)} {limit}"
+        )
+        proc = self._remote(address, script)
+        if proc.returncode != 0:
+            raise _small_file_remote_error(
+                remote_path, limit, proc.returncode, proc.stderr
+            )
+        data = proc.stdout
+        if len(data) > limit:
+            raise TransportError(
+                f"small file exceeds {limit} byte limit: {remote_path}"
+            )
+        return data
+
     def pull_files(self, remote_root: str, local_root: Path, rel_paths: list[str]) -> None:
         if len(rel_paths) < 2:
             return super().pull_files(remote_root, local_root, rel_paths)
@@ -1426,9 +2388,12 @@ class SSHPowerShellTransport(_SSHCommon):
     """Windows backend over OpenSSH + PowerShell.
 
     Commands and filesystem ops are sent as PowerShell scripts via
-    ``-EncodedCommand`` (base64 UTF-16LE), which sidesteps all cmd/pwsh quoting
-    regardless of the remote default shell. File transfers stream base64 over
-    stdin (push) / stdout (pull) so they are binary-safe and need no scp.
+    ``-EncodedCommand`` (base64 UTF-16LE), which protects the remote launcher
+    boundary regardless of the configured OpenSSH default shell. Top-level
+    ``.cmd``/``.bat`` commands are rejected because the current handoff to
+    ``cmd.exe`` is proved to corrupt some argv. File transfers stream base64
+    over stdin (push) / stdout (pull) so they are binary-safe and
+    need no scp.
 
     The PowerShell transport keeps quoting and telemetry handling generic;
     deployment validation belongs in the user's own fleet notes/config.
@@ -1456,18 +2421,26 @@ class SSHPowerShellTransport(_SSHCommon):
     def _ps_remote(self, address: str, script: str, input_bytes: bytes | None = None,
                    timeout: float | None = None,
                    on_stdout: StreamSink | None = None) -> subprocess.CompletedProcess:
-        cmd = f"{self._ps_exe()} -NoProfile -NonInteractive -EncodedCommand {_ps_encode(script)}"
+        cmd = _ps_remote_command(self._ps_exe(), script)
         return self._remote(address, cmd, input_bytes=input_bytes, timeout=timeout,
                             on_stdout=on_stdout)
 
     # --- diagnostics ------------------------------------------------------
     def probe(self) -> ProbeResult:
+        if self._ps_exe().lower() == "powershell":
+            return ProbeResult(
+                reachable=False,
+                address=None,
+                detail=_WINDOWS_POWERSHELL_UNSUPPORTED,
+                remote_os="windows",
+            )
         script = (
             "Write-Output 'remrun-ok'; "
             "Write-Output ([System.Environment]::OSVersion.Platform.ToString()); "
-            "Write-Output $env:USERPROFILE"
+            "Write-Output $env:USERPROFILE; "
+            "Write-Output $PSVersionTable.PSVersion.ToString()"
         )
-        encoded = f"{self._ps_exe()} -NoProfile -NonInteractive -EncodedCommand {_ps_encode(script)}"
+        encoded = _ps_remote_command(self._ps_exe(), script)
         last_detail = "no address candidates configured"
         for address in self.device.all_addresses():
             try:
@@ -1478,6 +2451,18 @@ class SSHPowerShellTransport(_SSHCommon):
             if proc.returncode == 0 and b"remrun-ok" in proc.stdout:
                 lines = [ln.strip() for ln in proc.stdout.decode("utf-8", "replace").splitlines()
                          if ln.strip()]
+                version_text = lines[3] if len(lines) > 3 else ""
+                try:
+                    version = tuple(int(part) for part in version_text.split(".")[:2])
+                except ValueError:
+                    version = ()
+                if len(version) < 2 or version < (7, 3):
+                    last_detail = (
+                        "unsupported pwsh version "
+                        f"{version_text or 'unknown'}; remrun requires pwsh 7.3+ "
+                        "for exact native argv passing"
+                    )
+                    continue
                 self._remote_home = lines[2] if len(lines) > 2 else None
                 self._address = address
                 return ProbeResult(reachable=True, address=address, detail="ssh ok",
@@ -1562,13 +2547,29 @@ class SSHPowerShellTransport(_SSHCommon):
             f"& {command}\n"
             "exit $LASTEXITCODE"
         )
-        remote = f"{self._ps_exe()} -NoProfile -NonInteractive -EncodedCommand {_ps_encode(script)}"
+        remote = _ps_remote_command(self._ps_exe(), script)
         return [*self._ssh_base(address), remote]
 
     # --- execution --------------------------------------------------------
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
-             telemetry=False, on_stdout=None) -> ExecResult:
-        address = self._address_or_resolve()
+             telemetry=False, on_stdout=None,
+             telemetry_request: TelemetryRequest | None = None,
+             memory_reservation: MemoryReservation | None = None) -> ExecResult:
+        if self.memory_guard is not None or memory_reservation is not None:
+            raise TransportError("memory guard schema 2 is not proved on Windows")
+        if self._ps_exe().lower() == "powershell":
+            raise TransportError(_WINDOWS_POWERSHELL_UNSUPPORTED)
+        _reject_explicit_windows_batch(command)
+        try:
+            address = self._address_or_resolve()
+        except TransportError as exc:
+            if self.memory_guard is None:
+                raise
+            guard = _controller_guard_refusal(
+                self.memory_guard, "transport_unavailable", str(exc)
+            )
+            return ExecResult(_GUARD_HELPER_EXIT, "", str(exc) + "\n", None, guard)
+
         lines = [
             "$ErrorActionPreference = 'Stop'",
             # Preserve native command exit codes (PS 7.4 would otherwise throw).
@@ -1580,45 +2581,99 @@ class SSHPowerShellTransport(_SSHCommon):
             joined = ";".join(self._expand_remote(p) for p in path_prepend) + ";"
             lines.append(f"$env:PATH = {_ps_squote(joined)} + $env:PATH")
         lines.append(f"Set-Location -LiteralPath {_ps_squote(self._expand_remote(cwd))}")
+        private_nonce = uuid.uuid4().hex
+        batch_marker = f"__REMRUN_BATCH_UNSUPPORTED_{private_nonce}__;"
+        lines.extend(_ps_batch_resolution_guard(command[0], batch_marker))
         cmd_tokens = " ".join(_ps_squote(c) for c in command)
-        if telemetry:
-            # Run the command under a Win32 Job Object sampler (peak memory + CPU
-            # of the whole process tree). The sampler is ~400 lines — too large to
-            # embed in a -EncodedCommand (Windows ~32KB command-line limit, the
-            # WinError 206 trap) — so stage it as a file via push_file (streamed
-            # over stdin, no cap) and invoke it by path. It emits the same
-            # __REMRUN_TELEMETRY__ stderr sentinel as the POSIX sampler; any
-            # staging failure degrades to a plain run with no telemetry.
+        exit_marker = f"__REMRUN_EXIT_{private_nonce}__"
+        exit_lines = [
+            "$remrunCommandSucceeded = $?",
+            "$remrunCommandExitCode = $LASTEXITCODE",
+            "if ($null -eq $remrunCommandExitCode) {",
+            (
+                "  if ($remrunCommandSucceeded) { $remrunCommandExitCode = 0 } "
+                "else { $remrunCommandExitCode = 1 }"
+            ),
+            "}",
+            (
+                f"[Console]::Error.Write({_ps_squote(exit_marker)} + "
+                "[string]$remrunCommandExitCode + ';')"
+            ),
+            "exit $remrunCommandExitCode",
+        ]
+        detailed = telemetry_request is not None
+        detailed_error = ""
+        telemetry_requested = detailed or telemetry
+
+        if telemetry_requested:
+            inherited_path_var = f"__REMRUN_INHERITED_PATH_{uuid.uuid4().hex}"
+            job_command = _ps_command_argv(
+                self._ps_exe(), command, inherited_path_var=inherited_path_var
+            )
+            job_tokens = " ".join(_ps_squote(token) for token in job_command)
             try:
                 home = (self._remote_home or "").rstrip("\\/")
                 if not home:
-                    raise TransportError("remote home unknown; skipping telemetry")
+                    raise TransportError("remote home unknown")
                 wrapper_remote = home + "\\AppData\\Local\\Temp\\remrun_win_telemetry.py"
-                self.push_file(Path(__file__).parent / "_win_telemetry.py", wrapper_remote)
                 py = _ps_squote(self.device.remote_python or "python")
-                lines.append(f"& {py} {_ps_squote(wrapper_remote)} '--' {cmd_tokens}")
-                lines.append("exit $LASTEXITCODE")
-            except Exception:
-                telemetry = False
+                telemetry_lines = [*lines]
+                telemetry_lines.append(f"$env:{inherited_path_var} = $env:PATH")
+                if detailed:
+                    telemetry_lines.append(
+                        f"& {py} {_ps_squote(wrapper_remote)} '--detailed' '--' {job_tokens}"
+                    )
+                else:
+                    telemetry_lines.append(
+                        f"& {py} {_ps_squote(wrapper_remote)} '--' {job_tokens}"
+                    )
+                telemetry_lines.extend(exit_lines)
+                if not _ps_remote_command_fits(self._ps_exe(), "\n".join(telemetry_lines)):
+                    raise TransportError(
+                        "nested telemetry/guard command exceeds the Windows "
+                        "remote-shell command-line limit"
+                    )
+                self.push_file(Path(__file__).parent / "_win_telemetry.py", wrapper_remote)
+                lines = telemetry_lines
+            except Exception as exc:
+                if detailed:
+                    detailed_error = (
+                        f"detailed telemetry unavailable: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    telemetry = False
                 lines.append("& " + cmd_tokens)
-                lines.append("exit $LASTEXITCODE")
+                lines.extend(exit_lines)
         else:
             lines.append("& " + cmd_tokens)
-            lines.append("exit $LASTEXITCODE")
-        # As on POSIX: the Job Object sampler's sentinel rides stderr, which streaming
-        # keeps separate from stdout, so the parse below is unchanged.
+            lines.extend(exit_lines)
+
         proc = self._ps_remote(address, "\n".join(lines), timeout=timeout, on_stdout=on_stdout)
-        if proc.returncode == 255:
-            raise TransportError(
-                f"ssh connection failed (exit 255): "
-                f"{proc.stderr.decode('utf-8', 'replace').strip()}"
-            )
         stdout = proc.stdout.decode("utf-8", "replace")
         stderr = proc.stderr.decode("utf-8", "replace")
+        if batch_marker in stderr:
+            raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+        stderr, exact_exit_code = _extract_windows_exit_marker(stderr, exit_marker)
+        helper_exit_code = proc.returncode if exact_exit_code is None else exact_exit_code
+
         telem = None
-        if telemetry:
+        if detailed:
+            if detailed_error:
+                telem = _unavailable_detailed_telemetry("windows", detailed_error)
+            else:
+                stderr, telem = _extract_telemetry(stderr)
+                if telem is None:
+                    telem = _unavailable_detailed_telemetry(
+                        "windows", "detailed telemetry helper emitted no result"
+                    )
+        elif telemetry:
             stderr, telem = _extract_telemetry(stderr)
-        return ExecResult(proc.returncode, stdout, stderr, telem)
+
+        if proc.returncode == 255 and exact_exit_code != 255:
+            raise TransportError(
+                f"ssh connection failed (exit 255): {stderr.strip()}"
+            )
+        return ExecResult(helper_exit_code, stdout, stderr, telem)
 
     # --- filesystem -------------------------------------------------------
     def ensure_remote_dir(self, remote_path: str) -> None:
@@ -1716,6 +2771,50 @@ class SSHPowerShellTransport(_SSHCommon):
             except (ValueError, OSError):
                 pass
         _atomic_write_local(local_path, fill)
+
+    def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
+        limit = _validate_small_file_limit(max_bytes)
+        address = self._address_or_resolve()
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            f"$p = {_ps_squote(remote_path)}\n"
+            f"$limit = [int64]{limit}\n"
+            "if (-not [IO.File]::Exists($p)) { "
+            f"[Console]::Error.WriteLine('{_SMALL_FILE_MISSING}'); exit 44 }}\n"
+            "$info = [IO.FileInfo]::new($p)\n"
+            "if ($info.Length -gt $limit) { "
+            f"[Console]::Error.WriteLine('{_SMALL_FILE_OVERSIZE}'); exit 45 }}\n"
+            "$stream = [IO.File]::Open($p,[IO.FileMode]::Open,[IO.FileAccess]::Read,"
+            "[IO.FileShare]::ReadWrite)\n"
+            "$memory = [IO.MemoryStream]::new()\n"
+            "$buffer = [byte[]]::new(65536)\n"
+            "try {\n"
+            "  while (($read = $stream.Read($buffer,0,$buffer.Length)) -gt 0) {\n"
+            "    if (($memory.Length + $read) -gt $limit) { "
+            f"[Console]::Error.WriteLine('{_SMALL_FILE_OVERSIZE}'); exit 45 }}\n"
+            "    $memory.Write($buffer,0,$read)\n"
+            "  }\n"
+            "  $bytes = $memory.ToArray()\n"
+            "} finally { $stream.Dispose(); $memory.Dispose() }\n"
+            "[Console]::Out.Write([Convert]::ToBase64String($bytes))\n"
+        )
+        proc = self._ps_remote(address, script)
+        if proc.returncode != 0:
+            raise _small_file_remote_error(
+                remote_path, limit, proc.returncode, proc.stderr
+            )
+        try:
+            encoded = proc.stdout.decode("ascii", "strict").strip()
+            data = base64.b64decode(encoded, validate=True)
+        except (UnicodeDecodeError, ValueError, binascii.Error) as exc:
+            raise TransportError(
+                f"read small file {remote_path} returned invalid base64"
+            ) from exc
+        if len(data) > limit:
+            raise TransportError(
+                f"small file exceeds {limit} byte limit: {remote_path}"
+            )
+        return data
 
     def pull_files(self, remote_root: str, local_root: Path, rel_paths: list[str]) -> None:
         if len(rel_paths) < 2:

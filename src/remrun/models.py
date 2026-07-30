@@ -47,6 +47,14 @@ class Device:
     eff_cores: int = 0
     ram_gb: float = 0.0
     vram_gb: float = 0.0
+    # Raw versioned resource policy. Validation belongs to the opt-in resource
+    # envelope path; preserving the original value ensures missing and malformed
+    # policy never become plausible defaults during ordinary configuration load.
+    resource_policy: object | None = None
+    # Optional versioned hard memory guard. Unlike resource_policy this is an
+    # execution boundary: when present, every command path must initialize it
+    # before user code and may not be disabled by a normal CLI flag.
+    memory_guard: object | None = None
 
     @classmethod
     def from_mapping(cls, name: str, data: dict[str, Any]) -> "Device":
@@ -80,6 +88,8 @@ class Device:
             eff_cores=int(data.get("eff_cores", 0) or 0),
             ram_gb=float(data.get("ram_gb", 0) or 0),
             vram_gb=float(data.get("vram_gb", 0) or 0),
+            resource_policy=data["resource_policy"] if "resource_policy" in data else None,
+            memory_guard=data["memory_guard"] if "memory_guard" in data else None,
         )
 
     @property
@@ -114,6 +124,30 @@ class ProjectContext:
 
 
 @dataclass(frozen=True)
+class WorkloadSpec:
+    """One explicitly selected versioned project resource adapter."""
+
+    name: str
+    adapter_id: str
+    adapter_version: int
+    work_unit: str
+    require_envelope: bool = False
+    require_receipt: bool = False
+    protocol: int = 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "adapter_id": self.adapter_id,
+            "adapter_version": self.adapter_version,
+            "work_unit": self.work_unit,
+            "require_envelope": self.require_envelope,
+            "require_receipt": self.require_receipt,
+            "protocol": self.protocol,
+        }
+
+
+@dataclass(frozen=True)
 class RunPlan:
     target: Device
     project: ProjectContext
@@ -129,9 +163,10 @@ class RunPlan:
     # Preference-ordered candidates for --auto (target is candidates[0] until the
     # CLI resolves reachability/load). Single element for an explicit target.
     candidates: list[Device] = field(default_factory=list)
+    workload: WorkloadSpec | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "target": {
                 "name": self.target.name,
                 "kind": self.target.kind,
@@ -156,3 +191,6 @@ class RunPlan:
             "write_scope": self.write_scope,
             "write_scope_paths": self.write_scope_paths,
         }
+        if self.workload is not None:
+            result["workload"] = self.workload.as_dict()
+        return result

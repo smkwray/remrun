@@ -1,0 +1,1147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:remrun:schema:run-context:v1",
+  "title": "remrun.run-context version 1",
+  "description": "Opt-in target resource context passed by path in REMRUN_RUN_CONTEXT.",
+  "$comment": "The encoded document is limited to 65536 bytes by the remrun protocol.",
+  "type": "object",
+  "required": [
+    "schema",
+    "version",
+    "run_id",
+    "created_at",
+    "workload",
+    "resources"
+  ],
+  "properties": {
+    "schema": {
+      "const": "remrun.run-context"
+    },
+    "version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "workload": {
+      "$ref": "#/$defs/workload"
+    },
+    "resources": {
+      "$ref": "#/$defs/resourceEnvelope"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "metricStatus": {
+      "enum": [
+        "measured",
+        "configured",
+        "unavailable",
+        "malformed",
+        "timeout",
+        "not_applicable"
+      ]
+    },
+    "knownMetricStatus": {
+      "enum": [
+        "measured",
+        "configured"
+      ]
+    },
+    "workload": {
+      "type": "object",
+      "required": [
+        "name",
+        "adapter_id",
+        "adapter_version",
+        "work_unit",
+        "receipt"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapter_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapter_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "work_unit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "receipt": {
+          "type": "object",
+          "required": [
+            "schema",
+            "version",
+            "path"
+          ],
+          "properties": {
+            "schema": {
+              "const": "remrun.workload-receipt"
+            },
+            "version": {
+              "const": 1
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "cpuStatic": {
+      "type": "object",
+      "required": [
+        "logical_cores",
+        "effective_cores",
+        "status",
+        "source",
+        "confidence"
+      ],
+      "properties": {
+        "logical_cores": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "effective_cores": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/metricStatus"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "$ref": "#/$defs/knownMetricStatus"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "logical_cores": {
+                "type": "number"
+              },
+              "effective_cores": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ramStatic": {
+      "type": "object",
+      "required": [
+        "total_bytes",
+        "status",
+        "source",
+        "confidence"
+      ],
+      "properties": {
+        "total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/metricStatus"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "$ref": "#/$defs/knownMetricStatus"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "total_bytes": {
+                "type": "integer"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "total_bytes": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "gpuStaticDeviceNoVram": {
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "gpuStaticDeviceDiscrete": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "vram_total_bytes",
+        "status",
+        "source",
+        "confidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "vram_total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/metricStatus"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "$ref": "#/$defs/knownMetricStatus"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "vram_total_bytes": {
+                "type": "integer"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "vram_total_bytes": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "cpuLive": {
+      "type": "object",
+      "required": [
+        "busy_pct",
+        "sample_interval_ms",
+        "status",
+        "source",
+        "confidence"
+      ],
+      "properties": {
+        "busy_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "sample_interval_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "status": {
+          "$ref": "#/$defs/metricStatus"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "$ref": "#/$defs/knownMetricStatus"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "busy_pct": {
+                "type": "number"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "busy_pct": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ramLive": {
+      "type": "object",
+      "required": [
+        "available_bytes",
+        "status",
+        "source",
+        "confidence"
+      ],
+      "properties": {
+        "available_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/metricStatus"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "$ref": "#/$defs/knownMetricStatus"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "available_bytes": {
+                "type": "integer"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "available_bytes": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "gpuLiveDeviceNoVram": {
+      "type": "object",
+      "required": [
+        "id",
+        "util_pct",
+        "status",
+        "source",
+        "confidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "util_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "status": {
+          "$ref": "#/$defs/metricStatus"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "$ref": "#/$defs/knownMetricStatus"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "util_pct": {
+                "type": "number"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "util_pct": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "gpuLiveDeviceDiscrete": {
+      "type": "object",
+      "required": [
+        "id",
+        "util_pct",
+        "vram_free_bytes",
+        "status",
+        "source",
+        "confidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "util_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "vram_free_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/metricStatus"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "$ref": "#/$defs/knownMetricStatus"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "vram_free_bytes": {
+                "type": "integer"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "vram_free_bytes": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "validPolicy": {
+      "type": "object",
+      "required": [
+        "mode",
+        "cpu_reserve_cores",
+        "cpu_max_fraction",
+        "ram_reserve_bytes",
+        "ram_max_fraction",
+        "gpu_busy_ceiling_pct",
+        "vram_reserve_bytes",
+        "vram_max_fraction",
+        "allow_static_fallback",
+        "status"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "interactive",
+            "unattended"
+          ]
+        },
+        "cpu_reserve_cores": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cpu_max_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "ram_reserve_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ram_max_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "gpu_busy_ceiling_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "vram_reserve_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "vram_max_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "allow_static_fallback": {
+          "type": "boolean"
+        },
+        "status": {
+          "const": "valid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "missingPolicy": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "const": "missing"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cpuOffer": {
+      "type": "object",
+      "required": [
+        "cores",
+        "status"
+      ],
+      "properties": {
+        "cores": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "usable",
+            "zero",
+            "unavailable"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "usable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cores": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "zero"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cores": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "cores": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ramOffer": {
+      "type": "object",
+      "required": [
+        "bytes",
+        "status"
+      ],
+      "properties": {
+        "bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "usable",
+            "zero",
+            "unavailable"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "usable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "bytes": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "zero"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "bytes": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "bytes": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "gpuOffer": {
+      "type": "object",
+      "required": [
+        "id",
+        "vram_bytes",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "vram_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "usable",
+            "zero",
+            "unavailable"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "usable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "vram_bytes": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "zero"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "vram_bytes": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "vram_bytes": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "resourceEnvelope": {
+      "type": "object",
+      "required": [
+        "schema",
+        "version",
+        "status",
+        "probe_status",
+        "static",
+        "live",
+        "policy",
+        "offered"
+      ],
+      "properties": {
+        "schema": {
+          "const": "remrun.resource-envelope"
+        },
+        "version": {
+          "const": 1
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "partial",
+            "policy_missing"
+          ]
+        },
+        "probe_status": {
+          "enum": [
+            "ok",
+            "partial",
+            "unavailable",
+            "malformed",
+            "timeout"
+          ]
+        },
+        "static": {
+          "type": "object",
+          "required": [
+            "cpu",
+            "ram",
+            "gpu"
+          ],
+          "properties": {
+            "cpu": {
+              "$ref": "#/$defs/cpuStatic"
+            },
+            "ram": {
+              "$ref": "#/$defs/ramStatic"
+            },
+            "gpu": {
+              "type": "object",
+              "required": [
+                "kind",
+                "devices"
+              ],
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "discrete",
+                    "unified",
+                    "none",
+                    "unknown"
+                  ]
+                },
+                "devices": {
+                  "type": "array"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "live": {
+          "type": "object",
+          "required": [
+            "captured_at",
+            "cpu",
+            "ram",
+            "gpu"
+          ],
+          "properties": {
+            "captured_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "cpu": {
+              "$ref": "#/$defs/cpuLive"
+            },
+            "ram": {
+              "$ref": "#/$defs/ramLive"
+            },
+            "gpu": {
+              "type": "array"
+            }
+          },
+          "additionalProperties": false
+        },
+        "policy": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/validPolicy"
+            },
+            {
+              "$ref": "#/$defs/missingPolicy"
+            }
+          ]
+        },
+        "offered": {
+          "type": "object",
+          "required": [
+            "cpu",
+            "ram",
+            "gpu"
+          ],
+          "properties": {
+            "cpu": {
+              "$ref": "#/$defs/cpuOffer"
+            },
+            "ram": {
+              "$ref": "#/$defs/ramOffer"
+            },
+            "gpu": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/gpuOffer"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "static": {
+                "properties": {
+                  "gpu": {
+                    "properties": {
+                      "kind": {
+                        "const": "discrete"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "required": [
+                  "gpu"
+                ]
+              }
+            },
+            "required": [
+              "static"
+            ]
+          },
+          "then": {
+            "properties": {
+              "static": {
+                "properties": {
+                  "gpu": {
+                    "properties": {
+                      "devices": {
+                        "items": {
+                          "$ref": "#/$defs/gpuStaticDeviceDiscrete"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "live": {
+                "properties": {
+                  "gpu": {
+                    "items": {
+                      "$ref": "#/$defs/gpuLiveDeviceDiscrete"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "static": {
+                "properties": {
+                  "gpu": {
+                    "properties": {
+                      "devices": {
+                        "items": {
+                          "$ref": "#/$defs/gpuStaticDeviceNoVram"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "live": {
+                "properties": {
+                  "gpu": {
+                    "items": {
+                      "$ref": "#/$defs/gpuLiveDeviceNoVram"
+                    }
+                  }
+                }
+              },
+              "offered": {
+                "properties": {
+                  "gpu": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

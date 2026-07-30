@@ -493,7 +493,7 @@ def cmd_cancel(args, reporter: Reporter) -> int:
 
 
 def cmd_resources(args, reporter: Reporter) -> int:
-    """Live hardware for the fleet: CPU / RAM / GPU per device.
+    """Live hardware for the fleet: CPU / RAM / GPU / disk per device.
 
     Distinct from `fleet status`, which reports the job QUEUE. This probes the
     devices themselves and is safe to run at any time: it never mutates state,
@@ -503,6 +503,19 @@ def cmd_resources(args, reporter: Reporter) -> int:
     from .resources_render import render_table, to_dict
 
     config = load_config()
+    usage_display = (
+        getattr(config, "defaults", {})
+        .get("fleet", {})
+        .get("resources", {})
+        .get("usage_display", "percent")
+    )
+    if usage_display not in {"percent", "amounts"}:
+        reporter.event(
+            "invalid_config",
+            detail=("fleet.resources.usage_display must be "
+                    f"'percent' or 'amounts', not {usage_display!r}"),
+        )
+        return EXIT_ERROR
     wanted = {d.upper() for d in (getattr(args, "device", None) or [])}
 
     # Visibility is not placement. `enabled = false` keeps a device out of run
@@ -578,7 +591,7 @@ def cmd_resources(args, reporter: Reporter) -> int:
         print(json.dumps({"devices": [to_dict(v) for v in views]},
                          indent=2, sort_keys=True))
     else:
-        print(render_table(views))
+        print(render_table(views, usage_display=usage_display))
 
     # Exit nonzero only if EVERY remote device failed: a single offline laptop
     # is normal and must not make the command look broken to a caller.
@@ -678,8 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
                                        "workers on every device, releasing configured resource locks")
     px.add_argument("--all", action="store_true", help="also wipe done/failed job history")
     px.add_argument("--json", action="store_true")
-    prs = sub.add_parser("resources", help="live CPU / RAM / GPU for every configured device "
-                                           "(hardware, not the job queue)")
+    prs = sub.add_parser("resources", help="live CPU / RAM / GPU / disk for every configured "
+                                           "device (hardware, not the job queue)")
     prs.add_argument("--device", action="append",
                      help="limit to this device (repeatable; default is all enabled)")
     prs.add_argument("--no-local", action="store_true",

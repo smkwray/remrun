@@ -184,6 +184,101 @@ def test_postrun_pullback_of_command_output(tmp_path: Path):
     assert not post.conflicts
 
 
+def test_postrun_next_baseline_retains_unrelated_local_create(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "input.txt").write_text("input")
+    pre = reconcile(local, remote_root, t, backup)
+
+    (Path(remote_root) / "remote-output.txt").write_text("remote-created")
+    (local / "local-work.txt").write_text("local-created-during-run")
+
+    post = postrun_pullback(
+        transport=t, local_root=local, remote_root=remote_root,
+        excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+        pre_remote_manifest=pre.remote_manifest, pre_local_manifest=pre.local_manifest,
+        backup_root=backup, conflict_remote_root=tmp_path / "state" / "remote",
+    )
+
+    assert post.next_baseline is not None
+    assert "remote-output.txt" in post.next_baseline.local_manifest
+    assert "remote-output.txt" in post.next_baseline.remote_manifest
+    assert "local-work.txt" not in post.next_baseline.local_manifest
+    assert "local-work.txt" not in post.next_baseline.remote_manifest
+
+    next_preflight = reconcile(
+        local, remote_root, t, backup,
+        post.next_baseline.local_manifest, post.next_baseline.remote_manifest,
+    )
+    assert next_preflight.pushed == ["local-work.txt"]
+    assert not next_preflight.has_conflicts
+
+
+def test_postrun_next_baseline_retains_unrelated_local_modify(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "remote-output.txt").write_text("remote-v0")
+    (local / "local-work.txt").write_text("local-v0")
+    pre = reconcile(local, remote_root, t, backup)
+
+    (Path(remote_root) / "remote-output.txt").write_text("remote-v1")
+    (local / "local-work.txt").write_text("local-v1-during-run")
+
+    post = postrun_pullback(
+        transport=t, local_root=local, remote_root=remote_root,
+        excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+        pre_remote_manifest=pre.remote_manifest, pre_local_manifest=pre.local_manifest,
+        backup_root=backup, conflict_remote_root=tmp_path / "state" / "remote",
+    )
+
+    assert post.next_baseline is not None
+    assert (
+        post.next_baseline.local_manifest["remote-output.txt"].sha256
+        != pre.local_manifest["remote-output.txt"].sha256
+    )
+    assert (
+        post.next_baseline.remote_manifest["remote-output.txt"]
+        == post.post_remote_manifest["remote-output.txt"]
+    )
+    assert post.next_baseline.local_manifest["local-work.txt"] == pre.local_manifest["local-work.txt"]
+    assert post.next_baseline.remote_manifest["local-work.txt"] == pre.remote_manifest["local-work.txt"]
+
+    next_preflight = reconcile(
+        local, remote_root, t, backup,
+        post.next_baseline.local_manifest, post.next_baseline.remote_manifest,
+    )
+    assert next_preflight.pushed == ["local-work.txt"]
+    assert not next_preflight.has_conflicts
+
+
+def test_postrun_next_baseline_retains_unrelated_local_delete(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "remote-output.txt").write_text("remote-v0")
+    (local / "local-work.txt").write_text("local-v0")
+    pre = reconcile(local, remote_root, t, backup)
+
+    (Path(remote_root) / "remote-output.txt").unlink()
+    (local / "local-work.txt").unlink()
+
+    post = postrun_pullback(
+        transport=t, local_root=local, remote_root=remote_root,
+        excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+        pre_remote_manifest=pre.remote_manifest, pre_local_manifest=pre.local_manifest,
+        backup_root=backup, conflict_remote_root=tmp_path / "state" / "remote",
+    )
+
+    assert post.next_baseline is not None
+    assert "remote-output.txt" not in post.next_baseline.local_manifest
+    assert "remote-output.txt" not in post.next_baseline.remote_manifest
+    assert post.next_baseline.local_manifest["local-work.txt"] == pre.local_manifest["local-work.txt"]
+    assert post.next_baseline.remote_manifest["local-work.txt"] == pre.remote_manifest["local-work.txt"]
+
+    next_preflight = reconcile(
+        local, remote_root, t, backup,
+        post.next_baseline.local_manifest, post.next_baseline.remote_manifest,
+    )
+    assert next_preflight.deleted_remote == ["local-work.txt"]
+    assert not next_preflight.has_conflicts
+
+
 def test_postrun_skips_pull_when_syncthing_already_delivered_identical(tmp_path: Path):
     # Idempotent external-writer: if Syncthing already delivered the identical output bytes to local
     # before pullback, remrun must NOT re-pull (the unnecessary overwrite that races Syncthing).
@@ -203,6 +298,9 @@ def test_postrun_skips_pull_when_syncthing_already_delivered_identical(tmp_path:
     assert post.skipped_identical == ["out.txt"]
     assert "out.txt" not in post.pulled
     assert (local / "out.txt").read_text() == "RESULT-DATA"
+    assert post.next_baseline is not None
+    assert "out.txt" in post.next_baseline.local_manifest
+    assert "out.txt" in post.next_baseline.remote_manifest
 
 
 def _converge_after_manifest(transport, write_side):
@@ -328,6 +426,8 @@ def test_hash_file_matches_sha256_file(tmp_path: Path):
         ValueError("malformed hash response"),
         "not-a-sha256",
         "",
+        None,
+        123,
     ],
 )
 def test_postrun_unverifiable_hash_cannot_silently_skip_large_equal_metadata(
@@ -367,6 +467,51 @@ def test_postrun_unverifiable_hash_cannot_silently_skip_large_equal_metadata(
     assert not post.pulled
     assert local_output.read_bytes() == b"L" * size
     assert (conflict_remote / "out.bin").read_bytes() == b"R" * size
+    assert post.next_baseline is None
+
+
+def test_postrun_pull_verification_failure_cannot_return_a_baseline(
+    tmp_path: Path,
+    monkeypatch,
+):
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "run.txt").write_text("input")
+    pre = reconcile(local, remote_root, t, backup)
+    (Path(remote_root) / "out.txt").write_text("expected-remote-output")
+
+    def corrupt_pull(_remote_path: str, local_path: Path) -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text("corrupt-transfer")
+
+    monkeypatch.setattr(t, "pull_file", corrupt_pull)
+
+    with pytest.raises(TransportError, match="pull verification failed for out.txt"):
+        postrun_pullback(
+            transport=t, local_root=local, remote_root=remote_root,
+            excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+            pre_remote_manifest=pre.remote_manifest, pre_local_manifest=pre.local_manifest,
+            backup_root=backup, conflict_remote_root=tmp_path / "state" / "remote",
+        )
+
+
+def test_postrun_scope_escape_withholds_next_baseline(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "run.txt").write_text("input")
+    pre = reconcile(local, remote_root, t, backup)
+    remote_escaped = Path(remote_root) / "escaped" / "out.txt"
+    remote_escaped.parent.mkdir(parents=True)
+    remote_escaped.write_text("outside declared write scope")
+
+    post = postrun_pullback(
+        transport=t, local_root=local, remote_root=remote_root,
+        excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+        pre_remote_manifest=pre.remote_manifest, pre_local_manifest=pre.local_manifest,
+        backup_root=backup, conflict_remote_root=tmp_path / "state" / "remote",
+        write_scope_paths=["allowed/**"],
+    )
+
+    assert post.conflicts == ["escaped/out.txt"]
+    assert post.next_baseline is None
 
 
 def test_postrun_local_change_during_run_is_conflict(tmp_path: Path):
@@ -387,6 +532,7 @@ def test_postrun_local_change_during_run_is_conflict(tmp_path: Path):
         backup_root=backup, conflict_remote_root=conflict_remote,
     )
     assert post.conflicts == ["shared.txt"]
+    assert post.next_baseline is None
     # Local edit preserved; remote version saved outside the project tree.
     assert (local / "shared.txt").read_text() == "local-v1"
     assert (conflict_remote / "shared.txt").read_text() == "remote-v1"

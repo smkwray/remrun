@@ -1,4 +1,4 @@
-"""Live hardware view of the fleet: CPU / RAM / GPU per device.
+"""Live hardware view of the fleet: CPU / RAM / GPU / disk per device.
 
 Separate from ``probes.py`` on purpose. ``probes.build_snapshot`` feeds the
 placement gate, where a wrong number silently misroutes real jobs; this module
@@ -11,10 +11,11 @@ zero. A device that cannot be reached carries the reason, not a bare dash.
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Lock
 
 from ..models import Device
@@ -33,10 +34,28 @@ echo "CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
 echo "LOADAVG=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' || cat /proc/loadavg 2>/dev/null)"
 # ACTUAL cpu busy. Load average is NOT this: it counts runnable AND blocked
 # threads, so a box waiting on disk or network reports a high load while its
-# cores idle. Measured on a 14-core laptop: load 10.84/14 = "77% busy", while top
-# reported 66% idle. `top -l 2` discards the first sample, which is a since-boot
-# average rather than a current reading.
-top -l 2 -n 0 2>/dev/null | grep "CPU usage" | tail -1 | sed 's/^/CPUUSAGE:/'
+# cores idle. macOS `top` can spend tens of seconds collecting process details
+# on a busy host, making this lightweight fleet probe time out after SSH already
+# succeeded. `iostat` supplies the same interval CPU counters without walking
+# every process. Linux uses the same interval-counter principle via /proc/stat.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  LC_ALL=C iostat -c 2 -w 1 2>/dev/null | tail -1 \
+    | awk 'NF >= 6 { printf "CPUUSAGE:CPU usage: %s%% user, %s%% sys, %s%% idle\n", $(NF-5), $(NF-4), $(NF-3) }'
+elif [ -r /proc/stat ]; then
+  set -- $(awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total+=$i; print total, $5+$6; exit }' /proc/stat)
+  total1=${1:-}; idle1=${2:-}
+  sleep 0.5
+  set -- $(awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total+=$i; print total, $5+$6; exit }' /proc/stat)
+  total2=${1:-}; idle2=${2:-}
+  awk -v total1="$total1" -v idle1="$idle1" -v total2="$total2" -v idle2="$idle2" \
+    'BEGIN {
+      total=total2-total1; idle=idle2-idle1
+      if (total > 0) {
+        idle_pct=100*idle/total
+        printf "CPUUSAGE:CPU usage: %.2f%% busy, %.2f%% idle\n", 100-idle_pct, idle_pct
+      }
+    }'
+fi
 vm_stat 2>/dev/null | sed 's/^/VMSTAT:/'
 if [ -r /proc/meminfo ]; then sed 's/^/MEMINFO:/' /proc/meminfo 2>/dev/null | head -5; fi
 # Apple GPU utilization, no sudo required.
@@ -45,6 +64,41 @@ ioreg -r -d 1 -w 0 -c AGXAccelerator 2>/dev/null \
 # Discrete NVIDIA (Linux boxes in the mesh).
 nvidia-smi --query-gpu=name,utilization.gpu,memory.free,memory.total \
   --format=csv,noheader,nounits 2>/dev/null | head -1 | sed 's/^/NVIDIA:/'
+# Primary-volume capacity metadata only: this does not enumerate files. On
+# macOS, "important usage" availability includes bytes APFS/macOS can reclaim
+# automatically, matching the effective-used figure shown by system monitors.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  disk_json=$(/usr/bin/osascript -l JavaScript -e '
+    ObjC.import("Foundation");
+    var url = $.NSURL.fileURLWithPath("/");
+    var total = Ref(), available = Ref(), error = Ref();
+    var totalOK = url.getResourceValueForKeyError(
+      total, $.NSURLVolumeTotalCapacityKey, error);
+    var availableOK = url.getResourceValueForKeyError(
+      available, $.NSURLVolumeAvailableCapacityForImportantUsageKey, error);
+    if (!totalOK || !availableOK) throw new Error("volume capacity unavailable");
+    console.log(JSON.stringify({
+      mount: "/",
+      total_bytes: ObjC.unwrap(total[0].stringValue),
+      available_bytes: ObjC.unwrap(available[0].stringValue),
+      semantics: "effective-used",
+      source: "Foundation important-usage capacity"
+    }));
+  ' 2>&1)
+  [ -n "$disk_json" ] && printf 'DISK_JSON=%s\n' "$disk_json"
+else
+  disk_values=$(df -B1 -P / 2>/dev/null | awk 'NR == 2 { print $2, $4 }')
+  if [ -z "$disk_values" ]; then
+    set -- $(df -kP / 2>/dev/null | awk 'NR == 2 { print $2, $4 }')
+    if [ "$#" -eq 2 ]; then
+      disk_values="$(($1 * 1024)) $(($2 * 1024))"
+    fi
+  fi
+  set -- $disk_values
+  if [ "$#" -eq 2 ]; then
+    printf 'DISK_JSON={"mount":"/","total_bytes":"%s","available_bytes":"%s","semantics":"allocated-used","source":"df"}\n' "$1" "$2"
+  fi
+fi
 exit 0
 """
 
@@ -64,8 +118,45 @@ Write-Output "NCPU=$($c[0].NumberOfLogicalProcessors)"
 Write-Output "CHIP=$($c[0].Name)"
 $g = nvidia-smi --query-gpu=name,utilization.gpu,memory.free,memory.total --format=csv,noheader,nounits
 if ($g) { Write-Output "NVIDIA:$(@($g)[0])" }
+$drive = $env:SystemDrive
+$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'"
+if ($disk) {
+    $diskPayload = [ordered]@{
+        mount = [string]$disk.DeviceID
+        total_bytes = [string][uint64]$disk.Size
+        available_bytes = [string][uint64]$disk.FreeSpace
+        semantics = 'allocated-used'
+        source = 'Win32_LogicalDisk'
+    } | ConvertTo-Json -Compress
+    Write-Output "DISK_JSON=$diskPayload"
+}
 exit 0
 """
+
+
+@dataclass
+class PrimaryDiskView:
+    """Primary filesystem capacity. Missing/malformed input stays unavailable."""
+
+    mount: str = ""
+    total_bytes: int | None = None
+    available_bytes: int | None = None
+    semantics: str = ""
+    source: str = ""
+    status: str = "unavailable"
+    detail: str = ""
+
+    @property
+    def used_bytes(self) -> int | None:
+        if self.total_bytes is None or self.available_bytes is None:
+            return None
+        return self.total_bytes - self.available_bytes
+
+    @property
+    def used_pct(self) -> float | None:
+        if not self.total_bytes or self.used_bytes is None:
+            return None
+        return self.used_bytes / self.total_bytes * 100.0
 
 
 @dataclass
@@ -80,10 +171,9 @@ class ResourceView:
     chip: str = ""
     cpu_busy_pct: float | None = None
     cpu_count: int | None = None
-    # 1-minute load average and that figure per core. Distinct from cpu_busy_pct:
-    # load counts runnable AND blocked threads, so it reveals queueing/contention
-    # that a utilization percentage cannot. >1.0 per core means more work is
-    # waiting than there are cores to run it.
+    # 1-minute scheduler demand and that figure per core. Distinct from
+    # cpu_busy_pct: a recent burst or platform-specific load accounting can leave
+    # this high while interval CPU utilization is low.
     load1: float | None = None
     load_per_core: float | None = None
     ram_free_mb: float | None = None
@@ -95,39 +185,30 @@ class ResourceView:
     # True when the GPU shares system RAM (Apple silicon), so a VRAM figure
     # would be a fiction rather than a measurement.
     gpu_unified: bool = False
+    primary_disk: PrimaryDiskView = field(default_factory=PrimaryDiskView)
     # Set when this row is the controller running the command.
     is_local: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
-    def oversubscribed(self) -> bool | None:
-        """More work queued than cores to run it (load per core > 1).
-
-        None when unmeasured. A box can be oversubscribed while showing modest
-        CPU busy — that is contention (threads waiting on each other or on I/O),
-        and it is the state that makes a device a bad place to send more work.
-        """
-        if self.load_per_core is None:
-            return None
-        return self.load_per_core > 1.0
-
-    @property
     def load_label(self) -> str:
-        """Short human verdict on queueing pressure."""
+        """Raw one-minute demand/core ratio, without a CPU-saturation verdict."""
         if self.load_per_core is None:
             return "-"
         ratio = self.load_per_core
-        if ratio > 2.0:
-            return f"{ratio:.1f}x OVERSUB"
-        if ratio > 1.0:
-            return f"{ratio:.1f}x busy"
-        return f"{ratio:.2f}x"
+        return f"{ratio:.1f}x" if ratio >= 1.0 else f"{ratio:.2f}x"
 
     @property
     def ram_used_pct(self) -> float | None:
         if not self.ram_total_mb or self.ram_free_mb is None:
             return None
         return max(0.0, min(100.0, (1.0 - self.ram_free_mb / self.ram_total_mb) * 100.0))
+
+    @property
+    def vram_used_pct(self) -> float | None:
+        if self.gpu_unified or not self.vram_total_mb or self.vram_free_mb is None:
+            return None
+        return max(0.0, min(100.0, (1.0 - self.vram_free_mb / self.vram_total_mb) * 100.0))
 
 
 def _kv(out: str) -> dict[str, str]:
@@ -170,6 +251,44 @@ def _parse_nvidia(line: str, view: ResourceView) -> None:
     view.vram_total_mb = _num(parts[3])
 
 
+def _byte_count(value: object) -> int | None:
+    """A non-negative exact integer from JSON, accepting decimal strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"\d+", value):
+        return int(value)
+    return None
+
+
+def _parse_disk_json(raw: str | None, view: ResourceView) -> None:
+    """Parse one strict disk-capacity record without inventing plausible zeros."""
+    if raw is None:
+        return
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        view.primary_disk = PrimaryDiskView(status="invalid", detail="malformed JSON")
+        return
+    if not isinstance(payload, dict):
+        view.primary_disk = PrimaryDiskView(status="invalid", detail="not an object")
+        return
+    total = _byte_count(payload.get("total_bytes"))
+    available = _byte_count(payload.get("available_bytes"))
+    if total is None or total <= 0 or available is None or available > total:
+        view.primary_disk = PrimaryDiskView(status="invalid", detail="invalid capacity")
+        return
+    view.primary_disk = PrimaryDiskView(
+        mount=str(payload.get("mount") or ""),
+        total_bytes=total,
+        available_bytes=available,
+        semantics=str(payload.get("semantics") or ""),
+        source=str(payload.get("source") or ""),
+        status="ok",
+    )
+
+
 def _parse_vm_stat(lines: list[str], view: ResourceView) -> None:
     """Available RAM = (free + inactive) pages.
 
@@ -204,6 +323,7 @@ def _parse_posix(out: str, view: ResourceView) -> None:
     total = _num(kv.get("MEMTOTAL"))
     if total:
         view.ram_total_mb = total / (1024.0 * 1024.0)   # bytes -> MB
+    _parse_disk_json(kv.get("DISK_JSON"), view)
 
     vm_lines = [ln[len("VMSTAT:"):] for ln in out.splitlines()
                 if ln.startswith("VMSTAT:")]
@@ -233,19 +353,13 @@ def _parse_posix(out: str, view: ResourceView) -> None:
                 view.cpu_busy_pct = max(0.0, min(100.0, 100.0 - idle))
             break
 
-    # Load average is kept as a SEPARATE signal, never as cpu_busy_pct: it counts
-    # blocked threads too, so it answers "is this box oversubscribed / is work
-    # queueing" rather than "how busy are the cores".
+    # Load average is kept as a separate demand signal, never converted into
+    # current CPU utilization.
     load1 = _num(kv.get("LOADAVG"))
     if load1 is not None:
         view.load1 = load1
         if view.cpu_count:
             view.load_per_core = load1 / view.cpu_count
-        # Only fall back to load when top gave us nothing, and say so, since the
-        # two are not the same measurement.
-        if view.cpu_busy_pct is None and view.cpu_count:
-            view.cpu_busy_pct = min(100.0, load1 / view.cpu_count * 100.0)
-            view.notes.append("cpu from loadavg (top unavailable)")
 
     for line in out.splitlines():
         if line.startswith("AGX:"):
@@ -263,6 +377,7 @@ def _parse_windows(out: str, view: ResourceView) -> None:
     view.chip = kv.get("CHIP", "")
     ncpu = _num(kv.get("NCPU"))
     view.cpu_count = int(ncpu) if ncpu else None
+    _parse_disk_json(kv.get("DISK_JSON"), view)
 
     total_kb = _num(kv.get("MEMTOTAL_KB"))
     if total_kb:
@@ -290,13 +405,12 @@ def _parse_windows(out: str, view: ResourceView) -> None:
 # on DNS. Reaching sshd and being refused is a far more specific fact than a name
 # that did not resolve, so it wins regardless of candidate order.
 _ERROR_RANK = (
-    ("permission denied", "ssh auth refused (no authorized key for this controller)"),
+    ("permission denied", "ssh auth refused"),
     ("host key verification failed", "host key not trusted (connect once to accept it)"),
     ("connection refused", "connection refused (sshd not running / not enabled)"),
     # "offline" would be a guess: a heavily loaded but healthy box times out too.
-    # Say what was observed (no answer in the budget) and name both causes.
-    ("connection timed out", "no answer within timeout (offline, or too loaded to reply)"),
-    ("operation timed out", "no answer within timeout (offline, or too loaded to reply)"),
+    ("connection timed out", "timeout (offline/busy)"),
+    ("operation timed out", "timeout (offline/busy)"),
     ("no route to host", "no route to host (device offline)"),
     ("could not resolve", "hostname did not resolve"),
     ("name or service not known", "hostname did not resolve"),
@@ -323,7 +437,7 @@ def _friendly_error(detail: str) -> str:
         if needle in low:
             return message
     if "timed out" in low or "timeout" in low:
-        return "no answer within timeout (offline, or too loaded to reply)"
+        return "timeout (offline/busy)"
     # Keep it to one line; ssh banners can run long.
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     return first[:160] or "unreachable"
@@ -398,7 +512,17 @@ def probe_device(device: Device, transport: BaseTransport | None = None,
     """
     view = ResourceView(name=device.name, reachable=False, os=device.os)
     try:
-        transport = transport or make_transport(device)
+        # This report runs only the fixed scripts above: bounded kernel/capacity
+        # metadata, never caller argv. Keep it outside the arbitrary-command
+        # memory guard so an unknown-job ceiling cannot hide the very resource
+        # state operators need to diagnose, or turn one SSH round trip into the
+        # full reserve/renew/claim/release handshake.
+        probe_device_config = (
+            replace(device, memory_guard=None)
+            if transport is None and device.memory_guard is not None
+            else device
+        )
+        transport = transport or make_transport(probe_device_config)
     except Exception as exc:                                  # noqa: BLE001
         view.detail = _friendly_error(str(exc))
         return view

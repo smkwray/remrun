@@ -50,6 +50,15 @@ use_venv = true
 # PYTHONUNBUFFERED = "1"
 # OMP_NUM_THREADS = "4"
 
-[resources.default]
-cores = 4
-memory_gb = 16
+[resources]
+schema = 1
+# Leave unset to require `remrun run --workload example.analysis ...`.
+# default_workload = "example.analysis"
+
+[resources.workloads."example.analysis"]
+protocol = 1
+adapter_id = "example.resource-policy"
+adapter_version = 1
+work_unit = "case"
+require_envelope = false
+require_receipt = true

@@ -22,11 +22,14 @@ any data paths that reveal projects or clients
 Run the checked public-surface scan:
 
 ```bash
+bash scripts/hygiene_check.sh
 python3 scripts/public_release_check.py
 ```
 
-The check scans package code, tests, examples, schemas, README, generic docs, and example config.
-It intentionally excludes private continuity/work-order notes and ignored local config.
+The hygiene gate checks paths, diffs, and commit attribution. The release checker
+scans package code, tests, examples, schemas, README, generic docs, and example
+config. Both intentionally exclude private continuity/work-order notes and ignored
+local config.
 
 ## Rename or scope if needed
 

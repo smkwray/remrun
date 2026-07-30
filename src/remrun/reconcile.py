@@ -73,6 +73,19 @@ class ReconcileResult:
         )
 
 
+@dataclass(frozen=True)
+class NextBaseline:
+    """The only baseline pair the CLI may persist after a completed pullback.
+
+    Each path either retains its pre-run generation or advances after positive
+    command-attributed reconciliation. Keeping the pair typed prevents callers
+    from reconstructing baseline meaning from unrelated full-tree snapshots.
+    """
+
+    local_manifest: Manifest
+    remote_manifest: Manifest
+
+
 @dataclass
 class PullbackResult:
     pulled: list[str] = field(default_factory=list)
@@ -81,6 +94,9 @@ class PullbackResult:
     skipped_identical: list[str] = field(default_factory=list)   # local already == remote (Syncthing delivered)
     post_remote_manifest: Manifest = field(default_factory=dict)
     local_manifest_after: Manifest = field(default_factory=dict)
+    # None means at least one command-attributed path was not positively
+    # reconciled, so the prior baseline must remain untouched.
+    next_baseline: NextBaseline | None = None
 
 
 def _fresh_local_entry(path: Path, *, hash_if_size: int | None) -> FileEntry | None:
@@ -425,6 +441,12 @@ def postrun_pullback(
     post_remote = transport.manifest(remote_root, excludes, hash_below_bytes)
     changed, deleted = diff_remote_changes(pre_remote_manifest, post_remote)
     cur_local = build_manifest(local_root, excludes, hash_below_bytes=hash_below_bytes or None)
+    # Baseline advancement is path-attributed, not a whole-tree snapshot. An
+    # unrelated local writer may create, edit, or delete a path while the remote
+    # command runs; retaining that path's preflight generation makes the next
+    # preflight detect and reconcile the local work.
+    next_local = dict(pre_local_manifest)
+    next_remote = dict(pre_remote_manifest)
 
     if write_scope_paths:
         escaped = [
@@ -456,21 +478,28 @@ def postrun_pullback(
         remote_entry = post_remote.get(rel)
         remote_path = transport.remote_join(remote_root, rel)
         local_path = local_root / rel
+        if remote_entry is None:
+            # ``changed`` is derived from ``post_remote``, so this can only happen
+            # if a malformed/unstable transport response broke attribution. Fail
+            # closed rather than pulling an unmanifested path.
+            result.conflicts.append(rel)
+            continue
 
         # Strong remote hash for the candidate: the manifest caps hashing at hash_below_bytes, so
         # a >64 MB output has sha256=None. Hash it now so the idempotent skip below is content-based
         # for large outputs too. If the hash cannot be obtained, preserve the remote candidate as a
         # conflict instead of silently degrading equality to size/mtime.
-        if remote_entry is not None and remote_entry.sha256 is None:
+        if remote_entry.sha256 is None:
             try:
                 digest = transport.hash_file(remote_path)
                 if (
-                    len(digest) != 64
+                    not isinstance(digest, str)
+                    or len(digest) != 64
                     or any(char not in "0123456789abcdef" for char in digest.lower())
                 ):
                     raise TransportError(f"hash {remote_path} returned an invalid SHA-256")
                 remote_entry = replace(remote_entry, sha256=digest.lower())
-            except (TransportError, NotImplementedError, ValueError):
+            except (TransportError, NotImplementedError, OSError, ValueError):
                 dest = conflict_remote_root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 transport.pull_file(remote_path, dest)
@@ -482,9 +511,13 @@ def postrun_pullback(
         # SKIP the pull — that avoids an unnecessary overwrite that races Syncthing's own delivery
         # (the temp-orphan / sync-conflict source). Idempotent external-writer behavior.
         local_now = _fresh_local_entry(
-            local_path, hash_if_size=(remote_entry.size if remote_entry is not None else None))
-        if remote_entry is not None and entries_same(local_now, remote_entry):
+            local_path, hash_if_size=remote_entry.size)
+        if local_now is not None and entries_same(local_now, remote_entry):
             result.skipped_identical.append(rel)
+            # Both entries are positively content-equal here: ``remote_entry`` has
+            # a strong hash and ``local_now`` hashes same-sized local content.
+            next_local[rel] = replace(local_now, path=rel)
+            next_remote[rel] = post_remote[rel]
             continue
 
         local_changed_during_run = _changed_since(pre_local_manifest.get(rel), local_now)
@@ -498,19 +531,31 @@ def postrun_pullback(
 
         _backup_local(local_root, rel, backup_root, backup_below_bytes)  # rollback snapshot
         transport.pull_file(remote_path, local_path)
-        # Verify the pull landed the expected bytes (cheap integrity guard when we know the hash).
-        if remote_entry is not None and remote_entry.sha256 is not None:
-            verify = _fresh_local_entry(local_path, hash_if_size=remote_entry.size)
-            if verify is None or not entries_same(verify, remote_entry):
-                raise TransportError(f"pull verification failed for {rel}")
+        # Every candidate has a strong remote hash by this point, so a successful
+        # pull always has positive content verification before its baseline path
+        # advances.
+        verify = _fresh_local_entry(local_path, hash_if_size=remote_entry.size)
+        if verify is None or not entries_same(verify, remote_entry):
+            raise TransportError(f"pull verification failed for {rel}")
         result.pulled.append(rel)
+        next_local[rel] = replace(verify, path=rel)
+        next_remote[rel] = post_remote[rel]
 
     for rel in deleted:
         local_path = local_root / rel
-        if not local_path.exists():
+        pre_local_entry = pre_local_manifest.get(rel)
+        local_now = _fresh_local_entry(
+            local_path,
+            hash_if_size=(pre_local_entry.size if pre_local_entry is not None else None),
+        )
+        if local_now is None:
+            # The command-attributed remote deletion is already reflected locally
+            # (for example, Syncthing delivered it first).
+            next_local.pop(rel, None)
+            next_remote.pop(rel, None)
             continue
         local_changed_during_run = _changed_since(
-            pre_local_manifest.get(rel), cur_local.get(rel)
+            pre_local_entry, local_now
         )
         if local_changed_during_run:
             # Remote deleted it but local changed it during the run -> keep local.
@@ -518,18 +563,28 @@ def postrun_pullback(
             continue
         _backup_local(local_root, rel, backup_root, backup_below_bytes)
         local_path.unlink(missing_ok=True)
+        if _fresh_local_entry(local_path, hash_if_size=None) is not None:
+            raise TransportError(f"delete verification failed for {rel}")
         result.deleted_local.append(rel)
+        next_local.pop(rel, None)
+        next_remote.pop(rel, None)
 
     result.post_remote_manifest = post_remote
     result.local_manifest_after = build_manifest(
         local_root, excludes, hash_below_bytes=hash_below_bytes or None
     )
+    if not result.conflicts:
+        result.next_baseline = NextBaseline(
+            local_manifest=next_local,
+            remote_manifest=next_remote,
+        )
     return result
 
 
 # Re-exported so callers can catch transfer failures distinctly.
 __all__ = [
     "ReconcileResult",
+    "NextBaseline",
     "PullbackResult",
     "preflight_reconcile",
     "postrun_pullback",

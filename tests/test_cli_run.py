@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -10,9 +11,15 @@ from pathlib import Path
 import pytest
 
 from remrun.cli import (
-    EXIT_CONFLICT, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, _best_remote_verdict, main,
+    EXIT_CONFLICT, EXIT_GUARD, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, _best_remote_verdict,
+    _workload_observation_from_run, main,
 )
-from remrun.profile import LOCAL_DEVICE, command_key, device_profile, load_profiles
+from remrun.models import WorkloadSpec
+from remrun.profile import (
+    LOCAL_DEVICE, WORKLOAD_PROFILES_KEY, command_key, device_profile, load_profiles,
+)
+from remrun.resource_context import ReceiptValidation
+from remrun.state import ProjectLock
 from remrun.transport import ExecResult, LocalSimTransport, TransportError
 
 
@@ -27,6 +34,102 @@ def set_log_cap(env: dict, max_bytes: int) -> None:
         + f'\n[logging]\nmax_full_log_mb = {max_bytes / (1024 * 1024)!r}\n',
         encoding="utf-8",
     )
+
+
+def configure_workload(
+    env: dict,
+    *,
+    require_envelope: bool = False,
+    require_receipt: bool = False,
+    default: bool = False,
+    device_policy: bool = True,
+) -> None:
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True, exist_ok=True)
+    default_line = 'default_workload = "demo.work"\n' if default else ""
+    (cfgdir / "remrun.toml").write_text(
+        "[resources]\n"
+        "schema = 1\n"
+        f"{default_line}"
+        '[resources.workloads."demo.work"]\n'
+        "protocol = 1\n"
+        'adapter_id = "demo.policy"\n'
+        "adapter_version = 1\n"
+        'work_unit = "case"\n'
+        f"require_envelope = {str(require_envelope).lower()}\n"
+        f"require_receipt = {str(require_receipt).lower()}\n",
+        encoding="utf-8",
+    )
+    if device_policy:
+        devices = env["remrun_root"] / "config" / "devices.toml"
+        devices.write_text(
+            devices.read_text(encoding="utf-8")
+            + "\n[devices.LOCAL_SIM.resource_policy]\n"
+            + "schema = 1\n"
+            + 'mode = "unattended"\n'
+            + "probe_timeout_sec = 5\n"
+            + "cpu_reserve_cores = 0\n"
+            + "cpu_max_fraction = 1.0\n"
+            + "ram_reserve_mib = 0\n"
+            + "ram_max_fraction = 1.0\n"
+            + "gpu_busy_ceiling_pct = 100\n"
+            + "vram_reserve_mib = 0\n"
+            + "vram_max_fraction = 1.0\n"
+            + "allow_static_fallback = false\n",
+            encoding="utf-8",
+        )
+
+
+def configure_memory_guard(
+    env: dict,
+    *,
+    ram_gb: int = 8,
+    max_command_mib: int = 512,
+    min_available_mib: int = 16,
+) -> None:
+    # Schema 2 derives exact rounded test thresholds from measured physical RAM.
+    # ``ram_gb`` remains in the helper signature only to keep older callers clear
+    # that declared placement RAM is not a protection authority.
+    del ram_gb
+    from remrun import _posix_telemetry as telemetry
+
+    total_bytes, _available = telemetry._host_memory()
+    command_fraction = ((max_command_mib + 0.25) * 1024**2) / total_bytes
+    reserve_fraction = ((min_available_mib - 0.25) * 1024**2) / total_bytes
+    assert 0 < command_fraction < 1
+    assert 0 < reserve_fraction < 1
+    assert command_fraction + reserve_fraction < 1
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text(encoding="utf-8")
+        + "\n[devices.LOCAL_SIM.memory_guard]\n"
+        + "schema = 2\n"
+        + f"command_limit_fraction = {command_fraction!r}\n"
+        + f"host_reserve_fraction = {reserve_fraction!r}\n",
+        encoding="utf-8",
+    )
+
+
+def receipt_writing_command(output: str = "adapted") -> list[str]:
+    script = (
+        "import json,os,pathlib\n"
+        "ctx=json.load(open(os.environ['REMRUN_RUN_CONTEXT'],encoding='utf-8'))\n"
+        "receipt={"
+        "'schema':'remrun.workload-receipt','version':1,"
+        "'run_id':ctx['run_id'],'workload':ctx['workload']['name'],"
+        "'adapter_id':ctx['workload']['adapter_id'],"
+        "'adapter_version':ctx['workload']['adapter_version'],"
+        "'status':'applied','evaluation':'accepted',"
+        "'setting':{'workers':1},'constraints':{'process_cap':1},"
+        "'work':{'unit':ctx['workload']['work_unit'],'count':1},"
+        "'setting_fingerprint':'sha256:test','written_at':'2026-07-28T23:18:21Z'}\n"
+        "dest=pathlib.Path(ctx['workload']['receipt']['path'])\n"
+        "tmp=dest.with_suffix(dest.suffix+'.tmp')\n"
+        "tmp.write_text(json.dumps(receipt),encoding='utf-8')\n"
+        "tmp.replace(dest)\n"
+        f"pathlib.Path('adapted.txt').write_text({output!r},encoding='utf-8')\n"
+    )
+    return ["python", "-c", script]
 
 
 @pytest.fixture()
@@ -92,6 +195,7 @@ def test_run_happy_path_pulls_output(env, capsys):
 def test_run_passes_through_nonzero_exit(env):
     code = main(["run", "LOCAL_SIM", "--", "python", "-c", "import sys; sys.exit(7)"])
     assert code == 7
+    assert load_profiles(env["state"]) == {}
 
 
 def test_exec_transport_failure_records_unknown_completion_guidance(
@@ -100,7 +204,15 @@ def test_exec_transport_failure_records_unknown_completion_guidance(
     def disconnect_after_start(*_args, **_kwargs):
         raise TransportError("injected connection reset")
 
+    real_release = ProjectLock.release
+
+    def release_after_hazard(self):
+        hazards = list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+        assert len(hazards) == 1
+        real_release(self)
+
     monkeypatch.setattr(LocalSimTransport, "exec", disconnect_after_start)
+    monkeypatch.setattr(ProjectLock, "release", release_after_hazard)
     code = main(["run", "LOCAL_SIM", "--", "python", "-c", "print('maybe ran')"])
 
     assert code == EXIT_INFRA
@@ -116,6 +228,75 @@ def test_exec_transport_failure_records_unknown_completion_guidance(
     assert not list((env["state"] / "locks").glob("**/*.lock"))
 
 
+def test_unknown_completion_hazard_blocks_clean_and_resolves_explicitly(
+    env, monkeypatch, capsys
+):
+    tracked = env["proj"] / "tracked.txt"
+    tracked.write_text("before")
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('seed')"]) == EXIT_OK
+    capsys.readouterr()
+
+    real_exec = LocalSimTransport.exec
+
+    def disconnect_after_start(*_args, **_kwargs):
+        raise TransportError("injected connection reset")
+
+    monkeypatch.setattr(LocalSimTransport, "exec", disconnect_after_start)
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('maybe ran')"]) == EXIT_INFRA
+
+    hazards = list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+    assert len(hazards) == 1
+    hazard = json.loads(hazards[0].read_text(encoding="utf-8"))
+    assert hazard["version"] == 1
+    assert hazard["project_id"] == "proj1"
+    assert hazard["target"] == "LOCAL_SIM"
+    unknown_run_id = hazard["run_id"]
+
+    # A new invocation (the controller process may have restarted) must fail before
+    # preflight or execution.  Another controller state root is intentionally not fenced.
+    monkeypatch.setattr(LocalSimTransport, "exec", real_exec)
+    assert main([
+        "run", "LOCAL_SIM", "--", "python", "-c",
+        "open('must-not-run.txt','w').write('unsafe')",
+    ]) == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "must-not-run.txt").exists()
+    err = capsys.readouterr().err
+    assert "unknown_completion_hazard" in err
+    assert "controller-local" in err
+
+    local_bench_called = False
+
+    def fail_if_local_bench_runs(*_args, **_kwargs):
+        nonlocal local_bench_called
+        local_bench_called = True
+        raise AssertionError("bench local leg ran despite unknown-completion hazard")
+
+    with monkeypatch.context() as bench_patch:
+        bench_patch.setattr("remrun.cli.subprocess.run", fail_if_local_bench_runs)
+        assert main([
+            "bench", "LOCAL_SIM", "--", "python", "-c", "print('must-not-bench')",
+        ]) == EXIT_INTERNAL
+    assert not local_bench_called
+
+    # Ordinary cleanup cannot erase the admission hazard or its resolution evidence.
+    assert main(["clean", "--keep", "0"]) == EXIT_OK
+    assert hazards[0].exists()
+    summary_path = env["state"] / "runs" / unknown_run_id / "summary.json"
+    assert summary_path.exists()
+
+    # Resolution records only the operator's confirmed-ended action.  It does not
+    # infer outputs or advance the last good baseline: a remote edit made while the
+    # outcome was unknown must still be discovered by the next normal preflight.
+    (env["remote_proj"] / "tracked.txt").write_text("remote-after-unknown")
+    assert main(["resolve-unknown", unknown_run_id, "--confirmed-ended"]) == EXIT_OK
+    assert not hazards[0].exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["unknown_resolution"]["action"] == "confirmed-ended"
+
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('safe-next')"]) == EXIT_OK
+    assert tracked.read_text() == "remote-after-unknown"
+
+
 def test_auto_resolves_target(env):
     # With only LOCAL_SIM configured, --auto resolves to it.
     code = main(["run", "--auto", "--", "python", "-c", "open('auto.txt','w').write('ok')"])
@@ -129,6 +310,539 @@ def test_dry_run_does_not_execute(env):
     assert code == EXIT_OK
     assert not (env["proj"] / "nope.txt").exists()
     assert not (env["remote_proj"]).exists() or not (env["remote_proj"] / "nope.txt").exists()
+
+
+def test_no_workload_uses_exact_legacy_exec_path(env, monkeypatch):
+    import remrun.cli as climod
+
+    def forbidden_probe(*_args, **_kwargs):
+        raise AssertionError("ordinary run must not probe resources")
+
+    real_exec = LocalSimTransport.exec
+    calls: list[tuple[list[str], dict]] = []
+
+    def capture_exec(self, command, **kwargs):
+        calls.append((command, kwargs))
+        return real_exec(self, command, **kwargs)
+
+    monkeypatch.setattr(climod, "probe_target_resources", forbidden_probe)
+    monkeypatch.setattr(LocalSimTransport, "exec", capture_exec)
+    command = ["python", "-c", "open('legacy.txt','w').write('ok')"]
+
+    assert main(["run", "LOCAL_SIM", "--", *command]) == EXIT_OK
+    assert calls == [
+        (
+            command,
+            {
+                "cwd": str(env["remote_proj"]),
+                "env": {},
+                "path_prepend": [],
+                "telemetry": True,
+                "on_stdout": calls[0][1]["on_stdout"],
+            },
+        )
+    ]
+    assert "REMRUN_RUN_CONTEXT" not in calls[0][1]["env"]
+    run = next((env["state"] / "runs").iterdir())
+    assert not list(run.glob("run-context*"))
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert "workload" not in summary
+    assert "workload" not in summary["plan"]
+
+
+def test_unselected_malformed_resources_remain_inert(env, monkeypatch):
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "remrun.toml").write_text(
+        '[resources.default]\ncores = "not-an-integer"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "remrun.cli.probe_target_resources",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("unselected legacy config must remain inert")
+        ),
+    )
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('legacy')"]) == EXIT_OK
+
+
+def test_workload_context_is_target_native_and_argv_is_unchanged(
+    env, monkeypatch
+):
+    from remrun.resource_envelope import Metric
+    from remrun.resource_probe import ResourceSnapshot
+
+    configure_workload(env, require_receipt=True)
+
+    def measured(value):
+        return Metric(value, "measured", "test", "exact")
+
+    monkeypatch.setattr(
+        "remrun.cli.probe_target_resources",
+        lambda *_a, **_k: ResourceSnapshot(
+            status="ok",
+            platform="test",
+            machine="test",
+            logical_cores=measured(8),
+            effective_cores=measured(8),
+            cpu_busy_pct=measured(25),
+            cpu_sample_interval_ms=500,
+            ram_total_bytes=measured(16 * 1024**3),
+            ram_available_bytes=measured(8 * 1024**3),
+            gpu_kind="none",
+        ),
+    )
+    real_exec = LocalSimTransport.exec
+    calls: list[tuple[list[str], dict]] = []
+
+    def capture_exec(self, command, **kwargs):
+        calls.append((command, kwargs))
+        return real_exec(self, command, **kwargs)
+
+    monkeypatch.setattr(LocalSimTransport, "exec", capture_exec)
+    command = receipt_writing_command()
+    assert main(["run", "LOCAL_SIM", "--workload", "demo.work", "--", *command]) == EXIT_OK
+
+    assert calls[-1][0] == command
+    context_path = calls[-1][1]["env"]["REMRUN_RUN_CONTEXT"]
+    assert context_path.startswith(str(env["state"] / "runs"))
+    assert not context_path.startswith(str(env["proj"]))
+    run = next((env["state"] / "runs").iterdir())
+    context = json.loads(
+        (run / "run-context.controller.v1.json").read_text(encoding="utf-8")
+    )
+    assert context["workload"]["receipt"]["path"].endswith(
+        "workload-receipt.v1.json"
+    )
+    assert context["resources"]["status"] == "ok"
+    assert (env["proj"] / "adapted.txt").read_text() == "adapted"
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert summary["receipt"]["status"] == "valid"
+    assert summary["command"] == command
+    assert summary["telemetry"]["memory"]["metric"] == "rss_sum_sampled"
+    assert summary["workload_profile"]["status"] == "recorded"
+    assert summary["workload_cleanup"] == {
+        "context": "deleted",
+        "receipt": "deleted",
+    }
+    workload_rows = load_profiles(env["state"])[WORKLOAD_PROFILES_KEY]["entries"]
+    assert len(workload_rows) == 1
+    row = next(iter(workload_rows.values()))
+    assert row["setting"] == {"workers": 1}
+    assert row["work_unit"] == "case"
+    assert row["throughput"] > 0
+    assert (run / "workload-receipt.controller.v1.json").exists()
+    assert not Path(context_path).exists()
+
+
+def test_workload_profiles_use_target_wall_not_controller_staging_time(
+    env, monkeypatch
+):
+    from remrun.resource_probe import unavailable_snapshot
+
+    configure_workload(env, require_receipt=True)
+    monkeypatch.setattr(
+        "remrun.cli.probe_target_resources",
+        lambda *_a, **_k: unavailable_snapshot("unavailable", "test"),
+    )
+    real_exec = LocalSimTransport.exec
+
+    def delayed_exec(self, *args, **kwargs):
+        time.sleep(0.35)
+        return real_exec(self, *args, **kwargs)
+
+    monkeypatch.setattr(LocalSimTransport, "exec", delayed_exec)
+    command = receipt_writing_command("timed")
+
+    assert main([
+        "run", "LOCAL_SIM", "--workload", "demo.work", "--", *command
+    ]) == EXIT_OK
+
+    summary = json.loads(
+        next((env["state"] / "runs").glob("*/summary.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    target_wall = summary["telemetry"]["wall_sec"]
+    assert summary["duration_sec"] - target_wall >= 0.3
+    profiles = load_profiles(env["state"])
+    generic = device_profile(
+        profiles,
+        "proj1",
+        command_key(command),
+        "LOCAL_SIM",
+    )
+    workload_row = next(
+        iter(profiles[WORKLOAD_PROFILES_KEY]["entries"].values())
+    )
+    assert generic["exec_s"] == pytest.approx(target_wall, abs=0.001)
+    assert workload_row["exec_s"] == pytest.approx(target_wall, abs=0.001)
+    assert workload_row["throughput"] == pytest.approx(
+        1 / target_wall,
+        abs=0.001,
+    )
+
+
+def test_default_workload_is_explicit_project_opt_in(env):
+    configure_workload(env, require_receipt=True, default=True)
+    command = receipt_writing_command("default")
+    assert main(["run", "LOCAL_SIM", "--", *command]) == EXIT_OK
+    assert (env["proj"] / "adapted.txt").read_text() == "default"
+
+
+def test_required_envelope_missing_policy_aborts_before_command(env):
+    configure_workload(env, require_envelope=True, device_policy=False)
+    code = main([
+        "run",
+        "LOCAL_SIM",
+        "--workload",
+        "demo.work",
+        "--",
+        "python",
+        "-c",
+        "open('must-not-run.txt','w').write('x')",
+    ])
+    assert code == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "must-not-run.txt").exists()
+    summary = json.loads(
+        next((env["state"] / "runs").glob("*/summary.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["phase"] == "workload_admission"
+
+
+def test_optional_missing_policy_stages_explicit_fallback_context(env):
+    configure_workload(env, device_policy=False)
+    script = (
+        "import json,os,pathlib;"
+        "ctx=json.load(open(os.environ['REMRUN_RUN_CONTEXT']));"
+        "pathlib.Path('policy.txt').write_text(ctx['resources']['status'])"
+    )
+    assert main([
+        "run", "LOCAL_SIM", "--workload", "demo.work", "--", "python", "-c", script
+    ]) == EXIT_OK
+    assert (env["proj"] / "policy.txt").read_text() == "policy_missing"
+
+
+@pytest.mark.parametrize(
+    "require_receipt,expected",
+    [(False, EXIT_OK), (True, EXIT_INTERNAL)],
+)
+def test_context_staging_failure_obeys_required_boundary(
+    env, monkeypatch, require_receipt, expected
+):
+    configure_workload(env, require_receipt=require_receipt)
+    real_push = LocalSimTransport.push_file
+
+    def fail_context(self, local_path, remote_path):
+        if remote_path.endswith("run-context.v1.json"):
+            raise TransportError("injected context staging failure")
+        return real_push(self, local_path, remote_path)
+
+    monkeypatch.setattr(LocalSimTransport, "push_file", fail_context)
+    command = (
+        "import os,pathlib;"
+        "pathlib.Path('staging.txt').write_text("
+        "'context' if 'REMRUN_RUN_CONTEXT' in os.environ else 'legacy')"
+    )
+    code = main([
+        "run", "LOCAL_SIM", "--workload", "demo.work", "--", "python", "-c", command
+    ])
+    assert code == expected
+    if require_receipt:
+        assert not (env["remote_proj"] / "staging.txt").exists()
+    else:
+        assert (env["proj"] / "staging.txt").read_text() == "legacy"
+
+
+@pytest.mark.parametrize(
+    "require_receipt,expected",
+    [(False, EXIT_OK), (True, EXIT_INTERNAL)],
+)
+def test_missing_receipt_is_checked_only_after_pullback(
+    env, require_receipt, expected
+):
+    configure_workload(env, require_receipt=require_receipt)
+    code = main([
+        "run",
+        "LOCAL_SIM",
+        "--workload",
+        "demo.work",
+        "--",
+        "python",
+        "-c",
+        "open('pulled-before-contract.txt','w').write('yes')",
+    ])
+    assert code == expected
+    assert (env["proj"] / "pulled-before-contract.txt").read_text() == "yes"
+    summary = json.loads(
+        next((env["state"] / "runs").glob("*/summary.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["command_exit_code"] == 0
+    assert summary["receipt"]["status"] == "missing"
+    assert summary["workload_profile"]["status"] == "not_recorded"
+    profiles = load_profiles(env["state"])
+    assert WORKLOAD_PROFILES_KEY not in profiles
+    if require_receipt:
+        assert profiles == {}
+
+
+@pytest.mark.parametrize(
+    "extra_arg,detail",
+    [
+        ("--no-telemetry", "detailed telemetry was disabled"),
+        ("--no-pullback", "pullback was disabled"),
+    ],
+)
+def test_workload_profile_requires_telemetry_and_verified_pullback(
+    env, extra_arg, detail
+):
+    configure_workload(env, require_receipt=True)
+    command = receipt_writing_command()
+
+    assert main([
+        "run",
+        "LOCAL_SIM",
+        "--workload",
+        "demo.work",
+        extra_arg,
+        "--",
+        *command,
+    ]) == EXIT_OK
+
+    summary = json.loads(
+        next((env["state"] / "runs").glob("*/summary.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["receipt"]["status"] == "valid"
+    assert summary["workload_profile"] == {
+        "status": "not_recorded",
+        "detail": detail,
+    }
+    profiles = load_profiles(env["state"])
+    assert WORKLOAD_PROFILES_KEY not in profiles
+    if extra_arg == "--no-pullback":
+        assert profiles == {}
+
+
+def test_workload_profile_rejects_failed_command_even_with_valid_receipt(env):
+    configure_workload(env, require_receipt=True)
+    command = receipt_writing_command()
+    command[-1] += "\nraise SystemExit(7)\n"
+
+    assert main([
+        "run", "LOCAL_SIM", "--workload", "demo.work", "--", *command
+    ]) == 7
+
+    summary = json.loads(
+        next((env["state"] / "runs").glob("*/summary.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["receipt"]["status"] == "valid"
+    assert summary["workload_profile"]["status"] == "not_recorded"
+    assert load_profiles(env["state"]) == {}
+
+
+def test_workload_observation_rejects_unknown_metrics_and_zero_work():
+    workload = WorkloadSpec(
+        name="demo.work",
+        protocol=1,
+        adapter_id="demo.policy",
+        adapter_version=1,
+        work_unit="case",
+        require_envelope=False,
+        require_receipt=False,
+    )
+    receipt_data = {
+        "status": "applied",
+        "evaluation": "trial",
+        "setting": {"workers": 2},
+        "constraints": {"process_cap": 2},
+        "work": {"unit": "case", "count": 1},
+        "setting_fingerprint": "sha256:test",
+    }
+    telemetry = {
+        "schema": 1,
+        "wall_sec": 1.0,
+        "process_tree_drained": True,
+        "memory": {
+            "peak_bytes": None,
+            "metric": "rss_sum_sampled",
+            "coverage": "sampler_failed",
+        },
+        "cpu": {
+            "cpu_sec": None,
+            "avg_cpu_pct": None,
+            "coverage": "sampler_failed",
+        },
+        "gpu": {
+            "scope": "whole_device",
+            "max_util_pct": None,
+            "min_vram_free_bytes": None,
+            "unified_memory_min_available_bytes": None,
+            "status": "unavailable",
+        },
+    }
+
+    observation, detail = _workload_observation_from_run(
+        project_id="proj",
+        command=["python", "run.py"],
+        device="LOCAL_SIM",
+        workload=workload,
+        receipt=ReceiptValidation("valid", data=receipt_data),
+        telemetry=telemetry,
+        trip_s=2,
+        updated="now",
+    )
+    assert observation is None
+    assert "memory telemetry" in detail
+
+    telemetry["memory"] = {
+        "peak_bytes": 1024,
+        "metric": "rss_sum_sampled",
+        "coverage": "known_tree_drained",
+    }
+    telemetry["cpu"] = {
+        "cpu_sec": 1,
+        "avg_cpu_pct": 100,
+        "coverage": "wait4_known_tree_drained_detached_possible",
+    }
+    telemetry["process_tree_drained"] = False
+    observation, detail = _workload_observation_from_run(
+        project_id="proj",
+        command=["python", "run.py"],
+        device="LOCAL_SIM",
+        workload=workload,
+        receipt=ReceiptValidation("valid", data=receipt_data),
+        telemetry=telemetry,
+        trip_s=2,
+        updated="now",
+    )
+    assert observation is None
+    assert "not proven drained" in detail
+
+    telemetry["process_tree_drained"] = True
+    telemetry["gpu"] = {
+        "scope": "garbage",
+        "max_util_pct": 999,
+        "min_vram_free_bytes": 1,
+        "status": "fabricated",
+    }
+    observation, detail = _workload_observation_from_run(
+        project_id="proj",
+        command=["python", "run.py"],
+        device="LOCAL_SIM",
+        workload=workload,
+        receipt=ReceiptValidation("valid", data=receipt_data),
+        telemetry=telemetry,
+        trip_s=2,
+        updated="now",
+    )
+    assert observation is None
+    assert "GPU telemetry" in detail
+
+    receipt_data["work"]["count"] = 0
+    observation, detail = _workload_observation_from_run(
+        project_id="proj",
+        command=["python", "run.py"],
+        device="LOCAL_SIM",
+        workload=workload,
+        receipt=ReceiptValidation("valid", data=receipt_data),
+        telemetry=telemetry,
+        trip_s=2,
+        updated="now",
+    )
+    assert observation is None
+    assert "work count" in detail
+
+
+def test_workload_observation_keeps_unified_memory_pressure():
+    workload = WorkloadSpec(
+        name="demo.work",
+        protocol=1,
+        adapter_id="demo.policy",
+        adapter_version=1,
+        work_unit="case",
+        require_envelope=False,
+        require_receipt=False,
+    )
+    receipt = ReceiptValidation(
+        "valid",
+        data={
+            "status": "applied",
+            "evaluation": "trial",
+            "setting": {"workers": 2},
+            "constraints": {"process_cap": 2},
+            "work": {"unit": "case", "count": 2},
+            "setting_fingerprint": "sha256:test",
+        },
+    )
+    telemetry = {
+        "schema": 1,
+        "wall_sec": 1.0,
+        "process_tree_drained": True,
+        "memory": {
+            "peak_bytes": 1024,
+            "metric": "rss_sum_sampled",
+            "coverage": "known_tree_drained",
+        },
+        "cpu": {
+            "cpu_sec": 1,
+            "avg_cpu_pct": 100,
+            "coverage": "wait4_known_tree_drained_detached_possible",
+        },
+        "gpu": {
+            "scope": "whole_device",
+            "max_util_pct": None,
+            "min_vram_free_bytes": None,
+            "unified_memory_min_available_bytes": 4096,
+            "status": "unavailable",
+        },
+    }
+
+    observation, detail = _workload_observation_from_run(
+        project_id="proj",
+        command=["python", "run.py"],
+        device="LOCAL_SIM",
+        workload=workload,
+        receipt=receipt,
+        telemetry=telemetry,
+        trip_s=2,
+        updated="now",
+    )
+
+    assert detail == ""
+    assert observation is not None
+    assert observation.gpu["min_vram_free_bytes"] is None
+    assert observation.gpu["unified_memory_min_available_bytes"] == 4096
+
+
+def test_workload_dry_run_does_not_probe_or_stage(env, monkeypatch):
+    configure_workload(env, require_receipt=True)
+    monkeypatch.setattr(
+        "remrun.cli.probe_target_resources",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("dry run must not sample resources")
+        ),
+    )
+    assert main([
+        "run",
+        "LOCAL_SIM",
+        "--workload",
+        "demo.work",
+        "--dry-run",
+        "--",
+        "python",
+        "-c",
+        "print('dry')",
+    ]) == EXIT_OK
+    run = next((env["state"] / "runs").iterdir())
+    assert not list(run.glob("run-context*"))
 
 
 def test_scoped_run_pulls_declared_output(env):
@@ -345,6 +1059,8 @@ def test_postrun_conflict_is_terminal_and_preserves_baseline(env):
     # Establish a baseline with conflict.txt identical on both sides.
     (env["proj"] / "conflict.txt").write_text("orig")
     assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('A')"]) == EXIT_OK
+    profile_path = env["state"] / "profiles.json"
+    admitted_profile_bytes = profile_path.read_bytes()
 
     # A run whose command rewrites the remote copy while the local copy also
     # changes (simulated via absolute-path write) is an unresolved post-run conflict.
@@ -354,6 +1070,7 @@ def test_postrun_conflict_is_terminal_and_preserves_baseline(env):
                  f"open(r'{lp}/conflict.txt','w').write('LOCAL')"])
     # Command exited 0, but remrun could not converge -> reported as a conflict.
     assert code == EXIT_CONFLICT
+    assert profile_path.read_bytes() == admitted_profile_bytes
     assert (env["proj"] / "conflict.txt").read_text() == "LOCAL"      # local not clobbered
     saved = list((env["state"] / "conflicts").glob("*/remote/conflict.txt"))
     assert saved and saved[0].read_text() == "REMOTE"                  # remote copy saved aside
@@ -363,6 +1080,50 @@ def test_postrun_conflict_is_terminal_and_preserves_baseline(env):
     assert main(["run", "LOCAL_SIM", "--", "python", "-c",
                  "open('should_not_exist.txt','w').write('x')"]) == EXIT_CONFLICT
     assert not (env["remote_proj"] / "should_not_exist.txt").exists()
+
+
+@pytest.mark.parametrize("local_action", ["create", "modify", "delete"])
+def test_postrun_baseline_advances_only_command_attributed_paths(
+    env, monkeypatch, local_action
+):
+    """A local-only edit during exec must remain visible to the next preflight.
+
+    The remote command changes ``remote-output.txt``.  The injected local change to
+    ``unrelated.txt`` happens only after preflight, inside the production exec seam.
+    The old implementation wrote the whole postrun local and remote manifests as one
+    baseline pair, teaching each half a different value for the unrelated path.  The
+    next preflight then called that divergence unchanged and did nothing.
+    """
+    unrelated = env["proj"] / "unrelated.txt"
+    if local_action != "create":
+        unrelated.write_text("before")
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('seed')"]) == EXIT_OK
+
+    real_exec = LocalSimTransport.exec
+
+    def exec_after_unrelated_local_change(self, *args, **kwargs):
+        if local_action == "delete":
+            unrelated.unlink()
+        else:
+            unrelated.write_text("local-during-run")
+        return real_exec(self, *args, **kwargs)
+
+    monkeypatch.setattr(LocalSimTransport, "exec", exec_after_unrelated_local_change)
+    assert main([
+        "run", "LOCAL_SIM", "--", "python", "-c",
+        "open('remote-output.txt','w').write('remote-command')",
+    ]) == EXIT_OK
+    assert (env["proj"] / "remote-output.txt").read_text() == "remote-command"
+
+    # The injection was for the prior run only.  This next run must reconcile the
+    # still-unattributed local edit from the retained pre-run baseline.
+    monkeypatch.setattr(LocalSimTransport, "exec", real_exec)
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('reconcile')"]) == EXIT_OK
+    remote_unrelated = env["remote_proj"] / "unrelated.txt"
+    if local_action == "delete":
+        assert not remote_unrelated.exists()
+    else:
+        assert remote_unrelated.read_text() == "local-during-run"
 
 
 def test_best_remote_verdict_ignores_excluded_devices():
@@ -899,3 +1660,294 @@ def test_unwritable_stdout_log_does_not_abort_run(env, monkeypatch):
 
     assert code == EXIT_OK
     assert (env["proj"] / "ran.txt").read_text() == "ok"
+
+
+def test_guarded_ordinary_run_preserves_real_exit_with_no_telemetry(env):
+    configure_memory_guard(env)
+
+    code = main(
+        [
+            "run",
+            "LOCAL_SIM",
+            "--no-telemetry",
+            "--",
+            sys.executable,
+            "-c",
+            "print('guarded ordinary'); raise SystemExit(7)",
+        ]
+    )
+
+    assert code == 7
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["exit_code"] == 7
+    assert summary["command_exit_code"] == 7
+    assert summary["telemetry"] is None
+    assert summary["memory_guard"]["status"] == "ok"
+    assert summary["memory_guard"]["command_started"] is True
+
+
+def test_no_telemetry_cannot_disable_guard_threshold_termination(env, capsys):
+    configure_memory_guard(env, max_command_mib=160)
+    program = (
+        "import time;"
+        "x=bytearray(160*1024*1024);"
+        "[x.__setitem__(i,1) for i in range(0,len(x),4096)];"
+        "time.sleep(10)"
+    )
+
+    code = main(
+        [
+            "run",
+            "LOCAL_SIM",
+            "--no-telemetry",
+            "--",
+            sys.executable,
+            "-c",
+            program,
+        ]
+    )
+
+    assert code == EXIT_GUARD
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["exit_code"] == EXIT_GUARD
+    assert summary["command_exit_code"] is None
+    assert summary["telemetry"] is None
+    assert summary["memory_guard"]["status"] == "terminated"
+    assert summary["memory_guard"]["reason"] == "command_memory_limit"
+    assert summary["memory_guard"]["cleanup_complete"] is True
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+    assert "memory_guard status=terminated" in capsys.readouterr().err
+
+
+def test_guard_prelaunch_refusal_is_distinct_and_user_code_never_runs(
+    env, monkeypatch
+):
+    from remrun.memory_guard import MemoryAdmissionResult
+
+    configure_memory_guard(env)
+    monkeypatch.setattr(
+        LocalSimTransport,
+        "reserve_memory_guard",
+        lambda self, *, predicted_rss_mb=None: MemoryAdmissionResult.refused(
+            "insufficient_live_memory", "deterministic pre-mutation refusal"
+        ),
+    )
+
+    code = main(
+        [
+            "run",
+            "LOCAL_SIM",
+            "--no-telemetry",
+            "--",
+            sys.executable,
+            "-c",
+            "open('must-not-run.txt','w').write('unsafe')",
+        ]
+    )
+
+    assert code == EXIT_GUARD
+    assert not (env["remote_proj"] / "must-not-run.txt").exists()
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["phase"] == "memory_admission"
+    assert summary["error"] == "no safe target capacity"
+    assert summary["memory_admission"]["status"] == "refused"
+    assert summary["memory_admission"]["reason"] == "insufficient_live_memory"
+
+def test_selected_workload_is_guarded_even_with_no_telemetry(env):
+    configure_workload(env, require_receipt=False)
+    configure_memory_guard(env, max_command_mib=160)
+    program = (
+        "import time;"
+        "x=bytearray(160*1024*1024);"
+        "[x.__setitem__(i,1) for i in range(0,len(x),4096)];"
+        "time.sleep(10)"
+    )
+
+    code = main(
+        [
+            "run",
+            "LOCAL_SIM",
+            "--workload",
+            "demo.work",
+            "--no-telemetry",
+            "--",
+            sys.executable,
+            "-c",
+            program,
+        ]
+    )
+
+    assert code == EXIT_GUARD
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["workload"]["name"] == "demo.work"
+    assert summary["telemetry"] is None
+    assert summary["memory_guard"]["status"] == "terminated"
+    assert summary["memory_guard"]["reason"] == "command_memory_limit"
+
+
+def _enable_relative_guards_for_two_sim_devices(env: dict) -> None:
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    with devices.open("a", encoding="utf-8") as handle:
+        for name in ("SIM_A", "SIM_B"):
+            handle.write(
+                f"\n[devices.{name}.memory_guard]\n"
+                "schema = 2\n"
+                "command_limit_fraction = 0.25\n"
+                "host_reserve_fraction = 0.25\n"
+            )
+
+
+def test_auto_memory_admission_skips_unsafe_candidate_before_project_mutation(
+    two_device_env, monkeypatch
+):
+    from remrun.memory_guard import MemoryAdmissionResult, MemoryReservation
+
+    env = two_device_env
+    _enable_relative_guards_for_two_sim_devices(env)
+    (env["proj"] / "input.txt").write_text("source", encoding="utf-8")
+
+    def reserve(self, *, predicted_rss_mb=None):
+        del predicted_rss_mb
+        if self.device.name == "SIM_A":
+            return MemoryAdmissionResult.refused(
+                "insufficient_live_memory", "deterministic unsafe candidate"
+            )
+        reservation = MemoryReservation(
+            lease_id="b" * 32,
+            lease_token="c" * 32,
+            state_root=self.device.state_root,
+            allowance_bytes=16 * 1024**3,
+            control_overhead_bytes=256 * 1024**2,
+            capacity_bytes=16 * 1024**3 + 256 * 1024**2,
+            max_command_bytes=16 * 1024**3,
+            min_available_bytes=16 * 1024**3,
+            host_total_bytes=64 * 1024**3,
+            safe_concurrency=2,
+            expires_at=time.time() + 60,
+        )
+        return MemoryAdmissionResult(
+            "admitted", "reserved", "safe", {"schema": 1, "status": "admitted"},
+            reservation,
+        )
+
+    def release(self, reservation, *, reserved_only=True):
+        del self, reservation, reserved_only
+        return MemoryAdmissionResult(
+            "released", "released", "released",
+            {"schema": 1, "status": "released", "reason": "released", "detail": "released"},
+        )
+
+    def execute(self, command, cwd, **kwargs):
+        del command
+        assert self.device.name == "SIM_B"
+        assert kwargs["memory_reservation"].lease_id == "b" * 32
+        Path(cwd, "ran.txt").write_text("ok", encoding="utf-8")
+        guard = {
+            "schema": 1,
+            "status": "ok",
+            "reason": "completed",
+            "detail": "test",
+            "command_started": True,
+            "command_exit_code": 0,
+            "helper_exit_code": 0,
+            "max_command_bytes": 16 * 1024**3,
+            "min_available_bytes": 16 * 1024**3,
+            "peak_command_bytes": 1,
+            "min_host_available_bytes": 32 * 1024**3,
+            "cleanup_complete": True,
+        }
+        return ExecResult(0, "", "", None, guard)
+
+    monkeypatch.setattr(LocalSimTransport, "reserve_memory_guard", reserve)
+    monkeypatch.setattr(LocalSimTransport, "release_memory_guard", release)
+    monkeypatch.setattr(LocalSimTransport, "exec", execute)
+
+    code = main(["run", "--auto", "--", "python", "-c", "print('unused')"])
+
+    assert code == EXIT_OK
+    assert not env["remote_a"].exists()
+    assert (env["remote_b"] / "input.txt").read_text(encoding="utf-8") == "source"
+    assert (env["proj"] / "ran.txt").read_text(encoding="utf-8") == "ok"
+    summaries = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (env["state"] / "runs").glob("*/summary.json")
+    ]
+    refused = next(item for item in summaries if item["plan"]["target"]["name"] == "SIM_A")
+    assert refused["phase"] == "memory_admission"
+    assert refused["error"] == "no safe target capacity"
+
+
+def test_auto_no_safe_memory_candidate_returns_structured_exit_five_without_mutation(
+    two_device_env, monkeypatch
+):
+    from remrun.memory_guard import MemoryAdmissionResult
+
+    env = two_device_env
+    _enable_relative_guards_for_two_sim_devices(env)
+    (env["proj"] / "input.txt").write_text("source", encoding="utf-8")
+
+    def refuse(self, *, predicted_rss_mb=None):
+        del predicted_rss_mb
+        return MemoryAdmissionResult.refused(
+            "insufficient_live_memory", f"{self.device.name} has no safe capacity"
+        )
+
+    monkeypatch.setattr(LocalSimTransport, "reserve_memory_guard", refuse)
+
+    code = main(["run", "--auto", "--", "python", "-c", "print('must not run')"])
+
+    assert code == EXIT_GUARD
+    assert not env["remote_a"].exists()
+    assert not env["remote_b"].exists()
+    summaries = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (env["state"] / "runs").glob("*/summary.json")
+    ]
+    assert len(summaries) == 2
+    assert all(item["phase"] == "memory_admission" for item in summaries)
+    assert all(item["error"] == "no safe target capacity" for item in summaries)
+
+
+def test_main_memory_guard_live_path_reserves_renews_executes_and_releases(
+    env, monkeypatch
+):
+    """Exercise the real CLI/admission/helper/argv/result/ledger-release path."""
+    configure_memory_guard(env, max_command_mib=512, min_available_mib=16)
+    operations: list[str] = []
+    real_invoke = LocalSimTransport._invoke_memory_admission
+
+    def recording_invoke(self, request):
+        operations.append(str(request.get("op")))
+        return real_invoke(self, request)
+
+    monkeypatch.setattr(LocalSimTransport, "_invoke_memory_admission", recording_invoke)
+
+    code = main(
+        [
+            "run",
+            "LOCAL_SIM",
+            "--no-telemetry",
+            "--",
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('guard-e2e.txt').write_text('ok')",
+        ]
+    )
+
+    assert code == EXIT_OK
+    assert (env["proj"] / "guard-e2e.txt").read_text(encoding="utf-8") == "ok"
+    assert operations[:2] == ["reserve", "renew"]
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["command_exit_code"] == 0
+    assert summary["memory_guard"]["status"] == "ok"
+    assert summary["memory_guard"]["command_started"] is True
+    ledger_path = env["state"] / "memory-guard" / "v2" / "ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["leases"] == []

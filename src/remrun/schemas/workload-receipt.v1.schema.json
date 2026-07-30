@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:remrun:schema:workload-receipt:v1",
+  "title": "remrun.workload-receipt version 1",
+  "description": "Project-written evidence describing how an opt-in workload used its run context.",
+  "$comment": "The encoded document is limited to 65536 bytes by the remrun protocol.",
+  "type": "object",
+  "required": [
+    "schema",
+    "version",
+    "run_id",
+    "workload",
+    "adapter_id",
+    "adapter_version",
+    "status",
+    "evaluation",
+    "setting",
+    "constraints",
+    "work",
+    "setting_fingerprint",
+    "written_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "remrun.workload-receipt"
+    },
+    "version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workload": {
+      "type": "string",
+      "minLength": 1
+    },
+    "adapter_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "adapter_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": [
+        "applied",
+        "fallback",
+        "no_op",
+        "blocked"
+      ]
+    },
+    "evaluation": {
+      "enum": [
+        "baseline",
+        "trial",
+        "accepted",
+        "fallback"
+      ]
+    },
+    "setting": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "work": {
+      "type": "object",
+      "required": [
+        "unit",
+        "count"
+      ],
+      "properties": {
+        "unit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "count": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "setting_fingerprint": {
+      "type": "string",
+      "minLength": 1
+    },
+    "written_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

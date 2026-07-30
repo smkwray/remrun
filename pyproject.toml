@@ -26,6 +26,9 @@ Issues = "https://github.com/smkwray/remrun/issues"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+remrun = ["schemas/*.json"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .memory_guard import parse_memory_guard
 from .models import Device
 
 
@@ -79,10 +80,25 @@ def load_config(remrun_root: Path | None = None) -> RemrunConfig:
     defaults = load_toml(root / "config" / "defaults.toml")
     devices_doc = load_toml(root / "config" / "devices.toml")
 
+    device_tables = devices_doc.get("devices", {})
     devices = {
         name: Device.from_mapping(name, data)
-        for name, data in devices_doc.get("devices", {}).items()
+        for name, data in device_tables.items()
     }
+    # A declared guard is a safety boundary, so reject malformed or physically
+    # impossible thresholds while loading config rather than improvising at run time.
+    # Validate against the raw value: Device.from_mapping intentionally normalizes
+    # ram_gb for ordinary callers, which would otherwise turn TOML true into 1.0.
+    for name, device in devices.items():
+        table = device_tables[name]
+        parse_memory_guard(
+            device.memory_guard,
+            ram_gb=table.get("ram_gb"),
+            device_name=device.name,
+            max_jobs=table.get("max_jobs", 1),
+            device_kind=device.kind,
+            device_os=device.os,
+        )
     project_roots = dict(devices_doc.get("project_roots", {}))
     offload = dict(devices_doc.get("offload", {}))
     sync_roots = {

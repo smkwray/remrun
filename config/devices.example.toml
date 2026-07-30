@@ -62,6 +62,31 @@ eff_cores = 4
 ram_gb = 32
 vram_gb = 0
 
+# Optional POSIX hard execution boundary. Fractions are applied to physical RAM
+# measured on the target; ram_gb remains scheduler/display metadata only.
+# max_jobs also caps concurrent guarded leases. The guard remains active for
+# ordinary runs, workload runs, and --no-telemetry.
+[devices.macbox.memory_guard]
+schema = 2
+command_limit_fraction = 0.3125
+host_reserve_fraction = 0.25
+
+# Resource adaptation is opt-in from project config. This explicit interactive
+# policy applies only after a workload is selected. On unified-memory Macs the
+# VRAM fields complete the v1 policy schema but never create a VRAM budget.
+[devices.macbox.resource_policy]
+schema = 1
+mode = "interactive"
+probe_timeout_sec = 5
+cpu_reserve_cores = 4
+cpu_max_fraction = 0.50
+ram_reserve_mib = 8192
+ram_max_fraction = 0.70
+gpu_busy_ceiling_pct = 15
+vram_reserve_mib = 2048
+vram_max_fraction = 0.70
+allow_static_fallback = false
+
 # Best-effort cancel configuration for POSIX targets. Empty/missing lists are no-ops.
 [devices.macbox.cancel]
 process_patterns = ["your-worker-process-regex"]
@@ -76,12 +101,35 @@ project_root = 'C:\projects'
 state_root = 'C:\remrun-state'
 cache_root = 'C:\remrun-cache'
 remote_python = "python"
-shell = "powershell"
+# Windows PowerShell 5.1 cannot preserve arbitrary native argv.
+# remrun requires PowerShell 7.3 or newer for ssh-powershell targets.
+# Top-level .cmd/.bat commands are rejected; the current seam is not exact.
+# Use an .exe or .ps1 wrapper.
+shell = "pwsh"
 login_shell = false
 perf_cores = 8
 eff_cores = 8
 ram_gb = 64
 vram_gb = 12
+
+# Memory-guard schema 2 is intentionally unconfigured on Windows until the
+# same target-local lease and process-boundary semantics are proved there.
+
+# Remote access never implies unattended use. Choose this mode only when the
+# device is genuinely dedicated; an actively used desktop should use
+# mode = "interactive" with its own reserves and fractions.
+[devices.winbox.resource_policy]
+schema = 1
+mode = "unattended"
+probe_timeout_sec = 5
+cpu_reserve_cores = 1
+cpu_max_fraction = 1.00
+ram_reserve_mib = 4096
+ram_max_fraction = 0.90
+gpu_busy_ceiling_pct = 100
+vram_reserve_mib = 1024
+vram_max_fraction = 0.95
+allow_static_fallback = false
 
 # Best-effort cancel configuration for Windows targets. Native process_patterns
 # are matched against CommandLine via PowerShell regex. WSL lists are optional.

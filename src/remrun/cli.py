@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import socket
@@ -9,7 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import (
@@ -17,40 +18,63 @@ from .config import (
     scheduler_config,
 )
 from .gitsync import HOOK_BEGIN
-from .models import RunPlan
+from .memory_guard import MemoryReservation
+from .models import RunPlan, WorkloadSpec
 from .output import Reporter
 from .planner import make_run_plan
 from .project import ProjectDetectionError, detect_project, find_project_config
 from .profile import (
-    LOCAL_DEVICE, command_key, device_profile, load_job_costs, load_profiles,
-    merge_job_costs, predict_job, recommend_offload, update_job_costs, update_profile,
+    LOCAL_DEVICE, WorkloadObservation, command_key, device_profile, load_job_costs,
+    load_profiles, merge_job_costs, predict_job, recommend_offload, update_profile,
+    update_workload_profile,
 )
 from .scheduler import pick_by_load
 from .reconcile import postrun_pullback, preflight_reconcile
+from .resource_context import (
+    MAX_RESOURCE_DOCUMENT_BYTES,
+    ReceiptValidation,
+    ResourceContextError,
+    build_resource_envelope,
+    build_run_context,
+    envelope_meets_required_minimum,
+    validate_workload_receipt_bytes,
+    write_bounded_json,
+)
+from .resource_envelope import (
+    MissingResourcePolicy,
+    ResourcePolicy,
+    ResourcePolicyError,
+    parse_device_resource_policy,
+)
+from .resource_probe import probe_target_resources, unavailable_snapshot
 from .runenv import resolve_run_env
 from .scopes import configured_scope_names
 from .state import (
     ProjectLock,
     LockError,
     RetentionPolicy,
+    UnknownCompletionHazardError,
     cap_text,
+    clear_unknown_completion_hazard,
     conflict_dir,
     default_state_root,
     new_run_id,
     prune_state,
     read_baseline,
     read_json,
+    read_unknown_completion_hazard,
     run_dir,
     utc_now_iso,
     write_baseline,
     write_json,
     write_manifest,
+    write_unknown_completion_hazard,
 )
-from .transport import TransportError, make_transport
+from .transport import TelemetryRequest, TransportError, make_transport
 
 KNOWN_COMMANDS = {
     "devices", "doctor", "plan", "run", "status", "logs", "clean", "bench", "sync",
-    "git-sync", "runner", "action",
+    "git-sync", "runner", "action", "resolve-unknown",
 }
 
 # Exit codes (see docs/AGENT_OUTPUT_SPEC.md).
@@ -59,6 +83,21 @@ EXIT_INTERNAL = 1
 EXIT_CONFLICT = 2
 EXIT_TRANSFER = 3
 EXIT_INFRA = 4
+EXIT_GUARD = 5
+RUN_CONTEXT_ENV = "REMRUN_RUN_CONTEXT"
+
+
+@dataclass(frozen=True)
+class _WorkloadRuntime:
+    resources: dict
+    remote_context_path: str | None
+    remote_receipt_path: str | None
+    context_staged: bool
+    staging_error: str = ""
+
+
+class _WorkloadAdmissionError(RuntimeError):
+    """The selected workload cannot safely launch on the chosen target."""
 
 
 class _PreflightConflict(Exception):
@@ -208,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_runner(args, reporter)
         if args.command_name == "action":
             return cmd_action(args, reporter)
+        if args.command_name == "resolve-unknown":
+            return cmd_resolve_unknown(args, reporter)
         parser.print_help()
         return EXIT_INTERNAL
     except Exception as exc:  # Keep agent-visible error concise.
@@ -229,6 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", nargs="?", default="auto")
     p.add_argument("--auto", action="store_true", help="Pick the target device automatically")
     p.add_argument("--scope", help="declared [parallel.scopes.<name>] write scope for this run")
+    p.add_argument("--workload", help="selected schema-1 project resource workload")
     p.add_argument("--probe", action="store_true",
                    help="probe each candidate for reachability and live CPU load "
                         "(costs a round-trip per device; off by default)")
@@ -243,6 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.add_argument("--auto", action="store_true", help="Pick the target device automatically")
     p.add_argument("--scope", help="declared [parallel.scopes.<name>] write scope for this run")
+    p.add_argument("--workload", help="selected schema-1 project resource workload")
     p.add_argument("--dry-run", action="store_true", help="Print plan and do not execute")
     p.add_argument("--no-pullback", action="store_true", help="Skip post-run pullback")
     p.add_argument("--no-telemetry", action="store_true", help="Skip resource telemetry")
@@ -262,6 +305,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep", type=int, metavar="N",
                    help="Keep only the most recent N runs; delete older")
     p.add_argument("--dry-run", action="store_true", help="Report what would be removed")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser(
+        "resolve-unknown",
+        help="Clear a controller-local unknown-completion hazard after confirming the run ended",
+    )
+    p.add_argument("run_id", help="the exact unknown run ID reported by remrun")
+    p.add_argument(
+        "--confirmed-ended",
+        action="store_true",
+        required=True,
+        help="confirm a read-only check proved the remote command has ended",
+    )
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("bench", help="Benchmark a command on multiple devices")
@@ -344,10 +400,8 @@ def cmd_action(args: argparse.Namespace, reporter: Reporter) -> int:
     return result.exit_code
 
 
-def _store_costs_in_project(config) -> bool:
-    """Whether to persist a job's PORTABLE resource costs into the project's
-    do/remrun/job_costs.json (so they travel with the project, not the controller).
-    Default off; enable with [profile] store_in_project = true in defaults.toml."""
+def _import_legacy_job_costs(config) -> bool:
+    """Honor the retired writer knob as read-only import for one compatibility release."""
     return config.defaults.get("profile", {}).get("store_in_project", False) is True
 
 
@@ -560,7 +614,8 @@ def _probe_candidates(plan: RunPlan, config, *, check_git: bool) -> list[dict]:
     """Live per-candidate readiness for an orchestrator choosing a device.
 
     OPT-IN and never on the run path: probing costs a round-trip per device (the POSIX
-    load sample runs `top -l 2`, ~2 s), which is why `plan` stays probe-free by default.
+    utilization sample uses a bounded interval counter), which is why `plan` stays
+    probe-free by default.
 
     Reports, per candidate: reachability, live CPU busy %, static capacity, and the
     derived spare perf-core-equivalents that `pick_by_load` actually ranks on — so the
@@ -658,6 +713,7 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         command=command,
         scope_name=args.scope,
         json_events=args.json,
+        requested_workload=args.workload,
     )
     candidates = (_probe_candidates(plan, config, check_git=args.check_git)
                   if (args.probe or args.check_git) else None)
@@ -673,6 +729,8 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("transfer_mode", mode=plan.transfer_mode)
         reporter.event("write_scope", name=plan.write_scope or "project",
                        paths=plan.write_scope_paths)
+        if plan.workload is not None:
+            reporter.event("workload", **plan.workload.as_dict())
         reporter.event("active_surface", excludes=len(plan.excludes), hash_below_bytes=plan.hash_below_bytes)
         for entry in (candidates or []):
             reporter.event("candidate_probe", **entry)
@@ -778,6 +836,390 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
     return [(device, transport, probe, reason), *rest]
 
 
+def _unknown_completion_guidance(hazard: dict[str, object]) -> str:
+    run_id = str(hazard["run_id"])
+    return (
+        f"project is blocked by controller-local unknown-completion hazard for run {run_id}; "
+        "do not retry this project; use a read-only process/artifact probe to prove the prior "
+        "command ended, then run "
+        f"`remrun resolve-unknown {run_id} --confirmed-ended`. This legacy-mode hazard does "
+        "not fence another controller that uses a different state root"
+    )
+
+
+def _report_unknown_completion_hazard(
+    project_id: str,
+    reporter: Reporter,
+) -> dict[str, object] | None:
+    hazard = read_unknown_completion_hazard(project_id)
+    if hazard is None:
+        return None
+    reporter.event(
+        "unknown_completion_hazard",
+        project_id=project_id,
+        target=hazard["target"],
+        run_id=hazard["run_id"],
+        created_at=hazard["created_at"],
+        guidance=_unknown_completion_guidance(hazard),
+    )
+    return hazard
+
+
+def _stage_workload_context(
+    *,
+    plan: RunPlan,
+    transport,
+    policy: ResourcePolicy,
+    run_id: str,
+    rdir: Path,
+    reporter: Reporter,
+) -> _WorkloadRuntime:
+    """Capture and stage one selected workload's non-project launch context."""
+    workload = plan.workload
+    if workload is None:  # pragma: no cover - caller guards the inactive path
+        raise AssertionError("workload context requested without a selected workload")
+
+    if isinstance(policy, MissingResourcePolicy):
+        snapshot = unavailable_snapshot(
+            "unavailable",
+            "device resource_policy is missing; live probe was not attempted",
+        )
+    else:
+        snapshot = probe_target_resources(
+            transport,
+            plan.target,
+            timeout_sec=policy.probe_timeout_sec,
+        )
+    captured_at = utc_now_iso()
+    resources = build_resource_envelope(
+        snapshot=snapshot,
+        policy=policy,
+        device=plan.target,
+        captured_at=captured_at,
+    )
+    reporter.event(
+        "resource_envelope",
+        workload=workload.name,
+        status=resources["status"],
+        probe_status=resources["probe_status"],
+        cpu_status=resources["offered"]["cpu"]["status"],
+        ram_status=resources["offered"]["ram"]["status"],
+    )
+
+    if workload.require_envelope and not envelope_meets_required_minimum(resources):
+        raise _WorkloadAdmissionError(
+            "selected workload requires a usable resource envelope, but the chosen "
+            f"target reported {resources['status']!r}"
+        )
+    remote_context_path: str | None = None
+    remote_receipt_path: str | None = None
+    try:
+        if not plan.target.state_root.strip():
+            raise ResourceContextError(
+                f"device {plan.target.name} has no state_root for workload context"
+            )
+        state_root = transport.expand_remote(plan.target.state_root)
+        if not state_root:
+            raise ResourceContextError(
+                f"device {plan.target.name} state_root resolved to an empty path"
+            )
+        remote_run_dir = transport.native_join(state_root, "runs", run_id)
+        remote_context_path = transport.native_join(
+            remote_run_dir, "run-context.v1.json"
+        )
+        remote_receipt_path = transport.native_join(
+            remote_run_dir, "workload-receipt.v1.json"
+        )
+        context = build_run_context(
+            run_id=run_id,
+            created_at=utc_now_iso(),
+            workload=workload,
+            receipt_path=remote_receipt_path,
+            resources=resources,
+        )
+        # Keep the controller copy under a distinct name: LocalSim may map target
+        # state to this same run directory, and source==destination is not atomic.
+        local_context = rdir / "run-context.controller.v1.json"
+        write_bounded_json(local_context, context)
+        transport.ensure_remote_dir(remote_run_dir)
+        transport.push_file(local_context, remote_context_path)
+    except (OSError, ResourceContextError, TransportError, ValueError) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        reporter.event(
+            "workload_context",
+            workload=workload.name,
+            staged=False,
+            detail=detail,
+        )
+        if workload.require_envelope or workload.require_receipt:
+            raise _WorkloadAdmissionError(
+                "selected workload requires a staged run context: " + detail
+            ) from exc
+        return _WorkloadRuntime(
+            resources=resources,
+            remote_context_path=remote_context_path,
+            remote_receipt_path=remote_receipt_path,
+            context_staged=False,
+            staging_error=detail,
+        )
+
+    reporter.event(
+        "workload_context",
+        workload=workload.name,
+        staged=True,
+        path=remote_context_path,
+    )
+    return _WorkloadRuntime(
+        resources=resources,
+        remote_context_path=remote_context_path,
+        remote_receipt_path=remote_receipt_path,
+        context_staged=True,
+    )
+
+
+def _collect_workload_receipt(
+    *,
+    plan: RunPlan,
+    transport,
+    runtime: _WorkloadRuntime,
+    run_id: str,
+    rdir: Path,
+    reporter: Reporter,
+) -> ReceiptValidation | None:
+    """Collect and validate bounded adapter evidence after pullback."""
+    workload = plan.workload
+    if workload is None or not runtime.context_staged:
+        return None
+    receipt_path = runtime.remote_receipt_path
+    if receipt_path is None:  # pragma: no cover - staged runtime invariant
+        return ReceiptValidation("missing", detail="receipt path was not staged")
+    try:
+        raw = transport.read_small_file(
+            receipt_path,
+            MAX_RESOURCE_DOCUMENT_BYTES,
+        )
+    except TransportError as exc:
+        detail = str(exc)
+        status = "missing" if "small file missing:" in detail else "malformed"
+        validation = ReceiptValidation(status, detail=detail)
+    else:
+        # Distinct from the target filename for LocalSim, whose target state root
+        # may intentionally be the controller state root in production-path tests.
+        local_receipt = rdir / "workload-receipt.controller.v1.json"
+        try:
+            local_receipt.write_bytes(raw)
+        except OSError as exc:
+            # Validation is over the transferred bytes; a controller-journal write
+            # failure is evidence loss, so fail the receipt rather than claiming it.
+            validation = ReceiptValidation(
+                "malformed",
+                detail=f"controller receipt write failed: {type(exc).__name__}: {exc}",
+            )
+        else:
+            validation = validate_workload_receipt_bytes(
+                raw,
+                run_id=run_id,
+                workload=workload,
+            )
+    reporter.event(
+        "workload_receipt",
+        workload=workload.name,
+        status=validation.status,
+        detail=validation.detail or None,
+    )
+    return validation
+
+
+def _cleanup_workload_files(
+    *,
+    transport,
+    runtime: _WorkloadRuntime,
+    reporter: Reporter,
+) -> dict[str, str]:
+    """Best-effort exact-file cleanup; never remove an entire target run tree."""
+    cleanup: dict[str, str] = {}
+    for name, path in (
+        ("context", runtime.remote_context_path),
+        ("receipt", runtime.remote_receipt_path),
+    ):
+        if path is None:
+            cleanup[name] = "not_staged"
+            continue
+        try:
+            transport.delete_remote(path)
+        except (OSError, TransportError) as exc:
+            cleanup[name] = f"failed: {type(exc).__name__}: {exc}"
+        else:
+            cleanup[name] = "deleted"
+    reporter.event("workload_cleanup", **cleanup)
+    return cleanup
+
+
+def _workload_observation_from_run(
+    *,
+    project_id: str,
+    command: list[str],
+    device: str,
+    workload: WorkloadSpec,
+    receipt: ReceiptValidation | None,
+    telemetry: dict | None,
+    trip_s: float,
+    updated: str,
+) -> tuple[WorkloadObservation | None, str]:
+    """Build one setting-specific observation from already-admitted run evidence.
+
+    Command/pullback admission is intentionally owned by the caller.  This helper
+    validates only the generic receipt, work count, and normalized telemetry
+    semantics.  Unknown metrics are never converted to plausible zeroes.
+    """
+    if receipt is None or not receipt.valid or not isinstance(receipt.data, dict):
+        return None, "receipt is missing or invalid"
+    data = receipt.data
+    if data.get("status") == "blocked":
+        return None, "adapter reported blocked"
+    if not math.isfinite(trip_s) or trip_s <= 0:
+        return None, "trip duration is not positive"
+
+    work = data.get("work")
+    count = work.get("count") if isinstance(work, dict) else None
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, (int, float))
+        or not math.isfinite(count)
+        or count <= 0
+    ):
+        return None, "receipt work count is not positive"
+
+    if (
+        not isinstance(telemetry, dict)
+        or telemetry.get("schema") != 1
+        or isinstance(telemetry.get("schema"), bool)
+    ):
+        return None, "detailed telemetry is unavailable"
+    command_wall_s = telemetry.get("wall_sec")
+    if (
+        isinstance(command_wall_s, bool)
+        or not isinstance(command_wall_s, (int, float))
+        or not math.isfinite(command_wall_s)
+        or command_wall_s <= 0
+    ):
+        return None, "target-measured command duration is not positive"
+    if telemetry.get("process_tree_drained") is not True:
+        return None, "process tree was not proven drained"
+    memory = telemetry.get("memory")
+    cpu = telemetry.get("cpu")
+    gpu = telemetry.get("gpu")
+    if not all(isinstance(section, dict) for section in (memory, cpu, gpu)):
+        return None, "detailed telemetry sections are malformed"
+
+    memory_metric = memory.get("metric")
+    memory_coverage = memory.get("coverage")
+    memory_peak = memory.get("peak_bytes")
+    if (
+        memory_metric not in {"rss_sum_sampled", "job_memory_peak"}
+        or not isinstance(memory_coverage, str)
+        or memory_coverage
+        not in {"short_lived_sampled", "known_tree_drained", "job_object_drained"}
+        or isinstance(memory_peak, bool)
+        or not isinstance(memory_peak, (int, float))
+        or not math.isfinite(memory_peak)
+        or memory_peak < 0
+    ):
+        return None, "memory telemetry is not setting-comparable"
+
+    cpu_coverage = cpu.get("coverage")
+    cpu_sec = cpu.get("cpu_sec")
+    avg_cpu_pct = cpu.get("avg_cpu_pct")
+    if (
+        not isinstance(cpu_coverage, str)
+        or cpu_coverage
+        not in {
+            "wait4_known_tree_drained_detached_possible",
+            "job_object_drained",
+        }
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            for value in (cpu_sec, avg_cpu_pct)
+        )
+    ):
+        return None, "CPU telemetry is not setting-comparable"
+
+    gpu_scope = gpu.get("scope")
+    gpu_status = gpu.get("status")
+    if (
+        gpu_scope != "whole_device"
+        or gpu_status not in {"measured", "partial", "unavailable", "not_applicable"}
+    ):
+        return None, "GPU telemetry labels are malformed"
+    for key in (
+        "max_util_pct",
+        "min_vram_free_bytes",
+        "unified_memory_min_available_bytes",
+    ):
+        value = gpu.get(key)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            return None, f"GPU telemetry {key} is malformed"
+    if (
+        isinstance(gpu.get("max_util_pct"), (int, float))
+        and not isinstance(gpu.get("max_util_pct"), bool)
+        and gpu["max_util_pct"] > 100
+    ):
+        return None, "GPU telemetry max_util_pct is malformed"
+    if gpu_status in {"unavailable", "not_applicable"} and any(
+        gpu.get(key) is not None
+        for key in ("max_util_pct", "min_vram_free_bytes")
+    ):
+        return None, "unavailable GPU telemetry carries plausible values"
+
+    return (
+        WorkloadObservation(
+            project_id=project_id,
+            command_key=command_key(command),
+            device=device,
+            workload_name=workload.name,
+            adapter_version=workload.adapter_version,
+            setting_fingerprint=data["setting_fingerprint"],
+            receipt_status=data["status"],
+            work_unit=workload.work_unit,
+            evaluation=data["evaluation"],
+            updated=updated,
+            setting=data["setting"],
+            constraints=data["constraints"],
+            exec_s=float(command_wall_s),
+            trip_s=trip_s,
+            throughput=float(count) / float(command_wall_s),
+            memory={
+                "peak_bytes": memory_peak,
+                "metric": memory_metric,
+                "coverage": memory_coverage,
+            },
+            cpu={
+                "cpu_sec": cpu_sec,
+                "avg_cpu_pct": avg_cpu_pct,
+                "coverage": cpu_coverage,
+            },
+            gpu={
+                "scope": gpu_scope,
+                "max_util_pct": gpu.get("max_util_pct"),
+                "min_vram_free_bytes": gpu.get("min_vram_free_bytes"),
+                "unified_memory_min_available_bytes": gpu.get(
+                    "unified_memory_min_available_bytes"
+                ),
+                "status": gpu_status,
+            },
+        ),
+        "",
+    )
+
+
 def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
     config = load_config()
     policy = load_retention(config)
@@ -791,7 +1233,14 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         command=command,
         scope_name=getattr(args, "scope", None),
         json_events=args.json,
+        requested_workload=getattr(args, "workload", None),
+        allow_default_workload=not getattr(args, "suppress_default_workload", False),
     )
+
+    if not args.dry_run and _report_unknown_completion_hazard(
+        plan.project.project_id, reporter
+    ):
+        return EXIT_INTERNAL
 
     if args.dry_run:
         run_id = new_run_id(plan.target.name, plan.project.project_id)
@@ -811,7 +1260,7 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
     # When explicitly enabled, placement overlays the project's PORTABLE job costs so
     # --auto can use prior measurements from another controller.
     profiles = load_profiles(default_state_root())
-    if _store_costs_in_project(config):
+    if _import_legacy_job_costs(config):
         profiles = merge_job_costs(profiles, plan.project.project_id,
                                    load_job_costs(plan.project.local_project_root))
     prediction = predict_job(profiles, plan.project.project_id, command_key(plan.command))
@@ -854,6 +1303,65 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("target_reachable", address=probe.address, remote_os=probe.remote_os)
         reporter.event("write_scope", name=plan.write_scope or "project",
                        paths=plan.write_scope_paths)
+        if plan.workload is not None:
+            reporter.event("workload", **plan.workload.as_dict())
+
+        resource_policy: ResourcePolicy | None = None
+        if plan.workload is not None:
+            try:
+                resource_policy = parse_device_resource_policy(plan.target.resource_policy)
+            except ResourcePolicyError as exc:
+                reporter.event(
+                    "resource_policy_error",
+                    target=plan.target.name,
+                    message=str(exc),
+                )
+                write_json(
+                    summary_path,
+                    {
+                        "run_id": run_id,
+                        "error": str(exc),
+                        "phase": "resource_policy",
+                        "plan": plan.as_dict(),
+                    },
+                )
+                return EXIT_INTERNAL
+
+        reservation: MemoryReservation | None = None
+        if getattr(transport, "memory_guard", None) is not None:
+            predicted_rss_mb = prediction.get("rss_mb") if prediction else None
+            admission = transport.reserve_memory_guard(
+                predicted_rss_mb=predicted_rss_mb
+            )
+            reporter.event(
+                "memory_admission",
+                target=plan.target.name,
+                status=admission.status,
+                reason=admission.reason,
+                detail=admission.detail,
+                phase="pre_mutation",
+            )
+            if not admission.admitted:
+                write_json(
+                    summary_path,
+                    {
+                        "run_id": run_id,
+                        "error": "no safe target capacity",
+                        "phase": "memory_admission",
+                        "memory_admission": admission.payload,
+                        "plan": plan.as_dict(),
+                    },
+                )
+                if remaining:
+                    reporter.event(
+                        "candidate_skipped",
+                        name=plan.target.name,
+                        reason="memory_admission",
+                        detail=admission.detail,
+                    )
+                    continue
+                return EXIT_GUARD
+            reservation = admission.reservation
 
         remote_root = transport.remote_project_path(plan.project)
         remote_cwd = transport.remote_join(remote_root, plan.project.relative_cwd)
@@ -863,6 +1371,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             lock = ProjectLock(plan.project.project_id, plan.target.name,
                                scope=plan.write_scope).acquire()
         except LockError as exc:
+            if reservation is not None:
+                transport.release_memory_guard(reservation, reserved_only=True)
             reporter.event("locked", message=str(exc))
             write_json(summary_path, {"run_id": run_id, "error": str(exc), "plan": plan.as_dict()})
             return EXIT_INTERNAL
@@ -872,7 +1382,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         try:
             return _run_locked(args, reporter, plan, transport, remote_root, remote_cwd,
                                run_id, rdir, summary_path, started_at, t0, policy,
-                               telemetry_default, attempt > 0, attempted_run_ids)
+                               telemetry_default, attempt > 0, attempted_run_ids,
+                               resource_policy, reservation)
         except _PreflightConflict as exc:
             last_conflict_exit = exc.exit_code
             # A non-retryable conflict (e.g. local-vanished) is global: stop the whole run.
@@ -883,6 +1394,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                            conflict_state=str(exc.conflict_dir))
         finally:
             lock.release()
+            if reservation is not None:
+                transport.release_memory_guard(reservation, reserved_only=True)
             # Prune even when a run errors out early (preflight/exec/pullback may already have
             # written backups), so repeated failures can't grow the state unbounded.
             try:
@@ -910,6 +1423,8 @@ def _run_locked(
     telemetry_default: bool,
     is_fallback: bool,
     attempted_run_ids: set[str],
+    resource_policy: ResourcePolicy | None,
+    memory_reservation: MemoryReservation | None,
 ) -> int:
     local_root = plan.project.local_project_root
     prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
@@ -985,11 +1500,49 @@ def _run_locked(
     )
     if runenv.venv:
         reporter.event("venv", path=runenv.venv)
-    if runenv.env or runenv.path_prepend:
-        reporter.event("run_env", vars=sorted(runenv.env), path_prepend=len(runenv.path_prepend))
+    exec_env = runenv.env
+    workload_runtime: _WorkloadRuntime | None = None
+    if plan.workload is not None:
+        if resource_policy is None:  # pragma: no cover - cmd_run constructs it
+            raise AssertionError("selected workload has no parsed resource policy")
+        try:
+            if RUN_CONTEXT_ENV in runenv.env:
+                raise _WorkloadAdmissionError(
+                    f"{RUN_CONTEXT_ENV} is reserved when a workload is selected"
+                )
+            workload_runtime = _stage_workload_context(
+                plan=plan,
+                transport=transport,
+                policy=resource_policy,
+                run_id=run_id,
+                rdir=rdir,
+                reporter=reporter,
+            )
+        except _WorkloadAdmissionError as exc:
+            reporter.event("workload_admission_failed", message=str(exc))
+            write_json(
+                summary_path,
+                {
+                    "run_id": run_id,
+                    "error": str(exc),
+                    "phase": "workload_admission",
+                    "workload": plan.workload.as_dict(),
+                    "plan": plan.as_dict(),
+                },
+            )
+            return EXIT_INTERNAL
+        if workload_runtime.context_staged:
+            exec_env = {**runenv.env, RUN_CONTEXT_ENV: workload_runtime.remote_context_path}
+    if exec_env or runenv.path_prepend:
+        reporter.event("run_env", vars=sorted(exec_env), path_prepend=len(runenv.path_prepend))
     telemetry_on = telemetry_default and not args.no_telemetry
     transport.ensure_remote_dir(remote_cwd)
-    reporter.event("command_started", run_id=run_id, command=" ".join(plan.command))
+    guarded_dispatch = getattr(transport, "memory_guard", None) is not None
+    reporter.event(
+        "command_dispatch" if guarded_dispatch else "command_started",
+        run_id=run_id,
+        command=" ".join(plan.command),
+    )
     cmd_t0 = time.monotonic()
     # Tee stdout as it arrives without letting a verbose process exhaust controller
     # storage. Once the cap is reached, retain a bounded head plus a visible marker; the
@@ -1001,26 +1554,77 @@ def _run_locked(
         live_log.append(chunk)
 
     try:
-        result = transport.exec(plan.command, cwd=remote_cwd,
-                                env=runenv.env, path_prepend=runenv.path_prepend,
-                                telemetry=telemetry_on, on_stdout=tee_stdout)
+        if plan.workload is None and memory_reservation is None:
+            # Keep the unselected, unguarded path byte-for-byte equivalent at the
+            # transport boundary. Third-party transports retain the established
+            # signature and behavior.
+            result = transport.exec(
+                plan.command,
+                cwd=remote_cwd,
+                env=exec_env,
+                path_prepend=runenv.path_prepend,
+                telemetry=telemetry_on,
+                on_stdout=tee_stdout,
+            )
+        elif plan.workload is None:
+            result = transport.exec(
+                plan.command,
+                cwd=remote_cwd,
+                env=exec_env,
+                path_prepend=runenv.path_prepend,
+                telemetry=telemetry_on,
+                on_stdout=tee_stdout,
+                memory_reservation=memory_reservation,
+            )
+        elif memory_reservation is None:
+            result = transport.exec(
+                plan.command,
+                cwd=remote_cwd,
+                env=exec_env,
+                path_prepend=runenv.path_prepend,
+                telemetry=telemetry_on,
+                on_stdout=tee_stdout,
+                telemetry_request=TelemetryRequest() if telemetry_on else None,
+            )
+        else:
+            result = transport.exec(
+                plan.command,
+                cwd=remote_cwd,
+                env=exec_env,
+                path_prepend=runenv.path_prepend,
+                telemetry=telemetry_on,
+                on_stdout=tee_stdout,
+                telemetry_request=TelemetryRequest() if telemetry_on else None,
+                memory_reservation=memory_reservation,
+            )
     except TransportError as exc:
         reporter.event("exec_error", message=str(exc))
-        guidance = (
-            "remote start/completion is unknown; do not retry or remove the live project lock "
-            "until a read-only process/artifact probe shows the prior command ended"
+        hazard = write_unknown_completion_hazard(
+            plan.project.project_id,
+            plan.target.name,
+            run_id,
         )
+        guidance = _unknown_completion_guidance(hazard)
         reporter.event("completion_unknown", guidance=guidance)
+        unknown_summary = {
+            "run_id": run_id,
+            "error": str(exc),
+            "phase": "exec",
+            "completion_state": "unknown",
+            "guidance": guidance,
+            "plan": plan.as_dict(),
+        }
+        if plan.workload is not None and workload_runtime is not None:
+            unknown_summary["workload"] = plan.workload.as_dict()
+            unknown_summary["run_context"] = {
+                "staged": workload_runtime.context_staged,
+                "remote_path": workload_runtime.remote_context_path,
+                "retained": True,
+            }
+            unknown_summary["resource_envelope"] = workload_runtime.resources
         write_json(
             summary_path,
-            {
-                "run_id": run_id,
-                "error": str(exc),
-                "phase": "exec",
-                "completion_state": "unknown",
-                "guidance": guidance,
-                "plan": plan.as_dict(),
-            },
+            unknown_summary,
         )
         # Whatever the command printed before the transport dropped is the only
         # evidence of how far it got; it is already capped on disk.
@@ -1041,7 +1645,38 @@ def _run_locked(
     if result.stderr:
         sys.stderr.write(result.stderr)
         sys.stderr.flush()
-    finished_fields = {"exit_code": result.exit_code, "duration_sec": round(time.monotonic() - t0, 3)}
+    guard_result = result.memory_guard if isinstance(result.memory_guard, dict) else None
+    guard_status = guard_result.get("status") if guard_result is not None else None
+    guard_failed = guard_result is not None and guard_status != "ok"
+    command_exit_code = (
+        guard_result.get("command_exit_code")
+        if guard_result is not None
+        else result.exit_code
+    )
+    reported_exit_code = EXIT_GUARD if guard_failed else result.exit_code
+    if guard_result is not None:
+        if guard_result.get("command_started") is True:
+            reporter.event(
+                "command_started",
+                run_id=run_id,
+                command=" ".join(plan.command),
+                confirmed_by="memory_guard",
+            )
+        reporter.event(
+            "memory_guard",
+            status=guard_status,
+            reason=guard_result.get("reason"),
+            command_started=guard_result.get("command_started"),
+            command_exit_code=command_exit_code,
+            peak_command_bytes=guard_result.get("peak_command_bytes"),
+            min_host_available_bytes=guard_result.get("min_host_available_bytes"),
+            cleanup_complete=guard_result.get("cleanup_complete"),
+        )
+    finished_fields = {
+        "exit_code": reported_exit_code,
+        "command_exit_code": command_exit_code,
+        "duration_sec": round(time.monotonic() - t0, 3),
+    }
     if result.telemetry:
         finished_fields["peak_rss_mb"] = result.telemetry.get("peak_rss_mb")
         finished_fields["avg_cpu_pct"] = result.telemetry.get("avg_cpu_pct")
@@ -1070,9 +1705,26 @@ def _run_locked(
             )
         except TransportError as exc:
             reporter.event("transfer_error", phase="pullback", message=str(exc))
-            write_json(summary_path, {"run_id": run_id, "exit_code": result.exit_code,
-                                      "error": str(exc), "phase": "pullback", "plan": plan.as_dict()})
-            return EXIT_TRANSFER
+            pullback_summary = {
+                "run_id": run_id,
+                "exit_code": EXIT_GUARD if guard_failed else result.exit_code,
+                "command_exit_code": command_exit_code,
+                "error": str(exc),
+                "phase": "pullback",
+                "plan": plan.as_dict(),
+            }
+            if plan.workload is not None and workload_runtime is not None:
+                pullback_summary["workload"] = plan.workload.as_dict()
+                pullback_summary["run_context"] = {
+                    "staged": workload_runtime.context_staged,
+                    "remote_path": workload_runtime.remote_context_path,
+                    "retained": True,
+                }
+            write_json(summary_path, pullback_summary)
+            # A later pullback failure must not erase the primary safety result.
+            # The summary still records the transfer error, while the process exit
+            # remains the distinct guard outcome required by automation.
+            return EXIT_GUARD if guard_failed else EXIT_TRANSFER
 
         write_manifest(rdir / "post_remote_manifest.json", post.post_remote_manifest)
         if post.conflicts:
@@ -1085,13 +1737,39 @@ def _run_locked(
             # Do NOT advance the baseline. Leaving the prior baseline in place makes the
             # next preflight classify these paths as both-changed and abort until the
             # user resolves them, instead of silently mtime-resolving the divergence.
-        else:
+        elif post.next_baseline is not None:
+            # Reconciliation owns path attribution. Persist only its typed pair:
+            # unrelated local work deliberately retains the pre-run generation and
+            # remains visible to the next preflight.
             write_baseline(plan.target.name, plan.project.project_id,
-                           post.local_manifest_after, post.post_remote_manifest)
+                           post.next_baseline.local_manifest,
+                           post.next_baseline.remote_manifest)
+        else:  # defensive: uncertain attribution can never manufacture a baseline
+            reporter.event(
+                "baseline_not_advanced",
+                note="postrun reconciliation returned no attributable baseline",
+            )
     else:
         # Still record a baseline so future runs have delete evidence.
         write_baseline(plan.target.name, plan.project.project_id,
                        pre.local_manifest, pre.remote_manifest)
+
+    receipt_validation: ReceiptValidation | None = None
+    workload_cleanup: dict[str, str] | None = None
+    if workload_runtime is not None:
+        receipt_validation = _collect_workload_receipt(
+            plan=plan,
+            transport=transport,
+            runtime=workload_runtime,
+            run_id=run_id,
+            rdir=rdir,
+            reporter=reporter,
+        )
+        workload_cleanup = _cleanup_workload_files(
+            transport=transport,
+            runtime=workload_runtime,
+            reporter=reporter,
+        )
 
     duration = round(time.monotonic() - t0, 3)
 
@@ -1100,27 +1778,116 @@ def _run_locked(
     # rather than reporting a clean success; the command's own code is preserved in
     # the summary as command_exit_code and in the command_finished event.
     postrun_unresolved = bool(post and post.conflicts)
-    final_exit = EXIT_CONFLICT if (postrun_unresolved and result.exit_code == 0) else result.exit_code
+    required_receipt_invalid = bool(
+        plan.workload is not None
+        and plan.workload.require_receipt
+        and (receipt_validation is None or not receipt_validation.valid)
+    )
+    if required_receipt_invalid:
+        reporter.event(
+            "workload_contract_failed",
+            workload=plan.workload.name if plan.workload is not None else None,
+            receipt_status=(
+                receipt_validation.status
+                if receipt_validation is not None
+                else "not_collected"
+            ),
+        )
+    if guard_failed:
+        final_exit = EXIT_GUARD
+    elif result.exit_code != 0:
+        final_exit = result.exit_code
+    elif postrun_unresolved:
+        final_exit = EXIT_CONFLICT
+    elif required_receipt_invalid:
+        final_exit = EXIT_INTERNAL
+    else:
+        final_exit = EXIT_OK
 
-    # Per-device resource + timing profile (EWMA; advisory for placement and the
-    # offload recommendation). exec_s = remote command; trip_s = full round-trip
-    # (push+exec+pullback); overhead = trip - exec. The controller-specific timing
-    # (trip/overhead) + the LOCAL baseline live in local state; the PORTABLE resource
-    # costs (rss/cpu/exec) may also go to the project's do/remrun job-cost file when
-    # explicitly enabled. Best-effort; never breaks a run.
-    try:
-        tel = result.telemetry or {}
-        ckey = command_key(plan.command)
-        update_profile(default_state_root(), plan.project.project_id, ckey, plan.target.name,
-                       peak_rss_mb=tel.get("peak_rss_mb"),
-                       avg_cpu_pct=tel.get("avg_cpu_pct"),
-                       exec_s=exec_s, trip_s=duration, now=utc_now_iso())
-        if _store_costs_in_project(load_config()):
-            update_job_costs(plan.project.local_project_root, ckey, plan.target.name,
-                             rss_mb=tel.get("peak_rss_mb"), cpu_pct=tel.get("avg_cpu_pct"),
-                             exec_s=exec_s, now=utc_now_iso())
-    except Exception:
-        pass
+    # Scheduler-consumed profiles are admitted only after a successful command and
+    # positively attributable pullback. Failed commands, disabled pullback, scope
+    # escapes, invalid required receipts, and uncertain baselines are not evidence
+    # of a reusable job cost. Best-effort storage must never break a valid run.
+    profile_admissible = bool(
+        not guard_failed
+        and result.exit_code == 0
+        and final_exit == EXIT_OK
+        and not args.no_pullback
+        and post is not None
+        and not post.conflicts
+        and post.next_baseline is not None
+    )
+    if profile_admissible:
+        try:
+            tel = result.telemetry or {}
+            ckey = command_key(plan.command)
+            profile_exec_s = exec_s
+            target_wall = tel.get("wall_sec")
+            if (
+                plan.workload is not None
+                and isinstance(target_wall, (int, float))
+                and not isinstance(target_wall, bool)
+                and math.isfinite(target_wall)
+                and target_wall > 0
+            ):
+                profile_exec_s = float(target_wall)
+            update_profile(
+                default_state_root(),
+                plan.project.project_id,
+                ckey,
+                plan.target.name,
+                peak_rss_mb=tel.get("peak_rss_mb"),
+                avg_cpu_pct=tel.get("avg_cpu_pct"),
+                exec_s=profile_exec_s,
+                trip_s=duration,
+                now=utc_now_iso(),
+            )
+        except Exception:
+            pass
+
+    workload_profile_result: dict[str, str] | None = None
+    if plan.workload is not None:
+        observation: WorkloadObservation | None = None
+        if final_exit != EXIT_OK or result.exit_code != 0:
+            detail = "final run result is not successful"
+        elif args.no_pullback:
+            detail = "pullback was disabled"
+        elif post is None or post.conflicts or post.next_baseline is None:
+            detail = "pullback did not yield a verified attributable baseline"
+        elif workload_runtime is None or not workload_runtime.context_staged:
+            detail = "workload context was not staged"
+        elif not telemetry_on:
+            detail = "detailed telemetry was disabled"
+        else:
+            observation, detail = _workload_observation_from_run(
+                project_id=plan.project.project_id,
+                command=plan.command,
+                device=plan.target.name,
+                workload=plan.workload,
+                receipt=receipt_validation,
+                telemetry=result.telemetry,
+                trip_s=duration,
+                updated=utc_now_iso(),
+            )
+        if observation is not None:
+            try:
+                recorded = update_workload_profile(default_state_root(), observation)
+            except Exception:
+                recorded = False
+            if recorded:
+                workload_profile_result = {"status": "recorded", "detail": ""}
+            else:
+                workload_profile_result = {
+                    "status": "not_recorded",
+                    "detail": "controller profile store rejected the observation",
+                }
+        else:
+            workload_profile_result = {"status": "not_recorded", "detail": detail}
+        reporter.event(
+            "workload_profile",
+            workload=plan.workload.name,
+            **workload_profile_result,
+        )
 
     summary = {
         "run_id": run_id,
@@ -1128,7 +1895,7 @@ def _run_locked(
         "target": plan.target.name,
         "command": plan.command,
         "exit_code": final_exit,
-        "command_exit_code": result.exit_code,
+        "command_exit_code": command_exit_code,
         "started_at": started_at,
         "ended_at": utc_now_iso(),
         "duration_sec": duration,
@@ -1143,10 +1910,35 @@ def _run_locked(
         "preflight_conflicts": 0,
         "postrun_conflicts": len(post.conflicts) if post else 0,
         "telemetry": result.telemetry,
+        "memory_guard": guard_result,
         "peak_rss_mb": result.telemetry.get("peak_rss_mb") if result.telemetry else None,
         "avg_cpu_pct": result.telemetry.get("avg_cpu_pct") if result.telemetry else None,
         "plan": plan.as_dict(),
     }
+    if plan.workload is not None and workload_runtime is not None:
+        summary["workload"] = plan.workload.as_dict()
+        summary["run_context"] = {
+            "staged": workload_runtime.context_staged,
+            "remote_path": workload_runtime.remote_context_path,
+            "staging_error": workload_runtime.staging_error or None,
+        }
+        summary["resource_envelope"] = workload_runtime.resources
+        summary["receipt"] = {
+            "status": (
+                receipt_validation.status
+                if receipt_validation is not None
+                else "not_collected"
+            ),
+            "detail": (
+                receipt_validation.detail
+                if receipt_validation is not None
+                else "workload context was not staged"
+            ),
+            "data": receipt_validation.data if receipt_validation is not None else None,
+            "required": plan.workload.require_receipt,
+        }
+        summary["workload_cleanup"] = workload_cleanup
+        summary["workload_profile"] = workload_profile_result
     write_json(summary_path, summary)
     reporter.event("summary", run_id=run_id, exit_code=final_exit,
                    files_pushed=summary["files_pushed"], files_pulled_post=summary["files_pulled_post"],
@@ -1190,8 +1982,11 @@ def cmd_bench(args: argparse.Namespace, reporter: Reporter) -> int:
         cwd=Path.cwd(), config=config,
         target_name=targets[0] if targets else "auto",
         command=command, json_events=args.json,
+        allow_default_workload=False,
     )
     project = probe_plan.project
+    if _report_unknown_completion_hazard(project.project_id, reporter):
+        return EXIT_INTERNAL
     key = command_key(command)
     state_root = default_state_root()
 
@@ -1220,13 +2015,16 @@ def cmd_bench(args: argparse.Namespace, reporter: Reporter) -> int:
     # A leg only contributes to the verdict if its round-trip actually completed;
     # a remrun-level failure (unreachable/transfer/conflict/internal) recorded no
     # fresh row, so an unrelated stale row must not silently drive the recommendation.
-    infra_failures = {EXIT_INTERNAL, EXIT_CONFLICT, EXIT_TRANSFER, EXIT_INFRA}
+    infra_failures = {
+        EXIT_INTERNAL, EXIT_CONFLICT, EXIT_TRANSFER, EXIT_INFRA, EXIT_GUARD
+    }
     ran: list[str] = []
     for dev in targets:
         reporter.event("bench_remote_started", device=dev)
         run_args = argparse.Namespace(
             target=dev, auto=False, cmd=command, json=args.json,
             dry_run=False, no_pullback=False, no_telemetry=False,
+            workload=None, suppress_default_workload=True,
         )
         rc = cmd_run(run_args, reporter)
         reporter.event("bench_remote_finished", device=dev, exit_code=rc)
@@ -1394,6 +2192,57 @@ def cmd_logs(args: argparse.Namespace, reporter: Reporter) -> int:
             print(f"=== {name} ({target.name}) ===")
             stream = sys.stderr if name == "stderr.log" else sys.stdout
             stream.write(f.read_text(encoding="utf-8"))
+    return EXIT_OK
+
+
+def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
+    """Clear this project's local admission hazard after an explicit ended check.
+
+    Resolution is deliberately narrow: it records the operator action in the
+    original summary, then removes only the matching hazard. It neither infers
+    outputs nor changes a baseline, so the next run performs normal preflight from
+    the last positively completed generation.
+    """
+    if not args.confirmed_ended:  # argparse requires it; retain a direct-call guard.
+        raise ValueError("--confirmed-ended is required")
+    config = load_config()
+    project = detect_project(Path.cwd(), config)
+    hazard = read_unknown_completion_hazard(project.project_id)
+    if hazard is None:
+        raise UnknownCompletionHazardError(
+            f"project {project.project_id!r} has no unknown-completion hazard"
+        )
+    if hazard["run_id"] != args.run_id:
+        raise UnknownCompletionHazardError(
+            f"project {project.project_id!r} is blocked by run {hazard['run_id']!r}, "
+            f"not {args.run_id!r}"
+        )
+
+    summary_path = run_dir(args.run_id) / "summary.json"
+    summary = read_json(summary_path)
+    if not isinstance(summary, dict):
+        raise UnknownCompletionHazardError(
+            f"cannot record resolution because the original summary is missing at {summary_path}"
+        )
+    existing = summary.get("unknown_resolution")
+    if not isinstance(existing, dict) or existing.get("action") != "confirmed-ended":
+        summary["unknown_resolution"] = {
+            "action": "confirmed-ended",
+            "resolved_at": utc_now_iso(),
+        }
+        write_json(summary_path, summary)
+
+    if not clear_unknown_completion_hazard(project.project_id, args.run_id):
+        raise UnknownCompletionHazardError(
+            f"unknown-completion hazard changed while resolving run {args.run_id!r}"
+        )
+    reporter.event(
+        "unknown_completion_resolved",
+        project_id=project.project_id,
+        target=hazard["target"],
+        run_id=args.run_id,
+        note="baseline unchanged; next run will perform normal whole-project preflight",
+    )
     return EXIT_OK
 
 
