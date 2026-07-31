@@ -24,6 +24,7 @@ PUBLIC_INCLUDE_GLOBS = [
     "config/defaults.toml",
     "docs/**/*",
     "examples/**/*",
+    "native-gates/*",
     "schemas/**/*",
     "scripts/**/*",
     "src/**/*",

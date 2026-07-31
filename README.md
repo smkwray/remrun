@@ -68,7 +68,15 @@ remrun git-sync --install-hook      # post-commit best-effort push to [git_sync]
 remrun git-sync --uninstall-hook    # remove remrun's hook and restore any prior hook
 remrun runner install macbox        # install + probe the inert versioned helper
 remrun runner probe macbox          # verify the exact pinned helper and SQLite store
+remrun fleet jobs [--device NAME]  # read-only active-job view across configured targets
 ```
+
+`fleet jobs` querying is read-only. Launch-side registration is a separate, real
+activation seam and is **off by default**: ordinary `run` and fleet dispatcher commands
+continue through the established `exec()` path unless the controller process explicitly
+sets `REMRUN_FLEET_JOBS_OBSERVE=1`. Enable it only after the target's bounded native
+Windows/macOS gates pass. Direct callers of the explicit `exec_observed()` transport API
+are opting into that launch boundary themselves.
 
 ### Agent gotchas (learned in production — read before your first `run`)
 

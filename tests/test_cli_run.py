@@ -1951,3 +1951,38 @@ def test_main_memory_guard_live_path_reserves_renews_executes_and_releases(
     ledger_path = env["state"] / "memory-guard" / "v2" / "ledger.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert ledger["leases"] == []
+
+
+def test_run_routes_command_through_observation_seam(env, monkeypatch):
+    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "1")
+    captured = []
+    original = LocalSimTransport.exec_observed
+
+    def record(self, command, cwd, *, observation, **kwargs):
+        captured.append(observation)
+        return original(self, command, cwd, observation=observation, **kwargs)
+
+    monkeypatch.setattr(LocalSimTransport, "exec_observed", record)
+    code = main(["run", "LOCAL_SIM", "--", "python", "-c", "print('observed')"])
+    assert code == EXIT_OK
+    assert len(captured) == 1
+    item = captured[0]
+    assert item.project == "proj1"
+    assert item.target == "LOCAL_SIM"
+    assert item.phase == "command"
+    assert item.command_label == "python"
+    assert item.job_id
+
+
+def test_run_observation_is_dormant_by_default(env, monkeypatch):
+    from remrun import cli
+
+    monkeypatch.delenv("REMRUN_FLEET_JOBS_OBSERVE", raising=False)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("default-off run must not enter observation code")
+
+    monkeypatch.setattr(LocalSimTransport, "exec_observed", unexpected)
+    monkeypatch.setattr(cli.JobObservation, "for_command", classmethod(unexpected))
+    code = main(["run", "LOCAL_SIM", "--", "python", "-c", "print('plain')"])
+    assert code == EXIT_OK

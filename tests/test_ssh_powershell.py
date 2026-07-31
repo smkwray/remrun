@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from remrun.job_observation import JobObservation
 from remrun.memory_guard import MemoryGuardConfigError
 from remrun.models import Device
 from remrun.transport import (
@@ -551,6 +552,131 @@ def test_exec_detailed_job_preserves_powershell_command_semantics(
     assert "& " + " ".join(_ps_squote(token) for token in command) not in outer_script
 
 
+def test_exec_observed_telemetry_grants_breakaway_only_to_observer_wrapper(
+    monkeypatch,
+):
+    t = SSHPowerShellTransport(device(shell="pwsh"))
+    t._address = "winbox"
+    t._remote_home = r"C:\home\runner"
+    monkeypatch.setattr(
+        t,
+        "_ensure_job_observer",
+        lambda: (r"D:\remrun\state", r"D:\remrun\state\observer.py"),
+    )
+    staged = []
+
+    def capture_stage(local, remote):
+        staged.append((local.name, remote, local.read_bytes()))
+
+    monkeypatch.setattr(t, "push_file", capture_stage)
+    deleted = []
+    monkeypatch.setattr(t, "delete_remote", lambda remote: deleted.append(remote))
+    telemetry_payload = {"peak_rss_mb": 4.0, "avg_cpu_pct": 1.0}
+    telemetry_stderr = (
+        "\n__REMRUN_TELEMETRY__ " + json.dumps(telemetry_payload) + "\n"
+    ).encode()
+    rec = Recorder(lambda argv, inp: cp(37, stderr=telemetry_stderr))
+    monkeypatch.setattr(t, "_run", rec)
+    command = ["Write-Output", "observed"]
+    observation = JobObservation.for_command(
+        job_id="native-1",
+        project="@native-gate",
+        source_controller="test-controller",
+        target="WINBOX",
+        phase="telemetry-on",
+        command=command,
+    )
+
+    result = t.exec_observed(
+        command,
+        cwd=r"C:\project",
+        observation=observation,
+        telemetry=True,
+    )
+
+    assert result.exit_code == 37
+    assert result.telemetry == telemetry_payload
+    outer_script = decoded(rec.commands[-1])
+    assert "'--allow-observed-breakaway' '--argv-json-file'" in outer_script
+    assert len(rec.commands[-1]) <= 8_191
+    assert {name for name, _remote, _data in staged} == {
+        "_win_telemetry.py",
+        "argv.json",
+    }
+    request_entry = next(item for item in staged if item[0] == "argv.json")
+    request_remote = request_entry[1]
+    assert request_remote in outer_script
+    assert deleted == [request_remote]
+    observed_argv = json.loads(request_entry[2].decode("utf-8"))
+    assert observed_argv[:3] == [
+        "python",
+        "-S",
+        r"D:\remrun\state\observer.py",
+    ]
+    child_index = observed_argv.index("--") + 1
+    assert observed_argv[child_index:child_index + 4] == [
+        "pwsh",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+    ]
+    user_script = base64.b64decode(observed_argv[child_index + 4]).decode(
+        "utf-16-le"
+    )
+    assert "& 'Write-Output' 'observed'" in user_script
+
+
+def test_exec_observed_telemetry_staging_failure_falls_back_before_user_start(
+    monkeypatch,
+):
+    t = SSHPowerShellTransport(device(shell="pwsh"))
+    t._address = "winbox"
+    t._remote_home = r"C:\home\runner"
+    monkeypatch.setattr(
+        t,
+        "_ensure_job_observer",
+        lambda: (r"D:\remrun\state", r"D:\remrun\state\observer.py"),
+    )
+    staged = []
+
+    def fail_request_stage(local, remote):
+        staged.append((local.name, remote))
+        if local.name == "argv.json":
+            raise OSError("request stage failed")
+
+    monkeypatch.setattr(t, "push_file", fail_request_stage)
+    deleted = []
+    monkeypatch.setattr(t, "delete_remote", lambda remote: deleted.append(remote))
+    rec = Recorder(lambda argv, inp: cp(19))
+    monkeypatch.setattr(t, "_run", rec)
+    command = ["Write-Output", "once"]
+    observation = JobObservation.for_command(
+        job_id="native-fallback",
+        project="@native-gate",
+        source_controller="test-controller",
+        target="WINBOX",
+        phase="telemetry-stage-fallback",
+        command=command,
+    )
+
+    result = t.exec_observed(
+        command,
+        cwd=r"C:\project",
+        observation=observation,
+        telemetry=True,
+    )
+
+    assert result.exit_code == 19
+    assert result.telemetry is None
+    assert len(rec.calls) == 1
+    script = decoded(rec.commands[-1])
+    assert "_win_telemetry.py" not in script
+    assert "--allow-observed-breakaway" not in script
+    assert script.count(r"D:\remrun\state\observer.py") == 1
+    assert staged[0][0] == "argv.json"
+    assert deleted == [staged[0][1]]
+
+
 def test_exec_legacy_telemetry_also_job_tracks_the_powershell_seam(monkeypatch):
     t = SSHPowerShellTransport(device(shell="pwsh"))
     t._address = "winbox"
@@ -570,6 +696,7 @@ def test_exec_legacy_telemetry_also_job_tracks_the_powershell_seam(monkeypatch):
     shell, job_script = nested_job_script(outer_script)
     assert shell == "pwsh"
     assert "'--detailed'" not in outer_script
+    assert "'--allow-observed-breakaway'" not in outer_script
     assert "& 'Write-Output' 'value&still-one-argument'" in job_script
 
 

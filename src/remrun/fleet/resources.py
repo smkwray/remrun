@@ -113,6 +113,8 @@ Write-Output "MEMFREE_KB=$($os.FreePhysicalMemory)"
 $p = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor |
      Where-Object { $_.Name -eq '_Total' }
 Write-Output "CPU_IDLE=$($p.PercentIdleTime)"
+$s = Get-CimInstance Win32_PerfFormattedData_PerfOS_System
+Write-Output "CPU_QUEUE=$($s.ProcessorQueueLength)"
 $c = @(Get-CimInstance Win32_Processor)
 Write-Output "NCPU=$($c[0].NumberOfLogicalProcessors)"
 Write-Output "CHIP=$($c[0].Name)"
@@ -176,6 +178,13 @@ class ResourceView:
     # this high while interval CPU utilization is low.
     load1: float | None = None
     load_per_core: float | None = None
+    # Windows has no Unix load average. ProcessorQueueLength is the current
+    # number of ready threads waiting for a processor; normalizing it by logical
+    # processors makes differently sized Windows hosts comparable to each other.
+    # It remains a distinct metric because it excludes running threads and is
+    # not a one-minute average.
+    processor_queue_length: float | None = None
+    processor_queue_per_core: float | None = None
     ram_free_mb: float | None = None
     ram_total_mb: float | None = None
     gpu_name: str = ""
@@ -192,11 +201,14 @@ class ResourceView:
 
     @property
     def load_label(self) -> str:
-        """Raw one-minute demand/core ratio, without a CPU-saturation verdict."""
-        if self.load_per_core is None:
-            return "-"
-        ratio = self.load_per_core
-        return f"{ratio:.1f}x" if ratio >= 1.0 else f"{ratio:.2f}x"
+        """Compact OS-native demand signal, with semantics carried by its suffix."""
+        if self.load_per_core is not None:
+            ratio = self.load_per_core
+            return f"{ratio:.1f}x" if ratio >= 1.0 else f"{ratio:.2f}x"
+        if self.processor_queue_per_core is not None:
+            ratio = self.processor_queue_per_core
+            return f"{ratio:.1f}q" if ratio >= 1.0 else f"{ratio:.2f}q"
+        return "-"
 
     @property
     def ram_used_pct(self) -> float | None:
@@ -393,6 +405,12 @@ def _parse_windows(out: str, view: ResourceView) -> None:
     idle = _num(kv.get("CPU_IDLE"))
     if idle is not None:
         view.cpu_busy_pct = max(0.0, min(100.0, 100.0 - idle))
+
+    queue = _num(kv.get("CPU_QUEUE"))
+    if queue is not None and queue >= 0:
+        view.processor_queue_length = queue
+        if view.cpu_count is not None and view.cpu_count > 0:
+            view.processor_queue_per_core = queue / view.cpu_count
 
     for line in out.splitlines():
         if line.startswith("NVIDIA:"):

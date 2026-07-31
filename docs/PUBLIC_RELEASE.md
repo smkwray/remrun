@@ -27,9 +27,9 @@ python3 scripts/public_release_check.py
 ```
 
 The hygiene gate checks paths, diffs, and commit attribution. The release checker
-scans package code, tests, examples, schemas, README, generic docs, and example
-config. Both intentionally exclude private continuity/work-order notes and ignored
-local config.
+scans package code, tests, generic native gates, examples, schemas, README,
+generic docs, and example config. Both intentionally exclude private
+continuity/work-order notes and ignored local config.
 
 ## Rename or scope if needed
 

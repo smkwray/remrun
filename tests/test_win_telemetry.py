@@ -297,6 +297,233 @@ def test_gpu_aggregate_downgrades_after_later_failed_sample(monkeypatch):
     assert payload["min_vram_free_bytes"] == 100
 
 
+
+
+def test_staged_observed_argv_is_bounded_validated_and_removed(tmp_path):
+    request = tmp_path / "argv.json"
+    request.write_text('["pwsh", "-EncodedCommand", "encoded"]', encoding="utf-8")
+
+    assert telemetry._load_staged_argv(str(request)) == [
+        "pwsh",
+        "-EncodedCommand",
+        "encoded",
+    ]
+    assert not request.exists()
+
+
+def test_invalid_staged_observed_argv_is_removed_before_refusal(tmp_path):
+    request = tmp_path / "argv.json"
+    request.write_text('{"not": "argv"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bounded string array"):
+        telemetry._load_staged_argv(str(request))
+
+    assert not request.exists()
+
+
+
+def test_observed_breakaway_telemetry_is_explicit_unknown_not_wrapper_metrics():
+    payload = telemetry._observed_breakaway_payload(1.25)
+
+    assert payload["status"] == "unavailable"
+    assert payload["coverage"] == "observer_wrapper_only"
+    assert payload["cpu"]["coverage"] == "observer_wrapper_only"
+    assert payload["memory"]["coverage"] == "observer_wrapper_only"
+    assert payload["peak_rss_mb"] is None
+    assert payload["avg_cpu_pct"] is None
+    assert payload["cpu_sec"] is None
+    assert payload["process_tree_drained"] is None
+    assert "separate inner Job" in payload["detail"]
+
+
+def test_observed_breakaway_programs_only_the_explicit_job_limit(monkeypatch):
+    captured = {}
+
+    class Kernel32:
+        def SetInformationJobObject(self, _job, info_class, pointer, size):
+            captured["class"] = info_class
+            captured["size"] = int(size)
+            info = telemetry.ctypes.cast(
+                pointer,
+                telemetry.ctypes.POINTER(
+                    telemetry.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+                ),
+            ).contents
+            captured["flags"] = int(info.BasicLimitInformation.LimitFlags)
+            return True
+
+    monkeypatch.setattr(telemetry, "_kernel32", lambda: Kernel32())
+
+    telemetry._enable_observed_breakaway(object())
+
+    assert captured["class"] == telemetry.JobObjectExtendedLimitInformation
+    assert captured["size"] == telemetry.ctypes.sizeof(
+        telemetry.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    )
+    assert captured["flags"] == telemetry.JOB_OBJECT_LIMIT_BREAKAWAY_OK
+
+
+def test_observed_breakaway_is_enabled_before_user_create(monkeypatch):
+    order = []
+
+    class Kernel32:
+        def CreateJobObjectW(self, _security, _name):
+            order.append("create-job")
+            return telemetry.HANDLE(1)
+
+    monkeypatch.setattr(telemetry, "_kernel32", lambda: Kernel32())
+    monkeypatch.setattr(
+        telemetry,
+        "_enable_observed_breakaway",
+        lambda _job: order.append("enable-breakaway"),
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "_create_suspended",
+        lambda _argv: order.append("create-user")
+        or (_ for _ in ()).throw(OSError("pre-start failure")),
+    )
+    monkeypatch.setattr(telemetry, "_close_handle", lambda _handle: None)
+
+    with pytest.raises(OSError, match="pre-start failure"):
+        telemetry._job_run(["example.exe"], allow_observed_breakaway=True)
+
+    assert order == ["create-job", "enable-breakaway", "create-user"]
+
+
+def test_staged_observed_argv_routes_to_breakaway_job_once(tmp_path, monkeypatch):
+    request = tmp_path / "argv.json"
+    argv = ["pwsh", "-EncodedCommand", "encoded"]
+    request.write_text(__import__("json").dumps(argv), encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(telemetry.os, "name", "nt")
+    monkeypatch.setattr(
+        telemetry,
+        "_job_run",
+        lambda command, *, allow_observed_breakaway=False: calls.append(
+            (command, allow_observed_breakaway)
+        )
+        or 7,
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "_plain_run",
+        lambda _command: (_ for _ in ()).throw(
+            AssertionError("successful staged launch must not fall back")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "_win_telemetry.py",
+            "--allow-observed-breakaway",
+            "--argv-json-file",
+            str(request),
+            "--",
+        ],
+    )
+
+    assert telemetry.main() == 7
+    assert calls == [(argv, True)]
+    assert not request.exists()
+
+
+def test_observed_breakaway_poststart_failure_never_retries_user_argv(monkeypatch):
+    calls = []
+
+    def fail_after_possible_start(command, *, allow_observed_breakaway=False):
+        calls.append((command, allow_observed_breakaway))
+        raise RuntimeError("late failure")
+
+    monkeypatch.setattr(telemetry.os, "name", "nt")
+    monkeypatch.setattr(telemetry, "_job_run_detailed", fail_after_possible_start)
+    monkeypatch.setattr(
+        telemetry,
+        "_plain_run",
+        lambda _command: (_ for _ in ()).throw(
+            AssertionError("post-start uncertainty must never retry")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "_win_telemetry.py",
+            "--detailed",
+            "--allow-observed-breakaway",
+            "--",
+            "pwsh",
+            "-EncodedCommand",
+            "encoded",
+        ],
+    )
+
+    assert telemetry.main() == 1
+    assert calls == [(["pwsh", "-EncodedCommand", "encoded"], True)]
+
+
+def test_observed_breakaway_prestart_failure_falls_back_exactly_once(monkeypatch):
+    argv = ["pwsh", "-EncodedCommand", "encoded"]
+    calls = []
+
+    def fail_before_start(command, *, allow_observed_breakaway=False):
+        calls.append(("job", command, allow_observed_breakaway))
+        raise OSError("CreateJobObjectW failed")
+
+    monkeypatch.setattr(telemetry.os, "name", "nt")
+    monkeypatch.setattr(telemetry, "_job_run", fail_before_start)
+    monkeypatch.setattr(
+        telemetry,
+        "_plain_run",
+        lambda command: calls.append(("plain", command)) or 6,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "_win_telemetry.py",
+            "--allow-observed-breakaway",
+            "--",
+            *argv,
+        ],
+    )
+
+    assert telemetry.main() == 6
+    assert calls == [("job", argv, True), ("plain", argv)]
+
+
+def test_observed_breakaway_is_rejected_on_the_memory_guard_path(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        telemetry,
+        "_guarded_job_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("guarded user execution must not begin")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "_win_telemetry.py",
+            "--allow-observed-breakaway",
+            "--guard-max-bytes",
+            "1024",
+            "--guard-min-available-bytes",
+            "1024",
+            "--guard-token",
+            "a" * 32,
+            "--",
+            "example.exe",
+        ],
+    )
+
+    assert telemetry.main() == 2
+    assert "incompatible with the memory guard" in capsys.readouterr().err
+
 def _guard_payload_from_stderr(stderr: str, token: str) -> dict:
     import json
 

@@ -23,6 +23,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable
 
 from .frame import decode_file_frame, encode_file_frame
+from .job_observation import JobObservation, observation_warning
 from .manifest import Manifest, build_manifest, sha256_file
 from .memory_guard import (
     RESERVATION_TTL_SECONDS,
@@ -40,6 +41,20 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 _RUNNER_SOURCE: str | None = None
+
+# Tiny helper-integrity probe. Unlike ``hash_file()``, this does not upload the
+# full general-purpose remote runner on every observed launch/query. The remote
+# Python reads the already-staged helper and returns one 64-byte digest.
+_REMOTE_HELPER_SHA256_SOURCE = (
+    "import hashlib,sys\n"
+    "h=hashlib.sha256()\n"
+    "with open(sys.argv[1],'rb') as f:\n"
+    " while True:\n"
+    "  b=f.read(1048576)\n"
+    "  if not b: break\n"
+    "  h.update(b)\n"
+    "print(h.hexdigest())\n"
+)
 
 
 def _runner_source() -> bytes:
@@ -659,6 +674,28 @@ def _unavailable_detailed_telemetry(platform_name: str, detail: str) -> dict:
     }
 
 
+def _parse_job_query_payload(stdout: bytes, stderr: bytes = b"") -> dict[str, object]:
+    """Parse the observer's single bounded JSON document strictly."""
+    text = stdout.decode("utf-8", "replace").strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        detail = stderr.decode("utf-8", "replace").strip()
+        raise TransportError(
+            "active-job observer returned invalid JSON"
+            + (f": {detail}" if detail else "")
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != 1
+        or payload.get("status") not in {"ok", "partial", "unknown", "unsupported"}
+        or not isinstance(payload.get("jobs"), list)
+        or not isinstance(payload.get("errors", []), list)
+    ):
+        raise TransportError("active-job observer returned an invalid schema")
+    return payload
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     reachable: bool
@@ -844,6 +881,61 @@ class BaseTransport:
         ExecResult is authoritative either way.
         """
         raise NotImplementedError
+
+    def exec_observed(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        observation: JobObservation,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+        telemetry: bool = False,
+        on_stdout: StreamSink | None = None,
+        telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
+    ) -> ExecResult:
+        """Run with target-local observation when a backend supports it.
+
+        The default preserves third-party transport compatibility by delegating
+        exactly once to the established ``exec`` contract. Such jobs are outside
+        ``fleet jobs`` coverage and the query reports that mixed-version limit.
+        """
+        del observation
+        kwargs: dict[str, object] = {
+            "env": env,
+            "path_prepend": path_prepend,
+            "telemetry": telemetry,
+            "on_stdout": on_stdout,
+        }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if telemetry_request is not None:
+            kwargs["telemetry_request"] = telemetry_request
+        if memory_reservation is not None:
+            kwargs["memory_reservation"] = memory_reservation
+        return self.exec(command, cwd=cwd, **kwargs)
+
+    def query_observed_jobs(
+        self, *, sample_interval: float = 0.2, timeout: float = 45.0
+    ) -> dict[str, object]:
+        """Return a target-local active-job document, or explicit unsupported."""
+        del sample_interval, timeout
+        return {
+            "schema": 1,
+            "status": "unsupported",
+            "jobs": [],
+            "errors": [{
+                "kind": "unsupported_transport",
+                "detail": f"{type(self).__name__} has no target-local observer",
+            }],
+            "coverage": {
+                "scope": "none",
+                "mixed_version": True,
+                "detail": "this transport cannot query target-local active jobs",
+            },
+        }
 
     # --- filesystem -------------------------------------------------------
     def ensure_remote_dir(self, remote_path: str) -> None:
@@ -1392,6 +1484,39 @@ class _SSHCommon(BaseTransport):
         # Both ssh backends define _expand_remote (POSIX vs backslash ~ handling).
         return self._expand_remote(path)
 
+    def _job_helper_sha256(self, remote_path: str) -> str:
+        """Return a verified remote helper digest using a bounded native probe."""
+        raise NotImplementedError
+
+    def _ensure_remote_helper_exact(self, source: Path, remote_path: str) -> None:
+        """Verify a content-addressed helper byte-for-byte before use.
+
+        ``push_file`` already commits atomically on both SSH backends. A missing,
+        truncated, or corrupt helper therefore takes the same pre-start repair
+        path; a failed post-write hash is a setup failure and user code has not
+        started. The warm path sends only a tiny inline digest probe rather than
+        re-uploading the general-purpose remote runner.
+        """
+        expected = sha256_file(source)
+        try:
+            actual = self._job_helper_sha256(remote_path)
+        except Exception:
+            actual = ""
+        if actual == expected:
+            return
+        self.push_file(source, remote_path)
+        try:
+            actual = self._job_helper_sha256(remote_path)
+        except Exception as exc:
+            raise TransportError(
+                f"helper verification failed after atomic replacement: {remote_path}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if actual != expected:
+            raise TransportError(
+                f"helper verification failed after atomic replacement: {remote_path}"
+            )
+
     def _ssh_base(self, address: str, connect_timeout: int | None = None) -> list[str]:
         opts = [
             "-o", "BatchMode=yes",
@@ -1662,6 +1787,7 @@ def _ps_command_argv(
     command: list[str],
     *,
     inherited_path_var: str | None = None,
+    batch_marker: str | None = None,
 ) -> list[str]:
     """Run ``command`` through the same PowerShell ``&`` seam as the transport.
 
@@ -1687,6 +1813,8 @@ def _ps_command_argv(
                 f"$env:{inherited_path_var} = $null",
             ]
         )
+    if batch_marker is not None:
+        lines.extend(_ps_batch_resolution_guard(command[0], batch_marker))
     lines.extend(
         [
             invocation,
@@ -1917,6 +2045,131 @@ class SSHPosixTransport(_SSHCommon):
         self.push_file(Path(__file__).parent / "_posix_telemetry.py", helper)
         return helper
 
+    def _job_state_root(self) -> str:
+        root = self._expand_remote(self.device.state_root).rstrip("/")
+        if not root:
+            raise TransportError("target state root is empty")
+        if root == "~" or root.startswith("~/"):
+            raise TransportError("remote home unknown")
+        return root
+
+    def _job_helper_sha256(self, remote_path: str) -> str:
+        address = self._address_or_resolve()
+        script = shlex.join(
+            [
+                self.device.remote_python or "python3",
+                "-S",
+                "-c",
+                _REMOTE_HELPER_SHA256_SOURCE,
+                remote_path,
+            ]
+        )
+        proc = self._remote(address, script)
+        if proc.returncode != 0:
+            raise TransportError(
+                f"hash helper {remote_path} failed: "
+                f"{proc.stderr.decode('utf-8', 'replace').strip() or f'exit {proc.returncode}'}"
+            )
+        digest = proc.stdout.decode("ascii", "strict").strip().lower()
+        if len(digest) != 64:
+            raise TransportError(f"hash helper {remote_path} returned an invalid digest")
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise TransportError(
+                f"hash helper {remote_path} returned an invalid digest"
+            ) from exc
+        return digest
+
+    def _ensure_job_observer(self) -> tuple[str, str]:
+        root = self._job_state_root()
+        source = Path(__file__).parent / "_job_observer.py"
+        digest = sha256_file(source)[:16]
+        helper = posixpath.join(
+            root, "helpers", f"remrun_job_observer_v1_{digest}.py"
+        )
+        # The name is content-addressed for bounded warm-path reuse, but existence
+        # alone is not proof: verify the full helper bytes before launch/query.
+        self._ensure_remote_helper_exact(source, helper)
+        return root, helper
+
+    def exec_observed(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        observation: JobObservation,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+        telemetry: bool = False,
+        on_stdout: StreamSink | None = None,
+        telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
+    ) -> ExecResult:
+        # Setup failure is known to precede user code, so fallback is safe and
+        # executes the original command exactly once. A wrapper/run failure is
+        # never retried because completion could already be partial or unknown.
+        try:
+            state_root, helper = self._ensure_job_observer()
+            metadata = observation.encoded()
+        except Exception as exc:
+            result = self.exec(
+                command,
+                cwd,
+                env=env,
+                timeout=timeout,
+                path_prepend=path_prepend,
+                telemetry=telemetry,
+                on_stdout=on_stdout,
+                telemetry_request=telemetry_request,
+                memory_reservation=memory_reservation,
+            )
+            return observation_warning(result, f"{type(exc).__name__}: {exc}")
+
+        # Insert the observer immediately outside the established shell argv.
+        # _exec_posix still owns env/PATH/cwd, the one login/profile boundary,
+        # telemetry, timeout, exact exit, and schema-2 memory-guard handling.
+        return self._exec_posix(
+            command,
+            cwd,
+            env=env,
+            timeout=timeout,
+            path_prepend=path_prepend,
+            telemetry=telemetry,
+            on_stdout=on_stdout,
+            telemetry_request=telemetry_request,
+            memory_reservation=memory_reservation,
+            observation_wrapper=(state_root, helper, metadata),
+        )
+
+    def query_observed_jobs(
+        self, *, sample_interval: float = 0.2, timeout: float = 45.0
+    ) -> dict[str, object]:
+        address = self._address_or_resolve()
+        state_root, helper = self._ensure_job_observer()
+        script = shlex.join(
+            [
+                self.device.remote_python or "python3",
+                "-S",
+                helper,
+                "query",
+                "--state-root",
+                state_root,
+                "--sample-interval",
+                str(float(sample_interval)),
+            ]
+        )
+        # Deliberately bypass exec(): an observation query must not reserve,
+        # renew, claim, or release the schema-2 memory-guard ledger.
+        proc = self._remote(address, script, timeout=timeout)
+        if proc.returncode == 255:
+            raise TransportError(
+                "ssh connection failed while querying active jobs: "
+                + proc.stderr.decode("utf-8", "replace").strip()
+            )
+        return _parse_job_query_payload(proc.stdout, proc.stderr)
+
     def _invoke_memory_admission(
         self, request: dict[str, object]
     ) -> dict[str, object]:
@@ -2053,6 +2306,19 @@ class SSHPosixTransport(_SSHCommon):
              telemetry=False, on_stdout=None,
              telemetry_request: TelemetryRequest | None = None,
              memory_reservation: MemoryReservation | None = None) -> ExecResult:
+        return self._exec_posix(
+            command, cwd, env=env, timeout=timeout, path_prepend=path_prepend,
+            telemetry=telemetry, on_stdout=on_stdout,
+            telemetry_request=telemetry_request, memory_reservation=memory_reservation,
+        )
+
+    def _exec_posix(
+        self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
+        telemetry=False, on_stdout=None,
+        telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
+        observation_wrapper: tuple[str, str, str] | None = None,
+    ) -> ExecResult:
         try:
             address = self._address_or_resolve()
         except TransportError as exc:
@@ -2084,6 +2350,21 @@ class SSHPosixTransport(_SSHCommon):
         # A login shell makes the remote PATH match the user's normal environment
         # (e.g. Homebrew's Rscript), which a bare non-interactive ssh shell omits.
         shell_flag = "-lc" if self.device.login_shell else "-c"
+        run_argv = [self.device.shell, shell_flag, inner]
+        if observation_wrapper is not None:
+            state_root, helper, metadata = observation_wrapper
+            run_argv = [
+                self.device.remote_python or "python3",
+                "-S",
+                helper,
+                "run",
+                "--state-root",
+                state_root,
+                "--metadata-b64",
+                metadata,
+                "--",
+                *run_argv,
+            ]
         detailed = telemetry_request is not None
         detailed_error = ""
         guard_token: str | None = None
@@ -2113,9 +2394,7 @@ class SSHPosixTransport(_SSHCommon):
                     [
                         self.device.remote_python or "python3",
                         *helper_args,
-                        self.device.shell,
-                        shell_flag,
-                        inner,
+                        *run_argv,
                     ]
                 )
             except Exception as exc:
@@ -2147,24 +2426,26 @@ class SSHPosixTransport(_SSHCommon):
                         wrapper_remote,
                         "--detailed",
                         "--",
-                        self.device.shell,
-                        shell_flag,
-                        inner,
+                        *run_argv,
                     ]
                 )
             except Exception as exc:
                 detailed_error = f"detailed telemetry staging failed: {type(exc).__name__}: {exc}"
-                if self.device.login_shell:
+                if observation_wrapper is not None:
+                    script = shlex.join(run_argv)
+                elif self.device.login_shell:
                     script = f"{self.device.shell} -lc {shlex.quote(inner)}"
                 else:
                     script = inner
         elif telemetry:
             # Wrap the (unchanged) shell invocation in the stdlib rusage sampler.
-            measured = " ".join(shlex.quote(a) for a in (self.device.shell, shell_flag, inner))
+            measured = shlex.join(run_argv)
             script = (
                 f"{shlex.quote(self.device.remote_python)} -c "
                 f"{shlex.quote(_POSIX_TELEMETRY_SAMPLER)} -- {measured}"
             )
+        elif observation_wrapper is not None:
+            script = shlex.join(run_argv)
         elif self.device.login_shell:
             script = f"{self.device.shell} -lc {shlex.quote(inner)}"
         else:
@@ -2409,6 +2690,136 @@ class SSHPowerShellTransport(_SSHCommon):
             return self._remote_home.rstrip("\\/") + path[1:].replace("/", "\\")
         return path
 
+    def _job_state_root(self) -> str:
+        root = self._expand_remote(self.device.state_root).rstrip("\\/")
+        if not root:
+            raise TransportError("target state root is empty")
+        if root == "~" or root.startswith(("~/", "~\\")):
+            raise TransportError("remote home unknown")
+        return root
+
+    def _job_helper_sha256(self, remote_path: str) -> str:
+        address = self._address_or_resolve()
+        py = _ps_squote(self.device.remote_python or "python")
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            f"& {py} '-S' '-c' {_ps_squote(_REMOTE_HELPER_SHA256_SOURCE)} "
+            f"{_ps_squote(remote_path)}\n"
+            "exit $LASTEXITCODE"
+        )
+        proc = self._ps_remote(address, script)
+        if proc.returncode != 0:
+            raise TransportError(
+                f"hash helper {remote_path} failed: "
+                f"{proc.stderr.decode('utf-8', 'replace').strip() or f'exit {proc.returncode}'}"
+            )
+        digest = proc.stdout.decode("ascii", "strict").strip().lower()
+        if len(digest) != 64:
+            raise TransportError(f"hash helper {remote_path} returned an invalid digest")
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise TransportError(
+                f"hash helper {remote_path} returned an invalid digest"
+            ) from exc
+        return digest
+
+    def _ensure_job_observer(self) -> tuple[str, str]:
+        root = self._job_state_root()
+        source = Path(__file__).parent / "_job_observer.py"
+        digest = sha256_file(source)[:16]
+        helper = self.native_join(
+            root, "helpers", f"remrun_job_observer_v1_{digest}.py"
+        )
+        self._ensure_remote_helper_exact(source, helper)
+        return root, helper
+
+    def exec_observed(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        observation: JobObservation,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+        telemetry: bool = False,
+        on_stdout: StreamSink | None = None,
+        telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
+    ) -> ExecResult:
+        _reject_explicit_windows_batch(command)
+        marker = f"__REMRUN_BATCH_UNSUPPORTED_{uuid.uuid4().hex}__;"
+        try:
+            state_root, helper = self._ensure_job_observer()
+            metadata = observation.encoded()
+            child = _ps_command_argv(self._ps_exe(), command, batch_marker=marker)
+        except Exception as exc:
+            result = self.exec(
+                command,
+                cwd,
+                env=env,
+                timeout=timeout,
+                path_prepend=path_prepend,
+                telemetry=telemetry,
+                on_stdout=on_stdout,
+                telemetry_request=telemetry_request,
+                memory_reservation=memory_reservation,
+            )
+            return observation_warning(result, f"{type(exc).__name__}: {exc}")
+
+        wrapped = [
+            self.device.remote_python or "python",
+            "-S",
+            helper,
+            "run",
+            "--state-root",
+            state_root,
+            "--metadata-b64",
+            metadata,
+            "--",
+            *child,
+        ]
+        result = self.exec(
+            wrapped,
+            cwd,
+            env=env,
+            timeout=timeout,
+            path_prepend=path_prepend,
+            telemetry=telemetry,
+            on_stdout=on_stdout,
+            telemetry_request=telemetry_request,
+            memory_reservation=memory_reservation,
+            _allow_observed_breakaway=True,
+        )
+        if marker in result.stderr:
+            raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+        return result
+
+    def query_observed_jobs(
+        self, *, sample_interval: float = 0.2, timeout: float = 45.0
+    ) -> dict[str, object]:
+        if self._ps_exe().lower() == "powershell":
+            raise TransportError(_WINDOWS_POWERSHELL_UNSUPPORTED)
+        address = self._address_or_resolve()
+        state_root, helper = self._ensure_job_observer()
+        py = _ps_squote(self.device.remote_python or "python")
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            f"& {py} '-S' {_ps_squote(helper)} 'query' '--state-root' "
+            f"{_ps_squote(state_root)} '--sample-interval' "
+            f"{_ps_squote(str(float(sample_interval)))}\n"
+            "exit $LASTEXITCODE"
+        )
+        # Raw control path: do not touch the memory-guard ledger or register the query.
+        proc = self._ps_remote(address, script, timeout=timeout)
+        if proc.returncode == 255:
+            raise TransportError(
+                "ssh connection failed while querying active jobs: "
+                + proc.stderr.decode("utf-8", "replace").strip()
+            )
+        return _parse_job_query_payload(proc.stdout, proc.stderr)
+
     def remote_project_path(self, project: ProjectContext) -> str:
         root = self._expand_remote(self.device.project_root).rstrip("\\/")
         return root + "\\" + project.project_id.replace("/", "\\")
@@ -2554,7 +2965,8 @@ class SSHPowerShellTransport(_SSHCommon):
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
              telemetry=False, on_stdout=None,
              telemetry_request: TelemetryRequest | None = None,
-             memory_reservation: MemoryReservation | None = None) -> ExecResult:
+             memory_reservation: MemoryReservation | None = None,
+             _allow_observed_breakaway: bool = False) -> ExecResult:
         if self.memory_guard is not None or memory_reservation is not None:
             raise TransportError("memory guard schema 2 is not proved on Windows")
         if self._ps_exe().lower() == "powershell":
@@ -2604,12 +3016,24 @@ class SSHPowerShellTransport(_SSHCommon):
         detailed = telemetry_request is not None
         detailed_error = ""
         telemetry_requested = detailed or telemetry
+        telemetry_argv_remote: str | None = None
 
         if telemetry_requested:
-            inherited_path_var = f"__REMRUN_INHERITED_PATH_{uuid.uuid4().hex}"
-            job_command = _ps_command_argv(
-                self._ps_exe(), command, inherited_path_var=inherited_path_var
-            )
+            inherited_path_var: str | None = None
+            if _allow_observed_breakaway:
+                # exec_observed() already built a native Python observer argv whose
+                # child is the established encoded PowerShell command. Launch that
+                # helper directly inside the telemetry Job: a second encoded shell
+                # adds no semantics, can exceed the Windows command-line bound, and
+                # would put another workload parent between telemetry and observation.
+                job_command = command
+            else:
+                inherited_path_var = (
+                    f"__REMRUN_INHERITED_PATH_{uuid.uuid4().hex}"
+                )
+                job_command = _ps_command_argv(
+                    self._ps_exe(), command, inherited_path_var=inherited_path_var
+                )
             job_tokens = " ".join(_ps_squote(token) for token in job_command)
             try:
                 home = (self._remote_home or "").rstrip("\\/")
@@ -2618,15 +3042,38 @@ class SSHPowerShellTransport(_SSHCommon):
                 wrapper_remote = home + "\\AppData\\Local\\Temp\\remrun_win_telemetry.py"
                 py = _ps_squote(self.device.remote_python or "python")
                 telemetry_lines = [*lines]
-                telemetry_lines.append(f"$env:{inherited_path_var} = $env:PATH")
+                if inherited_path_var is not None:
+                    telemetry_lines.append(
+                        f"$env:{inherited_path_var} = $env:PATH"
+                    )
+                wrapper_args = [wrapper_remote]
                 if detailed:
-                    telemetry_lines.append(
-                        f"& {py} {_ps_squote(wrapper_remote)} '--detailed' '--' {job_tokens}"
+                    wrapper_args.append("--detailed")
+                if _allow_observed_breakaway:
+                    wrapper_args.append("--allow-observed-breakaway")
+                    telemetry_argv_remote = (
+                        home
+                        + "\\AppData\\Local\\Temp\\"
+                        + f"remrun_win_telemetry_argv_{private_nonce}.json"
                     )
-                else:
-                    telemetry_lines.append(
-                        f"& {py} {_ps_squote(wrapper_remote)} '--' {job_tokens}"
+                    with tempfile.TemporaryDirectory(
+                        prefix="remrun-observed-argv-"
+                    ) as temp_dir:
+                        local_argv = Path(temp_dir) / "argv.json"
+                        local_argv.write_text(
+                            json.dumps(job_command, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                        self.push_file(local_argv, telemetry_argv_remote)
+                    wrapper_args.extend(
+                        ["--argv-json-file", telemetry_argv_remote]
                     )
+                    job_tokens = ""
+                wrapper_tokens = " ".join(_ps_squote(token) for token in wrapper_args)
+                telemetry_lines.append(
+                    f"& {py} {wrapper_tokens} '--'"
+                    + (f" {job_tokens}" if job_tokens else "")
+                )
                 telemetry_lines.extend(exit_lines)
                 if not _ps_remote_command_fits(self._ps_exe(), "\n".join(telemetry_lines)):
                     raise TransportError(
@@ -2636,6 +3083,12 @@ class SSHPowerShellTransport(_SSHCommon):
                 self.push_file(Path(__file__).parent / "_win_telemetry.py", wrapper_remote)
                 lines = telemetry_lines
             except Exception as exc:
+                if telemetry_argv_remote is not None:
+                    try:
+                        self.delete_remote(telemetry_argv_remote)
+                    except Exception:
+                        pass
+                    telemetry_argv_remote = None
                 if detailed:
                     detailed_error = (
                         f"detailed telemetry unavailable: {type(exc).__name__}: {exc}"
@@ -2648,7 +3101,16 @@ class SSHPowerShellTransport(_SSHCommon):
             lines.append("& " + cmd_tokens)
             lines.extend(exit_lines)
 
-        proc = self._ps_remote(address, "\n".join(lines), timeout=timeout, on_stdout=on_stdout)
+        try:
+            proc = self._ps_remote(
+                address, "\n".join(lines), timeout=timeout, on_stdout=on_stdout
+            )
+        finally:
+            if telemetry_argv_remote is not None:
+                try:
+                    self.delete_remote(telemetry_argv_remote)
+                except Exception:
+                    pass
         stdout = proc.stdout.decode("utf-8", "replace")
         stderr = proc.stderr.decode("utf-8", "replace")
         if batch_marker in stderr:

@@ -16,6 +16,19 @@ def test_uv_lock_is_scanned(tmp_path):
     assert [(path, line) for path, line, _pattern, _text in hits] == [(lock, 1)]
 
 
+def test_native_gate_is_scanned(tmp_path):
+    gate_dir = tmp_path / "native-gates"
+    gate_dir.mkdir()
+    gate = gate_dir / "cross_platform_gate.py"
+    gate.write_text("PRIVATE_MARKER\n")
+    patterns = tmp_path / "patterns.txt"
+    patterns.write_text("PRIVATE_MARKER\n")
+
+    assert gate in iter_public_files(tmp_path)
+    hits = scan(tmp_path, pattern_file=patterns)
+    assert [(path, line) for path, line, _pattern, _text in hits] == [(gate, 1)]
+
+
 @pytest.mark.parametrize("address", [
     ".".join(("10", "1", "2", "3")),
     ".".join(("172", "16", "2", "3")),

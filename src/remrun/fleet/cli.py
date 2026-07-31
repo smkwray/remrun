@@ -500,7 +500,7 @@ def cmd_resources(args, reporter: Reporter) -> int:
     never stages files, and never touches the queue.
     """
     from . import local_resources, resources
-    from .resources_render import render_table, to_dict
+    from .resources_render import IncrementalTable, render_table, to_dict
 
     config = load_config()
     usage_display = (
@@ -536,11 +536,31 @@ def cmd_resources(args, reporter: Reporter) -> int:
     if unknown:
         reporter.event("unknown_devices", names=",".join(sorted(unknown)))
 
-    # Progress to stderr: a fleet probe takes seconds per device, and a blank
-    # terminal is indistinguishable from a hang. Suppressed for --json (which
-    # must stay machine-parseable) and when stderr is not a TTY.
+    # A TTY gets an append-only table immediately, with one row per completed
+    # probe. Redirected output and --json remain buffered and deterministic.
+    # --no-progress preserves the prior one-shot table for callers that prefer it.
     quiet = getattr(args, "json", False) or getattr(args, "no_progress", False)
-    show = not quiet and sys.stderr.isatty()
+    stream = not quiet and sys.stdout.isatty()
+    include_local = (
+        not getattr(args, "no_local", False)
+        and not wanted
+    )
+    incremental = None
+    local = None
+    if stream:
+        labels = [device.name for device in targets]
+        if include_local:
+            local_label = (platform.node().split(".")[0] or "LOCAL").upper()
+            labels.append(local_label)
+        incremental = IncrementalTable(labels, usage_display=usage_display)
+        print(incremental.header(), flush=True)
+        if include_local:
+            local = local_resources.local_view()
+            print(incremental.row(local), flush=True)
+
+    # The old compact progress lines remain useful when stdout is not a TTY but
+    # stderr is (for example, when the final table is redirected to a file).
+    show = not quiet and not stream and sys.stderr.isatty()
     pending: set[str] = set()
     # Width of the last status line written, so it can be erased exactly. A `\r`
     # alone only moves the cursor: without overwriting, a shorter line leaves the
@@ -548,8 +568,27 @@ def cmd_resources(args, reporter: Reporter) -> int:
     # "ok DEV1ing DEV1, DEV2".
     last_width = 0
 
+    def is_local_duplicate(view) -> bool:  # noqa: ANN001
+        if local is None or view is None:
+            return False
+        local_hostname = (local.hostname or "").split(".")[0].casefold()
+        return (
+            view.name.casefold() == local.name.casefold()
+            or (
+                local_hostname
+                and (view.hostname or "").split(".")[0].casefold() == local_hostname
+            )
+        )
+
     def on_event(kind: str, name: str, view) -> None:  # noqa: ANN001
         nonlocal last_width
+        if (
+            incremental is not None
+            and kind == "done"
+            and view is not None
+            and not is_local_duplicate(view)
+        ):
+            print(incremental.row(view), flush=True)
         if not show:
             return
         if last_width:
@@ -572,8 +611,9 @@ def cmd_resources(args, reporter: Reporter) -> int:
                                   on_event=on_event)
     if show and last_width:
         print("\r" + " " * last_width + "\r", end="", file=sys.stderr, flush=True)
-    if not getattr(args, "no_local", False) and not wanted:
-        local = local_resources.local_view()
+    if include_local:
+        if local is None:
+            local = local_resources.local_view()
         # The controller is frequently ALSO a configured device (a laptop is both the
         # box you sit at and a run target for the rest of the mesh). Probing it over SSH
         # from itself usually fails — it has no authorized key for its own controller —
@@ -590,6 +630,10 @@ def cmd_resources(args, reporter: Reporter) -> int:
     if getattr(args, "json", False):
         print(json.dumps({"devices": [to_dict(v) for v in views]},
                          indent=2, sort_keys=True))
+    elif incremental is not None:
+        footer = incremental.footer(views)
+        if footer:
+            print(footer)
     else:
         print(render_table(views, usage_display=usage_display))
 
@@ -600,6 +644,100 @@ def cmd_resources(args, reporter: Reporter) -> int:
         return EXIT_ERROR
     return EXIT_OK
 
+
+def cmd_jobs(args, reporter: Reporter) -> int:
+    """Cross-controller view of target-local active remrun jobs.
+
+    This is distinct from ``fleet status``: it queries each target's bounded
+    active-job registry and never treats an unreachable or incompatible target
+    as an empty target.
+    """
+    from . import jobs
+    from .jobs_render import IncrementalTable, render_table
+
+    config = load_config()
+    wanted = {d.upper() for d in (getattr(args, "device", None) or [])}
+    targets = []
+    for name, dev in config.devices.items():
+        if dev.kind == "local-sim":
+            continue
+        if wanted and name.upper() not in wanted:
+            continue
+        if getattr(args, "enabled_only", False) and not dev.enabled:
+            continue
+        targets.append(dev)
+
+    selected = {d.name.upper() for d in targets}
+    unknown = wanted - selected
+    if unknown:
+        reporter.event("unknown_devices", names=",".join(sorted(unknown)))
+    if not targets:
+        reporter.event("no_devices")
+        return EXIT_ERROR
+
+    quiet = getattr(args, "json", False) or getattr(args, "no_progress", False)
+    stream = not quiet and sys.stdout.isatty()
+    incremental = IncrementalTable([d.name for d in targets]) if stream else None
+    if incremental is not None:
+        print(incremental.header(), flush=True)
+
+    pending: set[str] = set()
+    show = not quiet and not stream and sys.stderr.isatty()
+    last_width = 0
+
+    def on_event(kind: str, name: str, view) -> None:  # noqa: ANN001
+        nonlocal last_width
+        if incremental is not None and kind == "done" and view is not None:
+            for row in incremental.rows(view):
+                print(row, flush=True)
+        if not show:
+            return
+        if last_width:
+            print("\r" + " " * last_width + "\r", end="", file=sys.stderr, flush=True)
+            last_width = 0
+        if kind == "start":
+            pending.add(name)
+        else:
+            pending.discard(name)
+            mark = "ok" if view is not None and view.status in {"ok", "partial"} else "--"
+            print(f"  {mark} {name}", file=sys.stderr, flush=True)
+        if pending:
+            line = f"  .. querying {', '.join(sorted(pending))}"
+            last_width = len(line)
+            print(line, end="\r", file=sys.stderr, flush=True)
+
+    if show:
+        print(f"querying {len(targets)} device(s)...", file=sys.stderr, flush=True)
+    controller = (platform.node().split(".", 1)[0] or "").casefold()
+    local_names = {
+        device.name.casefold()
+        for device in targets
+        if controller and device.name.casefold() == controller
+    }
+    views = jobs.probe_fleet(
+        targets,
+        sample_interval=getattr(args, "sample_interval", 0.2),
+        timeout=getattr(args, "timeout", 45.0),
+        local_names=local_names,
+        on_event=on_event,
+    )
+    if show and last_width:
+        print("\r" + " " * last_width + "\r", end="", file=sys.stderr, flush=True)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "schema": 1,
+            "jobs": jobs.flatten_jobs(views),
+            "targets": [jobs.to_dict(v) for v in views],
+        }, indent=2, sort_keys=True))
+    elif incremental is None:
+        print(render_table(views))
+
+    # One offline target is normal. The command fails only when no target
+    # supplied a supported observation document, avoiding a plausible empty fleet.
+    if not any(view.status in {"ok", "partial"} for view in views):
+        return EXIT_ERROR
+    return EXIT_OK
 
 def cmd_mesh(args, reporter: Reporter) -> int:
     """Directed SSH reachability: which devices can log into which.
@@ -706,6 +844,19 @@ def build_parser() -> argparse.ArgumentParser:
     prs.add_argument("--no-progress", dest="no_progress", action="store_true",
                      help="suppress the per-device progress lines on stderr")
     prs.add_argument("--json", action="store_true")
+    pj = sub.add_parser("jobs", help="active remrun jobs observed on configured targets "
+                                     "(cross-controller; not the local queue)")
+    pj.add_argument("--device", action="append",
+                    help="limit to this target (repeatable; default is all configured targets)")
+    pj.add_argument("--enabled-only", dest="enabled_only", action="store_true",
+                    help="only targets with enabled = true")
+    pj.add_argument("--sample-interval", dest="sample_interval", type=float, default=0.2,
+                    help="bounded CPU sampling interval per target in seconds (default 0.2)")
+    pj.add_argument("--timeout", type=float, default=45.0,
+                    help="per-target query timeout in seconds (default 45)")
+    pj.add_argument("--no-progress", dest="no_progress", action="store_true",
+                    help="suppress progressive completion output")
+    pj.add_argument("--json", action="store_true")
     pm = sub.add_parser("mesh", help="who can ssh into whom: directed reachability matrix "
                                      "across the fleet (read-only, measured not inferred)")
     pm.add_argument("--device", action="append",
@@ -738,6 +889,8 @@ def main(argv: list[str]) -> int:
             return cmd_cancel(args, reporter)
         if args.fleet_command == "resources":
             return cmd_resources(args, reporter)
+        if args.fleet_command == "jobs":
+            return cmd_jobs(args, reporter)
         if args.fleet_command == "mesh":
             return cmd_mesh(args, reporter)
     except Exception as exc:  # noqa: BLE001 - keep agent-visible error concise

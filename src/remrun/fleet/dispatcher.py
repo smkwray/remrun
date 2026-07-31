@@ -28,6 +28,7 @@ from typing import Any, Callable
 from .. import sync
 from ..config import RemrunConfig, global_excludes
 from ..output import Reporter
+from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, utc_now_iso
 from . import adapters, executor, placement, probes, profiles
 from .config import fleet_config, idle_grace_s as configured_idle_grace_s, load_costs, safety_fraction
@@ -388,8 +389,10 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
         pre_output = _remote_output_mtimes(config, device, head)   # baseline the root BEFORE the run (2b)
         try:
             with BatchHeartbeat(db_path, batch_id, lease_seconds):
-                res = executor.run_batch(device, btasks, config, state_root=state_root,
-                                         job_ids=job_ids)
+                res = executor.run_batch(
+                    device, btasks, config, state_root=state_root, job_ids=job_ids,
+                    observation_id=batch_id,
+                )
                 if res.get("ok"):
                     q.set_batch_state(batch_id, "fetching")     # 2b: verify BEFORE marking done
                     verify = _verify_batch_output(config, device, head, reporter, pre_output)
@@ -516,8 +519,23 @@ def _run_device_reclaim(dev, reporter: Reporter) -> bool:  # noqa: ANN001
         if not transport.probe().reachable:
             return False
         tokens = [transport.expand_remote(t) if t.startswith("~") else t for t in tokens]
-        transport.exec(tokens, cwd=("C:\\" if dev.is_windows else "/"),
-                       telemetry=False, timeout=30)
+        observed_exec = getattr(transport, "exec_observed", None)
+        if not active_job_observation_enabled() or observed_exec is None:
+            transport.exec(tokens, cwd=("C:\\" if dev.is_windows else "/"),
+                           telemetry=False, timeout=30)
+        else:
+            observation = JobObservation.for_command(
+                job_id=f"reclaim-{uuid.uuid4().hex[:12]}",
+                project="@fleet",
+                target=dev.name,
+                phase="reclaim",
+                command=tokens,
+                declared_label="host-ram-reclaim",
+            )
+            observed_exec(
+                tokens, cwd=("C:\\" if dev.is_windows else "/"), observation=observation,
+                telemetry=False, timeout=30,
+            )
         return True
     except Exception as exc:  # noqa: BLE001 - reclaim is best-effort, must not break dispatch
         reporter.event("dispatch_reclaim_error", device=dev.name, error=str(exc))

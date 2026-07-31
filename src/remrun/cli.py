@@ -18,6 +18,7 @@ from .config import (
     scheduler_config,
 )
 from .gitsync import HOOK_BEGIN
+from .job_observation import JobObservation, active_job_observation_enabled
 from .memory_guard import MemoryReservation
 from .models import RunPlan, WorkloadSpec
 from .output import Reporter
@@ -1554,48 +1555,34 @@ def _run_locked(
         live_log.append(chunk)
 
     try:
-        if plan.workload is None and memory_reservation is None:
-            # Keep the unselected, unguarded path byte-for-byte equivalent at the
-            # transport boundary. Third-party transports retain the established
-            # signature and behavior.
-            result = transport.exec(
-                plan.command,
-                cwd=remote_cwd,
-                env=exec_env,
-                path_prepend=runenv.path_prepend,
-                telemetry=telemetry_on,
-                on_stdout=tee_stdout,
-            )
-        elif plan.workload is None:
-            result = transport.exec(
-                plan.command,
-                cwd=remote_cwd,
-                env=exec_env,
-                path_prepend=runenv.path_prepend,
-                telemetry=telemetry_on,
-                on_stdout=tee_stdout,
-                memory_reservation=memory_reservation,
-            )
-        elif memory_reservation is None:
-            result = transport.exec(
-                plan.command,
-                cwd=remote_cwd,
-                env=exec_env,
-                path_prepend=runenv.path_prepend,
-                telemetry=telemetry_on,
-                on_stdout=tee_stdout,
-                telemetry_request=TelemetryRequest() if telemetry_on else None,
-            )
+        exec_kwargs: dict[str, object] = {
+            "env": exec_env,
+            "path_prepend": runenv.path_prepend,
+            "telemetry": telemetry_on,
+            "on_stdout": tee_stdout,
+        }
+        if plan.workload is not None and telemetry_on:
+            exec_kwargs["telemetry_request"] = TelemetryRequest()
+        if memory_reservation is not None:
+            exec_kwargs["memory_reservation"] = memory_reservation
+        observed_exec = getattr(transport, "exec_observed", None)
+        if not active_job_observation_enabled() or observed_exec is None:
+            # Exact-base landing is dormant unless the controller explicitly opts in.
+            # Third-party/test doubles continue through their established exec seam.
+            result = transport.exec(plan.command, cwd=remote_cwd, **exec_kwargs)
         else:
-            result = transport.exec(
+            observation = JobObservation.for_command(
+                job_id=run_id,
+                project=plan.project.project_id,
+                target=plan.target.name,
+                phase="command",
+                command=plan.command,
+            )
+            result = observed_exec(
                 plan.command,
                 cwd=remote_cwd,
-                env=exec_env,
-                path_prepend=runenv.path_prepend,
-                telemetry=telemetry_on,
-                on_stdout=tee_stdout,
-                telemetry_request=TelemetryRequest() if telemetry_on else None,
-                memory_reservation=memory_reservation,
+                observation=observation,
+                **exec_kwargs,
             )
     except TransportError as exc:
         reporter.event("exec_error", message=str(exc))

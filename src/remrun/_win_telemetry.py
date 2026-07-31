@@ -55,6 +55,7 @@ ERROR_WAIT_TIMEOUT = 258
 DETAILED_SAMPLE_MS = 200
 GUARD_HELPER_EXIT = 125
 JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT = 9
 JOB_OBJECT_MSG_JOB_MEMORY_LIMIT = 10
@@ -424,6 +425,19 @@ def _query_extended(h_job) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
     ):
         raise _last_error("QueryInformationJobObject(ExtendedLimit)")
     return info
+
+
+def _enable_observed_breakaway(h_job) -> None:
+    """Permit only explicitly breakaway-created descendants of this telemetry Job."""
+    info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    if not _kernel32().SetInformationJobObject(
+        h_job,
+        JobObjectExtendedLimitInformation,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        raise _last_error("SetInformationJobObject(ObservedBreakaway)")
 
 
 def _wait_job_empty(h_job, timeout_s: float = JOB_DRAIN_GRACE_S) -> tuple[bool, int]:
@@ -814,6 +828,22 @@ def _emit_telemetry(h_job, wall: float, *, process_tree_drained: bool = True,
             pass
 
 
+def _observed_breakaway_payload(wall: float | None) -> dict[str, object]:
+    """Return explicit unknowns: the workload moved to remrun's inner Job."""
+    payload = _unknown_detailed_payload(
+        "observed workload runs in a separate inner Job after explicit breakaway",
+        wall,
+    )
+    payload["coverage"] = "observer_wrapper_only"
+    cpu = payload.get("cpu")
+    if isinstance(cpu, dict):
+        cpu["coverage"] = "observer_wrapper_only"
+    memory = payload.get("memory")
+    if isinstance(memory, dict):
+        memory["coverage"] = "observer_wrapper_only"
+    return payload
+
+
 def _plain_run(argv: list[str]) -> int:
     try:
         return int(subprocess.call(argv))
@@ -828,7 +858,7 @@ def _plain_run(argv: list[str]) -> int:
         return 127
 
 
-def _job_run(argv: list[str]) -> int:
+def _job_run(argv: list[str], *, allow_observed_breakaway: bool = False) -> int:
     job = None
     pi = PROCESS_INFORMATION()
     created = False
@@ -839,6 +869,8 @@ def _job_run(argv: list[str]) -> int:
         job = _kernel32().CreateJobObjectW(None, None)
         if not _valid_handle(job):
             raise _last_error("CreateJobObjectW")
+        if allow_observed_breakaway:
+            _enable_observed_breakaway(job)
 
         pi = _create_suspended(argv)
         created = True
@@ -865,12 +897,15 @@ def _job_run(argv: list[str]) -> int:
         drained, active = _wait_job_empty(job)
 
         wall = time.time() - t0
-        _emit_telemetry(
-            job,
-            wall,
-            process_tree_drained=drained,
-            active_processes_at_cutoff=active,
-        )
+        if allow_observed_breakaway:
+            _emit_payload(_observed_breakaway_payload(wall))
+        else:
+            _emit_telemetry(
+                job,
+                wall,
+                process_tree_drained=drained,
+                active_processes_at_cutoff=active,
+            )
         return child_rc
 
     except Exception:
@@ -902,7 +937,9 @@ def _job_run(argv: list[str]) -> int:
         _close_handle(job)
 
 
-def _job_run_detailed(argv: list[str]) -> int:
+def _job_run_detailed(
+    argv: list[str], *, allow_observed_breakaway: bool = False
+) -> int:
     job = None
     pi = PROCESS_INFORMATION()
     created = False
@@ -914,6 +951,8 @@ def _job_run_detailed(argv: list[str]) -> int:
         job = _kernel32().CreateJobObjectW(None, None)
         if not _valid_handle(job):
             raise _last_error("CreateJobObjectW")
+        if allow_observed_breakaway:
+            _enable_observed_breakaway(job)
 
         pi = _create_suspended(argv)
         created = True
@@ -939,13 +978,17 @@ def _job_run_detailed(argv: list[str]) -> int:
         pi.hProcess = None
 
         drained, active = _wait_job_empty(job)
-        payload = _detailed_payload(
-            job,
-            time.time() - started,
-            samples,
-            process_tree_drained=drained,
-            active_processes_at_cutoff=active,
-        )
+        wall = time.time() - started
+        if allow_observed_breakaway:
+            payload = _observed_breakaway_payload(wall)
+        else:
+            payload = _detailed_payload(
+                job,
+                wall,
+                samples,
+                process_tree_drained=drained,
+                active_processes_at_cutoff=active,
+            )
         _emit_payload(payload)
         return child_rc
 
@@ -1584,6 +1627,37 @@ def _guarded_job_run(
         _close_handle(job)
         _close_handle(port)
 
+
+_ARGV_FILE_MAX_BYTES = 1024 * 1024
+_ARGV_FILE_MAX_ITEMS = 4096
+
+
+def _load_staged_argv(path: str) -> list[str]:
+    """Read one bounded private argv document and remove it before user start."""
+    try:
+        with open(path, "rb") as stream:
+            data = stream.read(_ARGV_FILE_MAX_BYTES + 1)
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    if len(data) > _ARGV_FILE_MAX_BYTES:
+        raise ValueError("staged argv document exceeds the bounded size")
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("staged argv document is invalid JSON") from exc
+    if (
+        not isinstance(payload, list)
+        or not payload
+        or len(payload) > _ARGV_FILE_MAX_ITEMS
+        or not all(isinstance(value, str) and "\0" not in value for value in payload)
+    ):
+        raise ValueError("staged argv document is not a bounded string array")
+    return payload
+
+
 def main() -> int:
     try:
         idx = sys.argv.index("--")
@@ -1592,6 +1666,7 @@ def main() -> int:
     except ValueError:
         sys.stderr.write(
             "usage: python _win_telemetry.py [--detailed] "
+            "[--allow-observed-breakaway --argv-json-file PATH] "
             "[--guard-max-bytes N --guard-min-available-bytes N --guard-token TOKEN] "
             "-- <command> [args...]\n"
         )
@@ -1599,6 +1674,8 @@ def main() -> int:
 
     detailed = "--detailed" in options
     telemetry = "--telemetry" in options
+    allow_observed_breakaway = "--allow-observed-breakaway" in options
+    argv_json_file = None
 
     def option_value(name: str) -> str | None:
         if name not in options:
@@ -1613,23 +1690,58 @@ def main() -> int:
         "--guard-min-available-bytes",
         "--guard-token",
     }
+    value_names = {*guard_names, "--argv-json-file"}
     guard_requested = any(name in options for name in guard_names)
-    allowed = {"--detailed", "--telemetry", *guard_names}
+    allowed = {
+        "--detailed",
+        "--telemetry",
+        "--allow-observed-breakaway",
+        "--argv-json-file",
+        *guard_names,
+    }
     consumed_value_indexes = {
         index + 1
         for index, value in enumerate(options)
-        if value in guard_names and index + 1 < len(options)
+        if value in value_names and index + 1 < len(options)
     }
     unknown = [
         value
         for index, value in enumerate(options)
         if index not in consumed_value_indexes and value not in allowed
     ]
-    if unknown or not argv:
+    if unknown:
+        sys.stderr.write("remrun telemetry wrapper: invalid options or empty command\n")
+        return 2
+
+    try:
+        argv_json_file = option_value("--argv-json-file")
+    except ValueError:
+        sys.stderr.write("remrun telemetry wrapper: invalid staged argv option\n")
+        return 2
+    if argv_json_file is not None:
+        if not allow_observed_breakaway or argv:
+            sys.stderr.write(
+                "remrun telemetry wrapper: staged argv is observed-only and exclusive\n"
+            )
+            return 2
+        try:
+            argv = _load_staged_argv(argv_json_file)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(
+                f"remrun telemetry wrapper: staged argv unavailable: {exc}\n"
+            )
+            return 2
+    if not argv:
         sys.stderr.write("remrun telemetry wrapper: invalid options or empty command\n")
         return 2
 
     if guard_requested:
+        if allow_observed_breakaway:
+            sys.stderr.write(
+                "remrun telemetry wrapper: observed breakaway is incompatible "
+                "with the memory guard\n"
+            )
+            return 2
         token = option_value("--guard-token") or ""
         try:
             max_bytes = int(option_value("--guard-max-bytes") or "")
@@ -1663,11 +1775,15 @@ def main() -> int:
 
     if not detailed:
         try:
+            if allow_observed_breakaway:
+                return _job_run(argv, allow_observed_breakaway=True)
             return _job_run(argv)
         except Exception:
             return _plain_run(argv)
 
     try:
+        if allow_observed_breakaway:
+            return _job_run_detailed(argv, allow_observed_breakaway=True)
         return _job_run_detailed(argv)
     except _CommandNotStarted as exc:
         started = time.time()

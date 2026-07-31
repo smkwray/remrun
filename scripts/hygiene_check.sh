@@ -17,7 +17,7 @@ fi
 
 EXPECTED_NAME="smkwray"
 EXPECTED_EMAIL="45633267+smkwray@users.noreply.github.com"
-SCAN_ROOTS=(src scripts config docs examples schemas tests bin)
+SCAN_ROOTS=(src scripts config docs examples native-gates schemas tests bin)
 TOP_LEVEL_FILES=(README.md LICENSE pyproject.toml uv.lock)
 violations=0
 warnings=0

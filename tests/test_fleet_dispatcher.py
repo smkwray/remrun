@@ -102,6 +102,7 @@ def test_drain_once_per_item_metrics_complete_successes_requeue_failures(tmp_pat
 
     def fake_run_batch(_device, _tasks, _config, **kwargs):
         assert kwargs["job_ids"] == [j1, j2]
+        assert kwargs["observation_id"]
         return {"ok": True, "exit_code": 0, "elapsed_s": 1.0, "item_results": [
             {"job_id": j1, "ok": True, "outputs": ["a.md"]},
             {"job_id": j2, "ok": False, "error": "bad page"},

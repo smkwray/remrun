@@ -5,6 +5,7 @@ so a change that breaks a parser fails here rather than silently rendering `-`.
 """
 from __future__ import annotations
 
+import io
 import json
 import time
 from types import SimpleNamespace
@@ -20,7 +21,7 @@ from remrun.fleet.resources import (
     _parse_windows,
     probe_fleet,
 )
-from remrun.fleet.resources_render import render_table, to_dict
+from remrun.fleet.resources_render import IncrementalTable, render_table, to_dict
 from remrun.models import Device
 from remrun.resource_envelope import MIB, Metric
 from remrun.resource_probe import GPUResourceSnapshot, ResourceSnapshot
@@ -48,6 +49,7 @@ RAM_AVAIL_MB=14830
 MEMFREE_KB=15184000
 CPU_IDLE=84
 NCPU=20
+CPU_QUEUE=3
 CHIP=Intel(R) Core(TM) Ultra 7 255HX
 NVIDIA:NVIDIA GeForce RTX 5060 Ti, 3, 14321, 16311
 DISK_JSON={"mount":"C:","total_bytes":"1000000000000","available_bytes":"400000000000","semantics":"allocated-used","source":"Win32_LogicalDisk"}
@@ -111,12 +113,23 @@ def test_disk_probe_reads_capacity_metadata_without_scanning_files():
         assert recursive_scan not in resources._WINDOWS_SCRIPT
 
 
+def test_windows_resource_script_reads_bounded_processor_queue_metadata():
+    script = resources._WINDOWS_SCRIPT
+    assert "Win32_PerfFormattedData_PerfOS_System" in script
+    assert "ProcessorQueueLength" in script
+    assert "Get-Counter" not in script
+    assert "Start-Sleep" not in script
+
+
 def test_parse_windows_discrete_gpu():
     view = ResourceView(name="WINBOX", reachable=True)
     _parse_windows(WINDOWS_RESOURCE_OUT, view)
     assert view.hostname == "WINBOX"
     assert view.cpu_count == 20
     assert view.cpu_busy_pct == pytest.approx(16.0)     # 100 - 84 idle
+    assert view.processor_queue_length == 3.0
+    assert view.processor_queue_per_core == pytest.approx(0.15)
+    assert view.load_label == "0.15q"
     assert view.ram_total_mb == pytest.approx(32229.1, rel=1e-3)
     assert view.ram_free_mb == 14830.0                  # AvailableMBytes, not FreePhysicalMemory
     assert view.gpu_unified is False
@@ -157,6 +170,18 @@ def test_load_average_never_becomes_plausible_cpu_utilization():
     _parse_posix("NCPU=8\nLOADAVG= 4.00 3.0 2.0\n", view)
     assert view.cpu_busy_pct is None
     assert view.load_per_core == pytest.approx(0.5)
+
+
+def test_windows_queue_requires_both_valid_queue_and_core_count():
+    for output in (
+        "NCPU=20\nCPU_QUEUE=bad\n",
+        "NCPU=0\nCPU_QUEUE=3\n",
+        "CPU_QUEUE=3\n",
+    ):
+        view = ResourceView(name="W", reachable=True)
+        _parse_windows(output, view)
+        assert view.processor_queue_per_core is None
+        assert view.load_label == "-"
 
 
 def test_timeout_is_retried_before_declaring_a_device_unreachable():
@@ -353,7 +378,10 @@ def test_render_marks_local_and_reports_unreachable_reason():
                      detail="ssh key missing on this controller: ~/.ssh/id_ed25519_mesh"),
     ]
     table = render_table(views)
-    assert "WINTWO*" in table and "* this controller" in table
+    local_row = next(ln for ln in table.splitlines() if ln.startswith("WINTWO"))
+    assert "WINTWO*" not in local_row
+    assert "local" in local_row
+    assert "* this controller" not in table
     # The compact failure still states the actionable cause.
     assert "key missing" in table
     assert "id_ed25519_mesh" not in table
@@ -383,6 +411,71 @@ def test_render_uses_compact_load_footnote():
         ResourceView(name="X", reachable=True, cpu_count=4, load1=2.0, load_per_core=0.5),
     ])
     assert "LOAD = 1-min demand/core; not CPU%" in table
+
+
+def test_render_distinguishes_posix_load_from_windows_queue():
+    table = render_table([
+        ResourceView(name="MAC", reachable=True, load1=2.0, load_per_core=0.5),
+        ResourceView(
+            name="WIN",
+            reachable=True,
+            processor_queue_length=1.0,
+            processor_queue_per_core=0.05,
+        ),
+    ])
+    assert "0.50x" in table
+    assert "0.05q" in table
+    assert "x=1-min run queue/core" in table
+    assert "q=ready waiters/core" in table
+
+
+def test_render_marks_only_values_at_or_above_alert_thresholds():
+    view = ResourceView(
+        name="BUSY",
+        reachable=True,
+        is_local=True,
+        cpu_busy_pct=85.0,
+        load1=4.0,
+        load_per_core=1.0,
+        ram_free_mb=15.0,
+        ram_total_mb=100.0,
+        gpu_util_pct=84.0,
+        vram_free_mb=16.0,
+        vram_total_mb=100.0,
+        primary_disk=PrimaryDiskView(
+            total_bytes=100,
+            available_bytes=15,
+            status="ok",
+        ),
+    )
+    table = render_table([view])
+    row = next(line for line in table.splitlines() if line.startswith("BUSY"))
+
+    assert "BUSY*" not in row
+    assert "85*" in row
+    assert "1.0x*" in row
+    assert "84%" in row
+    assert row.count("*") == 4  # CPU, LOAD, RAM, and DISK; not device/GPU/VRAM.
+    assert "* alert: usage >=85%; LOAD >=1.0x/q" in table
+
+
+def test_alert_marker_does_not_widen_incremental_percent_columns():
+    table = IncrementalTable(["X"])
+    heading = table.header().splitlines()[0]
+    row = table.row(
+        ResourceView(
+            name="X",
+            reachable=True,
+            cpu_busy_pct=100.0,
+            ram_free_mb=0.0,
+            ram_total_mb=100.0,
+        )
+    )
+
+    assert "100*" in row
+    assert "100%*" not in row
+    assert row.index("100*") == heading.index("CPU")
+    assert row.index("100*", heading.index("RAM")) == heading.index("RAM")
 
 
 def test_unified_gpu_never_reports_a_vram_figure_or_long_label():
@@ -422,6 +515,36 @@ def test_percent_display_is_compact_default_and_amounts_are_configurable():
     assert "24/32 GB" in row
     assert "4/16 GB" in row
     assert "600/1000 GB" in row
+
+
+def test_incremental_table_keeps_columns_stable_across_arrival_order():
+    table = IncrementalTable(["A", "MUCH-LONGER"], usage_display="percent")
+    first = ResourceView(
+        name="A",
+        reachable=True,
+        cpu_busy_pct=5.0,
+        ram_free_mb=8 * 1024,
+        ram_total_mb=16 * 1024,
+    )
+    second = ResourceView(
+        name="MUCH-LONGER",
+        reachable=True,
+        cpu_busy_pct=100.0,
+        ram_free_mb=0,
+        ram_total_mb=16 * 1024,
+    )
+
+    header = table.header()
+    first_row = table.row(first)
+    second_row = table.row(second)
+
+    heading = header.splitlines()[0]
+    ram_column = heading.index("RAM")
+    assert heading.index("CPU") == first_row.index("5%")
+    assert first_row.index("50%") == ram_column
+    assert second_row.index("100*", ram_column) == ram_column
+    assert first_row.startswith("A")
+    assert second_row.startswith("MUCH-LONGER")
 
 
 @pytest.mark.parametrize(
@@ -708,7 +831,9 @@ def test_pure_dns_failure_still_reports_dns():
 
 
 def test_json_payload_is_complete_and_serializable():
-    view = ResourceView(name="WINBOX", reachable=True, cpu_busy_pct=12.0, ram_free_mb=14608.0,
+    view = ResourceView(name="WINBOX", reachable=True, cpu_busy_pct=12.0,
+                        processor_queue_length=2.0, processor_queue_per_core=0.1,
+                        ram_free_mb=14608.0,
                         ram_total_mb=32229.0, gpu_util_pct=3.0, vram_free_mb=14321.0,
                         vram_total_mb=16311.0, gpu_name="RTX 5060 Ti",
                         primary_disk=PrimaryDiskView(
@@ -717,6 +842,8 @@ def test_json_payload_is_complete_and_serializable():
     payload = to_dict(view)
     json.dumps(payload)                     # must not raise
     assert payload["gpu_util_pct"] == 3.0
+    assert payload["processor_queue_length"] == 2.0
+    assert payload["processor_queue_per_core"] == 0.1
     assert payload["vram_free_mb"] == 14321.0
     assert payload["ram_used_pct"] == pytest.approx(54.68, rel=1e-3)
     assert payload["vram_used_pct"] == pytest.approx(12.2, rel=1e-2)
@@ -751,6 +878,192 @@ def test_resources_command_shows_disabled_devices_by_default(monkeypatch, capsys
     args.enabled_only = True
     cli.cmd_resources(args, Reporter(json_events=False))
     assert "MACFS" not in capsys.readouterr().out
+
+
+def test_resources_tty_prints_header_then_rows_as_probes_finish(monkeypatch):
+    from remrun.fleet import cli
+    from remrun.output import Reporter
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    stdout = TTY()
+    stderr = TTY()
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+    devices = {name: _device(name) for name in ("SLOW", "FAST")}
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SimpleNamespace(devices=devices, defaults={}),
+    )
+
+    def finish_out_of_order(targets, *, timeout, on_event):
+        assert stdout.getvalue().startswith("DEVICE")
+        fast = ResourceView(name="FAST", reachable=True, cpu_busy_pct=4.0)
+        slow = ResourceView(name="SLOW", reachable=True, cpu_busy_pct=8.0)
+        on_event("start", "SLOW", None)
+        on_event("start", "FAST", None)
+        on_event("done", "FAST", fast)
+        assert "FAST" in stdout.getvalue()
+        assert "SLOW" not in stdout.getvalue()
+        on_event("done", "SLOW", slow)
+        return [slow, fast]
+
+    monkeypatch.setattr(
+        "remrun.fleet.resources.probe_fleet",
+        finish_out_of_order,
+    )
+    args = SimpleNamespace(
+        device=None,
+        no_local=True,
+        enabled_only=False,
+        timeout=5.0,
+        json=False,
+        no_progress=False,
+    )
+
+    assert cli.cmd_resources(args, Reporter(json_events=False)) == 0
+    out = stdout.getvalue()
+    assert out.index("FAST") < out.index("SLOW")
+    assert out.count("FAST") == 1
+    assert out.count("SLOW") == 1
+    assert "probing" not in stderr.getvalue()
+
+
+def test_resources_no_progress_keeps_buffered_config_order_in_tty(monkeypatch):
+    from remrun.fleet import cli
+    from remrun.output import Reporter
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    stdout = TTY()
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    devices = {name: _device(name) for name in ("FIRST", "SECOND")}
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SimpleNamespace(devices=devices, defaults={}),
+    )
+
+    def finish_out_of_order(targets, *, timeout, on_event):
+        second = ResourceView(name="SECOND", reachable=True)
+        first = ResourceView(name="FIRST", reachable=True)
+        on_event("done", "SECOND", second)
+        on_event("done", "FIRST", first)
+        return [first, second]
+
+    monkeypatch.setattr(
+        "remrun.fleet.resources.probe_fleet",
+        finish_out_of_order,
+    )
+    args = SimpleNamespace(
+        device=None,
+        no_local=True,
+        enabled_only=False,
+        timeout=5.0,
+        json=False,
+        no_progress=True,
+    )
+
+    assert cli.cmd_resources(args, Reporter(json_events=False)) == 0
+    out = stdout.getvalue()
+    assert out.index("FIRST") < out.index("SECOND")
+    assert out.count("DEVICE") == 1
+
+
+def test_resources_json_stays_one_buffered_document_in_tty(monkeypatch):
+    from remrun.fleet import cli
+    from remrun.output import Reporter
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    stdout = TTY()
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    device = _device("BOX")
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SimpleNamespace(devices={"BOX": device}, defaults={}),
+    )
+
+    def finish(targets, *, timeout, on_event):
+        view = ResourceView(name="BOX", reachable=True, cpu_busy_pct=3.0)
+        on_event("done", "BOX", view)
+        return [view]
+
+    monkeypatch.setattr("remrun.fleet.resources.probe_fleet", finish)
+    args = SimpleNamespace(
+        device=None,
+        no_local=True,
+        enabled_only=False,
+        timeout=5.0,
+        json=True,
+        no_progress=False,
+    )
+
+    assert cli.cmd_resources(args, Reporter(json_events=False)) == 0
+    payload = json.loads(stdout.getvalue())
+    assert payload["devices"][0]["name"] == "BOX"
+
+
+def test_resources_stream_suppresses_remote_duplicate_of_local_row(monkeypatch):
+    from remrun.fleet import cli, local_resources
+    from remrun.output import Reporter
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    stdout = TTY()
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    devices = {name: _device(name) for name in ("CTRL", "REMOTE")}
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SimpleNamespace(devices=devices, defaults={}),
+    )
+    monkeypatch.setattr(
+        local_resources,
+        "local_view",
+        lambda: ResourceView(
+            name="CTRL",
+            hostname="ctrl.local",
+            reachable=True,
+            is_local=True,
+        ),
+    )
+
+    def finish(targets, *, timeout, on_event):
+        controller = ResourceView(
+            name="CTRL",
+            hostname="ctrl.local",
+            reachable=True,
+        )
+        remote = ResourceView(name="REMOTE", hostname="remote.local", reachable=True)
+        on_event("done", "CTRL", controller)
+        on_event("done", "REMOTE", remote)
+        return [controller, remote]
+
+    monkeypatch.setattr("remrun.fleet.resources.probe_fleet", finish)
+    args = SimpleNamespace(
+        device=None,
+        no_local=False,
+        enabled_only=False,
+        timeout=5.0,
+        json=False,
+        no_progress=False,
+    )
+
+    assert cli.cmd_resources(args, Reporter(json_events=False)) == 0
+    rows = stdout.getvalue().splitlines()
+    assert len([line for line in rows if line.startswith("CTRL")]) == 1
+    assert len([line for line in rows if line.startswith("REMOTE")]) == 1
 
 
 def test_local_sim_is_never_reported(monkeypatch, capsys):

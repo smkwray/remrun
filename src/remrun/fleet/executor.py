@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import RemrunConfig
+from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, iso_plus_seconds, utc_now_iso
 from ..transport import TransportError, make_transport
 from . import adapters, placement, probes, profiles
@@ -110,7 +111,7 @@ def _run_one_leased(device_name: str, task: FleetTask, config: RemrunConfig, *,
         q.set_batch_state(batch_id, "running")
         try:
             res = run_batch(device_name, [task], config, state_root=state_root,
-                            cleanup=cleanup, job_ids=[job_id])
+                            cleanup=cleanup, job_ids=[job_id], observation_id=batch_id)
         except BaseException as exc:  # noqa: BLE001 - never leave the lease held on an error
             q.fail_batch(batch_id, f"run raised: {type(exc).__name__}: {exc}", max_attempts=1)
             raise
@@ -125,7 +126,8 @@ def _run_one_leased(device_name: str, task: FleetTask, config: RemrunConfig, *,
 
 def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
               state_root: Path | None = None, cleanup: bool = True,
-              job_ids: list[str] | None = None) -> dict[str, Any]:
+              job_ids: list[str] | None = None,
+              observation_id: str | None = None) -> dict[str, Any]:
     """Run a batch of COMPATIBLE jobs on an ALREADY-CHOSEN device with ONE worker
     invocation — so the cold model load is paid once for the whole burst (Invariant 0's
     only amortization). The caller (the dispatcher) is responsible for grouping
@@ -236,15 +238,35 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
     command = adapters.render_command(head, device_name, stage_in, output_root)
     command = [transport.expand_remote(x) if x.startswith("~") else x for x in command]
 
+    exec_env = {
+        "REMRUN_BATCH_MANIFEST": manifest_path,
+        "REMRUN_BATCH_METRICS": metrics_path,
+        "REMRUN_DONE_JSON": done_path,
+        "REMRUN_STAGE_IN": stage_in,
+        "REMRUN_OUTPUT_ROOT": output_root,
+    }
     t0 = time.monotonic()
     try:
-        res = transport.exec(command, cwd=stage, telemetry=True, env={
-            "REMRUN_BATCH_MANIFEST": manifest_path,
-            "REMRUN_BATCH_METRICS": metrics_path,
-            "REMRUN_DONE_JSON": done_path,
-            "REMRUN_STAGE_IN": stage_in,
-            "REMRUN_OUTPUT_ROOT": output_root,
-        })
+        observed_exec = getattr(transport, "exec_observed", None)
+        if not active_job_observation_enabled() or observed_exec is None:
+            res = transport.exec(command, cwd=stage, telemetry=True, env=exec_env)
+        else:
+            observed_id = observation_id
+            if not observed_id:
+                observed_id = (job_ids[0] if job_ids and len(job_ids) == 1
+                               else f"fleet-{uuid.uuid4().hex[:12]}")
+            observation = JobObservation.for_command(
+                job_id=observed_id,
+                project="@fleet",
+                target=device_name,
+                phase="fleet-worker",
+                command=command,
+                declared_label=f"{head.task_type}:{adapters.engine_for(head, device_name)}",
+                member_count=len(tasks),
+            )
+            res = observed_exec(
+                command, cwd=stage, telemetry=True, env=exec_env, observation=observation
+            )
     except TransportError as exc:
         if cleanup:
             _safe_delete(transport, stage)
