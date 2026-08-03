@@ -6,6 +6,17 @@ from typing import Any
 from .jobs import TargetJobsView
 
 HEADERS = ("PROJECT", "FROM", "TO", "AGE", "CPU", "THR", "RAM", "STATE", "COMMAND")
+DISPLAY_LIMITS = (16, 8, 6, 7, 6, 4, 7, 11, 22)
+
+
+def _clip(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "~"
+
+
+def _display_row(row: list[str]) -> list[str]:
+    return [_clip(value, DISPLAY_LIMITS[index]) for index, value in enumerate(row)]
 
 
 def _compact_age(seconds: object) -> str:
@@ -52,7 +63,7 @@ def _job_row(job: dict[str, Any], target: str) -> list[str]:
     threads = job.get("threads") if isinstance(job.get("threads"), dict) else {}
     memory = job.get("memory") if isinstance(job.get("memory"), dict) else {}
     command = job.get("command") if isinstance(job.get("command"), dict) else {}
-    return [
+    return _display_row([
         str(job.get("project") or "-"),
         str(job.get("source_controller") or "-"),
         target,
@@ -62,17 +73,17 @@ def _job_row(job: dict[str, Any], target: str) -> list[str]:
         _compact_bytes(memory.get("current_bytes")),
         str(job.get("state") or "UNKNOWN"),
         str(command.get("label") or "command"),
-    ]
+    ])
 
 
 def rows_for_view(view: TargetJobsView) -> list[list[str]]:
     if view.jobs:
         return [_job_row(job, view.name) for job in view.jobs]
     if view.status == "ok":
-        return [["-", "-", view.name, "-", "-", "-", "-", "IDLE", "no registered jobs"]]
+        return [_display_row(["-", "-", view.name, "-", "-", "-", "-", "IDLE", "-"])]
     state = "UNSUPPORTED" if view.status == "unsupported" else view.status.upper()
     detail = (view.detail or "target query failed").replace("\n", " ")[:64]
-    return [["-", "-", view.name, "-", "-", "-", "-", state, detail]]
+    return [_display_row(["-", "-", view.name, "-", "-", "-", "-", state, detail])]
 
 
 def _widths(rows: list[list[str]]) -> list[int]:
@@ -95,9 +106,11 @@ class IncrementalTable:
     def __init__(self, labels: list[str]) -> None:
         seed = [
             list(HEADERS),
-            ["project-name", "controller", max(labels or ["target"], key=len),
-             "999d23h", "999.9%", "9999", "999.9G", "UNSUPPORTED", "command-label"],
+            ["x" * limit for limit in DISPLAY_LIMITS],
         ]
+        seed[1][2] = _clip(max(labels or ["target"], key=len), DISPLAY_LIMITS[2]).ljust(
+            DISPLAY_LIMITS[2], "x"
+        )
         self.widths = _widths(seed)
 
     def header(self) -> str:

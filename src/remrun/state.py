@@ -374,7 +374,8 @@ class ProjectLock:
     """
 
     def __init__(self, project_id: str, target: str, state_root: Path | None = None,
-                 scope: str | None = None) -> None:
+                 scope: str | None = None, *, run_id: str | None = None,
+                 adopt_dead_run: bool = False) -> None:
         root = state_root or default_state_root()
         project_key = hashlib.sha256(project_id.encode()).hexdigest()[:16]
         self.root = root / "locks" / "project" / project_key
@@ -388,6 +389,8 @@ class ProjectLock:
         self.project_id = project_id
         self.target = target
         self.scope = scope
+        self.run_id = run_id
+        self.adopt_dead_run = adopt_dead_run
 
     def _acquire_guard(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -440,6 +443,39 @@ class ProjectLock:
             return []
         return sorted(p for p in scopes_dir.glob("*.lock") if p.is_dir())
 
+    @staticmethod
+    def _pid_is_alive(value: object) -> bool:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return True
+        try:
+            os.kill(value, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            # Fail closed when this process cannot prove the recorded holder died.
+            return True
+
+    def _adopt_exact_dead_run(self, conflicts: list[Path]) -> bool:
+        """Remove only this run's exact stale lock while holding the table guard."""
+        if not self.adopt_dead_run or not self.run_id or conflicts != [self.path]:
+            return False
+        info = self._lock_info(self.path)
+        if (
+            info.get("run_id") != self.run_id
+            or info.get("project_id") != self.project_id
+            or info.get("target") != self.target
+            or info.get("scope") != (self.scope or "project")
+            or self._pid_is_alive(info.get("pid"))
+        ):
+            return False
+        try:
+            (self.path / "info.json").unlink()
+            self.path.rmdir()
+        except OSError:
+            return False
+        return True
+
     def acquire(self) -> "ProjectLock":
         self._acquire_guard()
         try:
@@ -449,6 +485,8 @@ class ProjectLock:
                 if whole.exists():
                     conflicts.append(whole)
                 conflicts.extend(self._conflicting_scope_locks())
+                if conflicts and self._adopt_exact_dead_run(conflicts):
+                    conflicts = []
                 if conflicts:
                     raise LockError(
                         f"project {self.project_id} already locked at {conflicts[0]} "
@@ -459,6 +497,8 @@ class ProjectLock:
                 if whole.exists():
                     conflicts.append(whole)
                 conflicts.extend(self._conflicting_scope_locks())
+                if conflicts and self._adopt_exact_dead_run(conflicts):
+                    conflicts = []
                 if conflicts:
                     raise LockError(
                         f"project {self.project_id} already locked at {conflicts[0]} "
@@ -477,6 +517,7 @@ class ProjectLock:
                 self.path / "info.json",
                 {"project_id": self.project_id, "target": self.target,
                  "scope": self.scope or "project",
+                 "run_id": self.run_id,
                  "pid": os.getpid(), "acquired_at": utc_now_iso()},
             )
         finally:

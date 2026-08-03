@@ -547,6 +547,18 @@ def test_delete_and_mkdir(monkeypatch):
     assert rec.scripts[-1] == "mkdir -p /root/p/sub"
 
 
+def test_delete_expands_remote_home_before_quoting(monkeypatch):
+    t = SSHPosixTransport(device())
+    t._address = "h"
+    t._remote_home = "/srv/user"
+    rec = Recorder(lambda a, i: cp(0))
+    monkeypatch.setattr(t, "_run", rec)
+
+    t.delete_remote("~/workspace/proj/old.txt")
+
+    assert rec.scripts == ["rm -f /srv/user/workspace/proj/old.txt"]
+
+
 def test_probe_captures_home_and_expands_tilde(monkeypatch):
     t = SSHPosixTransport(device(project_root="~/workspace/proj"))
     monkeypatch.setattr(t, "_run",

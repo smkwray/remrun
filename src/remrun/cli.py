@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -18,7 +19,9 @@ from .config import (
     scheduler_config,
 )
 from .gitsync import HOOK_BEGIN
-from .job_observation import JobObservation, active_job_observation_enabled
+from .job_observation import (
+    JobObservation, active_job_observation_enabled, controller_label,
+)
 from .memory_guard import MemoryReservation
 from .models import RunPlan, WorkloadSpec
 from .output import Reporter
@@ -63,6 +66,7 @@ from .state import (
     prune_state,
     read_baseline,
     read_json,
+    read_manifest,
     read_unknown_completion_hazard,
     run_dir,
     utc_now_iso,
@@ -71,11 +75,14 @@ from .state import (
     write_manifest,
     write_unknown_completion_hazard,
 )
-from .transport import TelemetryRequest, TransportError, make_transport
+from .transport import (
+    DurablePrestartError, DurableStateError, TelemetryRequest, TransportError,
+    finalize_durable_result, make_transport,
+)
 
 KNOWN_COMMANDS = {
     "devices", "doctor", "plan", "run", "status", "logs", "clean", "bench", "sync",
-    "git-sync", "runner", "action", "resolve-unknown",
+    "git-sync", "runner", "action", "resolve-unknown", "resume",
 }
 
 # Exit codes (see docs/AGENT_OUTPUT_SPEC.md).
@@ -232,6 +239,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_plan(args, reporter)
         if args.command_name == "run":
             return cmd_run(args, reporter)
+        if args.command_name == "resume":
+            return cmd_resume(args, reporter)
         if args.command_name == "status":
             return cmd_status(args, reporter)
         if args.command_name == "logs":
@@ -290,6 +299,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Print plan and do not execute")
     p.add_argument("--no-pullback", action="store_true", help="Skip post-run pullback")
     p.add_argument("--no-telemetry", action="store_true", help="Skip resource telemetry")
+    p.add_argument(
+        "--durable", action="store_true",
+        help="opt into a target-supervised run resumable by this controller; "
+             "with --auto, selection freezes before launch",
+    )
+
+    p = sub.add_parser("resume", help="Resume an exact controller-owned durable run")
+    p.add_argument("run_id", help="the exact durable run ID")
+    p.add_argument("--no-wait", action="store_true", help="report a running state and return")
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("status", help="Show recent remrun status")
     p.add_argument("device", nargs="?", help="show only runs targeting this device")
@@ -1238,6 +1257,19 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         allow_default_workload=not getattr(args, "suppress_default_workload", False),
     )
 
+    if getattr(args, "durable", False):
+        if (
+            target_name != "auto"
+            and plan.target.kind not in {"ssh-posix", "ssh-powershell"}
+        ):
+            raise ValueError(
+                "durable runs support only built-in ssh-posix and ssh-powershell transports"
+            )
+        if plan.workload is not None:
+            raise ValueError(
+                "durable ordinary-run v1 does not support workload envelopes/receipts"
+            )
+
     if not args.dry_run and _report_unknown_completion_hazard(
         plan.project.project_id, reporter
     ):
@@ -1270,10 +1302,28 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                        predicted_rss_mb=prediction.get("rss_mb"),
                        predicted_dur_s=prediction.get("dur_s"))
     selection = _resolve_targets(plan, target_name, sched, reporter, prediction)
+    if getattr(args, "durable", False) and target_name == "auto":
+        durable_selection = []
+        for candidate in selection:
+            if candidate[0].kind not in {"ssh-posix", "ssh-powershell"}:
+                reporter.event(
+                    "candidate_skipped",
+                    name=candidate[0].name,
+                    reason="durable_unsupported_transport",
+                    detail="durable runs require a built-in SSH transport",
+                )
+                continue
+            durable_selection.append(candidate)
+        selection = durable_selection
     if not selection:
         run_id = new_run_id(plan.target.name, plan.project.project_id)
+        error = (
+            "no reachable durable-capable target"
+            if getattr(args, "durable", False)
+            else "target unreachable"
+        )
         write_json(run_dir(run_id) / "summary.json",
-                   {"run_id": run_id, "error": "target unreachable", "plan": plan.as_dict()})
+                   {"run_id": run_id, "error": error, "plan": plan.as_dict()})
         return EXIT_INFRA
 
     # Walk the ranked candidates. A preflight conflict is a property of ONE candidate's
@@ -1385,8 +1435,12 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("remote_cwd", path=remote_cwd)
 
         try:
-            lock = ProjectLock(plan.project.project_id, plan.target.name,
-                               scope=plan.write_scope).acquire()
+            lock = ProjectLock(
+                plan.project.project_id,
+                plan.target.name,
+                scope=plan.write_scope,
+                run_id=run_id if getattr(args, "durable", False) else None,
+            ).acquire()
         except LockError as exc:
             if reservation is not None:
                 transport.release_memory_guard(reservation, reserved_only=True)
@@ -1525,6 +1579,21 @@ def _run_locked(
                    deleted_remote=len(pre.deleted_remote), deleted_local=len(pre.deleted_local),
                    skipped_identical=len(pre.skipped_identical),
                    converged_conflicts=len(pre.converged_conflicts), conflicts=0)
+
+    if getattr(args, "durable", False):
+        reporter.event(
+            "durable_target_bound",
+            run_id=run_id,
+            target=plan.target.name,
+            note="selection is permanent; no candidate fallback after launch is attempted",
+        )
+        return _run_durable_locked(
+            args=args, reporter=reporter, plan=plan, transport=transport,
+            remote_root=remote_root, remote_cwd=remote_cwd, run_id=run_id,
+            rdir=rdir, summary_path=summary_path, started_at=started_at, t0=t0,
+            policy=policy, telemetry_default=telemetry_default, pre=pre,
+            backup_root=backup_root, memory_reservation=memory_reservation,
+        )
 
     # --- execute -------------------------------------------------------------
     runenv = resolve_run_env(
@@ -2260,6 +2329,729 @@ def cmd_logs(args: argparse.Namespace, reporter: Reporter) -> int:
             stream = sys.stderr if name == "stderr.log" else sys.stdout
             stream.write(f.read_text(encoding="utf-8"))
     return EXIT_OK
+
+
+def _durable_record_path(rdir: Path) -> Path:
+    return rdir / "durable.json"
+
+
+def _validate_durable_identity(
+    status: dict[str, object], record: dict[str, object], *, require_complete: bool = False
+) -> None:
+    expected = {
+        "run_id": record["run_id"],
+        "project_id": record["project_id"],
+        "target": record["target"],
+        "controller": record["controller"],
+        "command_sha256": record["command_sha256"],
+    }
+    for field, value in expected.items():
+        if status.get(field) != value:
+            raise DurableStateError(f"durable target state {field} mismatch")
+    state = status.get("state")
+    if state not in {"launching", "pending", "running", "complete", "failed"}:
+        raise DurableStateError("durable target state is invalid")
+    if require_complete and state != "complete":
+        raise DurableStateError("durable target result is not complete")
+
+
+def _detached_durable(
+    reporter: Reporter,
+    summary_path: Path,
+    record: dict[str, object],
+    status: dict[str, object],
+    *,
+    reason: str,
+) -> int:
+    summary = read_json(summary_path) or {"run_id": record["run_id"]}
+    summary.update(
+        phase="durable_wait",
+        completion_state="detached",
+        terminal=False,
+        durable_state=status.get("state", "running_or_pending"),
+        durable_acknowledged=True,
+        detached_reason=reason,
+        plan=record["plan"],
+    )
+    write_json(summary_path, summary)
+    reporter.event(
+        "durable_detached",
+        run_id=record["run_id"],
+        state=status.get("state", "running_or_pending"),
+        note="target supervisor remains authoritative; resume with the exact run ID",
+    )
+    return EXIT_OK
+
+
+def _running_observation_matches(transport, record: dict[str, object]) -> bool:  # noqa: ANN001
+    payload = transport.query_observed_jobs(sample_interval=0.05, timeout=30.0)
+    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    if not isinstance(jobs, list):
+        raise DurableStateError("observer query returned malformed jobs")
+    matches = [job for job in jobs if isinstance(job, dict) and job.get("job_id") == record["run_id"]]
+    if len(matches) != 1:
+        return False
+    job = matches[0]
+    expected = {
+        "project": record["project_id"],
+        "source_controller": record["controller"],
+        "target": record["target"],
+    }
+    for field, value in expected.items():
+        if job.get(field) != value:
+            raise DurableStateError(f"durable observer {field} mismatch")
+    command = job.get("command")
+    if not isinstance(command, dict) or command.get("sha256") != record["command_sha256"]:
+        raise DurableStateError("durable observer command digest mismatch")
+    if job.get("observation_status") == "unknown":
+        raise DurableStateError("durable observer ownership is unknown")
+    return True
+
+
+def _finalize_durable_run(
+    *,
+    args: argparse.Namespace,
+    reporter: Reporter,
+    plan: RunPlan,
+    transport,
+    remote_root: str,
+    run_id: str,
+    rdir: Path,
+    summary_path: Path,
+    policy: RetentionPolicy,
+    record: dict[str, object],
+) -> int:
+    existing = read_json(summary_path)
+    if (
+        isinstance(existing, dict)
+        and existing.get("completion_state") == "complete"
+        and existing.get("terminal") is True
+    ):
+        code = existing.get("exit_code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
+        raise UnknownCompletionHazardError("completed durable summary has no valid exit code")
+
+    payload = transport.durable_status(run_id, str(record["resume_token"]), include_logs=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("status"), dict):
+        raise TransportError("durable result payload is malformed")
+    status = payload["status"]
+    _validate_durable_identity(status, record, require_complete=True)
+    execution = record.get("execution")
+    if not isinstance(execution, dict):
+        raise UnknownCompletionHazardError("saved durable execution metadata is missing")
+    result = finalize_durable_result(payload, execution)
+
+    command_exit_code_checkpoint = (
+        result.memory_guard.get("command_exit_code")
+        if isinstance(result.memory_guard, dict)
+        else result.exit_code
+    )
+    guarded_started = (
+        result.memory_guard.get("command_started")
+        if isinstance(result.memory_guard, dict)
+        else status.get("command_started")
+    )
+    write_json(summary_path, {
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "command": plan.command,
+        "started_at": record["started_at"],
+        "phase": "finalize" if bool(record["no_pullback"]) else "pullback",
+        "completion_state": "command_complete",
+        "command_started": guarded_started,
+        "command_exit_code": command_exit_code_checkpoint,
+        "terminal": False,
+        "durable": True,
+        "plan": plan.as_dict(),
+    })
+
+    for log_name, text in (("stdout.log", result.stdout), ("stderr.log", result.stderr)):
+        try:
+            (rdir / log_name).write_text(cap_text(text, policy.max_log_bytes), encoding="utf-8")
+        except OSError:
+            pass
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+        sys.stdout.flush()
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+        sys.stderr.flush()
+
+    guard_result = result.memory_guard if isinstance(result.memory_guard, dict) else None
+    guard_status = guard_result.get("status") if guard_result is not None else None
+    guard_failed = guard_result is not None and guard_status != "ok"
+    command_exit_code = (
+        guard_result.get("command_exit_code") if guard_result is not None else result.exit_code
+    )
+    if guard_result is not None:
+        reporter.event(
+            "memory_guard",
+            status=guard_status,
+            reason=guard_result.get("reason"),
+            command_started=guard_result.get("command_started"),
+            command_exit_code=command_exit_code,
+            peak_command_bytes=guard_result.get("peak_command_bytes"),
+            min_host_available_bytes=guard_result.get("min_host_available_bytes"),
+            cleanup_complete=guard_result.get("cleanup_complete"),
+        )
+
+    pre_local = read_manifest(rdir / "pre_local_manifest.json")
+    pre_remote = read_manifest(rdir / "pre_remote_manifest.json")
+    backup_root = conflict_dir(run_id) / "backup"
+    post = None
+    if not bool(record["no_pullback"]):
+        try:
+            post = postrun_pullback(
+                transport=transport,
+                local_root=plan.project.local_project_root,
+                remote_root=remote_root,
+                excludes=plan.excludes,
+                hash_below_bytes=plan.hash_below_bytes,
+                pre_remote_manifest=pre_remote,
+                pre_local_manifest=pre_local,
+                backup_root=backup_root,
+                conflict_remote_root=conflict_dir(run_id) / "remote",
+                backup_below_bytes=policy.backup_below_bytes,
+                write_scope_paths=plan.write_scope_paths or None,
+            )
+        except TransportError as exc:
+            reporter.event("transfer_error", phase="pullback", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "phase": "pullback",
+                "completion_state": "finalization_failed",
+                "terminal": True,
+                "command_exit_code": command_exit_code,
+                "error": str(exc),
+                "durable": True,
+                "plan": plan.as_dict(),
+            })
+            return EXIT_GUARD if guard_failed else EXIT_TRANSFER
+        write_manifest(rdir / "post_remote_manifest.json", post.post_remote_manifest)
+        if post.conflicts:
+            for rel in post.conflicts:
+                reporter.event(
+                    "postrun_conflict", path=rel,
+                    saved=str(conflict_dir(run_id) / "remote" / rel),
+                )
+        elif post.next_baseline is not None:
+            write_baseline(
+                plan.target.name,
+                plan.project.project_id,
+                post.next_baseline.local_manifest,
+                post.next_baseline.remote_manifest,
+            )
+    else:
+        write_baseline(plan.target.name, plan.project.project_id, pre_local, pre_remote)
+
+    postrun_unresolved = bool(post and post.conflicts)
+    if guard_failed:
+        final_exit = EXIT_GUARD
+    elif result.exit_code != 0:
+        final_exit = result.exit_code
+    elif postrun_unresolved:
+        final_exit = EXIT_CONFLICT
+    else:
+        final_exit = EXIT_OK
+
+    duration = max(0.0, time.time() - float(status.get("created_epoch", time.time())))
+    checkpoint = {
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "command": plan.command,
+        "exit_code": final_exit,
+        "command_exit_code": command_exit_code,
+        "started_at": record["started_at"],
+        "ended_at": utc_now_iso(),
+        "completion_state": "finalization_complete",
+        "terminal": False,
+        "duration_sec": round(duration, 3),
+        "files_pulled_post": len(post.pulled) if post else 0,
+        "postrun_conflicts": len(post.conflicts) if post else 0,
+        "telemetry": result.telemetry,
+        "memory_guard": guard_result,
+        "durable": True,
+        "plan": plan.as_dict(),
+    }
+    write_json(summary_path, checkpoint)
+    if not clear_unknown_completion_hazard(plan.project.project_id, run_id):
+        raise UnknownCompletionHazardError(
+            f"durable completion fence changed before finalization for {run_id!r}"
+        )
+    checkpoint["completion_state"] = "complete"
+    checkpoint["terminal"] = True
+    write_json(summary_path, checkpoint)
+    reporter.event(
+        "command_finished",
+        exit_code=final_exit,
+        command_exit_code=command_exit_code,
+        durable=True,
+    )
+    try:
+        transport.durable_cleanup(run_id, str(record["resume_token"]))
+    except TransportError as exc:
+        reporter.event("durable_cleanup_deferred", run_id=run_id, message=str(exc))
+    else:
+        checkpoint["durable_cleanup_complete"] = True
+        write_json(summary_path, checkpoint)
+    return final_exit
+
+
+def _poll_durable(
+    *,
+    args: argparse.Namespace,
+    reporter: Reporter,
+    plan: RunPlan,
+    transport,
+    remote_root: str,
+    run_id: str,
+    rdir: Path,
+    summary_path: Path,
+    policy: RetentionPolicy,
+    record: dict[str, object],
+    initial_status: dict[str, object],
+    no_wait: bool = False,
+) -> int:
+    status = initial_status
+    acknowledged = bool(status.get("acknowledged"))
+    ownership_checked = False
+    if acknowledged:
+        reporter.event("durable_acknowledged", run_id=run_id, state=status.get("state"))
+    if status.get("detached_after_ack") and acknowledged:
+        return _detached_durable(
+            reporter, summary_path, record, status, reason="launch connection lost after acknowledgement"
+        )
+    while True:
+        _validate_durable_identity(status, record)
+        state = status.get("state")
+        if state == "complete":
+            return _finalize_durable_run(
+                args=args, reporter=reporter, plan=plan, transport=transport,
+                remote_root=remote_root, run_id=run_id, rdir=rdir,
+                summary_path=summary_path, policy=policy, record=record,
+            )
+        if state == "failed":
+            write_json(summary_path, {
+                "run_id": run_id,
+                "phase": "durable_wait",
+                "completion_state": "unknown",
+                "terminal": True,
+                "error": status.get("error", "durable target state failed closed"),
+                "durable": True,
+                "plan": plan.as_dict(),
+            })
+            reporter.event(
+                "completion_unknown",
+                run_id=run_id,
+                guidance=(
+                    "target durable state is missing, corrupt, mismatched, or "
+                    "ambiguous; do not retry user code"
+                ),
+            )
+            return EXIT_INFRA
+        if state == "running" and acknowledged and not ownership_checked:
+            try:
+                if not _running_observation_matches(transport, record):
+                    status = transport.durable_status(
+                        run_id, str(record["resume_token"])
+                    )
+                    _validate_durable_identity(status, record)
+                    if status.get("state") != "complete":
+                        raise DurableStateError(
+                            "durable state says running but the exact observer "
+                            "ownership row is absent"
+                        )
+                    continue
+                ownership_checked = True
+            except DurableStateError as exc:
+                write_json(summary_path, {
+                    "run_id": run_id,
+                    "phase": "durable_wait",
+                    "completion_state": "unknown",
+                    "terminal": True,
+                    "error": str(exc),
+                    "durable": True,
+                    "plan": plan.as_dict(),
+                })
+                reporter.event(
+                    "completion_unknown", run_id=run_id,
+                    guidance=(
+                        "authenticated durable state or observer ownership failed "
+                        "validation; do not retry user code"
+                    ),
+                )
+                return EXIT_INFRA
+            except TransportError as exc:
+                return _detached_durable(
+                    reporter, summary_path, record, status, reason=str(exc)
+                )
+        if no_wait and acknowledged:
+            return _detached_durable(
+                reporter, summary_path, record, status, reason="resume requested --no-wait"
+            )
+        try:
+            time.sleep(1.0)
+            next_status = transport.durable_status(
+                run_id, str(record["resume_token"])
+            )
+            _validate_durable_identity(next_status, record)
+            status = next_status
+            if status.get("acknowledged") and not acknowledged:
+                acknowledged = True
+                reporter.event(
+                    "durable_acknowledged",
+                    run_id=run_id,
+                    state=status.get("state"),
+                )
+        except KeyboardInterrupt:
+            if acknowledged:
+                return _detached_durable(
+                    reporter, summary_path, record, status,
+                    reason="controller interrupted after acknowledgement",
+                )
+            raise
+        except DurableStateError as exc:
+            write_json(summary_path, {
+                "run_id": run_id,
+                "phase": "durable_wait",
+                "completion_state": "unknown",
+                "terminal": True,
+                "error": str(exc),
+                "durable": True,
+                "plan": plan.as_dict(),
+            })
+            reporter.event(
+                "completion_unknown",
+                run_id=run_id,
+                guidance=(
+                    "authenticated durable state or observer ownership failed "
+                    "validation; do not retry user code"
+                ),
+            )
+            return EXIT_INFRA
+        except TransportError as exc:
+            if acknowledged:
+                return _detached_durable(
+                    reporter, summary_path, record, status, reason=str(exc)
+                )
+            reporter.event(
+                "completion_unknown",
+                run_id=run_id,
+                guidance=(
+                    "connection lost before durable acknowledgement; do not retry "
+                    "user code"
+                ),
+            )
+            write_json(summary_path, {
+                "run_id": run_id,
+                "phase": "durable_launch",
+                "completion_state": "unknown",
+                "terminal": True,
+                "error": str(exc),
+                "durable": True,
+                "plan": plan.as_dict(),
+            })
+            return EXIT_INFRA
+
+
+def _run_durable_locked(
+    *,
+    args: argparse.Namespace,
+    reporter: Reporter,
+    plan: RunPlan,
+    transport,
+    remote_root: str,
+    remote_cwd: str,
+    run_id: str,
+    rdir: Path,
+    summary_path: Path,
+    started_at: str,
+    t0: float,
+    policy: RetentionPolicy,
+    telemetry_default: bool,
+    pre,
+    backup_root: Path,
+    memory_reservation: MemoryReservation | None,
+) -> int:
+    del t0, pre, backup_root
+    runenv = resolve_run_env(
+        device=plan.target, project=plan.project, project_config=plan.project_config
+    )
+    transport.ensure_remote_dir(remote_cwd)
+    resume_token = secrets.token_urlsafe(32)
+    source_controller = controller_label()
+    observation = JobObservation.for_command(
+        job_id=run_id,
+        project=plan.project.project_id,
+        target=plan.target.name,
+        phase="command",
+        command=plan.command,
+        source_controller=source_controller,
+    )
+    record: dict[str, object] = {
+        "schema": 1,
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "controller": source_controller,
+        "command_sha256": observation.command_sha256,
+        "resume_token": resume_token,
+        "started_at": started_at,
+        "remote_root": remote_root,
+        "remote_cwd": remote_cwd,
+        "no_pullback": bool(args.no_pullback),
+        "plan": plan.as_dict(),
+        "execution": None,
+    }
+    write_json(_durable_record_path(rdir), record)
+    hazard = write_unknown_completion_hazard(
+        plan.project.project_id, plan.target.name, run_id
+    )
+    write_json(summary_path, {
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "command": plan.command,
+        "started_at": started_at,
+        "phase": "durable_launch",
+        "completion_state": "unknown",
+        "command_started": None,
+        "terminal": False,
+        "guidance": _unknown_completion_guidance(hazard),
+        "durable": True,
+        "plan": plan.as_dict(),
+    })
+    telemetry_on = telemetry_default and not args.no_telemetry
+    reporter.event("durable_launch", run_id=run_id, target=plan.target.name)
+    try:
+        status, execution = transport.launch_durable(
+            plan.command,
+            remote_cwd,
+            run_id=run_id,
+            resume_token=resume_token,
+            observation=observation,
+            controller=source_controller,
+            project_id=plan.project.project_id,
+            max_log_bytes=policy.max_log_bytes,
+            created_at=started_at,
+            env=runenv.env,
+            path_prepend=runenv.path_prepend,
+            telemetry=telemetry_on,
+            telemetry_request=None,
+            memory_reservation=memory_reservation,
+        )
+    except DurablePrestartError as exc:
+        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        reporter.event(
+            "durable_prestart_refused", run_id=run_id, target=plan.target.name,
+            detail=str(exc),
+        )
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "phase": "durable_prestart_refused",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "exit_code": exc.exit_code,
+            "error": str(exc),
+            "durable": True,
+            "plan": plan.as_dict(),
+        })
+        return exc.exit_code
+    except TransportError as exc:
+        reporter.event(
+            "completion_unknown",
+            run_id=run_id,
+            guidance=(
+                "connection or target state failed before positive durable "
+                "acknowledgement; do not retry user code"
+            ),
+        )
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "phase": "durable_launch",
+            "completion_state": "unknown",
+            "terminal": True,
+            "error": str(exc),
+            "durable": True,
+            "plan": plan.as_dict(),
+        })
+        return EXIT_INFRA
+    record["execution"] = execution
+    record["last_target_status"] = status
+    write_json(_durable_record_path(rdir), record)
+    return _poll_durable(
+        args=args, reporter=reporter, plan=plan, transport=transport,
+        remote_root=remote_root, run_id=run_id, rdir=rdir,
+        summary_path=summary_path, policy=policy, record=record,
+        initial_status=status,
+    )
+
+
+def _load_resume_plan(
+    run_id: str,
+) -> tuple[RunPlan, dict[str, object], Path, Path, object]:
+    rdir = run_dir(run_id)
+    record = read_json(_durable_record_path(rdir))
+    if (
+        not isinstance(record, dict)
+        or record.get("schema") != 1
+        or record.get("run_id") != run_id
+    ):
+        raise UnknownCompletionHazardError(
+            f"durable controller state is missing or malformed for {run_id!r}"
+        )
+    saved_plan = record.get("plan")
+    if not isinstance(saved_plan, dict):
+        raise UnknownCompletionHazardError("saved durable plan is missing")
+    saved_project = saved_plan.get("project")
+    saved_target = saved_plan.get("target")
+    command = saved_plan.get("command")
+    if (
+        not isinstance(saved_project, dict)
+        or not isinstance(saved_target, dict)
+        or not isinstance(command, list)
+    ):
+        raise UnknownCompletionHazardError("saved durable plan is malformed")
+    config = load_config()
+    local_cwd = Path(str(saved_project.get("local_cwd", "")))
+    plan = make_run_plan(
+        cwd=local_cwd,
+        config=config,
+        target_name=str(saved_target.get("name", "")),
+        command=[str(token) for token in command],
+        scope_name=saved_plan.get("write_scope"),
+        json_events=False,
+        requested_workload=None,
+        allow_default_workload=False,
+    )
+    if plan.as_dict() != saved_plan:
+        raise UnknownCompletionHazardError(
+            "current project/config no longer matches the exact saved durable plan"
+        )
+    if plan.target.kind not in {"ssh-posix", "ssh-powershell"}:
+        raise UnknownCompletionHazardError("saved durable target transport is unsupported")
+    saved_controller = record.get("controller")
+    if not isinstance(saved_controller, str) or controller_label() != saved_controller:
+        raise UnknownCompletionHazardError(
+            "resume is restricted to the controller that created the durable run"
+        )
+    current = detect_project(Path.cwd(), config)
+    if (
+        current.project_id != plan.project.project_id
+        or current.local_project_root.resolve() != plan.project.local_project_root.resolve()
+    ):
+        raise UnknownCompletionHazardError(
+            "resume must run from the same saved controller project"
+        )
+    summary_path = rdir / "summary.json"
+    return plan, record, rdir, summary_path, config
+
+
+def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
+    plan, record, rdir, summary_path, _config = _load_resume_plan(args.run_id)
+    summary = read_json(summary_path)
+    if (
+        isinstance(summary, dict)
+        and summary.get("completion_state") == "complete"
+        and summary.get("terminal") is True
+    ):
+        code = summary.get("exit_code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            if summary.get("durable_cleanup_complete") is not True:
+                try:
+                    make_transport(plan.target).durable_cleanup(
+                        args.run_id, str(record["resume_token"])
+                    )
+                except TransportError as exc:
+                    reporter.event(
+                        "durable_cleanup_deferred", run_id=args.run_id, message=str(exc)
+                    )
+                else:
+                    summary["durable_cleanup_complete"] = True
+                    write_json(summary_path, summary)
+            reporter.event("durable_already_finalized", run_id=args.run_id, exit_code=code)
+            return code
+        raise UnknownCompletionHazardError("completed durable summary has invalid exit code")
+    if (
+        isinstance(summary, dict)
+        and summary.get("completion_state") == "finalization_complete"
+        and summary.get("terminal") is False
+    ):
+        code = summary.get("exit_code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            raise UnknownCompletionHazardError(
+                "durable finalization checkpoint has invalid exit code"
+            )
+        hazard = read_unknown_completion_hazard(plan.project.project_id)
+        if hazard is not None:
+            if (
+                hazard.get("run_id") != args.run_id
+                or hazard.get("target") != plan.target.name
+            ):
+                raise UnknownCompletionHazardError(
+                    "durable completion fence changed after finalization checkpoint"
+                )
+            if not clear_unknown_completion_hazard(
+                plan.project.project_id, args.run_id
+            ):
+                raise UnknownCompletionHazardError(
+                    "durable completion fence could not be cleared"
+                )
+        summary["completion_state"] = "complete"
+        summary["terminal"] = True
+        write_json(summary_path, summary)
+        reporter.event(
+            "durable_finalization_recovered", run_id=args.run_id, exit_code=code
+        )
+        try:
+            make_transport(plan.target).durable_cleanup(
+                args.run_id, str(record["resume_token"])
+            )
+        except TransportError as exc:
+            reporter.event(
+                "durable_cleanup_deferred", run_id=args.run_id, message=str(exc)
+            )
+        else:
+            summary["durable_cleanup_complete"] = True
+            write_json(summary_path, summary)
+        return code
+    hazard = read_unknown_completion_hazard(plan.project.project_id)
+    if hazard is None or hazard.get("run_id") != args.run_id or hazard.get("target") != plan.target.name:
+        raise UnknownCompletionHazardError(
+            "durable completion fence is missing or names a different run"
+        )
+    transport = make_transport(plan.target)
+    lock = ProjectLock(
+        plan.project.project_id,
+        plan.target.name,
+        scope=plan.write_scope,
+        run_id=args.run_id,
+        adopt_dead_run=True,
+    ).acquire()
+    try:
+        status = transport.durable_status(args.run_id, str(record["resume_token"]))
+        _validate_durable_identity(status, record)
+        return _poll_durable(
+            args=args, reporter=reporter, plan=plan, transport=transport,
+            remote_root=str(record["remote_root"]), run_id=args.run_id,
+            rdir=rdir, summary_path=summary_path, policy=load_retention(load_config()),
+            record=record, initial_status=status, no_wait=bool(args.no_wait),
+        )
+    finally:
+        lock.release()
 
 
 def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:

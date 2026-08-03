@@ -143,7 +143,7 @@ def test_render_distinguishes_job_idle_unknown_and_unsupported():
     assert "PROJECT" in text and "FROM" in text and "COMMAND" in text
     assert "125%" in text and "1.5M" in text and "1m" in text
     assert "IDLE" in text and "UNKNOWN" in text and "UNSUPPORTED" in text
-    assert "no registered jobs" in text
+    assert "no registered jobs" not in text
 
 
 def test_incremental_header_precedes_completion_rows():
@@ -151,6 +151,21 @@ def test_incremental_header_precedes_completion_rows():
     assert table.header().splitlines()[0].startswith("PROJECT")
     rows = table.rows(jobs.TargetJobsView("DEV", True, "ok", jobs=[job_row()]))
     assert len(rows) == 1 and "proj" in rows[0]
+
+
+def test_render_caps_long_labels_and_preserves_full_json_elsewhere():
+    row = job_row(
+        project="project-name-that-is-too-long",
+        source_controller="controller-name-that-is-too-long",
+        command={"label": "command-label-that-is-much-too-long", "sha256": "b" * 64},
+    )
+    text = render_table([jobs.TargetJobsView("DEVICE-NAME", True, "ok", jobs=[row])])
+
+    assert "project-name-th~" in text
+    assert "control~" in text
+    assert "DEVIC~" in text
+    assert "command-label-that-is~" in text
+    assert max(map(len, text.splitlines())) <= 103
 
 
 def test_cmd_jobs_json_is_deterministic_and_exit_success(monkeypatch, capsys):

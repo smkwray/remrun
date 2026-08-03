@@ -1920,6 +1920,50 @@ def _query(root: Path, sample_interval: float) -> dict[str, object]:
     return result
 
 
+def _write_ready_file(
+    root: Path, ready_file: str | None, metadata: dict[str, object], owner_kind: str
+) -> None:
+    """Durably acknowledge observation before durable user code may start."""
+    if ready_file is None:
+        return
+    path = Path(ready_file)
+    try:
+        resolved_parent = path.parent.resolve()
+        resolved_root = root.resolve()
+        resolved_parent.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise RegistryError("observer ready file is outside the target state root") from exc
+    payload = {
+        "schema": 1,
+        "job_id": metadata["job_id"],
+        "command_sha256": metadata["command_sha256"],
+        "owner_kind": owner_kind,
+        "written_at_ns": time.time_ns(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + f".tmp-{os.getpid()}-{time.time_ns()}")
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+    os.replace(temp, path)
+    try:
+        directory = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory)
+    except OSError:
+        pass
+    finally:
+        os.close(directory)
+
+
 def _warning(detail: str) -> None:
     print(
         "remrun observation unavailable; command continues unobserved: " + detail,
@@ -1980,7 +2024,9 @@ def _best_witness(rows: list[ProcessRow], preferred: ProcessRow | None = None) -
     )
 
 
-def _run_posix_command(root: Path, metadata: dict[str, object], command: list[str]) -> int:
+def _run_posix_command(
+    root: Path, metadata: dict[str, object], command: list[str], ready_file: str | None = None
+) -> int:
     try:
         owner = _posix_owner_row()
         token = _register(
@@ -1993,10 +2039,13 @@ def _run_posix_command(root: Path, metadata: dict[str, object], command: list[st
             witness=owner,
         )
     except Exception as exc:
+        if ready_file is not None:
+            raise
         _warning(f"{type(exc).__name__}: {exc}")
         return _wait_popen(subprocess.Popen(command))
 
     try:
+        _write_ready_file(root, ready_file, metadata, "posix_pgid")
         proc = subprocess.Popen(command)
     except BaseException:
         _unregister(root, token)
@@ -2033,7 +2082,9 @@ def _run_posix_command(root: Path, metadata: dict[str, object], command: list[st
     return (128 - return_code) if return_code < 0 else return_code
 
 
-def _run_windows_command(root: Path, metadata: dict[str, object], command: list[str]) -> int:
+def _run_windows_command(
+    root: Path, metadata: dict[str, object], command: list[str], ready_file: str | None = None
+) -> int:
     token = uuid.uuid4().hex
     job_name = _win_job_name(token)
     job = None
@@ -2069,6 +2120,7 @@ def _run_windows_command(root: Path, metadata: dict[str, object], command: list[
             witness=keeper_row,
         )
         registered = True
+        _write_ready_file(root, ready_file, metadata, "windows_job_v2")
         _win_resume(process)
         started = True
         _remove_keeper_ready(root, token)
@@ -2086,6 +2138,8 @@ def _run_windows_command(root: Path, metadata: dict[str, object], command: list[
             keeper = None
         _win_close(job)
         _remove_keeper_ready(root, token)
+        if ready_file is not None:
+            raise
         _warning(f"{type(exc).__name__}: {exc}")
         return _wait_popen(subprocess.Popen(command))
 
@@ -2116,13 +2170,17 @@ def _run_windows_command(root: Path, metadata: dict[str, object], command: list[
 
 
 
-def _run_command(root: Path, metadata: dict[str, object], command: list[str]) -> int:
+def _run_command(
+    root: Path, metadata: dict[str, object], command: list[str], ready_file: str | None = None
+) -> int:
     if not command:
         raise ValueError("run requires an argv after --")
     if os.name == "nt":
-        return _run_windows_command(root, metadata, command)
+        return _run_windows_command(root, metadata, command, ready_file)
     if os.name == "posix":
-        return _run_posix_command(root, metadata, command)
+        return _run_posix_command(root, metadata, command, ready_file)
+    if ready_file is not None:
+        raise RegistryError("durable observation is unsupported on this platform")
     proc = subprocess.Popen(command)
     row = _child_row(proc)
     token = None
@@ -2148,6 +2206,7 @@ def _parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run")
     run.add_argument("--state-root", required=True)
     run.add_argument("--metadata-b64", required=True)
+    run.add_argument("--ready-file")
     run.add_argument("command", nargs=argparse.REMAINDER)
     query_parser = sub.add_parser("query")
     query_parser.add_argument("--state-root", required=True)
@@ -2167,7 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
         if command and command[0] == "--":
             command = command[1:]
         metadata = _decode_metadata(args.metadata_b64)
-        return _run_command(root, metadata, command)
+        return _run_command(root, metadata, command, args.ready_file)
     if args.operation == "hold-windows-job":
         token = _bounded_text(args.token, "token", 64)
         expected = _win_job_name(token)

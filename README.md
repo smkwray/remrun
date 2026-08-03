@@ -27,8 +27,11 @@ arbitrary-command parity with POSIX.
 The default coordination mode remains `legacy`: one controller may write a project at
 a time. Versioned-runner, lease/fencing, and snapshot components are experimental and
 disabled; they are not a supported multi-controller execution path. A network
-disconnect after a remote command starts can leave completion unknown; remrun reports
-that state and requires a read-only process or artifact check before retrying.
+disconnect during an ordinary run can leave completion unknown; remrun reports that
+state and requires a read-only process or artifact check before retrying. For a long,
+noninteractive command that must survive controller sleep or connectivity loss, an
+SSH target selected automatically or named explicitly can use a target-supervised
+durable run and later resume from the originating controller.
 
 ## How to run it
 
@@ -55,6 +58,10 @@ remrun doctor                       # show config root, devices, project roots, 
 remrun plan macbox -- <cmd>         # show what a run would do; mutates nothing
 remrun run macbox -- <cmd>          # reconcile -> run remotely -> pull outputs back
 remrun run --auto -- <cmd>          # probe/rank targets; conflict-safe failover
+remrun run --durable --auto -- <cmd>  # auto-select once, then survive source disconnect
+remrun run --durable macbox -- <cmd>  # explicit target; same durable behavior
+remrun resume <run_id>              # recover logs, exit code, and pullback
+remrun resume <run_id> --no-wait    # report authenticated target state and return
 remrun run --scope spec_a --auto -- <cmd>  # opt-in declared write scope
 remrun status [DEVICE] [--limit N]  # recent runs, optionally filtered by target
 remrun logs [last|<run_id>] [--json]
@@ -74,6 +81,33 @@ remrun runner install macbox        # install + probe the inert versioned helper
 remrun runner probe macbox          # verify the exact pinned helper and SQLite store
 remrun resolve-unknown <run_id> --confirmed-ended  # clear a verified completion fence
 ```
+
+### Durable runs
+
+`--durable` is a narrow opt-in for unattended ordinary commands. After remrun records
+a positive acknowledgement, a detached target-side supervisor owns the process and
+bounded stdout/stderr spools. The command can finish while the source laptop sleeps or
+its network disappears. `resume` from the same controller and project verifies the
+saved identity, waits if needed, restores the exact exit code and logs, performs the
+normal conflict-safe pullback once, and cleans the target record. Repeating `resume`
+does not run the command or pull outputs a second time.
+
+The first invocation still waits by default; interrupt or close it only after the
+`durable_acknowledged` event is visible. If connectivity is lost before that positive
+acknowledgement, remrun fails closed and the command must not be retried until its
+completion state is resolved.
+
+With `--auto`, remrun uses the ordinary reachability, learned RAM/duration, live-load,
+memory-admission, and conflict-safe preflight selection path. It may shop another
+candidate only before durable launch. Immediately before launch it records
+`durable_target_bound`; from then on the selected target is permanent and any ambiguous
+launch result fails closed instead of risking duplicate execution elsewhere.
+
+This v1 surface deliberately supports one selected `ssh-posix` or `ssh-powershell`
+target, noninteractive input, and the controller that created the run. It does not
+support workload envelopes, target reboot restart, adoption from a different
+controller, or a global fence against another controller starting an unrelated
+ordinary run. Ordinary `remrun run` behavior is unchanged.
 
 ### Fleet utilities
 

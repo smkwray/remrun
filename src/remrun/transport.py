@@ -90,6 +90,75 @@ class TelemetryRequest:
             raise ValueError("telemetry request schema must be 1")
 
 
+def finalize_durable_result(
+    payload: dict[str, object], execution: dict[str, object]
+) -> ExecResult:
+    """Validate and decode one complete target-side durable result."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("status"), dict):
+        raise TransportError("durable result payload is malformed")
+    status = payload["status"]
+    if status.get("state") != "complete":
+        raise TransportError("durable result is not complete")
+    code = status.get("wrapper_exit_code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise TransportError("durable result omitted the wrapper exit code")
+    try:
+        stdout = base64.b64decode(str(payload["stdout_b64"]), validate=True).decode(
+            "utf-8", "replace"
+        )
+        stderr = base64.b64decode(str(payload["stderr_b64"]), validate=True).decode(
+            "utf-8", "replace"
+        )
+    except (KeyError, ValueError, binascii.Error) as exc:
+        raise TransportError("durable result logs are malformed") from exc
+
+    telemetry_kind = execution.get("telemetry")
+    telemetry = None
+    if telemetry_kind in {"legacy", "detailed"}:
+        stderr, telemetry = _extract_telemetry(stderr)
+        if telemetry_kind == "detailed" and telemetry is None:
+            telemetry = _unavailable_detailed_telemetry(
+                str(execution.get("platform") or "unknown"),
+                "durable telemetry helper emitted no result",
+            )
+
+    marker = execution.get("batch_marker")
+    if isinstance(marker, str) and marker and marker in stderr:
+        raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+
+    guard_token = execution.get("guard_token")
+    if isinstance(guard_token, str) and guard_token:
+        raw = execution.get("memory_reservation")
+        if not isinstance(raw, dict):
+            raise TransportError("durable guard metadata is missing")
+        try:
+            reservation = MemoryReservation(
+                lease_id=str(raw["lease_id"]),
+                lease_token=str(raw["lease_token"]),
+                state_root=str(raw["state_root"]),
+                allowance_bytes=int(raw["allowance_bytes"]),
+                control_overhead_bytes=int(raw["control_overhead_bytes"]),
+                capacity_bytes=int(raw["capacity_bytes"]),
+                max_command_bytes=int(raw["max_command_bytes"]),
+                min_available_bytes=int(raw["min_available_bytes"]),
+                host_total_bytes=int(raw["host_total_bytes"]),
+                safe_concurrency=int(raw["safe_concurrency"]),
+                expires_at=float(raw["expires_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TransportError("durable guard metadata is malformed") from exc
+        return _finalize_guarded_result(
+            helper_exit_code=code,
+            stdout=stdout,
+            stderr=stderr,
+            token=guard_token,
+            reservation=reservation,
+            telemetry=telemetry,
+            platform_name=str(execution.get("platform") or "target"),
+        )
+    return ExecResult(code, stdout, stderr, telemetry)
+
+
 # Sink for live remote output. `exec(on_stdout=...)` calls it with each decoded chunk
 # as it arrives so the caller can tee to a log; the full text is still returned in
 # ExecResult, so nothing downstream has to change.
@@ -708,6 +777,18 @@ class TransportError(RuntimeError):
     pass
 
 
+class DurablePrestartError(TransportError):
+    """A conclusive target-side refusal before the durable supervisor starts."""
+
+    def __init__(self, detail: str, *, exit_code: int = 5) -> None:
+        super().__init__(detail)
+        self.exit_code = exit_code
+
+
+class DurableStateError(TransportError):
+    """Authenticated target durable state is missing, corrupt, or ambiguous."""
+
+
 class BaseTransport:
     """Abstract backend contract.
 
@@ -916,6 +997,47 @@ class BaseTransport:
         if memory_reservation is not None:
             kwargs["memory_reservation"] = memory_reservation
         return self.exec(command, cwd=cwd, **kwargs)
+
+    def launch_durable(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        run_id: str,
+        resume_token: str,
+        observation: JobObservation,
+        controller: str,
+        project_id: str,
+        max_log_bytes: int,
+        created_at: str,
+        env: dict[str, str] | None = None,
+        path_prepend: list[str] | None = None,
+        telemetry: bool = False,
+        telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        del (
+            command, cwd, run_id, resume_token, observation, controller, project_id,
+            max_log_bytes, created_at, env, path_prepend, telemetry,
+            telemetry_request, memory_reservation,
+        )
+        raise TransportError(
+            f"durable ordinary runs are unsupported by transport {type(self).__name__}"
+        )
+
+    def durable_status(
+        self, run_id: str, resume_token: str, *, include_logs: bool = False
+    ) -> dict[str, object]:
+        del run_id, resume_token, include_logs
+        raise TransportError(
+            f"durable ordinary runs are unsupported by transport {type(self).__name__}"
+        )
+
+    def durable_cleanup(self, run_id: str, resume_token: str) -> dict[str, object]:
+        del run_id, resume_token
+        raise TransportError(
+            f"durable ordinary runs are unsupported by transport {type(self).__name__}"
+        )
 
     def query_observed_jobs(
         self, *, sample_interval: float = 0.2, timeout: float = 45.0
@@ -1479,6 +1601,7 @@ class _SSHCommon(BaseTransport):
         super().__init__(device)
         self._address: str | None = None
         self._remote_home: str | None = None
+        self._durable_runner_cache: tuple[str, str] | None = None
 
     def expand_remote(self, path: str) -> str:
         # Both ssh backends define _expand_remote (POSIX vs backslash ~ handling).
@@ -2275,6 +2398,167 @@ class SSHPosixTransport(_SSHCommon):
                 + proc.stderr.decode("utf-8", "replace").strip()
             )
 
+    def _ensure_durable_runner(self) -> tuple[str, str]:
+        if self._durable_runner_cache is not None:
+            return self._durable_runner_cache
+        root = self._job_state_root()
+        source = Path(__file__).parent / "_durable_runner.py"
+        helper = posixpath.join(root, "helpers", "remrun_durable_runner_v1.py")
+        self._ensure_remote_helper_exact(source, helper)
+        self._durable_runner_cache = (root, helper)
+        return self._durable_runner_cache
+
+    def _durable_control(
+        self, operation: str, *, run_id: str | None = None,
+        resume_token: str | None = None, include_logs: bool = False,
+        input_bytes: bytes | None = None, timeout: float = 60.0,
+    ) -> dict[str, object]:
+        address = self._address_or_resolve()
+        root, helper = self._ensure_durable_runner()
+        argv = [
+            self.device.remote_python or "python3", "-S", helper, operation,
+            "--state-root", root,
+        ]
+        if run_id is not None:
+            argv.extend(["--run-id", run_id])
+        if resume_token is not None:
+            argv.extend(["--resume-token", resume_token])
+        if include_logs:
+            argv.append("--include-logs")
+        proc = self._remote(address, shlex.join(argv), input_bytes=input_bytes, timeout=timeout)
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            if proc.returncode == 255:
+                raise TransportError(
+                    f"ssh connection failed during durable {operation}: {detail}"
+                )
+            error = f"durable {operation} failed: {detail or f'exit {proc.returncode}'}"
+            if operation == "status":
+                raise DurableStateError(error)
+            raise TransportError(error)
+        try:
+            payload = json.loads(proc.stdout.decode("utf-8", "strict"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise TransportError(f"durable {operation} returned malformed JSON") from exc
+        if not isinstance(payload, dict):
+            raise TransportError(f"durable {operation} returned a non-object")
+        return payload
+
+    def launch_durable(
+        self, command: list[str], cwd: str, *, run_id: str, resume_token: str,
+        observation: JobObservation, controller: str, project_id: str,
+        max_log_bytes: int, created_at: str,
+        env: dict[str, str] | None = None, path_prepend: list[str] | None = None,
+        telemetry: bool = False, telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        root, observer = self._ensure_job_observer()
+        durable_root, _durable = self._ensure_durable_runner()
+        if durable_root != root:
+            raise TransportError("durable and observer state roots disagree")
+        ready_path = posixpath.join(root, "durable-runs", run_id, "observer-ready.json")
+
+        parts: list[str] = []
+        for key, value in (env or {}).items():
+            parts.append(f"export {key}={shlex.quote(self._expand_remote(str(value)))}")
+        if path_prepend:
+            joined = ":".join(shlex.quote(self._expand_remote(p)) for p in path_prepend)
+            parts.append(f'export PATH={joined}:"$PATH"')
+        parts.append(f"cd {shlex.quote(cwd)} && {shlex.join(command)}")
+        inner = "; ".join(parts)
+        shell_flag = "-lc" if self.device.login_shell else "-c"
+        user_argv = [self.device.shell, shell_flag, inner]
+        observed_argv = [
+            self.device.remote_python or "python3", "-S", observer, "run",
+            "--state-root", root, "--metadata-b64", observation.encoded(),
+            "--ready-file", ready_path, "--", *user_argv,
+        ]
+        final_argv = observed_argv
+        execution: dict[str, object] = {"platform": "POSIX", "telemetry": "none"}
+
+        reservation = memory_reservation
+        if self.memory_guard is not None:
+            if reservation is None:
+                raise TransportError("durable guarded launch requires a reserved memory lease")
+            helper = self._ensure_memory_guard_helper()
+            renewal = self.renew_memory_guard(reservation)
+            if not renewal.admitted:
+                detail = str(
+                    renewal.payload.get("detail")
+                    or renewal.reason
+                    or "memory guard renewal refused"
+                )
+                raise DurablePrestartError(detail)
+            reservation = renewal.reservation
+            assert reservation is not None
+            guard_token = uuid.uuid4().hex
+            final_argv = [
+                self.device.remote_python or "python3",
+                *_guarded_helper_args(
+                    helper, self.memory_guard, reservation, guard_token,
+                    detailed=telemetry_request is not None, telemetry=telemetry,
+                ),
+                *observed_argv,
+            ]
+            execution.update(
+                guard_token=guard_token,
+                memory_reservation=reservation.as_dict(include_token=True),
+                telemetry=(
+                    "detailed"
+                    if telemetry_request is not None
+                    else "legacy" if telemetry else "none"
+                ),
+            )
+        elif telemetry_request is not None:
+            helper = posixpath.join(root, "helpers", "remrun_posix_telemetry_v1.py")
+            self.push_file(Path(__file__).parent / "_posix_telemetry.py", helper)
+            final_argv = [
+                self.device.remote_python or "python3", helper, "--detailed", "--",
+                *observed_argv,
+            ]
+            execution["telemetry"] = "detailed"
+        elif telemetry:
+            final_argv = [
+                self.device.remote_python or "python3", "-c",
+                _POSIX_TELEMETRY_SAMPLER, "--", *observed_argv,
+            ]
+            execution["telemetry"] = "legacy"
+
+        spec = {
+            "schema": 1, "run_id": run_id, "resume_token": resume_token,
+            "controller": controller, "project_id": project_id,
+            "target": self.device.name, "command_sha256": observation.command_sha256,
+            "argv": final_argv, "ready_path": ready_path,
+            "max_log_bytes": max_log_bytes,
+            "created_at": created_at,
+        }
+        raw = json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            status = self._durable_control("launch", input_bytes=raw, timeout=45.0)
+        except TransportError:
+            try:
+                status = self.durable_status(run_id, resume_token)
+            except TransportError:
+                raise
+            if not status.get("acknowledged"):
+                raise TransportError("durable launch connection was lost before acknowledgement")
+            status = dict(status)
+            status["detached_after_ack"] = True
+        return status, execution
+
+    def durable_status(
+        self, run_id: str, resume_token: str, *, include_logs: bool = False
+    ) -> dict[str, object]:
+        return self._durable_control(
+            "status", run_id=run_id, resume_token=resume_token,
+            include_logs=include_logs, timeout=60.0,
+        )
+
+    def durable_cleanup(self, run_id: str, resume_token: str) -> dict[str, object]:
+        return self._durable_control(
+            "cleanup", run_id=run_id, resume_token=resume_token, timeout=60.0
+        )
+
     def runner_rpc(self, runner_path: str, state_root: str, request_frame: bytes) -> bytes:
         address = self._address_or_resolve()
         script = (
@@ -2607,7 +2891,8 @@ class SSHPosixTransport(_SSHCommon):
 
     def delete_remote(self, remote_path: str) -> None:
         address = self._address_or_resolve()
-        proc = self._remote(address, f"rm -f {shlex.quote(remote_path)}")
+        path = self._expand_remote(remote_path)
+        proc = self._remote(address, f"rm -f {shlex.quote(path)}")
         if proc.returncode != 0:
             raise TransportError(
                 f"delete {remote_path} failed: {proc.stderr.decode('utf-8', 'replace')}"
@@ -2926,6 +3211,159 @@ class SSHPowerShellTransport(_SSHCommon):
                 "versioned runner install failed: "
                 + proc.stderr.decode("utf-8", "replace").strip()
             )
+
+    def _ensure_durable_runner(self) -> tuple[str, str]:
+        if self._durable_runner_cache is not None:
+            return self._durable_runner_cache
+        root = self._job_state_root()
+        source = Path(__file__).parent / "_durable_runner.py"
+        helper = self.native_join(root, "helpers", "remrun_durable_runner_v1.py")
+        self._ensure_remote_helper_exact(source, helper)
+        self._durable_runner_cache = (root, helper)
+        return self._durable_runner_cache
+
+    def _durable_control(
+        self, operation: str, *, run_id: str | None = None,
+        resume_token: str | None = None, include_logs: bool = False,
+        input_bytes: bytes | None = None, timeout: float = 60.0,
+    ) -> dict[str, object]:
+        address = self._address_or_resolve()
+        root, helper = self._ensure_durable_runner()
+        argv = [
+            self.device.remote_python or "python", "-S", helper, operation,
+            "--state-root", root,
+        ]
+        if run_id is not None:
+            argv.extend(["--run-id", run_id])
+        if resume_token is not None:
+            argv.extend(["--resume-token", resume_token])
+        if include_logs:
+            argv.append("--include-logs")
+        tokens = " ".join(_ps_squote(token) for token in argv)
+        proc = self._ps_remote(
+            address,
+            f"& {tokens}; exit $LASTEXITCODE",
+            input_bytes=input_bytes,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            if proc.returncode == 255:
+                raise TransportError(
+                    f"ssh connection failed during durable {operation}: {detail}"
+                )
+            error = f"durable {operation} failed: {detail or f'exit {proc.returncode}'}"
+            if operation == "status":
+                raise DurableStateError(error)
+            raise TransportError(error)
+        try:
+            payload = json.loads(proc.stdout.decode("utf-8", "strict"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise TransportError(f"durable {operation} returned malformed JSON") from exc
+        if not isinstance(payload, dict):
+            raise TransportError(f"durable {operation} returned a non-object")
+        return payload
+
+    def launch_durable(
+        self, command: list[str], cwd: str, *, run_id: str, resume_token: str,
+        observation: JobObservation, controller: str, project_id: str,
+        max_log_bytes: int, created_at: str,
+        env: dict[str, str] | None = None, path_prepend: list[str] | None = None,
+        telemetry: bool = False, telemetry_request: TelemetryRequest | None = None,
+        memory_reservation: MemoryReservation | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if self.memory_guard is not None or memory_reservation is not None:
+            raise TransportError("schema-2 memory guard is unsupported on ssh-powershell")
+        if self._ps_exe().lower() == "powershell":
+            raise TransportError(_WINDOWS_POWERSHELL_UNSUPPORTED)
+        _reject_explicit_windows_batch(command)
+        root, observer = self._ensure_job_observer()
+        durable_root, _durable = self._ensure_durable_runner()
+        if durable_root != root:
+            raise TransportError("durable and observer state roots disagree")
+        ready_path = self.native_join(root, "durable-runs", run_id, "observer-ready.json")
+        marker = f"__REMRUN_BATCH_UNSUPPORTED_{uuid.uuid4().hex}__;"
+        lines = [
+            "$ErrorActionPreference = 'Stop'",
+            "$PSNativeCommandUseErrorActionPreference = $false",
+        ]
+        for key, value in (env or {}).items():
+            lines.append(f"$env:{key} = {_ps_squote(self._expand_remote(str(value)))}")
+        if path_prepend:
+            joined = ";".join(self._expand_remote(p) for p in path_prepend) + ";"
+            lines.append(f"$env:PATH = {_ps_squote(joined)} + $env:PATH")
+        lines.append(f"Set-Location -LiteralPath {_ps_squote(self._expand_remote(cwd))}")
+        lines.extend(_ps_batch_resolution_guard(command[0], marker))
+        lines.append("& " + " ".join(_ps_squote(token) for token in command))
+        lines.extend([
+            "$remrunCommandSucceeded = $?",
+            "$remrunCommandExitCode = $LASTEXITCODE",
+            "if ($null -ne $remrunCommandExitCode) { exit $remrunCommandExitCode }",
+            "if ($remrunCommandSucceeded) { exit 0 }",
+            "exit 1",
+        ])
+        user_argv = [
+            self._ps_exe(), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+            _ps_encode("\n".join(lines)),
+        ]
+        observed_argv = [
+            self.device.remote_python or "python", "-S", observer, "run",
+            "--state-root", root, "--metadata-b64", observation.encoded(),
+            "--ready-file", ready_path, "--", *user_argv,
+        ]
+        final_argv = observed_argv
+        telemetry_kind = "none"
+        if telemetry_request is not None or telemetry:
+            telemetry_helper = self.native_join(
+                root, "helpers", "remrun_win_telemetry_v1.py"
+            )
+            self._ensure_remote_helper_exact(
+                Path(__file__).parent / "_win_telemetry.py", telemetry_helper
+            )
+            option = "--detailed" if telemetry_request is not None else "--telemetry"
+            final_argv = [
+                self.device.remote_python or "python", telemetry_helper, option,
+                "--allow-observed-breakaway", "--", *observed_argv,
+            ]
+            telemetry_kind = "detailed" if telemetry_request is not None else "legacy"
+        execution: dict[str, object] = {
+            "platform": "Windows", "telemetry": telemetry_kind,
+            "batch_marker": marker,
+        }
+        spec = {
+            "schema": 1, "run_id": run_id, "resume_token": resume_token,
+            "controller": controller, "project_id": project_id,
+            "target": self.device.name, "command_sha256": observation.command_sha256,
+            "argv": final_argv, "ready_path": ready_path,
+            "max_log_bytes": max_log_bytes,
+            "created_at": created_at,
+        }
+        raw = json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            status = self._durable_control("launch", input_bytes=raw, timeout=45.0)
+        except TransportError:
+            try:
+                status = self.durable_status(run_id, resume_token)
+            except TransportError:
+                raise
+            if not status.get("acknowledged"):
+                raise TransportError("durable launch connection was lost before acknowledgement")
+            status = dict(status)
+            status["detached_after_ack"] = True
+        return status, execution
+
+    def durable_status(
+        self, run_id: str, resume_token: str, *, include_logs: bool = False
+    ) -> dict[str, object]:
+        return self._durable_control(
+            "status", run_id=run_id, resume_token=resume_token,
+            include_logs=include_logs, timeout=60.0,
+        )
+
+    def durable_cleanup(self, run_id: str, resume_token: str) -> dict[str, object]:
+        return self._durable_control(
+            "cleanup", run_id=run_id, resume_token=resume_token, timeout=60.0
+        )
 
     def runner_rpc(self, runner_path: str, state_root: str, request_frame: bytes) -> bytes:
         address = self._address_or_resolve()
