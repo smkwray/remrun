@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import __version__
 from .config import (
     load_config, load_project_config, load_retention, offload_policy, offload_threshold,
     scheduler_config,
@@ -268,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="remrun")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command_name", required=True)
 
     p = sub.add_parser("devices", help="List configured devices")

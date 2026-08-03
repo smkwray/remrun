@@ -314,6 +314,28 @@ def test_read_only_query_accepts_physical_legacy_schema_without_migration(tmp_pa
     assert records[0]["owner_key"] is None
     assert db.read_bytes() == before
 
+
+def test_read_only_query_waits_for_concurrent_schema_initialization(
+    tmp_path, monkeypatch
+):
+    db = observer._db_path(tmp_path)
+    db.parent.mkdir(parents=True)
+    sqlite3.connect(db).close()
+    sleeps = []
+
+    def finish_initialization(delay):
+        sleeps.append(delay)
+        conn = observer._writer(tmp_path)
+        conn.close()
+
+    monkeypatch.setattr(observer.time, "sleep", finish_initialization)
+    records, errors = observer._read_records(tmp_path)
+
+    assert sleeps == [observer._SCHEMA_READY_DELAY_SECONDS]
+    assert records == []
+    assert errors == []
+
+
 def test_corrupt_registry_returns_explicit_unknown_without_overwrite(tmp_path):
     db = observer._db_path(tmp_path)
     db.parent.mkdir(parents=True)

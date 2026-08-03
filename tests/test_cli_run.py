@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from remrun import __version__
 from remrun.cli import (
     EXIT_CONFLICT, EXIT_GUARD, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, _best_remote_verdict,
     _workload_observation_from_run, main,
@@ -21,6 +22,14 @@ from remrun.profile import (
 from remrun.resource_context import ReceiptValidation
 from remrun.state import ProjectLock
 from remrun.transport import ExecResult, LocalSimTransport, TransportError
+
+
+def test_cli_reports_package_version(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out == f"remrun {__version__}\n"
 
 
 def posix(p: Path) -> str:

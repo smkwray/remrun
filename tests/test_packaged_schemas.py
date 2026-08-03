@@ -65,6 +65,16 @@ def test_setuptools_declares_schema_package_data() -> None:
     assert project["tool"]["setuptools"]["package-data"]["remrun"] == ["schemas/*.json"]
 
 
+def test_setuptools_reads_the_package_version_from_one_source() -> None:
+    project = _toml(ROOT / "pyproject.toml")
+
+    assert project["project"]["dynamic"] == ["version"]
+    assert "version" not in project["project"]
+    assert project["tool"]["setuptools"]["dynamic"]["version"] == {
+        "attr": "remrun.__version__"
+    }
+
+
 def test_public_project_example_is_schema_1_and_explicitly_selected() -> None:
     project_config = _toml(ROOT / "examples/project/do/remrun/remrun.toml")
 

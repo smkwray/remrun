@@ -93,7 +93,6 @@ wheels = [
 
 [[package]]
 name = "remrun"
-version = "0.0.1"
 source = { editable = "." }
 
 [package.optional-dependencies]

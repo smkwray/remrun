@@ -45,6 +45,8 @@ OWNED_TABLE = "owned_jobs_v2"
 _WIN_KEEPER_READY_TIMEOUT = 5.0
 _WIN_KEEPER_POLL_SECONDS = 1.0
 _WIN_KEEPER_CLEANUP_RETRIES = 50
+_SCHEMA_READY_ATTEMPTS = 25
+_SCHEMA_READY_DELAY_SECONDS = 0.02
 _SAFE = re.compile(r"^[A-Za-z0-9._:@+-]+$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -1399,10 +1401,26 @@ def _read_records(root: Path) -> tuple[list[dict[str, object]], list[dict[str, s
     if conn is None:
         return [], []
     try:
-        meta = conn.execute(
-            "SELECT value FROM registry_meta WHERE key='schema'"
-        ).fetchone()
-        if meta is None or meta[0] != str(REGISTRY_SCHEMA):
+        # sqlite3.connect() creates the file before the first schema statement.
+        # A concurrent read in that small initialization window must remain
+        # read-only and bounded, but should not misclassify a healthy registry as
+        # corrupt merely because its writer has not committed the metadata row yet.
+        meta = None
+        for attempt in range(_SCHEMA_READY_ATTEMPTS):
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='registry_meta'"
+            ).fetchone()
+            if table is not None:
+                meta = conn.execute(
+                    "SELECT value FROM registry_meta WHERE key='schema'"
+                ).fetchone()
+                if meta is not None:
+                    break
+            if attempt + 1 < _SCHEMA_READY_ATTEMPTS:
+                time.sleep(_SCHEMA_READY_DELAY_SECONDS)
+        if meta is None:
+            raise RegistryError("active-job registry schema is unavailable")
+        if meta[0] != str(REGISTRY_SCHEMA):
             raise RegistryError("unsupported active-job registry schema")
         tables = {
             str(row[0])

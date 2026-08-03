@@ -11,6 +11,9 @@ not a correctness dependency.
 
 ## Status
 
+`remrun` is a public alpha. Its documented safety boundaries are stable enough for
+regular use, while configuration and command details may still evolve before 1.0.
+
 The core runner is implemented and tested on POSIX/macOS and Windows SSH targets:
 safe project reconciliation and pullback, conflict preservation, target scheduling,
 resource telemetry, external-tree `sync`, commit-only `git-sync`, allowlisted target
@@ -53,6 +56,7 @@ on PATH (entry point `remrun.cli:main`). The launchers set `REMRUN_ROOT` and
 ### Commands
 
 ```bash
+remrun --version                     # show the installed/source version
 remrun devices                      # list configured devices
 remrun doctor                       # show config root, devices, project roots, state root
 remrun plan macbox -- <cmd>         # show what a run would do; mutates nothing
