@@ -37,6 +37,17 @@ def _config_tts(tmp_path, cmd: list[str]) -> RemrunConfig:
     )
 
 
+def _config_ocr(tmp_path, cmd: list[str]) -> RemrunConfig:
+    cfg = _config(tmp_path)
+    return RemrunConfig(
+        repo_root=cfg.repo_root, defaults=cfg.defaults, devices=cfg.devices,
+        project_roots=cfg.project_roots, offload=cfg.offload,
+        fleet_adapters={"ocr": {"LOCAL_SIM": {"engine": "ocr", "output_root": "",
+                                               "pool": "gpu", "memory_kind": "cpu",
+                                               "cmd": cmd}}},
+    )
+
+
 def test_run_once_cmd_stages_runs_and_writes_output(tmp_path):
     out = tmp_path / "out"
     out.mkdir()
@@ -154,6 +165,68 @@ def test_run_batch_reads_per_item_metrics_and_exposes_manifest(tmp_path):
     assert res["item_results"][0]["ok"] is True
     assert res["item_results"][1]["ok"] is False
     assert res["item_results"][1]["error"] == "bad input"
+
+
+def test_run_batch_rejects_controller_native_output_path_for_posix_target(tmp_path):
+    task = FleetTask(
+        task_type="cmd", force_device="LOCAL_SIM", output_root=r"D:\sync\out",
+        options={"argv": ["python", "-c", "raise AssertionError('must not run')"]},
+    )
+    res = executor.run_batch("LOCAL_SIM", [task], _config(tmp_path),
+                             state_root=tmp_path / "state")
+    assert res["ok"] is False
+    assert res["phase"] == "output_root"
+    assert "Windows path" in res["error"] and "POSIX target" in res["error"]
+    assert not (tmp_path / "cache").exists()
+
+
+def test_multi_item_ocr_requires_complete_per_file_evidence(tmp_path):
+    out = tmp_path / "ocr-out"
+    out.mkdir()
+    files = []
+    for name in ("a.pdf", "b.pdf"):
+        path = tmp_path / name
+        path.write_text(name)
+        files.append(path)
+    cmd = ["python", "-c", "pass"]
+    tasks = [FleetTask(task_type="ocr", inputs=[str(path)], output_root=str(out))
+             for path in files]
+    cfg = _config_ocr(tmp_path, cmd)
+    adapters.configure(cfg)
+    res = executor.run_batch("LOCAL_SIM", tasks, cfg,
+                             state_root=tmp_path / "state", job_ids=["j1", "j2"])
+    assert res["ok"] is False
+    assert res["no_retry"] is True
+    assert res["completion_evidence"] == "missing"
+    assert "per-file completion evidence" in res["error"]
+
+
+def test_multi_item_ocr_evidence_matches_each_staged_stem(tmp_path):
+    out = tmp_path / "ocr-evidence"
+    out.mkdir()
+    files = []
+    for name in ("a.pdf", "b.pdf"):
+        path = tmp_path / name
+        path.write_text(name)
+        files.append(path)
+    cmd = [
+        "python", "-c",
+        "import json,os,pathlib;"
+        "m=json.loads(pathlib.Path(os.environ['REMRUN_BATCH_MANIFEST']).read_text());"
+        "items=[{'job_id':x['job_id'],'index':x['index'],'ok':True,"
+        "'outputs':[x['reserved_output_stem']+'.md']} for x in m['items']];"
+        "pathlib.Path(os.environ['REMRUN_BATCH_METRICS']).write_text(json.dumps({'items':items}))",
+    ]
+    tasks = [FleetTask(task_type="ocr", inputs=[str(path)], output_root=str(out))
+             for path in files]
+    cfg = _config_ocr(tmp_path, cmd)
+    adapters.configure(cfg)
+    res = executor.run_batch("LOCAL_SIM", tasks, cfg,
+                             state_root=tmp_path / "state", job_ids=["j1", "j2"])
+    assert res["ok"] is True
+    assert res["completion_evidence"] == "complete"
+    assert [item["job_id"] for item in res["item_results"]] == ["j1", "j2"]
+    assert executor._portable_stem(r"C:\output\a.md") == "a"
 
 
 def test_run_batch_stages_tts_with_reserved_output_stem(tmp_path):

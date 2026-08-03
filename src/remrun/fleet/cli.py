@@ -387,10 +387,14 @@ def cmd_run(args, reporter: Reporter) -> int:
     config = load_config()
     adapters.configure(config)   # load [fleet.adapters] from devices.toml (core ships none)
     task = _build_task(args)
+    tasks = _split_tasks(task)
     # Acquire the same configured resource lease the dispatcher uses, so an
     # ad-hoc run cannot race a dispatcher batch onto an exclusive resource
     # (--no-lease opts out for dev/test).
-    result = executor.run_once(task, config, use_lease=not getattr(args, "no_lease", False))
+    result = executor.run_group(
+        tasks, config, placement_task=task,
+        use_lease=not getattr(args, "no_lease", False),
+    )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
     else:

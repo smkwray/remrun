@@ -161,21 +161,6 @@ def _learn_oom_memory(config: RemrunConfig, state_root: Path, device: str, engin
                    task_type=task.task_type, field=field, value_mb=value)
 
 
-def _item_result_maps(item_results: list[dict[str, Any]]) -> tuple[dict[str, str | None],
-                                                                   dict[str, str]]:
-    succeeded: dict[str, str | None] = {}
-    failed: dict[str, str] = {}
-    for item in item_results:
-        jid = item.get("job_id")
-        if not jid:
-            continue
-        if item.get("ok"):
-            succeeded[jid] = json.dumps(item, sort_keys=True)
-        else:
-            failed[jid] = item.get("error") or "worker reported item failure"
-    return succeeded, failed
-
-
 def _allows_fallback(task: FleetTask) -> bool:
     """Whether a forced job may retry through normal auto placement after this device fails."""
     return bool(task.force_device and task.options.get("_allow_fallback"))
@@ -414,9 +399,17 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
             return out
         out["ran"] = 1
         if not res.get("ok"):
+            if res.get("no_retry"):
+                error = res.get("error") or "worker completion evidence is incomplete"
+                _health_audit(config, q, device, engine, reporter)
+                q.fail_batch(batch_id, error, max_attempts=1)
+                out["failed"] = 1
+                reporter.event("dispatch_failed", batch=batch_id, device=device,
+                               error=error, final=True, retry_suppressed=True)
+                return out
             item_results = res.get("item_results") or []
             if item_results and job_ids:
-                succeeded, failed = _item_result_maps(item_results)
+                succeeded, failed = executor.item_result_maps(item_results)
                 if succeeded:
                     verify = _verify_batch_output(config, device, head, reporter, pre_output)
                     if verify["status"] == "final":
@@ -462,7 +455,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
         elif verify["status"] in ("ok", "skip"):
             item_results = res.get("item_results") or []
             if item_results and job_ids:
-                succeeded, failed = _item_result_maps(item_results)
+                succeeded, failed = executor.item_result_maps(item_results)
                 _health_audit(config, q, device, engine, reporter)
                 fallback = _allows_fallback(head) and bool(failed)
                 q.complete_batch_items(batch_id, succeeded, failed,

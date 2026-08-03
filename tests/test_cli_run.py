@@ -224,6 +224,7 @@ def test_exec_transport_failure_records_unknown_completion_guidance(
     summary = json.loads(summaries[0].read_text(encoding="utf-8"))
     assert summary["phase"] == "exec"
     assert summary["completion_state"] == "unknown"
+    assert summary["terminal"] is True
     assert "read-only process/artifact probe" in summary["guidance"]
     assert not list((env["state"] / "locks").glob("**/*.lock"))
 
@@ -295,6 +296,49 @@ def test_unknown_completion_hazard_blocks_clean_and_resolves_explicitly(
 
     assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('safe-next')"]) == EXIT_OK
     assert tracked.read_text() == "remote-after-unknown"
+
+
+def test_controller_loss_during_dispatch_leaves_receipt_and_unknown_hazard(
+    env, monkeypatch
+):
+    class ControllerLost(BaseException):
+        pass
+
+    def vanish_during_dispatch(*_args, **_kwargs):
+        raise ControllerLost("injected controller loss")
+
+    monkeypatch.setattr(LocalSimTransport, "exec", vanish_during_dispatch)
+    with pytest.raises(ControllerLost):
+        main(["run", "LOCAL_SIM", "--", "python", "-c", "print('maybe')"])
+
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["phase"] == "exec"
+    assert summary["completion_state"] == "unknown"
+    assert summary["terminal"] is False
+    hazards = list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+    assert len(hazards) == 1
+
+
+def test_finalization_exception_after_known_completion_writes_terminal_receipt(
+    env, monkeypatch
+):
+    import remrun.cli as climod
+
+    def fail_finalization(**_kwargs):
+        raise RuntimeError("injected finalization failure")
+
+    monkeypatch.setattr(climod, "postrun_pullback", fail_finalization)
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('done')"]) == EXIT_INTERNAL
+
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["terminal"] is True
+    assert summary["completion_state"] == "finalization_failed"
+    assert summary["command_exit_code"] == 0
+    assert summary["phase"] == "pullback"
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
 
 
 def test_auto_resolves_target(env):

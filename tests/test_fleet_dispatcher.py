@@ -7,7 +7,7 @@ from pathlib import Path
 
 from remrun.config import RemrunConfig
 from remrun.fleet import dispatcher
-from remrun.fleet.models import FleetTask
+from remrun.fleet.models import DeviceSnapshot, FleetTask
 from remrun.fleet.queue import FleetQueue
 from remrun.models import Device
 from remrun.output import Reporter
@@ -141,6 +141,43 @@ def test_drain_once_nonzero_with_item_metrics_is_partial_not_whole_batch(tmp_pat
     try:
         assert q.get(j1)["state"] == "done"
         assert q.get(j2)["state"] == "queued"
+    finally:
+        q.close()
+
+
+def test_drain_once_missing_model_item_evidence_is_final_not_retried(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    q = _queue(state)
+    job_ids = [
+        q.enqueue(FleetTask(task_type="ocr", force_device="LOCAL_SIM",
+                            inputs=[str(tmp_path / f"{name}.pdf")]))
+        for name in ("a", "b")
+    ]
+    assert q.claim_many(job_ids, "LOCAL_SIM", batch_id="B-EVIDENCE",
+                        lease_until="2099-01-01T00:00:00Z", pool="gpu",
+                        task_type="ocr", engine="ocr-test")
+    q.close()
+    monkeypatch.setattr(dispatcher, "_remote_output_mtimes", lambda *_a, **_k: {})
+    monkeypatch.setattr(dispatcher.executor, "run_batch", lambda *_a, **_k: {
+        "ok": False,
+        "exit_code": 0,
+        "no_retry": True,
+        "error": "worker succeeded without complete per-file completion evidence",
+        "item_results": [],
+    })
+
+    tasks = [FleetTask(task_type="ocr", force_device="LOCAL_SIM",
+                       inputs=[str(tmp_path / f"{name}.pdf")]) for name in ("a", "b")]
+    summary = dispatcher._run_claimed_batch(
+        _config_ocr(tmp_path), state,
+        {"device": "LOCAL_SIM", "batch_id": "B-EVIDENCE", "btasks": tasks,
+         "engine": "ocr-test", "job_ids": job_ids},
+        lease_seconds=300, reporter=Reporter(json_events=False),
+    )
+    assert summary["failed"] == 1
+    q = _queue(state)
+    try:
+        assert all(q.get(job_id)["state"] == "failed_final" for job_id in job_ids)
     finally:
         q.close()
 
@@ -420,6 +457,14 @@ def test_oom_failure_raises_memory_estimate_for_future_placement(tmp_path, monke
     monkeypatch.setattr("remrun.fleet.executor.run_batch",
                         lambda *a, **k: {"ok": False, "exit_code": 1, "error": "worker failed",
                                          "stderr_tail": "RuntimeError: CUDA out of memory"})
+    # This test exercises OOM learning after placement; host memory pressure on the
+    # test controller must not prevent the mocked worker from reaching that branch.
+    monkeypatch.setattr(dispatcher.probes, "build_snapshot", lambda dev, *_a, **_k:
+                        DeviceSnapshot(name=dev.name, reachable=True,
+                                       ram_free_mb=64_000.0, ram_total_mb=64_000.0,
+                                       vram_free_mb=16_000.0, vram_total_mb=16_000.0,
+                                       max_jobs=dev.max_jobs, pool_free={"gpu": 1},
+                                       engines_available=frozenset({"ocr-test"})))
     q = _queue(state)
     q.enqueue(FleetTask(task_type="ocr", force_device="LOCAL_SIM"))
     q.close()
@@ -726,7 +771,6 @@ def test_batch_heartbeat_keeps_lease_alive_vs_recover_stale(tmp_path):
 
 
 # --- host-RAM reclaim gate (_reclaim_marginal_devices) ------------------------------------------
-from remrun.fleet.models import DeviceSnapshot   # noqa: E402
 
 
 def _reclaim_dev(name="RCL", with_command=True):

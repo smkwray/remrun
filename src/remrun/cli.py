@@ -1296,6 +1296,7 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         attempted_run_ids.add(run_id)
         rdir = run_dir(run_id)
         summary_path = rdir / "summary.json"
+        started_at = utc_now_iso()
 
         reporter.event("run_id", run_id=run_id)
         reporter.event("project", project_id=plan.project.project_id,
@@ -1306,6 +1307,21 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                        paths=plan.write_scope_paths)
         if plan.workload is not None:
             reporter.event("workload", **plan.workload.as_dict())
+        # Create the receipt before any target mutation or other failure-prone phase.
+        # If the controller is killed, status still has a durable attempt row rather
+        # than silently implying that no run existed.
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "phase": "preflight",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": False,
+            "plan": plan.as_dict(),
+        })
 
         resource_policy: ResourcePolicy | None = None
         if plan.workload is not None:
@@ -1378,7 +1394,6 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             write_json(summary_path, {"run_id": run_id, "error": str(exc), "plan": plan.as_dict()})
             return EXIT_INTERNAL
 
-        started_at = utc_now_iso()
         t0 = time.monotonic()
         try:
             return _run_locked(args, reporter, plan, transport, remote_root, remote_cwd,
@@ -1393,6 +1408,22 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             reporter.event("candidate_skipped", name=plan.target.name,
                            reason="preflight_conflict", detail=exc.detail,
                            conflict_state=str(exc.conflict_dir))
+        except Exception as exc:
+            # Normal Python finalization failures must still terminate the durable
+            # receipt. BaseException deliberately escapes: an interrupted/killed
+            # controller retains the last checkpoint and any unknown-completion fence.
+            checkpoint = read_json(summary_path) or {"run_id": run_id}
+            checkpoint.update({
+                "error": f"{type(exc).__name__}: {exc}",
+                "terminal": True,
+                "ended_at": utc_now_iso(),
+            })
+            if checkpoint.get("completion_state") == "command_complete":
+                checkpoint["completion_state"] = "finalization_failed"
+            elif checkpoint.get("completion_state") != "unknown":
+                checkpoint["completion_state"] = "failed_before_completion"
+            write_json(summary_path, checkpoint)
+            raise
         finally:
             lock.release()
             if reservation is not None:
@@ -1539,6 +1570,28 @@ def _run_locked(
     telemetry_on = telemetry_default and not args.no_telemetry
     transport.ensure_remote_dir(remote_cwd)
     guarded_dispatch = getattr(transport, "memory_guard", None) is not None
+    # Fence before dispatch, not after a transport exception. A controller can be
+    # killed without Python regaining control; in that case the remote start/result
+    # is unknowable and an automatic retry is unsafe.
+    hazard = write_unknown_completion_hazard(
+        plan.project.project_id,
+        plan.target.name,
+        run_id,
+    )
+    guidance = _unknown_completion_guidance(hazard)
+    write_json(summary_path, {
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "command": plan.command,
+        "started_at": started_at,
+        "phase": "exec",
+        "completion_state": "unknown",
+        "command_started": None,
+        "terminal": False,
+        "guidance": guidance,
+        "plan": plan.as_dict(),
+    })
     reporter.event(
         "command_dispatch" if guarded_dispatch else "command_started",
         run_id=run_id,
@@ -1586,18 +1639,15 @@ def _run_locked(
             )
     except TransportError as exc:
         reporter.event("exec_error", message=str(exc))
-        hazard = write_unknown_completion_hazard(
-            plan.project.project_id,
-            plan.target.name,
-            run_id,
-        )
-        guidance = _unknown_completion_guidance(hazard)
         reporter.event("completion_unknown", guidance=guidance)
         unknown_summary = {
             "run_id": run_id,
             "error": str(exc),
             "phase": "exec",
             "completion_state": "unknown",
+            "command_started": None,
+            "terminal": True,
+            "ended_at": utc_now_iso(),
             "guidance": guidance,
             "plan": plan.as_dict(),
         }
@@ -1618,6 +1668,34 @@ def _run_locked(
         return EXIT_INFRA
     finally:
         live_log.close()
+
+    # The transport returned a conclusive exit status. Checkpoint that fact before
+    # removing the pre-dispatch fence; pullback/receipt/profile finalization can still
+    # fail, but it cannot make the command outcome unknown again.
+    command_exit_code_checkpoint = (
+        result.memory_guard.get("command_exit_code")
+        if isinstance(result.memory_guard, dict)
+        else result.exit_code
+    )
+    guarded_started = (
+        result.memory_guard.get("command_started")
+        if isinstance(result.memory_guard, dict)
+        else True
+    )
+    write_json(summary_path, {
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "command": plan.command,
+        "started_at": started_at,
+        "phase": "finalize" if args.no_pullback else "pullback",
+        "completion_state": "command_complete",
+        "command_started": guarded_started,
+        "command_exit_code": command_exit_code_checkpoint,
+        "terminal": False,
+        "plan": plan.as_dict(),
+    })
+    clear_unknown_completion_hazard(plan.project.project_id, run_id)
 
     for log_name, text in (("stdout.log", result.stdout), ("stderr.log", result.stderr)):
         try:
@@ -1885,6 +1963,8 @@ def _run_locked(
         "command_exit_code": command_exit_code,
         "started_at": started_at,
         "ended_at": utc_now_iso(),
+        "completion_state": "complete",
+        "terminal": True,
         "duration_sec": duration,
         "files_pushed": len(pre.pushed),
         "files_pulled_pre": len(pre.pulled),

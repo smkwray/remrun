@@ -157,6 +157,33 @@ reporting a false non-start. `--no-telemetry` disables optional metrics only; it
 never disables admission or enforcement. A device without `memory_guard` keeps
 its prior behavior.
 
+## Fleet views and task adapters
+
+Fleet resource tables use compact percentages by default:
+
+```toml
+[fleet.resources]
+usage_display = "percent"  # or "amounts" for used/total RAM, VRAM, and disk
+```
+
+The JSON form always retains exact amounts, percentages, measurement semantics,
+and status regardless of the table setting. Resource probing reads bounded operating-
+system capacity metadata; it does not enumerate files. macOS primary-disk usage treats
+space available for important usage as available, while other platforms report allocated
+usage from their primary-volume metadata.
+
+OCR, TTS, and arbitrary-command workers are device-specific configuration rather than
+built-in model dependencies. Start from `config/fleet_adapters.example.toml`. A folder
+submission becomes one logical job per eligible file so the dispatcher can place work
+across devices and still batch compatible items into one worker invocation. Multi-item
+OCR/TTS workers must return per-file results matching the staged manifest; unattributed
+success is finalized without automatic retry.
+
+`remrun fleet jobs` reads target-local observation registries across the fleet. Querying
+is always read-only. Launch-side registration remains off unless the controller explicitly
+sets `REMRUN_FLEET_JOBS_OBSERVE=1`; enable it only after the target's native lifecycle gate
+passes. This switch changes observation only, not queue placement or memory-guard policy.
+
 ## Machine-local overrides
 
 Future support should allow non-synced or ignored local overrides:

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from remrun.fleet import cli
+from remrun.output import Reporter
 
 
 def test_resolve_clipboard_folder(tmp_path):
@@ -65,6 +66,29 @@ def test_split_tasks_passes_through_single_and_text_and_cmd(tmp_path):
     assert cli._split_tasks(one) == [one]
     assert cli._split_tasks(txt) == [txt]
     assert cli._split_tasks(cmd) == [cmd]   # cmd is never fanned out
+
+
+def test_direct_folder_run_uses_one_manifest_item_per_file(tmp_path, monkeypatch):
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    for name in ("a.pdf", "b.png", "c.txt"):
+        (folder / name).write_text("x")
+    args = SimpleNamespace(
+        task_type="ocr", text=None, input=[str(folder)], clipboard=False,
+        device="MACBOX", engine=None, opt=[], output_root="~/sync/out",
+        argv=None, allow_fallback=False, no_lease=True, json=False,
+    )
+    seen = []
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+    monkeypatch.setattr(
+        cli.executor,
+        "run_group",
+        lambda tasks, *_a, **_k: seen.extend(tasks) or {"ok": True},
+    )
+
+    assert cli.cmd_run(args, Reporter(json_events=False)) == cli.EXIT_OK
+    assert [Path(task.inputs[0]).name for task in seen] == ["a.pdf", "b.png"]
+    assert all(len(task.inputs) == 1 for task in seen)
 
 
 def test_resolve_clipboard_empty():

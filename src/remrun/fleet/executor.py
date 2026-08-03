@@ -65,19 +65,41 @@ def run_once(task: FleetTask, config: RemrunConfig, *, state_root: Path | None =
     ``use_lease=False`` (direct run — LOCAL_SIM tests, and callers that manage
     their own concurrency).
     """
+    return run_group(
+        [task], config, placement_task=task, state_root=state_root,
+        cleanup=cleanup, use_lease=use_lease, lease_seconds=lease_seconds,
+    )
+
+
+def run_group(tasks: list[FleetTask], config: RemrunConfig, *,
+              placement_task: FleetTask | None = None, state_root: Path | None = None,
+              cleanup: bool = True, use_lease: bool = False,
+              lease_seconds: int = 300) -> dict[str, Any]:
+    """Place one compatible synchronous group and run it in one worker invocation.
+
+    ``fleet run`` uses this for folder OCR/TTS: placement sees the original aggregate
+    task, while execution receives one task per input so the manifest and completion
+    evidence remain per-file.  The group still holds one resource lease and pays one
+    model-load cost.
+    """
+    if not tasks:
+        return {"ok": False, "error": "empty task group"}
     state_root = state_root or default_state_root()
     adapters.configure(config)
     fcfg = fleet_config(config)
     profs = load_costs(config, state_root)   # shared measured costs + local EWMA refinements
-    classified = adapters.with_variant(task, fcfg)        # classify regime pre-placement
+    placement_task = placement_task or tasks[0]
+    classified = adapters.with_variant(placement_task, fcfg)  # classify regime pre-placement
     features = adapters.extract_features(classified)
     device_name, skipped = _choose_device(classified, features, config, fcfg, profs)
     if device_name is None:
         return {"ok": False, "error": "no eligible device", "skipped": skipped}
     if not use_lease:
-        return run_batch(device_name, [task], config, state_root=state_root, cleanup=cleanup)
-    return _run_one_leased(device_name, task, config, state_root=state_root,
-                           cleanup=cleanup, lease_seconds=lease_seconds)
+        return _ad_hoc_result(
+            run_batch(device_name, tasks, config, state_root=state_root, cleanup=cleanup)
+        )
+    return _run_group_leased(device_name, tasks, config, state_root=state_root,
+                             cleanup=cleanup, lease_seconds=lease_seconds)
 
 
 def _run_one_leased(device_name: str, task: FleetTask, config: RemrunConfig, *,
@@ -87,39 +109,60 @@ def _run_one_leased(device_name: str, task: FleetTask, config: RemrunConfig, *,
     Fails fast with ``lease_busy`` if the resource is already leased; an ad-hoc
     failure is finalized (max_attempts=1), never left as a durable queued retry.
     """
+    return _run_group_leased(
+        device_name, [task], config, state_root=state_root,
+        cleanup=cleanup, lease_seconds=lease_seconds,
+    )
+
+
+def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
+                      state_root: Path, cleanup: bool,
+                      lease_seconds: int) -> dict[str, Any]:
+    """Run one compatible ad-hoc group under one target resource lease."""
+    task = tasks[0]
     fcfg = fleet_config(config)
     classified = adapters.with_variant(task, fcfg)
     pool = adapters.pool_for(classified, device_name)
     if not pool:
-        return run_batch(device_name, [task], config, state_root=state_root, cleanup=cleanup)
+        return _ad_hoc_result(
+            run_batch(device_name, tasks, config, state_root=state_root, cleanup=cleanup)
+        )
     q = FleetQueue(state_root / "fleet" / "fleet.db")
     try:
         now = utc_now_iso()
         lease_until = iso_plus_seconds(now, lease_seconds)
         batch_id = uuid.uuid4().hex[:12]
-        adhoc = dataclasses.replace(task, idempotency_key="")   # never dedupe an ad-hoc run
-        job_id = q.enqueue(adhoc, job_id=f"adhoc-{uuid.uuid4().hex[:12]}", now=now)
-        if not q.claim_many([job_id], device_name, batch_id=batch_id, lease_until=lease_until,
+        job_ids = [
+            q.enqueue(dataclasses.replace(item, idempotency_key=""),
+                      job_id=f"adhoc-{uuid.uuid4().hex[:12]}", now=now)
+            for item in tasks
+        ]
+        if not q.claim_many(job_ids, device_name, batch_id=batch_id, lease_until=lease_until,
                             pool=pool, task_type=task.task_type,
                             engine=adapters.engine_for(classified, device_name),
                             bucket=adapters.option_bucket(classified), now=now):
-            q.set_state(job_id, "failed_final",
-                        error=f"{device_name} {pool} lease busy", now=utc_now_iso())
+            for job_id in job_ids:
+                q.set_state(job_id, "failed_final",
+                            error=f"{device_name} {pool} lease busy", now=utc_now_iso())
             return {"ok": False, "device": device_name, "lease_busy": True,
                     "error": f"{device_name} resource is busy (lease held); "
                              "use `fleet submit` to queue"}
         q.set_batch_state(batch_id, "running")
         try:
-            res = run_batch(device_name, [task], config, state_root=state_root,
-                            cleanup=cleanup, job_ids=[job_id], observation_id=batch_id)
+            res = run_batch(device_name, tasks, config, state_root=state_root,
+                            cleanup=cleanup, job_ids=job_ids, observation_id=batch_id)
         except BaseException as exc:  # noqa: BLE001 - never leave the lease held on an error
             q.fail_batch(batch_id, f"run raised: {type(exc).__name__}: {exc}", max_attempts=1)
             raise
-        if res.get("ok"):
+        if res.get("ok") and res.get("item_results"):
+            succeeded, failed = item_result_maps(res["item_results"])
+            q.complete_batch_items(batch_id, succeeded, failed, max_attempts=1)
+        elif res.get("ok"):
             q.complete_batch(batch_id)
         else:
-            q.fail_batch(batch_id, res.get("error") or f"exit {res.get('exit_code')}", max_attempts=1)
-        return res
+            q.fail_batch(batch_id, res.get("error") or f"exit {res.get('exit_code')}",
+                         max_attempts=1)
+        return _ad_hoc_result(res)
     finally:
         q.close()
 
@@ -137,7 +180,8 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
     ``remrun_batch.json`` in the stage root and points workers to it via ``REMRUN_BATCH_MANIFEST``;
     compatible workers may emit ``batch_metrics.json`` or ``done.json`` (same stage root, stage
     input dir, or output root) to report per-item results. Workers that emit nothing preserve the
-    legacy all-or-nothing behavior.
+    legacy all-or-nothing behavior for commands and single-item model runs; multi-item OCR/TTS
+    requires exact per-file evidence because an unattributed success cannot be retried safely.
     """
     state_root = state_root or default_state_root()
     fcfg = fleet_config(config)
@@ -149,6 +193,12 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
     tasks = [adapters.with_variant(t, fcfg) for t in tasks]
     head = tasks[0]                                       # the batch's compatibility key
     transport = make_transport(device)
+
+    configured_output_root = adapters.resolve_output_root(head, device_name)
+    output_error = _output_root_error(configured_output_root, device)
+    if output_error:
+        return {"ok": False, "device": device_name, "phase": "output_root",
+                "error": output_error}
 
     try:
         stage = transport.remote_temp_dir("fleet")
@@ -215,7 +265,7 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
     # Adapter output roots and worker paths may use ``~``. exec/ensure_remote_dir
     # shlex-quote their arguments, so the remote shell never tilde-expands them —
     # expand ``~`` here via the remote home.
-    output_root = transport.expand_remote(adapters.resolve_output_root(head, device_name) or stage)
+    output_root = transport.expand_remote(configured_output_root or stage)
     transport.ensure_remote_dir(output_root)
     manifest_path = transport.native_join(stage, BATCH_MANIFEST_NAME)
     metrics_path = transport.native_join(stage, BATCH_METRICS_NAME)
@@ -275,12 +325,19 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
     elapsed = round(time.monotonic() - t0, 3)
     batch_metrics = _read_worker_metrics(transport, stage, stage_in, output_root)
     item_results = _normalize_item_results(batch_metrics, job_ids or [])
+    evidence_error = (
+        _per_item_evidence_error(head, item_manifest, item_results)
+        if res.exit_code == 0 else None
+    )
+    completion_evidence = None
+    if len(tasks) > 1 and head.task_type in ("ocr", "tts"):
+        completion_evidence = "missing" if evidence_error else "complete"
 
     # Record observed memory into the profile (drives future fit checks) — ONLY on a
     # SUCCESSFUL run (a failed worker often dies before loading the model, so its tiny
     # peak RSS/VRAM would corrupt the EWMA and make the memory-fit gate under-count).
     tel = res.telemetry or {}
-    if res.exit_code == 0:
+    if res.exit_code == 0 and not evidence_error:
         try:
             # Total units the worker actually processed this batch (pages for OCR, kchar for TTS)
             # so the profile can regress fixed-load vs per-unit time from `elapsed` (= worker wall
@@ -300,14 +357,100 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
     if cleanup:
         _safe_delete(transport, stage)
 
-    return {
-        "ok": res.exit_code == 0, "device": device_name,
+    worker_ok = res.exit_code == 0
+    result = {
+        "ok": worker_ok and not evidence_error, "device": device_name,
         "engine": adapters.engine_for(head, device_name),
         "exit_code": res.exit_code, "elapsed_s": elapsed, "staged": staged, "jobs": len(tasks),
         "output_root": output_root, "telemetry": res.telemetry,
         "batch_metrics": batch_metrics, "item_results": item_results,
         "stdout_tail": (res.stdout or "")[-500:], "stderr_tail": (res.stderr or "")[-500:],
     }
+    if completion_evidence is not None:
+        result["completion_evidence"] = completion_evidence
+    if evidence_error:
+        result["error"] = evidence_error
+        # User code exited successfully, but its per-file attribution is insufficient.
+        # Retrying could duplicate outputs, so callers must finalize this attempt.
+        result["no_retry"] = True
+    return result
+
+
+def _ad_hoc_result(result: dict[str, Any]) -> dict[str, Any]:
+    """For synchronous runs, any explicit per-item failure fails the command."""
+    item_results = result.get("item_results") or []
+    if result.get("ok") and any(not item.get("ok") for item in item_results):
+        result = dict(result)
+        result["ok"] = False
+        result["error"] = "one or more batch items failed"
+    return result
+
+
+def item_result_maps(item_results: list[dict[str, Any]]) -> tuple[dict[str, str | None],
+                                                                  dict[str, str]]:
+    """Convert normalized worker items into queue completion maps."""
+    succeeded: dict[str, str | None] = {}
+    failed: dict[str, str] = {}
+    for item in item_results:
+        jid = item.get("job_id")
+        if not jid:
+            continue
+        if item.get("ok"):
+            succeeded[jid] = json.dumps(item, sort_keys=True)
+        else:
+            failed[jid] = item.get("error") or "worker reported item failure"
+    return succeeded, failed
+
+
+def _output_root_error(output_root: str | None, device) -> str | None:  # noqa: ANN001
+    """Reject a controller-expanded absolute path that cannot name a target path."""
+    if not output_root or output_root.startswith("~"):
+        return None
+    windows_absolute = bool(re.match(r"^[A-Za-z]:[\\/]", output_root)) \
+        or output_root.startswith("\\\\")
+    posix_absolute = output_root.startswith("/")
+    if device.is_windows and posix_absolute:
+        return (f"output root {output_root!r} is a POSIX path but {device.name} is a "
+                "Windows target; use a target-native path")
+    if not device.is_windows and windows_absolute:
+        return (f"output root {output_root!r} is a Windows path but {device.name} is a "
+                "POSIX target; pass a target-native path (quote '~' on the controller)")
+    return None
+
+
+def _per_item_evidence_error(head: FleetTask, manifest: list[dict[str, Any]],
+                             results: list[dict[str, Any]]) -> str | None:
+    """Require exact staged-file attribution for multi-item OCR/TTS success."""
+    if len(manifest) <= 1 or head.task_type not in ("ocr", "tts"):
+        return None
+    by_job = {row.get("job_id"): row for row in results if row.get("job_id")}
+    by_index = {row.get("index"): row for row in results
+                if isinstance(row.get("index"), int)}
+    if len(results) != len(manifest):
+        return (f"worker succeeded without complete per-file completion evidence "
+                f"({len(results)}/{len(manifest)} items); outputs were not retried")
+    for expected in manifest:
+        row = by_job.get(expected.get("job_id")) if expected.get("job_id") else None
+        row = row or by_index.get(expected["index"])
+        if row is None:
+            return ("worker succeeded without complete per-file completion evidence; "
+                    f"manifest item {expected['index']} is missing")
+        if not row.get("ok"):
+            continue
+        expected_stem = expected.get("reserved_output_stem")
+        outputs = row.get("outputs")
+        if not expected_stem or not isinstance(outputs, list) or not any(
+            _portable_stem(value) == expected_stem for value in outputs
+        ):
+            return ("worker per-file completion evidence does not match staged item "
+                    f"{expected['index']} ({expected_stem or 'unknown stem'})")
+    return None
+
+
+def _portable_stem(value: object) -> str:
+    """Filename stem for target paths, independent of controller path syntax."""
+    name = re.split(r"[\\/]", str(value))[-1]
+    return name.rsplit(".", 1)[0]
 
 
 def _text_slug(text: str, maxlen: int = 30) -> str:

@@ -6,14 +6,18 @@ files to the remote, runs the command in the equivalent remote directory, and
 pulls changed outputs back to the same local paths. Syncthing is a convenience,
 not a correctness dependency.
 
-> **New here? Start with this file.** This is a working tool, not a seed.
+> **New here?** Start with [How to run it](#how-to-run-it), then copy and edit
+> `config/devices.example.toml` for your machines.
 
 ## Status
 
 The core runner is implemented and tested on POSIX/macOS and Windows SSH targets:
 safe project reconciliation and pullback, conflict preservation, target scheduling,
 resource telemetry, external-tree `sync`, commit-only `git-sync`, allowlisted target
-actions, and optional fleet dispatch. The Windows `ssh-powershell` command surface
+actions, and optional fleet dispatch with live resource, job, and SSH-mesh views.
+POSIX targets can opt into a RAM-relative hard memory guard that admits work before
+project mutation and terminates only the protected command tree if its configured
+limit or host reserve is breached. The Windows `ssh-powershell` command surface
 requires `pwsh` 7.3+ and supports native executables, cmdlets, aliases, and `.ps1`
 scripts. Top-level `.cmd`/`.bat` commands, including bare names resolved through
 `PATH`/`PATHEXT`, are rejected because the current PowerShell-to-`cmd.exe` path is
@@ -21,8 +25,8 @@ proved to corrupt some argv. This restriction means Windows is not full
 arbitrary-command parity with POSIX.
 
 The default coordination mode remains `legacy`: one controller may write a project at
-a time. Versioned-runner, lease/fencing, and snapshot components are experimental,
-disabled groundwork and are not a supported multi-controller execution path. A network
+a time. Versioned-runner, lease/fencing, and snapshot components are experimental and
+disabled; they are not a supported multi-controller execution path. A network
 disconnect after a remote command starts can leave completion unknown; remrun reports
 that state and requires a read-only process or artifact check before retrying.
 
@@ -68,19 +72,54 @@ remrun git-sync --install-hook      # post-commit best-effort push to [git_sync]
 remrun git-sync --uninstall-hook    # remove remrun's hook and restore any prior hook
 remrun runner install macbox        # install + probe the inert versioned helper
 remrun runner probe macbox          # verify the exact pinned helper and SQLite store
-remrun fleet jobs [--device NAME]  # read-only active-job view across configured targets
+remrun resolve-unknown <run_id> --confirmed-ended  # clear a verified completion fence
 ```
 
-`fleet jobs` querying is read-only. Launch-side registration is a separate, real
+### Fleet utilities
+
+Fleet mode is project-less: it stages explicit inputs, runs configured OCR, TTS, or
+arbitrary-command adapters, and keeps its queue and telemetry outside project trees.
+Model workers are loaded for a job or compatible burst and then unloaded; remrun does
+not require a resident model service.
+
+```bash
+remrun fleet resources                         # CPU, load/queue, RAM, GPU/VRAM, disk
+remrun fleet jobs [--device NAME]              # active jobs across all controllers
+remrun fleet mesh [--no-hops]                  # measured SSH reachability matrix
+remrun fleet plan ocr --input scans/           # placement preview; runs nothing
+remrun fleet run ocr --input scans/            # synchronous placement + execution
+remrun fleet submit tts --input chapters/       # durable per-file queue submission
+remrun fleet dispatch --drain                   # batch compatible jobs, then exit
+remrun fleet status                             # queue state and recent jobs
+remrun fleet clear                              # release queue leases/cooldowns
+remrun fleet cancel                             # clear queue and stop configured workers
+```
+
+`fleet resources`, `fleet jobs`, and `fleet mesh` are read-only. Resource probes read
+bounded operating-system metadata rather than scanning files. Interactive resource
+tables add rows as devices answer; JSON and redirected output remain deterministic.
+RAM, VRAM, and primary-disk usage default to compact percentages; set
+`[fleet.resources] usage_display = "amounts"` for used/total values. On macOS, disk
+usage uses the system's important-usage capacity so automatically reclaimable space is
+treated as available. On Windows, `LOAD` is ready waiters per core (`q`); on POSIX it is
+one-minute runnable demand per core (`x`), so the two are related congestion signals but
+not numerically identical.
+
+Folder OCR/TTS requests retain one worker invocation per compatible device batch while
+recording one manifest and result item per input file. A successful worker that omits or
+mismatches per-file evidence is reported as incomplete and is not retried automatically,
+avoiding duplicate outputs.
+
+`fleet jobs` launch-side registration is a separate, real
 activation seam and is **off by default**: ordinary `run` and fleet dispatcher commands
 continue through the established `exec()` path unless the controller process explicitly
 sets `REMRUN_FLEET_JOBS_OBSERVE=1`. Enable it only after the target's bounded native
 Windows/macOS gates pass. Direct callers of the explicit `exec_observed()` transport API
 are opting into that launch boundary themselves.
 
-### Agent gotchas (learned in production — read before your first `run`)
+### Common operational pitfalls
 
-Nine things bite first-time callers; all have one-line fixes:
+The most common failure modes and their fixes:
 
 1. **Windows controller: invoke from PowerShell or cmd, not Git Bash.** Git Bash
    mangles quoted argv after `--` (a `-c "a; b"` payload gets split on spaces).
@@ -108,11 +147,10 @@ Nine things bite first-time callers; all have one-line fixes:
    enough: first inspect the named remote process and expected artifacts to prove
    the remote work ended. Only after both checks may the stale lock be moved aside
    or removed and the command retried.
-5. **A yielded command-runner session is still a live remrun process.** A command
-   runner may return a session ID after its output wait expires (often 30 s);
-   that is not the command's exit. Keep polling that same session until it reports a
-   terminal exit before starting another run for the project. A lock whose recorded PID
-   is still alive is correct and must not be deleted.
+5. **An automation timeout does not prove remrun exited.** A supervising tool may stop
+   waiting while the local remrun process and remote command continue. Confirm the local
+   process reached a terminal exit before starting another run for the project. A lock
+   whose recorded PID is still alive is correct and must not be deleted.
 6. **An SSH reset after `command_started` means completion is unknown.** The remote
    command may still be running even though the controller exits `4`. Do not immediately
    retry a mutating command. Read the persisted `completion_state=unknown` guidance and
@@ -238,17 +276,11 @@ endings, and a background file sync can make the Mac checkout look like it has t
 local edits. `git-sync` will correctly refuse to advance a tracked-dirty checkout in
 that case.
 
-`runner install` is rollout groundwork for crash-safe multi-controller coordination. It
-installs a content-addressed self-contained helper through an RRFRAME2 payload, verifies
-the installed source hash, initializes the runner's local SQLite participant store, and
-checks protocol/filesystem/`sqlite3` prerequisites. It does **not** change `run` behavior;
-`[coordination] mode = "legacy"` remains the default until the later authority, execution,
-and transactional-reconcile production gates pass.
-
-The shadow authority store is disposable only as a whole coordination identity. If it is
-reset, initialize a **new `cluster_id`** and re-enroll targets. Recreating epoch 1 under an
-existing cluster is intentionally rejected by participants when its key differs; do not
-delete participant enrollment state to make an old cluster identity reusable.
+`runner install` installs and verifies the optional versioned helper used to evaluate
+crash-safe multi-controller coordination. It initializes a target-local participant store
+and checks protocol, filesystem, and SQLite prerequisites. It does **not** change ordinary
+`run` behavior; `[coordination] mode = "legacy"` remains the supported default. Most users
+do not need to install the helper.
 
 Target forms for `run`/`plan`: an explicit device (`macbox`, `winbox`, `LOCAL_SIM`),
 `--auto`, the literal `auto`, or omit it (defaults to auto). Run flags:
@@ -297,12 +329,12 @@ windows = 'C:\work'
 default = "~/work"
 ```
 
-The versioned-runner rollout is explicitly gated:
+The experimental versioned runner is explicitly disabled by default:
 
 ```toml
 [coordination]
-mode = "legacy"       # runner-v1 is not enabled by Step 3
-device = "macbox"     # future pinned coordination runner
+mode = "legacy"       # ordinary single-writer coordination
+device = "macbox"     # optional experimental coordination target
 protocol = 1
 ```
 
@@ -378,7 +410,7 @@ with `--no-telemetry` or `[telemetry] enabled = false`. On a device with a
 configured `memory_guard`, those controls suppress optional metrics only; the hard
 preflight, command ceiling, host reserve, and fail-safe cleanup remain active.
 
-## Operational gotchas (learned the hard way)
+## Additional portability notes
 
 - **SSH aliases:** put the authenticated alias or IP first in `address_candidates`.
   The backend tries candidates in order and lands on a working one.
