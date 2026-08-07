@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +13,8 @@ from remrun.gitsync import (
     EXIT_DIVERGED,
     EXIT_INFRA,
     EXIT_OK,
+    GitSyncError,
+    _ensure_remote_git_repo,
     _parse_dirty_summary,
     git_sync_status_result,
     install_git_sync_hook,
@@ -22,7 +25,7 @@ from remrun.gitsync import (
 )
 from remrun.models import Device
 from remrun.output import Reporter
-from remrun.transport import LocalSimTransport
+from remrun.transport import ExecResult, LocalSimTransport
 
 
 def posix(p: Path) -> str:
@@ -586,3 +589,180 @@ def test_uninstall_hook_removes_managed_hook_without_backup(repos):
     assert uninstall_git_sync_hook(cfg, reporter=Reporter()) == EXIT_OK
 
     assert not (local / ".git" / "hooks" / "post-commit").exists()
+
+
+@pytest.mark.parametrize("local_os_key", ["macos", "windows"])
+def test_repoless_broader_roots_preserve_leaf_for_status_and_pull(
+    tmp_path, monkeypatch, local_os_key
+):
+    local_sync_root = tmp_path / "local"
+    local_run_root = local_sync_root / "proj"
+    local = local_run_root / "hearken"
+    remote_sync_root = tmp_path / "remote"
+    remote_run_root = remote_sync_root / "proj"
+    remote = remote_run_root / "hearken"
+    local.mkdir(parents=True)
+    remote.mkdir(parents=True)
+    monkeypatch.setenv("REMRUN_STATE_ROOT", str(tmp_path / "state"))
+    monkeypatch.setattr("remrun.project.current_os_key", lambda: local_os_key)
+
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=str(remote), check=True,
+        capture_output=True, text=True,
+    )
+    git(remote, "config", "user.email", "remrun-test@example.invalid")
+    git(remote, "config", "user.name", "remrun Test")
+    peer_head = commit(remote, "base.txt", "peer bytes")
+
+    (local / "base.txt").write_text("local edited bytes", encoding="utf-8")
+    (local / "scratch.txt").write_text("local-only", encoding="utf-8")
+    before = {
+        path.relative_to(local).as_posix(): path.read_bytes()
+        for path in local.rglob("*") if path.is_file()
+    }
+
+    remote_os = "peer-test"
+    device = Device.from_mapping("LOCAL_SIM", {
+        "kind": "local-sim",
+        "os": remote_os,
+        "project_root": posix(remote_run_root),
+        "cache_root": posix(tmp_path / "cache"),
+    })
+    cfg = RemrunConfig(
+        repo_root=tmp_path / "tool",
+        defaults={},
+        devices={"LOCAL_SIM": device},
+        project_roots={
+            local_os_key: posix(local_run_root),
+            "default": posix(local_run_root),
+        },
+        git_sync={
+            "project_roots": {
+                local_os_key: posix(local_sync_root),
+                remote_os: posix(remote_sync_root),
+                "default": posix(local_sync_root),
+            },
+        },
+    )
+    monkeypatch.chdir(local)
+
+    status = git_sync_status_result(cfg, device_name="LOCAL_SIM", reporter=Reporter())
+
+    assert status.local_project == str(local)
+    assert Path(status.remote_project) == remote
+    assert status.local_history_present is False
+    assert not (local / ".git").exists()
+    assert {
+        path.relative_to(local).as_posix(): path.read_bytes()
+        for path in local.rglob("*") if path.is_file()
+    } == before
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="pull", reporter=Reporter()
+    )
+
+    assert result.local_project == str(local)
+    assert Path(result.remote_project) == remote
+    assert result.bootstrap is not None
+    assert result.bootstrap.head == peer_head
+    after = {
+        path.relative_to(local).as_posix(): path.read_bytes()
+        for path in local.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    }
+    assert after == before
+
+
+class _RemoteRepoProbeTransport:
+    def __init__(self, *, old_result: ExecResult, new_result: ExecResult) -> None:
+        self.old_result = old_result
+        self.new_result = new_result
+        self.calls: list[tuple[list[str], str]] = []
+
+    def exec(self, command, cwd, **_kwargs):
+        self.calls.append((list(command), cwd))
+        if command == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return self.old_result
+        return self.new_result
+
+
+def test_remote_repo_probe_rejects_real_mapped_child_of_parent_repo(tmp_path):
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=str(parent), check=True,
+        capture_output=True, text=True,
+    )
+    device = Device.from_mapping("LOCAL_SIM", {
+        "kind": "local-sim",
+        "os": "posix",
+        "project_root": posix(tmp_path),
+        "cache_root": posix(tmp_path / "cache"),
+    })
+
+    with pytest.raises(GitSyncError, match="inside a parent repository"):
+        _ensure_remote_git_repo(LocalSimTransport(device), str(child))
+
+
+def test_remote_repo_probe_accepts_login_shell_chatter_before_git_output():
+    remote_root = "/srv/projects/example"
+    transport = _RemoteRepoProbeTransport(
+        old_result=ExecResult(0, "profile banner\ntrue\n", ""),
+        new_result=ExecResult(
+            0,
+            "profile banner\n\n/srv/projects/example\n",
+            "",
+        ),
+    )
+
+    _ensure_remote_git_repo(transport, remote_root)
+
+    assert transport.calls == [(
+        ["git", "rev-parse", "--show-prefix", "--show-toplevel"],
+        remote_root,
+    )]
+
+
+@pytest.mark.parametrize(
+    ("result", "reason"),
+    [
+        (ExecResult(127, "", "git: command not found\n"), "git command failed"),
+        (ExecResult(0, "profile output only\n", ""), "git returned unexpected output"),
+    ],
+)
+def test_remote_repo_probe_diagnostics_classify_execution_and_output_failures(
+    result, reason
+):
+    remote_root = "/srv/projects/example"
+    transport = _RemoteRepoProbeTransport(old_result=result, new_result=result)
+
+    with pytest.raises(GitSyncError) as exc_info:
+        _ensure_remote_git_repo(transport, remote_root)
+
+    message = str(exc_info.value)
+    assert f"reason={reason}" in message
+    assert f"stdout_raw={json.dumps(result.stdout)}" in message
+    assert f"stderr_raw={json.dumps(result.stderr)}" in message
+
+
+def test_remote_repo_probe_rejects_parent_repo_and_retains_raw_diagnostics():
+    remote_root = "/srv/projects/example"
+    argv = ["git", "rev-parse", "--show-prefix", "--show-toplevel"]
+    stdout = "example/\n/srv/projects\n"
+    stderr = "remote warning\n"
+    transport = _RemoteRepoProbeTransport(
+        old_result=ExecResult(0, "true\n", ""),
+        new_result=ExecResult(0, stdout, stderr),
+    )
+
+    with pytest.raises(GitSyncError) as exc_info:
+        _ensure_remote_git_repo(transport, remote_root)
+
+    message = str(exc_info.value)
+    assert "mapped cwd is inside a parent repository" in message
+    assert f"cwd={json.dumps(remote_root)}" in message
+    assert f"argv={json.dumps(argv)}" in message
+    assert "exit_code=0" in message
+    assert f"stdout_raw={json.dumps(stdout)}" in message
+    assert f"stderr_raw={json.dumps(stderr)}" in message

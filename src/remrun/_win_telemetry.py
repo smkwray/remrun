@@ -332,8 +332,8 @@ def _startupinfo() -> tuple[STARTUPINFOW, bool]:
 
 def _command_for_createprocess(argv: list[str]) -> tuple[str | None, str]:
     # The transport passes an encoded PowerShell application argv so PowerShell,
-    # not this helper, remains the sole interpreter of cmdlets, scripts, and
-    # batch files.  Never improvise a cmd.exe layer here: list2cmdline implements
+    # not this helper, remains the sole interpreter of the supported native/.ps1
+    # command boundary. Never improvise a cmd.exe layer here: list2cmdline implements
     # the C-runtime grammar, not cmd.exe's metacharacter/percent-expansion rules.
     exe = shutil.which(argv[0])
     first = exe or argv[0]

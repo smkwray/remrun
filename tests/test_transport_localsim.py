@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 
 import pytest
@@ -107,6 +108,171 @@ def test_push_is_atomic_no_partial_on_failure(tmp_path: Path):
         pass
     assert dest.read_text() == "OLD GOOD CONTENT"                 # untouched
     assert not list(dest.parent.glob(".remrun-tmp-*"))            # no leaked temp
+
+
+def test_atomic_write_retries_bounded_windows_replace_lock(tmp_path: Path, monkeypatch):
+    import remrun.transport as transport_mod
+
+    dest = tmp_path / "out" / "result.exe"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"old")
+    real_replace = transport_mod.os.replace
+    calls = 0
+    sleeps: list[float] = []
+
+    def flaky_replace(src, target):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise PermissionError(13, "sharing violation")
+        return real_replace(src, target)
+
+    monkeypatch.setattr(transport_mod.os, "replace", flaky_replace)
+    monkeypatch.setattr(
+        transport_mod,
+        "_is_retryable_windows_replace_error",
+        lambda _exc: True,
+        raising=False,
+    )
+    monkeypatch.setattr(transport_mod.time, "sleep", sleeps.append)
+
+    transport_mod._atomic_write_local(dest, lambda tmp: tmp.write_bytes(b"new"))
+
+    assert dest.read_bytes() == b"new"
+    assert calls == 3
+    assert sleeps == list(transport_mod._LOCAL_REPLACE_RETRY_DELAYS[:2])
+    assert not list(dest.parent.glob(".remrun-tmp-*"))
+
+
+def test_atomic_write_retries_locked_temp_during_fsync(tmp_path: Path, monkeypatch):
+    import remrun.transport as transport_mod
+
+    dest = tmp_path / "out" / "result.exe"
+    real_open = Path.open
+    attempts = 0
+    sleeps: list[float] = []
+
+    def flaky_open(self, mode="r", *args, **kwargs):
+        nonlocal attempts
+        if self.name.startswith(".remrun-tmp-") and mode == "r+b":
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError(13, "scanner locked temp")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+    monkeypatch.setattr(
+        transport_mod,
+        "_is_retryable_windows_replace_error",
+        lambda _exc: True,
+    )
+    monkeypatch.setattr(transport_mod.time, "sleep", sleeps.append)
+
+    transport_mod._atomic_write_local(dest, lambda tmp: tmp.write_bytes(b"new"))
+
+    assert dest.read_bytes() == b"new"
+    assert attempts == 3
+    assert sleeps == list(transport_mod._LOCAL_REPLACE_RETRY_DELAYS[:2])
+    assert not list(dest.parent.glob(".remrun-tmp-*"))
+
+
+def test_atomic_write_exhausts_lock_retries_without_replacing_prior_bytes(
+    tmp_path: Path, monkeypatch
+):
+    import remrun.transport as transport_mod
+
+    dest = tmp_path / "out" / "result.exe"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"old complete result")
+    calls = 0
+
+    def locked_replace(_src, _target):
+        nonlocal calls
+        calls += 1
+        raise PermissionError(13, "sharing violation")
+
+    monkeypatch.setattr(transport_mod.os, "replace", locked_replace)
+    monkeypatch.setattr(
+        transport_mod,
+        "_is_retryable_windows_replace_error",
+        lambda _exc: True,
+        raising=False,
+    )
+    monkeypatch.setattr(transport_mod.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(PermissionError, match="sharing violation"):
+        transport_mod._atomic_write_local(dest, lambda tmp: tmp.write_bytes(b"new"))
+
+    assert calls == len(transport_mod._LOCAL_REPLACE_RETRY_DELAYS) + 1
+    assert dest.read_bytes() == b"old complete result"
+    assert not list(dest.parent.glob(".remrun-tmp-*"))
+
+
+def test_atomic_write_cleanup_lock_does_not_mask_install_failure(
+    tmp_path: Path, monkeypatch
+):
+    import remrun.transport as transport_mod
+
+    dest = tmp_path / "out" / "result.exe"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"old complete result")
+    real_unlink = Path.unlink
+    cleanup_attempts = 0
+
+    def fail_replace(_src, _target):
+        raise PermissionError(13, "install lock")
+
+    def locked_cleanup(self: Path, *args, **kwargs):
+        nonlocal cleanup_attempts
+        if self.name.startswith(".remrun-tmp-"):
+            cleanup_attempts += 1
+            if cleanup_attempts < 3:
+                raise PermissionError(13, "cleanup lock")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(transport_mod.os, "replace", fail_replace)
+    monkeypatch.setattr(
+        transport_mod,
+        "_is_retryable_windows_replace_error",
+        lambda exc: "cleanup lock" in str(exc),
+        raising=False,
+    )
+    monkeypatch.setattr(transport_mod.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(Path, "unlink", locked_cleanup)
+
+    with pytest.raises(PermissionError, match="install lock"):
+        transport_mod._atomic_write_local(dest, lambda tmp: tmp.write_bytes(b"new"))
+
+    assert cleanup_attempts == 3
+    assert dest.read_bytes() == b"old complete result"
+    assert not list(dest.parent.glob(".remrun-tmp-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode ordering")
+def test_atomic_write_applies_read_only_mode_after_writable_fsync(
+    tmp_path: Path, monkeypatch
+):
+    import remrun.transport as transport_mod
+
+    dest = tmp_path / "out" / "read-only-tool"
+    real_open = Path.open
+    saw_finalization_open = False
+
+    def assert_writable_before_fsync(self: Path, mode="r", *args, **kwargs):
+        nonlocal saw_finalization_open
+        if self.name.startswith(".remrun-tmp-") and mode == "r+b":
+            saw_finalization_open = True
+            assert self.stat().st_mode & 0o200
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", assert_writable_before_fsync)
+    transport_mod._atomic_write_local(
+        dest, lambda tmp: tmp.write_bytes(b"tool"), mode=0o444
+    )
+
+    assert saw_finalization_open is True
+    assert dest.read_bytes() == b"tool"
+    assert dest.stat().st_mode & 0o777 == 0o444
 
 
 def test_localsim_push_pull_preserves_content_and_mtime(tmp_path: Path):

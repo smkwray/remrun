@@ -1076,8 +1076,34 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 stale_reaped=stale_reaped,
             )
         predicted = request.get("predicted_rss_bytes")
-        if predicted is None:
+        explicit_limit = request.get("explicit_limit_bytes")
+        if predicted is not None and explicit_limit is not None:
+            raise ValueError(
+                "predicted_rss_bytes and explicit_limit_bytes are mutually exclusive"
+            )
+        if explicit_limit is not None:
+            if isinstance(explicit_limit, bool) or not isinstance(explicit_limit, int):
+                raise ValueError("explicit_limit_bytes must be an integer or null")
+            if explicit_limit <= 0 or explicit_limit % MIB != 0:
+                raise ValueError("explicit_limit_bytes must be a positive whole MiB")
+            allowance = explicit_limit
+            allowance_basis = "explicit_command_limit"
+            predicted_value = None
+            explicit_limit_value = explicit_limit
+            if allowance > int(policy["max_command_bytes"]):
+                return _admission_result(
+                    "refused",
+                    "explicit_limit_exceeds_command_limit",
+                    "explicit memory limit exceeds the target per-command ceiling",
+                    policy=policy,
+                    active_leases=len(leases),
+                    stale_reaped=stale_reaped,
+                )
+        elif predicted is None:
             allowance = int(policy["max_command_bytes"])
+            allowance_basis = "unprofiled_command_ceiling"
+            predicted_value = None
+            explicit_limit_value = None
         else:
             if isinstance(predicted, bool) or not isinstance(predicted, (int, float)):
                 raise ValueError("predicted_rss_bytes must be numeric or null")
@@ -1085,6 +1111,8 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
             if not math.isfinite(predicted_value) or predicted_value <= 0:
                 raise ValueError("predicted_rss_bytes must be positive")
             allowance = _ceil_mib(predicted_value * PREDICTION_HEADROOM_FACTOR)
+            allowance_basis = "learned_profile_plus_25_percent"
+            explicit_limit_value = None
             if allowance > int(policy["max_command_bytes"]):
                 return _admission_result(
                     "refused",
@@ -1128,6 +1156,15 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
         transaction_total, capacity = _capacity_transaction(
             candidate_leases, reserve_bytes=int(policy["min_available_bytes"])
         )
+        capacity.update(
+            {
+                "allowance_basis": allowance_basis,
+                "allowance_bytes": allowance,
+                "control_overhead_bytes": control_overhead,
+                "predicted_rss_bytes": predicted_value,
+                "explicit_limit_bytes": explicit_limit_value,
+            }
+        )
         if transaction_total != host_total:
             raise RuntimeError("physical-memory total changed while deriving admission policy")
         if not capacity["safe"]:
@@ -1143,7 +1180,13 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
             return _admission_result(
                 "refused",
                 "insufficient_live_memory",
-                "live memory cannot preserve the host reserve and every active capacity commitment",
+                (
+                    "unprofiled allowance cannot preserve host reserve"
+                    if predicted is None and explicit_limit is None
+                    else "explicit command limit cannot preserve host reserve"
+                    if explicit_limit is not None
+                    else "learned allowance cannot preserve host reserve"
+                ),
                 policy=policy,
                 capacity=capacity,
                 active_leases=len(leases),
@@ -1156,7 +1199,13 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
         return _admission_result(
             "admitted",
             "reserved",
-            "target capacity reserved before project mutation",
+            (
+                "unprofiled maximum allowance reserved before mutation"
+                if predicted is None and explicit_limit is None
+                else "explicit command limit reserved before mutation"
+                if explicit_limit is not None
+                else "learned allowance reserved before mutation"
+            ),
             policy=policy,
             capacity=capacity,
             lease=lease,

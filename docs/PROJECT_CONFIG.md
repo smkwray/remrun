@@ -58,6 +58,21 @@ Select the declaration explicitly with:
 remrun run --workload example.analysis --auto -- python analysis.py
 ```
 
+## Git-sync memory boundary on guarded targets
+
+```toml
+[git_sync]
+# Example syntax only: choose the limit for the target and repository.
+remote_memory_limit_mib = 2048
+```
+
+The project value overrides the global `[git_sync]` value; the CLI
+`--remote-memory-limit-mib` overrides both. It is a hard process-tree cap applied to each
+remote Git command in status, pull, push, and bootstrap, not a measured RSS profile.
+Without a value, guarded targets still permit the fixed repository probe and `--dry-run`
+under a built-in cap, but refuse before repository-scaling work or local bootstrap
+metadata is created. Unguarded targets do not require the setting.
+
 With neither `--workload` nor `default_workload`, resource adaptation is inert:
 there is no extra probe, environment variable, context file, or receipt. When a
 workload is selected, remrun probes only the chosen target, writes

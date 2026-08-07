@@ -20,12 +20,23 @@ resource telemetry, external-tree `sync`, commit-only `git-sync`, allowlisted ta
 actions, and optional fleet dispatch with live resource, job, and SSH-mesh views.
 POSIX targets can opt into a RAM-relative hard memory guard that admits work before
 project mutation and terminates only the protected command tree if its configured
-limit or host reserve is breached. The Windows `ssh-powershell` command surface
-requires `pwsh` 7.3+ and supports native executables, cmdlets, aliases, and `.ps1`
-scripts. Top-level `.cmd`/`.bat` commands, including bare names resolved through
-`PATH`/`PATHEXT`, are rejected because the current PowerShell-to-`cmd.exe` path is
-proved to corrupt some argv. This restriction means Windows is not full
-arbitrary-command parity with POSIX.
+limit or host reserve is breached. An unknown command receives the configured maximum
+allowance; that is a conservative capacity commitment, not an estimated requirement.
+Learned commands use their observed process-tree RSS high-water mark plus guard
+headroom. The guard cannot govern GPU or unified-memory allocations that the operating
+system does not attribute to process-tree RSS; do not use it as containment for those
+workloads. The Windows `ssh-powershell` command surface requires `pwsh` 7.3+ and supports
+native applications plus `.ps1` entry points with every following token preserved as
+positional data. Direct PowerShell cmdlets, functions, filters, configurations, and
+aliases are rejected before user code: already-resolvable commands fail during
+preflight and the target process rechecks after reconciliation. Remrun's exact
+`list[str]` command API has no typed distinction between a named parameter, a switch,
+and positional data. Put named-parameter syntax inside an explicit `.ps1` wrapper, or
+intentionally invoke `pwsh -NoProfile -Command <source>` as a native application.
+Top-level `.cmd`/`.bat` commands, including bare names resolved through
+`PATH`/`PATHEXT`, remain rejected
+because the PowerShell-to-`cmd.exe` path is proved to corrupt some argv. Windows is
+therefore a narrower command surface than POSIX.
 
 The default coordination mode remains `legacy`: one controller may write a project at
 a time. Versioned-runner, lease/fencing, and snapshot components are experimental and
@@ -60,6 +71,7 @@ remrun --version                     # show the installed/source version
 remrun devices                      # list configured devices
 remrun doctor                       # show config root, devices, project roots, state root
 remrun plan macbox -- <cmd>         # show what a run would do; mutates nothing
+remrun plan --auto --probe -- <cmd> # live-probe and show the same ranked target run would try
 remrun run macbox -- <cmd>          # reconcile -> run remotely -> pull outputs back
 remrun run --auto -- <cmd>          # probe/rank targets; conflict-safe failover
 remrun run --durable --auto -- <cmd>  # auto-select once, then survive source disconnect
@@ -259,9 +271,21 @@ branches are fetched into device-namespaced refs like `refs/remotes/winbox/main`
 or peer branches advance only by clean fast-forward. Divergence exits `2` and leaves both
 branches untouched. A dirty checked-out branch is fetched but not advanced; clean it up
 and merge/fast-forward manually. `git-sync` moves committed history, not uncommitted
-worktree edits. `--status` is non-mutating: it uses a temporary bare repository plus a peer
-bundle to report `up_to_date`, `ahead`, `would_fast_forward`, or `diverged`, along with
-tracked-dirty flags, content/mode-only/untracked counts, and hook diagnostics. From a
+worktree edits. Remote validation requires the mapped path itself to be the Git worktree
+root, not merely a child of some parent repository; a failed probe reports the exact cwd,
+argv, exit code, and raw stdout/stderr. `--status` is non-mutating: it uses a temporary bare
+repository plus a peer bundle to report `up_to_date`, `ahead`, `would_fast_forward`, or
+`diverged`, along with tracked-dirty flags, content/mode-only/untracked counts, and hook
+diagnostics. On a guarded POSIX target, the fixed repository-root probe (and `--dry-run`)
+runs under a built-in hard process-tree cap of at most 128 MiB. Full `--status`, pull,
+push, and bootstrap paths are not classified as bounded metadata: bundle packing/fetching
+and worktree scans can scale with repository size. They therefore require an explicit
+positive integer `[git_sync].remote_memory_limit_mib` or the one-off
+`--remote-memory-limit-mib <MiB>`. The value is a per-remote-Git-command hard cap, not a
+learned RSS measurement; admission still reserves that allowance atomically and preserves
+the target's configured host reserve. A guard refusal or termination is reported once and
+is never reinterpreted as a missing ref, divergence, or permission to retry. Unguarded
+targets retain the existing behavior. From a
 repo-less tree it reports each peer branch as `bootstrap_available` and does not create
 local Git metadata. A history-hub
 fast-forward that preserves a dirty tree prints the same counts and explicitly warns that the
@@ -305,8 +329,10 @@ differing Syncthing bytes remain visibly dirty until they converge.
 For repositories that sit beside the normal project tree, configure
 `[git_sync.project_roots]` with a broader common parent. The broader mapping applies only
 to Git history exchange; `run`, `plan`, and `bench` keep the narrower `[project_roots]`
-transfer boundary. A repository at `work/remrun` can then exchange with a peer alongside
-ordinary `work/proj/foo` repositories without a one-off config override.
+transfer boundary. Git-sync first preserves the project leaf detected under that ordinary
+boundary, then rebases its project ID onto the broader root; this also keeps marker-less
+repo-bootstrap/status paths at the same leaf. A repository at `work/remrun` can then exchange
+with a peer alongside ordinary `work/proj/foo` repositories without a one-off config override.
 
 For cross-platform synced working trees, prefer a project `.gitattributes` such as
 `* text eol=lf`. Otherwise Windows `core.autocrlf` can rewrite checked-out file line
@@ -379,6 +405,10 @@ protocol = 1
 ### Project hints — `<project>/do/remrun/remrun.toml` (optional)
 
 Never required; only optimizes behavior. See `examples/project/do/remrun/remrun.toml`.
+For a linked Git worktree allowed with `REMRUN_ALLOW_WORKTREE=1`, a config inside that
+worktree wins. If absent, remrun reads the main worktree's private config as identified by
+`git worktree list --porcelain`; it does not copy the file, track it, or change the worktree's
+project root.
 
 ```toml
 [run]
@@ -398,6 +428,8 @@ prefer = "winbox"
 
 [git_sync]
 peers = ["macbox", "winbox"]  # used by `remrun git-sync --install-hook`
+# Guarded targets require an explicit hard cap for bundle/status/push/pull work.
+# remote_memory_limit_mib = 2048  # illustrative only; select for the target/repository
 
 [transfer]
 exclude = ["data/raw/**", "scratch/**"]   # narrow the active surface (ADDED to global excludes)
@@ -439,12 +471,10 @@ snapshots are deleted after `backup_retention_days` (3), and a hard `max_backup_
 (`--older-than` / `--keep` / `--dry-run`).
 
 Each run records `peak_rss_mb` and `avg_cpu_pct` in the summary and `status`
-(stdlib-only). Caveat on RSS scope: ssh-powershell uses a Win32 Job Object
-(`PeakJobMemoryUsed` = true whole-process-tree peak), but ssh-posix uses
-`getrusage(RUSAGE_CHILDREN).ru_maxrss`, which is the peak of the **largest single
-child**, not the sum of a multi-process tree — so a job that fans out into many
-concurrent processes is under-reported on POSIX. CPU% is whole-tree on both. Disable
-with `--no-telemetry` or `[telemetry] enabled = false`. On a device with a
+(stdlib-only). ssh-powershell reads whole-tree peak memory from its Win32 Job Object;
+ssh-posix samples the concurrent RSS sum of the known process tree and drains that tree
+before accepting the measurement. CPU% is whole-tree on both. Disable optional
+telemetry with `--no-telemetry` or `[telemetry] enabled = false`. On a device with a
 configured `memory_guard`, those controls suppress optional metrics only; the hard
 preflight, command ceiling, host reserve, and fail-safe cleanup remain active.
 

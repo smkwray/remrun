@@ -7,7 +7,8 @@ from remrun.profile import (
     LOCAL_DEVICE, MAX_WORKLOAD_METADATA_BYTES, WORKLOAD_PROFILES_KEY,
     WorkloadObservation, command_key, device_profile,
     load_job_costs, load_profiles, load_profiles_checked, merge_job_costs,
-    predict_job, recommend_offload, update_profile, update_workload_profile,
+    predict_job, profile_project_id, recommend_offload, update_profile,
+    update_workload_profile,
     workload_profile,
 )
 
@@ -32,6 +33,34 @@ def test_command_key_empty():
     assert command_key([]) == "?"
 
 
+def test_profile_project_id_collapses_only_known_nested_worktree_roots():
+    assert profile_project_id("ratewall/.worktrees/v1-builder") == "ratewall"
+    assert profile_project_id("ratewall/.claude/worktrees/agent-a") == "ratewall"
+    assert profile_project_id("ratewall/.delegate-worktrees/a") == "ratewall"
+    assert profile_project_id("group/ratewall") == "group/ratewall"
+    assert profile_project_id(".worktrees/example") == ".worktrees/example"
+
+
+def test_command_key_normalizes_pytest_launchers_and_preserves_xdist_shape():
+    expected = "python:pytest[xdist=4]"
+    assert command_key(["python3.14", "-m", "pytest", "-q", "-n", "4"]) == expected
+    assert command_key(["pytest", "--numprocesses=4", "tests/test_a.py"]) == expected
+    assert command_key(["uv", "run", "python", "-m", "pytest", "-n4"]) == expected
+    assert command_key(["sh", "-lc", "python -m pytest -q -n 4 tests/test_a.py"]) == expected
+    assert command_key(["python", "-m", "pytest", "-q"]) == (
+        "python:pytest[xdist=default]"
+    )
+
+
+def test_command_key_does_not_interpret_shell_pipeline():
+    key = command_key(["sh", "-lc", "python -m pytest -n 4 | tail -1"])
+    assert key.startswith("sh:")
+    assert key != "python:pytest[xdist=4]"
+    assert command_key(["python", "-c", "print('x')", "-m", "pytest"]) != (
+        "python:pytest[xdist=default]"
+    )
+
+
 def test_update_and_get_device(tmp_path):
     update_profile(tmp_path, "proj", "python:run.py", "MACBOX",
                    peak_rss_mb=1000, avg_cpu_pct=90, exec_s=100, trip_s=110, now="t1")
@@ -45,6 +74,25 @@ def test_ewma_merge(tmp_path):
     update_profile(tmp_path, "proj", "k", "MACBOX", peak_rss_mb=2000, exec_s=200, trip_s=240, now="t2", alpha=0.5)
     e = device_profile(load_profiles(tmp_path), "proj", "k", "MACBOX")
     assert e["n"] == 2 and e["rss_mb"] == 1500.0 and e["exec_s"] == 150.0 and e["trip_s"] == 180.0
+    assert e["rss_high_mb"] == 2000.0
+    assert predict_job(load_profiles(tmp_path), "proj", "k")["rss_mb"] == 2000.0
+
+
+def test_rss_high_water_never_falls_after_a_smaller_run(tmp_path):
+    update_profile(tmp_path, "proj", "k", "MACBOX", peak_rss_mb=2000, now="t1")
+    update_profile(
+        tmp_path,
+        "proj",
+        "k",
+        "MACBOX",
+        peak_rss_mb=500,
+        now="t2",
+        alpha=0.5,
+    )
+    entry = device_profile(load_profiles(tmp_path), "proj", "k", "MACBOX")
+    assert entry["rss_mb"] == 1250.0
+    assert entry["rss_high_mb"] == 2000.0
+    assert predict_job(load_profiles(tmp_path), "proj", "k")["rss_mb"] == 2000.0
 
 
 def test_devices_are_separate_rows(tmp_path):

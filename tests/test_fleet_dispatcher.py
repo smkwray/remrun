@@ -182,6 +182,89 @@ def test_drain_once_missing_model_item_evidence_is_final_not_retried(tmp_path, m
         q.close()
 
 
+def test_runtime_guard_termination_is_final_and_keeps_queue_error(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    q = _queue(state)
+    jid = q.enqueue(FleetTask(
+        task_type="cmd",
+        force_device="LOCAL_SIM",
+        options={
+            "argv": ["python", "-c", "pass"],
+            "_allow_fallback": True,
+            "_preferred_device": "LOCAL_SIM",
+        },
+    ))
+    q.close()
+    error = (
+        "memory guard terminated after command start: command_memory_limit: "
+        "sampled RSS exceeded the reserved allowance"
+    )
+    monkeypatch.setattr(dispatcher.executor, "run_batch", lambda *_a, **_k: {
+        "ok": False,
+        "exit_code": 125,
+        "phase": "memory_guard",
+        "memory_guard": {
+            "status": "terminated",
+            "reason": "command_memory_limit",
+            "detail": "sampled RSS exceeded the reserved allowance",
+            "command_started": True,
+        },
+        "error": error,
+        "no_retry": True,
+    })
+
+    summary = dispatcher.drain_once(_config(tmp_path), state_root=state, debounce_s=0)
+
+    assert summary["ran"] == 1 and summary["failed"] == 1
+    q = _queue(state)
+    try:
+        row = q.get(jid)
+        assert row["state"] == "failed_final"
+        assert row["attempts"] == 1
+        assert row["last_error"] == error
+        # A workload that may have mutated output is neither retried nor auto-fallback-unpinned.
+        assert row["force_device"] == "LOCAL_SIM"
+    finally:
+        q.close()
+
+
+def test_prestart_guard_refusal_remains_retryable_and_explicit_target_stays_pinned(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "state"
+    q = _queue(state)
+    jid = q.enqueue(FleetTask(
+        task_type="cmd",
+        force_device="LOCAL_SIM",
+        options={"argv": ["python", "-c", "pass"]},
+    ))
+    q.close()
+    error = "memory admission refused before command start: host_memory_reserve: reserve low"
+    monkeypatch.setattr(dispatcher.executor, "run_batch", lambda *_a, **_k: {
+        "ok": False,
+        "phase": "memory_admission",
+        "memory_guard": {
+            "status": "refused",
+            "reason": "host_memory_reserve",
+            "detail": "reserve low",
+            "command_started": False,
+        },
+        "error": error,
+    })
+
+    summary = dispatcher.drain_once(_config(tmp_path), state_root=state, debounce_s=0)
+
+    assert summary["ran"] == 1 and summary["failed"] == 1
+    q = _queue(state)
+    try:
+        row = q.get(jid)
+        assert row["state"] == "queued"
+        assert row["force_device"] == "LOCAL_SIM"
+        assert row["last_error"] == error
+    finally:
+        q.close()
+
+
 def test_compat_key_separates_mixed_cmd_argv_and_output_roots():
     from remrun.fleet.dispatcher import _compat_key
     a = FleetTask(task_type="cmd", options={"argv": ["python", "x.py"]}, output_root="/o1")

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import shutil
+import stat
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 from .config import case_insensitive, casefold_collisions, current_os_key, device_os_key
-from .manifest import FileEntry, Manifest, build_manifest, sha256_file, should_exclude
+from .manifest import (
+    FileEntry, Manifest, ManifestError, build_manifest, sha256_file, should_exclude,
+)
 from .transfer_plan import (
     ABORT_CONFLICT,
     DELETE_LOCAL,
@@ -105,13 +108,36 @@ def _fresh_local_entry(path: Path, *, hash_if_size: int | None) -> FileEntry | N
     Hashes the file only when its size matches the remote candidate (a size mismatch already proves
     they differ, so hashing would be wasted)."""
     try:
-        if path.is_symlink() or not path.is_file():
-            return None
-        st = path.stat()
-    except OSError:
+        st = path.lstat()
+    except FileNotFoundError:
         return None
-    digest = sha256_file(path) if (hash_if_size is not None and st.st_size == hash_if_size) else None
+    except OSError as exc:
+        raise TransportError(f"cannot inspect local file {path}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        digest = (
+            sha256_file(path)
+            if hash_if_size is not None and st.st_size == hash_if_size
+            else None
+        )
+    except FileNotFoundError as exc:
+        raise TransportError(
+            f"local file changed while hashing {path}; retry the command"
+        ) from exc
+    except OSError as exc:
+        raise TransportError(f"cannot hash local file {path}: {exc}") from exc
     return FileEntry(path=path.name, kind="file", size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=digest)
+
+
+def _build_local_manifest(
+    root: Path, excludes: list[str], *, hash_below_bytes: int | None
+) -> Manifest:
+    """Map trustworthy-snapshot failures onto the run transfer-error seam."""
+    try:
+        return build_manifest(root, excludes, hash_below_bytes=hash_below_bytes)
+    except ManifestError as exc:
+        raise TransportError(str(exc)) from exc
 
 
 def _already_converged(local_path: Path, remote_entry: FileEntry | None) -> bool:
@@ -242,7 +268,9 @@ def preflight_reconcile(
     """
     result = ReconcileResult()
 
-    local_manifest = build_manifest(local_root, excludes, hash_below_bytes=hash_below_bytes or None)
+    local_manifest = _build_local_manifest(
+        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+    )
     remote_manifest = transport.manifest(remote_root, excludes, hash_below_bytes)
 
     # Vanished-root guard. If a side comes back *entirely empty* while its previous
@@ -407,7 +435,7 @@ def preflight_reconcile(
             progress(completed, total, action_totals)
 
     # Rebuild converged manifests to use as pre-run baselines.
-    result.local_manifest = build_manifest(
+    result.local_manifest = _build_local_manifest(
         local_root, excludes, hash_below_bytes=hash_below_bytes or None
     )
     result.remote_manifest = transport.manifest(remote_root, excludes, hash_below_bytes)
@@ -440,7 +468,9 @@ def postrun_pullback(
 
     post_remote = transport.manifest(remote_root, excludes, hash_below_bytes)
     changed, deleted = diff_remote_changes(pre_remote_manifest, post_remote)
-    cur_local = build_manifest(local_root, excludes, hash_below_bytes=hash_below_bytes or None)
+    cur_local = _build_local_manifest(
+        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+    )
     # Baseline advancement is path-attributed, not a whole-tree snapshot. An
     # unrelated local writer may create, edit, or delete a path while the remote
     # command runs; retaining that path's preflight generation makes the next
@@ -570,7 +600,7 @@ def postrun_pullback(
         next_remote.pop(rel, None)
 
     result.post_remote_manifest = post_remote
-    result.local_manifest_after = build_manifest(
+    result.local_manifest_after = _build_local_manifest(
         local_root, excludes, hash_below_bytes=hash_below_bytes or None
     )
     if not result.conflicts:

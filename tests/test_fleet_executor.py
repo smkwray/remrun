@@ -59,6 +59,7 @@ def test_run_once_cmd_stages_runs_and_writes_output(tmp_path):
     res = executor.run_once(task, _config(tmp_path), state_root=tmp_path / "state")
     assert res["ok"] is True
     assert res["device"] == "LOCAL_SIM" and res["exit_code"] == 0
+    assert "memory_guard" not in res
     assert (out / "done.txt").read_text() == "ok"
 
 
@@ -324,3 +325,209 @@ def test_run_once_no_eligible_device(tmp_path):
     task = FleetTask(task_type="ocr", force_device="MACBOX", inputs=[])
     res = executor.run_once(task, config, state_root=tmp_path / "state")
     assert res["ok"] is False and "no eligible device" in res["error"]
+
+
+def test_run_batch_reserves_memory_with_the_profiled_peak_rss(tmp_path, monkeypatch):
+    """A guarded device must be asked for the batch's MEASURED peak RSS.
+
+    Fleet exec used to reach `transport.exec` with no reservation, and exec's own
+    fallback reserves with no prediction — the device's configured maximum as an
+    unprofiled ceiling. A worker whose measured peak is ~5 GB therefore claimed a
+    fraction of total RAM (20 GiB on a 64 GiB box) and was refused whenever that
+    could not sit alongside the host reserve, even with tens of GB free.
+    """
+    from remrun.fleet import profiles
+    from remrun.memory_guard import MemoryAdmissionResult
+
+    config = _config(tmp_path)
+    adapters.configure(config)      # the dispatcher/CLI do this before run_batch
+    state = tmp_path / "state"
+    profiles.update_profile(state, "cmd", "cmd", "LOCAL_SIM", "default",
+                            fixed_load_s=1.0, var_per_unit_s=1.0, peak_rss_mb=5000.0)
+
+    calls: list[object] = []
+
+    class _Guarded:
+        """Marks the target guarded and records what the executor predicts for it."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.memory_guard = object()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def reserve_memory_guard(self, *, predicted_rss_mb=None):
+            calls.append(predicted_rss_mb)
+            return MemoryAdmissionResult.refused("test_stop", "recorded by test")
+
+    real_make_transport = executor.make_transport
+    monkeypatch.setattr(executor, "make_transport",
+                        lambda device: _Guarded(real_make_transport(device)))
+
+    out = tmp_path / "outguard"
+    out.mkdir()
+    task = FleetTask(task_type="cmd", force_device="LOCAL_SIM",
+                     output_root=str(out), options={"argv": ["python", "-c", "pass"]})
+    res = executor.run_batch("LOCAL_SIM", [task], config, state_root=state)
+
+    # The learned figure, not None (which the guard reads as "unprofiled -> ceiling").
+    assert calls == [5000.0]
+    # And a refusal is surfaced as its own phase rather than an opaque exit code.
+    assert res["ok"] is False and res["phase"] == "memory_admission"
+    assert res["memory_guard"]["status"] == "refused"
+    assert res["memory_guard"]["command_started"] is False
+    assert "no_retry" not in res
+    assert "test_stop" in res["error"]
+
+
+def test_run_batch_preserves_runtime_guard_termination_and_marks_attempt_final(
+    tmp_path, monkeypatch
+):
+    from remrun.memory_guard import MemoryAdmissionResult, MemoryGuard, MemoryReservation
+    from remrun.transport import ExecResult
+
+    config = _config(tmp_path)
+    adapters.configure(config)
+    inner = executor.make_transport(config.devices["LOCAL_SIM"])
+    reservation = MemoryReservation(
+        lease_id="lease",
+        lease_token="token",
+        state_root=str(tmp_path / "guard"),
+        allowance_bytes=8 * 1024**3,
+        control_overhead_bytes=256 * 1024**2,
+        capacity_bytes=16 * 1024**3,
+        max_command_bytes=8 * 1024**3,
+        min_available_bytes=4 * 1024**3,
+        host_total_bytes=32 * 1024**3,
+        safe_concurrency=1,
+        expires_at=4_102_444_800.0,
+    )
+    guard = {
+        "schema": 1,
+        "status": "terminated",
+        "reason": "command_memory_limit",
+        "detail": "sampled RSS exceeded the reserved allowance",
+        "command_started": True,
+        "command_exit_code": None,
+    }
+
+    class _Guarded:
+        def __init__(self):
+            self.memory_guard = MemoryGuard(0.5, 0.25, 1)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def reserve_memory_guard(self, *, predicted_rss_mb=None):
+            return MemoryAdmissionResult(
+                "admitted", "reserved", "", {"schema": 1, "status": "admitted"},
+                reservation,
+            )
+
+        def exec(self, *_args, **_kwargs):
+            return ExecResult(125, "", "", memory_guard=guard)
+
+    monkeypatch.setattr(executor, "make_transport", lambda _device: _Guarded())
+    monkeypatch.setattr(executor, "active_job_observation_enabled", lambda: False)
+    out = tmp_path / "guard-out"
+    out.mkdir()
+    task = FleetTask(
+        task_type="cmd",
+        force_device="LOCAL_SIM",
+        output_root=str(out),
+        options={"argv": ["python", "-c", "pass"]},
+    )
+
+    res = executor.run_batch("LOCAL_SIM", [task], config, state_root=tmp_path / "state")
+
+    assert res["ok"] is False and res["exit_code"] == 125
+    assert res["phase"] == "memory_guard"
+    assert res["memory_guard"] == guard
+    assert res["no_retry"] is True
+    assert res["error"] == (
+        "memory guard terminated after command start: command_memory_limit: "
+        "sampled RSS exceeded the reserved allowance"
+    )
+
+
+def test_run_batch_guard_finalization_unknown_is_never_retried(tmp_path, monkeypatch):
+    from remrun.memory_guard import MemoryAdmissionResult, MemoryGuard, MemoryReservation
+    from remrun.transport import TransportError
+
+    class _GuardFinalizationError(TransportError):
+        def __init__(self, detail, *, command_started, memory_guard=None):
+            super().__init__(detail)
+            self.command_started = command_started
+            self.memory_guard = memory_guard
+
+    # On patched source this substitutes the typed class used by the dedicated
+    # except arm. On exact base there is no such arm, so the same exception falls
+    # through the generic TransportError path and the regression is observable.
+    monkeypatch.setattr(
+        executor, "GuardFinalizationError", _GuardFinalizationError, raising=False
+    )
+
+    config = _config(tmp_path)
+    adapters.configure(config)
+    inner = executor.make_transport(config.devices["LOCAL_SIM"])
+    reservation = MemoryReservation(
+        lease_id="lease",
+        lease_token="token",
+        state_root=str(tmp_path / "guard"),
+        allowance_bytes=8 * 1024**3,
+        control_overhead_bytes=256 * 1024**2,
+        capacity_bytes=16 * 1024**3,
+        max_command_bytes=8 * 1024**3,
+        min_available_bytes=4 * 1024**3,
+        host_total_bytes=32 * 1024**3,
+        safe_concurrency=1,
+        expires_at=4_102_444_800.0,
+    )
+
+    removed: list[str] = []
+
+    class _Guarded:
+        def __init__(self):
+            self.memory_guard = MemoryGuard(0.5, 0.25, 1)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def reserve_memory_guard(self, *, predicted_rss_mb=None):
+            return MemoryAdmissionResult(
+                "admitted", "reserved", "", {"schema": 1, "status": "admitted"},
+                reservation,
+            )
+
+        def exec(self, *_args, **_kwargs):
+            raise _GuardFinalizationError(
+                "posix memory guard result missing after guard initialization; "
+                "command completion is unknown",
+                command_started=None,
+            )
+
+        def remove_remote_tree(self, remote_dir):
+            removed.append(remote_dir)
+
+    monkeypatch.setattr(executor, "make_transport", lambda _device: _Guarded())
+    monkeypatch.setattr(executor, "active_job_observation_enabled", lambda: False)
+    out = tmp_path / "unknown-out"
+    out.mkdir()
+    task = FleetTask(
+        task_type="cmd",
+        force_device="LOCAL_SIM",
+        output_root=str(out),
+        options={"argv": ["python", "-c", "pass"]},
+    )
+
+    res = executor.run_batch("LOCAL_SIM", [task], config, state_root=tmp_path / "state")
+
+    assert res["ok"] is False
+    assert res["phase"] == "memory_guard"
+    assert res["completion_state"] == "unknown"
+    assert res["command_started"] is None
+    assert res["no_retry"] is True
+    assert res["cleanup_deferred"] is True
+    assert res["stage_dir"]
+    assert removed == []

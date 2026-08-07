@@ -122,7 +122,9 @@ def test_powershell_exec_observed_preserves_shell_resolution_inside_child(monkey
 
     monkeypatch.setattr(transport, "exec", fake_exec)
     transport.exec_observed(
-        ["Write-Output", "hello world"], r"C:\work", observation=observation("WIN")
+        [r"C:\work\adapter.ps1", "hello world"],
+        r"C:\work",
+        observation=observation("WIN"),
     )
     assert len(calls) == 1
     wrapped, _cwd, kwargs = calls[0]
@@ -132,7 +134,7 @@ def test_powershell_exec_observed_preserves_shell_resolution_inside_child(monkey
     child = wrapped[split + 1:]
     assert child[:4] == ["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand"]
     script = base64.b64decode(child[4]).decode("utf-16-le")
-    assert "& 'Write-Output' 'hello world'" in script
+    assert "& 'C:\\work\\adapter.ps1' 'hello world'" in script
     assert "GetCommand" in script and "cmd|bat" in script
 
 
@@ -152,7 +154,7 @@ def test_powershell_observer_setup_failure_uses_ordinary_exec_scope(monkeypatch)
     monkeypatch.setattr(transport, "exec", fake_exec)
 
     result = transport.exec_observed(
-        ["Write-Output", "hello"],
+        [r"C:\work\adapter.ps1", "hello"],
         r"C:\work",
         observation=observation("WIN"),
         telemetry=True,
@@ -160,7 +162,7 @@ def test_powershell_observer_setup_failure_uses_ordinary_exec_scope(monkeypatch)
 
     assert result.exit_code == 9
     assert len(calls) == 1
-    assert calls[0][0] == ["Write-Output", "hello"]
+    assert calls[0][0] == [r"C:\work\adapter.ps1", "hello"]
     assert calls[0][2]["telemetry"] is True
     assert "_allow_observed_breakaway" not in calls[0][2]
     assert "ran unobserved" in result.stderr

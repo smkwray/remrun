@@ -179,6 +179,28 @@ def test_build_manifest_skips_file_that_vanished_mid_scan(tmp_path: Path, monkey
     assert "b.txt" in manifest
 
 
+def test_build_manifest_fails_closed_when_file_vanishes_during_hash(
+    tmp_path: Path, monkeypatch
+):
+    import remrun.manifest as manifest_mod
+
+    path = tmp_path / "generated.tmp"
+    path.write_text("transient", encoding="utf-8")
+    real_sha256 = manifest_mod.sha256_file
+
+    def disappear(candidate: Path) -> str:
+        if Path(candidate) == path:
+            path.unlink()
+            raise FileNotFoundError(2, "gone", str(candidate))
+        return real_sha256(candidate)
+
+    monkeypatch.setattr(manifest_mod, "sha256_file", disappear)
+    with pytest.raises(
+        ManifestError, match=r"changed while hashing generated\.tmp.*retry"
+    ):
+        build_manifest(tmp_path, [], hash_below_bytes=1024)
+
+
 # --- design Step 1: identity v2 + strong-manifest digest (inert groundwork) ----
 
 def test_build_manifest_captures_mode_and_always_hash(tmp_path: Path):

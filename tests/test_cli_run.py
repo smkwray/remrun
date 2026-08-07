@@ -12,7 +12,8 @@ import pytest
 
 from remrun import __version__
 from remrun.cli import (
-    EXIT_CONFLICT, EXIT_GUARD, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, _best_remote_verdict,
+    EXIT_CONFLICT, EXIT_GUARD, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, EXIT_TRANSFER,
+    _best_remote_verdict,
     _workload_observation_from_run, main,
 )
 from remrun.models import WorkloadSpec
@@ -207,6 +208,203 @@ def test_run_passes_through_nonzero_exit(env):
     assert load_profiles(env["state"]) == {}
 
 
+def test_ctrl_c_during_preflight_returns_130_and_terminalizes_not_started_receipt(
+    env, monkeypatch, capsys
+):
+    (env["proj"] / "input.txt").write_text("push me", encoding="utf-8")
+
+    def interrupt_push(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(LocalSimTransport, "push_file", interrupt_push)
+    try:
+        code = main([
+            "run", "LOCAL_SIM", "--", "python", "-c",
+            "open('must-not-run.txt','w').write('ran')",
+        ])
+    except KeyboardInterrupt:
+        pytest.fail("ordinary-run preflight leaked KeyboardInterrupt")
+
+    assert code == 130
+    assert not (env["remote_proj"] / "must-not-run.txt").exists()
+    err = capsys.readouterr().err
+    assert "cancelled" in err
+    assert "KeyboardInterrupt" not in err
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["phase"] == "preflight"
+    assert summary["completion_state"] == "cancelled"
+    assert summary["command_started"] is False
+    assert summary["terminal"] is True
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+
+
+def test_disappearing_file_during_preflight_hash_is_concise_retryable_failure(
+    env, monkeypatch, capsys
+):
+    import remrun.manifest as manifest_mod
+
+    transient = env["proj"] / "generated.tmp"
+    transient.write_text("transient", encoding="utf-8")
+    real_sha256 = manifest_mod.sha256_file
+    injected = False
+
+    def disappear_while_hashing(path: Path) -> str:
+        nonlocal injected
+        if Path(path) == transient and not injected:
+            injected = True
+            transient.unlink()
+            raise FileNotFoundError(2, "generated file vanished", str(path))
+        return real_sha256(path)
+
+    monkeypatch.setattr(manifest_mod, "sha256_file", disappear_while_hashing)
+    code = main([
+        "run", "LOCAL_SIM", "--", "python", "-c",
+        "open('must-not-run.txt','w').write('ran')",
+    ])
+
+    assert code == EXIT_TRANSFER
+    assert not (env["remote_proj"] / "must-not-run.txt").exists()
+    err = capsys.readouterr().err
+    assert "transfer_error" in err
+    assert "changed while hashing generated.tmp" in err
+    assert "retry" in err
+    assert "FileNotFoundError" not in err
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["phase"] == "preflight"
+    assert summary["completion_state"] == "not_started"
+    assert summary["command_started"] is False
+    assert summary["terminal"] is True
+
+
+def test_conclusive_predispatch_rejection_never_installs_unknown_fence(
+    env, monkeypatch, capsys
+):
+    import remrun.cli as cli_mod
+    import remrun.transport as transport_mod
+
+    rejection = getattr(transport_mod, "CommandNotStartedError", TransportError)
+    real_make_transport = cli_mod.make_transport
+
+    def make_rejecting_transport(device):
+        transport = real_make_transport(device)
+
+        def reject(_command, *, env=None, path_prepend=None):
+            assert env == {}
+            assert path_prepend == []
+            raise rejection("unsupported top-level .cmd/.bat")
+
+        monkeypatch.setattr(
+            transport, "validate_command_context", reject, raising=False
+        )
+        monkeypatch.setattr(
+            transport,
+            "exec",
+            lambda *_args, **_kwargs: pytest.fail("rejected argv reached dispatch"),
+        )
+        return transport
+
+    monkeypatch.setattr(cli_mod, "make_transport", make_rejecting_transport)
+    code = main(["run", "LOCAL_SIM", "--", "native_probe.cmd", "literal&arg"])
+
+    assert code == EXIT_INFRA
+    err = capsys.readouterr().err
+    assert "command_rejected" in err
+    assert "command_started" not in err
+    assert "completion_unknown" not in err
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["completion_state"] == "not_started"
+    assert summary["command_started"] is False
+    assert summary["terminal"] is True
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+
+
+def test_command_validation_transport_failure_is_conclusive_not_started(
+    env, monkeypatch, capsys
+):
+    import remrun.cli as cli_mod
+
+    real_make_transport = cli_mod.make_transport
+
+    def make_failing_transport(device):
+        transport = real_make_transport(device)
+
+        def fail(_command, *, env=None, path_prepend=None):
+            del env, path_prepend
+            raise TransportError("injected command discovery disconnect")
+
+        monkeypatch.setattr(
+            transport, "validate_command_context", fail, raising=False
+        )
+        monkeypatch.setattr(
+            transport,
+            "exec",
+            lambda *_args, **_kwargs: pytest.fail("failed validation reached dispatch"),
+        )
+        return transport
+
+    monkeypatch.setattr(cli_mod, "make_transport", make_failing_transport)
+    code = main(["run", "LOCAL_SIM", "--", "native_probe", "literal&arg"])
+
+    assert code == EXIT_TRANSFER
+    err = capsys.readouterr().err
+    assert "transfer_error" in err
+    assert "command_validation" in err
+    assert "command_started" not in err
+    assert "completion_unknown" not in err
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["phase"] == "command_validation"
+    assert summary["completion_state"] == "not_started"
+    assert summary["command_started"] is False
+    assert summary["terminal"] is True
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+
+
+def test_conclusive_remote_boundary_rejection_clears_fence_without_false_unknown(
+    env, monkeypatch, capsys
+):
+    import remrun.cli as cli_mod
+    import remrun.transport as transport_mod
+
+    rejection = getattr(transport_mod, "CommandNotStartedError", TransportError)
+    real_make_transport = cli_mod.make_transport
+
+    def make_guarded_transport(device):
+        transport = real_make_transport(device)
+        monkeypatch.setattr(
+            transport,
+            "command_start_requires_confirmation",
+            lambda: True,
+            raising=False,
+        )
+
+        def reject_after_remote_resolution(*_args, **_kwargs):
+            raise rejection("PATH command resolved to unsupported .cmd/.bat")
+
+        monkeypatch.setattr(transport, "exec", reject_after_remote_resolution)
+        return transport
+
+    monkeypatch.setattr(cli_mod, "make_transport", make_guarded_transport)
+    code = main(["run", "LOCAL_SIM", "--", "native_probe", "literal&arg"])
+
+    assert code == EXIT_INFRA
+    err = capsys.readouterr().err
+    assert "command_dispatch" in err
+    assert "command_started" not in err
+    assert "command_rejected" in err
+    assert "completion_unknown" not in err
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["completion_state"] == "not_started"
+    assert summary["command_started"] is False
+    assert summary["terminal"] is True
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+
+
 def test_exec_transport_failure_records_unknown_completion_guidance(
     env, monkeypatch, capsys
 ):
@@ -347,6 +545,35 @@ def test_finalization_exception_after_known_completion_writes_terminal_receipt(
     assert summary["completion_state"] == "finalization_failed"
     assert summary["command_exit_code"] == 0
     assert summary["phase"] == "pullback"
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+
+
+def test_pullback_transport_failure_keeps_completed_command_conclusive(
+    env, monkeypatch, capsys
+):
+    import remrun.cli as climod
+
+    def fail_pullback(**_kwargs):
+        raise TransportError("injected locked local temp")
+
+    monkeypatch.setattr(climod, "postrun_pullback", fail_pullback)
+    code = main([
+        "run", "LOCAL_SIM", "--", "python", "-c",
+        "open('ran-once.txt','a').write('x')",
+    ])
+
+    assert code == EXIT_TRANSFER
+    assert (env["remote_proj"] / "ran-once.txt").read_text(encoding="utf-8") == "x"
+    err = capsys.readouterr().err
+    assert "transfer_error" in err
+    assert "completion_unknown" not in err
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["phase"] == "pullback"
+    assert summary["completion_state"] == "finalization_failed"
+    assert summary["command_started"] is True
+    assert summary["command_exit_code"] == 0
+    assert summary["terminal"] is True
     assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
 
 
@@ -1059,6 +1286,61 @@ def test_plan_probe_reports_live_load_and_spare_capacity(env, capsys, monkeypatc
     assert entry["cpu_busy_pct"] == 25.0
     # Nothing was asked about git, so the key is absent rather than a misleading default.
     assert "git" not in entry
+
+
+def test_plan_auto_probe_displays_load_balanced_target_read_only(
+    env, capsys, monkeypatch
+):
+    from remrun import transport as transport_mod
+
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text(encoding="utf-8")
+        + "\n[scheduler]\n"
+        + 'primary = "SIM_A"\n'
+        + 'fallback = ["SIM_B"]\n'
+        + "busy_floor_pct = 40\n"
+        + "headroom_margin_cores = 4\n"
+        + "eff_core_weight = 1.0\n"
+        + "\n[devices.SIM_A]\n"
+        + 'kind = "local-sim"\n'
+        + 'os = "posix"\n'
+        + f'project_root = "{posix(env["proj"].parent.parent / "remote-a")}"\n'
+        + "perf_cores = 8\n"
+        + "\n[devices.SIM_B]\n"
+        + 'kind = "local-sim"\n'
+        + 'os = "posix"\n'
+        + f'project_root = "{posix(env["proj"].parent.parent / "remote-b")}"\n'
+        + "perf_cores = 8\n",
+        encoding="utf-8",
+    )
+    sentinel = env["proj"] / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+
+    busy = {"SIM_A": 95.0, "SIM_B": 0.0, "LOCAL_SIM": 50.0}
+    monkeypatch.setattr(
+        transport_mod.LocalSimTransport,
+        "sample_load",
+        lambda self: busy[self.device.name],
+        raising=False,
+    )
+
+    code = main([
+        "plan", "--auto", "--probe", "--json", "--",
+        "python", "-c", "print('p')",
+    ])
+
+    assert code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"]["name"] == "SIM_B"
+    assert payload["target_reason"] == "auto-loadbalance"
+    recommended = {entry["name"]: entry["recommended"]
+                   for entry in payload["candidates_probed"]}
+    assert recommended["SIM_A"] is False
+    assert recommended["SIM_B"] is True
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert not (env["proj"].parent.parent / "remote-a").exists()
+    assert not (env["proj"].parent.parent / "remote-b").exists()
 
 
 def test_plan_probe_reports_unknown_load_as_null_not_zero(env, capsys, monkeypatch):
@@ -1810,6 +2092,9 @@ def test_guard_prelaunch_refusal_is_distinct_and_user_code_never_runs(
     assert summary["error"] == "no safe target capacity"
     assert summary["memory_admission"]["status"] == "refused"
     assert summary["memory_admission"]["reason"] == "insufficient_live_memory"
+    assert summary["job_profile"]["status"] == "unprofiled"
+    assert summary["job_profile"]["project_id"] == "proj1"
+    assert summary["job_profile"]["predicted_rss_mb"] is None
 
 def test_selected_workload_is_guarded_even_with_no_telemetry(env):
     configure_workload(env, require_receipt=False)

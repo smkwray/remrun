@@ -472,6 +472,7 @@ def test_push_builds_mkdir_cat_and_mtime(monkeypatch, tmp_path: Path):
     t._address = "h"
     f = tmp_path / "f.txt"
     f.write_bytes(b"payload")
+    os.chmod(f, 0o755)
     rec = Recorder(lambda a, i: cp(0))
     monkeypatch.setattr(t, "_run", rec)
     t.push_file(f, "/root/p/sub/f.txt")
@@ -480,6 +481,9 @@ def test_push_builds_mkdir_cat_and_mtime(monkeypatch, tmp_path: Path):
     assert "t=/root/p/sub/f.txt.remrun-tmp" in script   # temp path bound to a shell var
     assert 'cat > "$t"' in script
     assert "os.utime" in script
+    assert "os.fchmod" in script
+    assert script.index("os.open") < script.index("os.fchmod")
+    assert script.endswith(" 493 && trap - EXIT")
     assert rec.calls[-1]["input"] == b"payload"
 
 
@@ -490,15 +494,17 @@ def test_push_files_streams_tar_archive(monkeypatch, tmp_path: Path):
     (local / "sub").mkdir(parents=True)
     (local / "a.txt").write_text("A")
     (local / "sub" / "b.txt").write_text("B")
+    os.chmod(local / "sub" / "b.txt", 0o755)
     rec = Recorder(lambda a, i: cp(0))
     monkeypatch.setattr(t, "_run", rec)
     t.push_files(local, "/root/out", ["a.txt", "sub/b.txt"])
     script = rec.scripts[-1]
-    assert "tarfile" in script and "os.replace" in script
+    assert "tarfile" in script and "os.replace" in script and "os.fchmod" in script
     archive = tmp_path / "pushed.tar"
     archive.write_bytes(rec.calls[-1]["input"])
     with tarfile.open(archive, "r:*") as tf:
         assert sorted(tf.getnames()) == ["a.txt", "sub/b.txt"]
+        assert tf.getmember("sub/b.txt").mode == 0o755
 
 
 def test_pull_files_extracts_tar_archive(monkeypatch, tmp_path: Path):
@@ -509,15 +515,18 @@ def test_pull_files_extracts_tar_archive(monkeypatch, tmp_path: Path):
         for name, data in {"a.txt": b"A", "sub/b.txt": b"B"}.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
+            info.mode = 0o755 if name == "sub/b.txt" else 0o644
             tf.addfile(info, io.BytesIO(data))
     monkeypatch.setattr(t, "_run", Recorder(lambda a, i: cp(0, archive.read_bytes())))
     out = tmp_path / "out"
     t.pull_files("/root/out", out, ["a.txt", "sub/b.txt"])
     assert (out / "a.txt").read_text() == "A"
     assert (out / "sub" / "b.txt").read_text() == "B"
+    if os.name == "posix":
+        assert (out / "sub" / "b.txt").stat().st_mode & 0o777 == 0o755
 
 
-def test_pull_writes_bytes_and_sets_mtime(monkeypatch, tmp_path: Path):
+def test_pull_writes_bytes_and_sets_mtime_and_mode(monkeypatch, tmp_path: Path):
     t = SSHPosixTransport(device())
     t._address = "h"
 
@@ -526,7 +535,7 @@ def test_pull_writes_bytes_and_sets_mtime(monkeypatch, tmp_path: Path):
         if script.startswith("cat "):
             return cp(0, b"remote-bytes")
         if "st_mtime_ns" in script:
-            return cp(0, b"1700000000000000000\n")
+            return cp(0, b"1700000000000000000 493\n")
         return cp(0)
 
     monkeypatch.setattr(t, "_run", Recorder(responder))
@@ -534,6 +543,8 @@ def test_pull_writes_bytes_and_sets_mtime(monkeypatch, tmp_path: Path):
     t.pull_file("/root/p/f.txt", out)
     assert out.read_bytes() == b"remote-bytes"
     assert abs(out.stat().st_mtime_ns - 1700000000000000000) < 1_000_000
+    if os.name == "posix":
+        assert out.stat().st_mode & 0o777 == 0o755
 
 
 def test_delete_and_mkdir(monkeypatch):

@@ -1,13 +1,14 @@
 # Scheduling, congestion, telemetry, and learned placement
 
-> **Status (2026-07-28): largely implemented.** `--auto` honors `[scheduler]`
+> **Status (2026-08-03): largely implemented.** `--auto` honors `[scheduler]`
 > order + project `[placement]` hints, fails over when a device is unreachable or
 > has a candidate-local preflight conflict, and load-balances by CPU utilization weighted by
 > per-device perf-core capacity. A fallback candidate may push controller bytes
 > outward but is rejected if its preflight would pull or delete locally. Telemetry
-> records whole-tree CPU on both backends; Windows reports whole-tree peak RAM,
-> while POSIX reports the largest single child. EWMA per-(project, command)
-> profiles drive RAM-headroom placement and a skip-probe shortcut for trivial jobs.
+> records whole-tree CPU and concurrent process-tree peak RAM on both backends.
+> Timing/CPU profiles use an EWMA; memory admission uses the observed RSS high-water
+> mark plus its guard margin. Profiles drive RAM-headroom placement and a skip-probe
+> shortcut for trivial jobs.
 > `bench` is implemented. GPU-memory-aware scheduling and project data-policy
 > hints remain incomplete; the design notes below include future extensions.
 
@@ -151,6 +152,13 @@ stata-mp -b do <PATH>
 ```
 
 Use exact command plus normalized signature. Never let the normalized signature replace the exact command in logs.
+
+The profile namespace collapses recognized nested agent-worktree paths back to the
+logical repository while run IDs, locks, transfers, and completion fences retain the
+exact checkout identity. Common direct, `uv run`, and simple shell-wrapped pytest
+launches share one signature, but pytest-xdist worker settings remain distinct: `-n 1`
+must not authorize the memory allowance for `-n 10`. Shell programs containing pipes,
+redirections, or other control operators remain opaque rather than being guessed.
 
 ## Scheduling score
 

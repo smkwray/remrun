@@ -83,6 +83,32 @@ def _guard_result(stderr: str, token: str) -> dict[str, object]:
     return json.loads(stderr.rsplit(marker, 1)[1].splitlines()[0])
 
 
+def test_admission_labels_unprofiled_allowance_separately_from_learned_need(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 30 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    state_root = tmp_path / "state"
+
+    unknown = telemetry._handle_admission_request(_request(state_root))
+    assert unknown["status"] == "refused"
+    assert unknown["detail"] == "unprofiled allowance cannot preserve host reserve"
+    assert unknown["capacity"]["allowance_basis"] == "unprofiled_command_ceiling"
+    assert unknown["capacity"]["allowance_bytes"] == 16 * GIB
+    assert unknown["capacity"]["predicted_rss_bytes"] is None
+
+    learned = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
+    assert learned["status"] == "admitted"
+    assert learned["detail"] == "learned allowance reserved before mutation"
+    assert learned["capacity"]["allowance_basis"] == (
+        "learned_profile_plus_25_percent"
+    )
+    assert learned["capacity"]["allowance_bytes"] == 10 * GIB
+    assert learned["capacity"]["predicted_rss_bytes"] == 8 * GIB
+
+
 def test_falling_live_memory_at_final_renewal_releases_and_later_controller_reclaims(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -195,7 +221,7 @@ def test_gate_release_interruption_is_completion_unknown_never_false(
     assert '"command_started":false' not in captured.err
     assert _ledger_leases(state_root) == []
 
-    with pytest.raises(TransportError, match="completion is unknown"):
+    with pytest.raises(TransportError, match="completion is unknown") as excinfo:
         _finalize_guarded_result(
             helper_exit_code=rc,
             stdout="",
@@ -205,6 +231,38 @@ def test_gate_release_interruption_is_completion_unknown_never_false(
             telemetry=None,
             platform_name="test",
         )
+    assert type(excinfo.value).__name__ == "GuardFinalizationError"
+    assert getattr(excinfo.value, "command_started", "missing") is None
+    assert getattr(excinfo.value, "memory_guard", "missing") is None
+
+
+def test_missing_guard_markers_are_completion_unknown_not_prestart():
+    reservation = MemoryReservation(
+        lease_id="lease",
+        lease_token="token",
+        state_root="/tmp/remrun-test",
+        allowance_bytes=8 * GIB,
+        control_overhead_bytes=CONTROL,
+        capacity_bytes=16 * GIB,
+        max_command_bytes=8 * GIB,
+        min_available_bytes=4 * GIB,
+        host_total_bytes=32 * GIB,
+        safe_concurrency=1,
+        expires_at=4_102_444_800.0,
+    )
+    with pytest.raises(TransportError, match="completion is unknown") as excinfo:
+        _finalize_guarded_result(
+            helper_exit_code=255,
+            stdout="",
+            stderr="ssh connection closed before private guard records arrived",
+            token="0" * 32,
+            reservation=reservation,
+            telemetry=None,
+            platform_name="test",
+        )
+    assert type(excinfo.value).__name__ == "GuardFinalizationError"
+    assert getattr(excinfo.value, "command_started", "missing") is None
+    assert getattr(excinfo.value, "memory_guard", "missing") is None
 
 
 def test_gate_status_eof_without_popen_proof_is_completion_unknown():

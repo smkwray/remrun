@@ -1,9 +1,12 @@
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from remrun.config import RemrunConfig, resolve_excludes
-from remrun.project import ProjectDetectionError, detect_project
+from remrun.config import RemrunConfig, load_project_config, resolve_excludes
+from remrun.project import (
+    ProjectDetectionError, detect_project, find_project_config,
+)
 
 
 def make_config(base: Path) -> RemrunConfig:
@@ -118,3 +121,67 @@ def test_resolve_excludes_merges_and_dedupes(tmp_path: Path):
     project_config = {"transfer": {"exclude": ["data/raw/**", "node_modules/**"]}}
     merged = resolve_excludes(cfg, project_config)
     assert merged == [".git/**", "node_modules/**", "data/raw/**"]
+
+
+
+def test_linked_worktree_inherits_main_private_config_without_copy(
+    tmp_path: Path, monkeypatch
+):
+    base = tmp_path / "proj"
+    main = base / "sampleproj"
+    main.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=str(main), check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "remrun-test@example.invalid"],
+        cwd=str(main), check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "remrun Test"],
+        cwd=str(main), check=True,
+    )
+    (main / ".gitignore").write_text(
+        "/do/remrun/remrun.toml\n/.worktrees/\n", encoding="utf-8"
+    )
+    (main / "README.md").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", ".gitignore", "README.md"], cwd=str(main), check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "base"], cwd=str(main), check=True,
+        capture_output=True, text=True,
+    )
+
+    private_config = main / "do" / "remrun" / "remrun.toml"
+    private_config.parent.mkdir(parents=True)
+    private_config.write_text(
+        '[transfer]\nexclude = ["private-cache/**"]\n'
+        '[run]\nvenv = ".venv"\n',
+        encoding="utf-8",
+    )
+    worktree = main / ".worktrees" / "agent"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "agent", str(worktree)],
+        cwd=str(main), check=True, capture_output=True, text=True,
+    )
+
+    monkeypatch.setenv("REMRUN_ALLOW_WORKTREE", "1")
+    ctx = detect_project(worktree, make_config(base))
+    resolved = find_project_config(ctx.local_project_root)
+
+    assert ctx.local_project_root == worktree.resolve()
+    assert ctx.project_id == "sampleproj/.worktrees/agent"
+    assert resolved == private_config
+    assert load_project_config(resolved)["transfer"]["exclude"] == ["private-cache/**"]
+    assert not (worktree / "do" / "remrun" / "remrun.toml").exists()
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "do/remrun/remrun.toml"],
+        cwd=str(main), capture_output=True, text=True,
+    )
+    assert tracked.returncode != 0
+    assert subprocess.run(
+        ["git", "status", "--short", "--untracked-files=all"],
+        cwd=str(main), capture_output=True, text=True, check=True,
+    ).stdout == ""

@@ -385,6 +385,16 @@ def test_exec_rejects_explicit_batch_before_connect_staging_or_run(
     assert touched == []
 
 
+def test_validate_command_exposes_explicit_batch_as_conclusive_prestart_rejection():
+    import remrun.transport as transport_mod
+
+    t = SSHPowerShellTransport(device(shell="pwsh"))
+    rejection = getattr(transport_mod, "CommandNotStartedError", TransportError)
+
+    with pytest.raises(rejection, match=r"top-level \.cmd/\.bat"):
+        t.validate_command(["C:\\Tools\\native_probe.cmd", "literal&arg"])
+
+
 def test_exec_guards_path_and_pathext_batch_resolution_before_invocation(monkeypatch):
     t = SSHPowerShellTransport(device(shell="pwsh"))
     t._address = "winbox"
@@ -394,15 +404,14 @@ def test_exec_guards_path_and_pathext_batch_resolution_before_invocation(monkeyp
     t.exec(["native_probe", "value&literal"], cwd="C:\\project")
 
     script = decoded(rec.commands[-1])
-    lookup = (
-        "$ExecutionContext.InvokeCommand.GetCommand('native_probe', "
-        "[System.Management.Automation.CommandTypes]::All)"
-    )
+    lookup = "$ExecutionContext.InvokeCommand.GetCommand('native_probe',"
     assert lookup in script
-    assert "$remrunBatch.ResolvedCommand" in script
-    assert "$remrunBatch.Path -match '\\.(cmd|bat)$'" in script
-    assert "__REMRUN_BATCH_UNSUPPORTED_" in script
-    cleanup = "Remove-Variable -Name remrunBatch"
+    assert "$ri.CommandType -eq 'Alias'" in script
+    assert "$ri.Path -match '\\.(cmd|bat)$'" in script
+    assert "$ri.CommandType -ne 'Application'" in script
+    assert "$ri.Path -notmatch '\\.ps1$'" in script
+    assert "__REMRUN_COMMAND_BOUNDARY_" in script
+    cleanup = "Remove-Variable ri,rm"
     assert cleanup in script
     assert script.index(lookup) < script.index(cleanup) < script.index("& 'native_probe'")
 
@@ -419,7 +428,7 @@ def test_exec_remote_batch_guard_raises_before_returning_corruption(
         lambda: SimpleNamespace(hex="d" * 32),
     )
     monkeypatch.setattr(t, "push_file", lambda *_args, **_kwargs: None)
-    marker = f"__REMRUN_BATCH_UNSUPPORTED_{'d' * 32}__;"
+    marker = f"__REMRUN_COMMAND_BOUNDARY_{'d' * 32}__B;"
     rec = Recorder(lambda argv, inp: cp(1, b"corrupt", (marker + "noise").encode()))
     monkeypatch.setattr(t, "_run", rec)
 
@@ -520,11 +529,10 @@ def test_exec_detailed_supported_ps1_adversarial_argv_fits_remote_limit(monkeypa
 @pytest.mark.parametrize(
     "command",
     [
-        ["Get-ChildItem", "-LiteralPath", "C:\\Program Files"],
         ["C:\\project\\adapter.ps1", "", "space value", "quote'value"],
         ["C:\\Python\\python.exe", "-c", "raise SystemExit(7)"],
     ],
-    ids=["cmdlet", "ps1", "exe"],
+    ids=["ps1", "exe"],
 )
 def test_exec_detailed_job_preserves_powershell_command_semantics(
     command, monkeypatch
@@ -577,7 +585,7 @@ def test_exec_observed_telemetry_grants_breakaway_only_to_observer_wrapper(
     ).encode()
     rec = Recorder(lambda argv, inp: cp(37, stderr=telemetry_stderr))
     monkeypatch.setattr(t, "_run", rec)
-    command = ["Write-Output", "observed"]
+    command = [r"C:\project\adapter.ps1", "observed"]
     observation = JobObservation.for_command(
         job_id="native-1",
         project="@native-gate",
@@ -623,7 +631,7 @@ def test_exec_observed_telemetry_grants_breakaway_only_to_observer_wrapper(
     user_script = base64.b64decode(observed_argv[child_index + 4]).decode(
         "utf-16-le"
     )
-    assert "& 'Write-Output' 'observed'" in user_script
+    assert "& 'C:\\project\\adapter.ps1' 'observed'" in user_script
 
 
 def test_exec_observed_telemetry_staging_failure_falls_back_before_user_start(
@@ -649,7 +657,7 @@ def test_exec_observed_telemetry_staging_failure_falls_back_before_user_start(
     monkeypatch.setattr(t, "delete_remote", lambda remote: deleted.append(remote))
     rec = Recorder(lambda argv, inp: cp(19))
     monkeypatch.setattr(t, "_run", rec)
-    command = ["Write-Output", "once"]
+    command = [r"C:\project\adapter.ps1", "once"]
     observation = JobObservation.for_command(
         job_id="native-fallback",
         project="@native-gate",
@@ -686,7 +694,7 @@ def test_exec_legacy_telemetry_also_job_tracks_the_powershell_seam(monkeypatch):
     monkeypatch.setattr(t, "_run", rec)
 
     result = t.exec(
-        ["Write-Output", "value&still-one-argument"],
+        [r"C:\project\adapter.ps1", "value&still-one-argument"],
         cwd="C:\\project",
         telemetry=True,
     )
@@ -697,7 +705,7 @@ def test_exec_legacy_telemetry_also_job_tracks_the_powershell_seam(monkeypatch):
     assert shell == "pwsh"
     assert "'--detailed'" not in outer_script
     assert "'--allow-observed-breakaway'" not in outer_script
-    assert "& 'Write-Output' 'value&still-one-argument'" in job_script
+    assert "& 'C:\\project\\adapter.ps1' 'value&still-one-argument'" in job_script
 
 
 def test_exec_detailed_nested_command_limit_falls_back_before_staging(monkeypatch):
@@ -711,7 +719,7 @@ def test_exec_detailed_nested_command_limit_falls_back_before_staging(monkeypatc
     long_argument = "x" * 1_000
 
     result = t.exec(
-        ["Write-Output", long_argument],
+        [r"C:\project\adapter.ps1", long_argument],
         cwd="C:\\project",
         telemetry_request=TelemetryRequest(),
     )
@@ -724,7 +732,7 @@ def test_exec_detailed_nested_command_limit_falls_back_before_staging(monkeypatc
     script = decoded(rec.commands[-1])
     assert "_win_telemetry.py" not in script
     assert "__REMRUN_INHERITED_PATH_" not in script
-    assert "& 'Write-Output' " + _ps_squote(long_argument) in script
+    assert "& 'C:\\project\\adapter.ps1' " + _ps_squote(long_argument) in script
 
 
 def test_exec_detailed_staging_failure_preserves_result_and_reports_unknown(monkeypatch):

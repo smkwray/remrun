@@ -14,7 +14,9 @@ from pathlib import Path
 
 from .config import RemrunConfig, load_project_config
 from .output import Reporter
-from .project import ProjectDetectionError, detect_project, find_project_config
+from .project import (
+    ProjectDetectionError, detect_project, find_project_config, project_root_base,
+)
 from .state import default_state_root
 from .transport import BaseTransport, TransportError, make_transport
 
@@ -25,12 +27,37 @@ EXIT_TRANSFER = 3
 EXIT_INFRA = 4
 HOOK_BEGIN = "# >>> remrun git-sync hook >>>"
 HOOK_END = "# <<< remrun git-sync hook <<<"
+_BOUNDED_GIT_METADATA_LIMIT_MIB = 128
+_REMOTE_MEMORY_LIMIT_KEY = "remote_memory_limit_mib"
 
 
 class GitSyncError(RuntimeError):
     def __init__(self, message: str, exit_code: int = EXIT_INTERNAL) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class _MemoryLimitedGitTransport:
+    """Delegate one Git-sync path through the generic explicit-limit seam."""
+
+    def __init__(self, transport: BaseTransport, memory_limit_mib: int) -> None:
+        self._transport = transport
+        self._memory_limit_mib = memory_limit_mib
+
+    def __getattr__(self, name: str):
+        return getattr(self._transport, name)
+
+    def exec(self, command: list[str], cwd: str, **kwargs):
+        if not command or command[0] != "git":
+            raise TransportError(
+                "Git-sync memory-limited transport accepts only direct git argv"
+            )
+        return self._transport.exec_with_memory_limit(
+            command,
+            cwd=cwd,
+            memory_limit_mib=self._memory_limit_mib,
+            **kwargs,
+        )
 
 
 @dataclass
@@ -182,6 +209,7 @@ def run_git_sync(
     dry_run: bool = False,
     branch: str | None = None,
     bootstrap: bool = False,
+    remote_memory_limit_mib: int | None = None,
     reporter: Reporter | None = None,
     as_json: bool = False,
 ) -> int:
@@ -194,6 +222,7 @@ def run_git_sync(
             dry_run=dry_run,
             branch=branch,
             bootstrap=bootstrap,
+            remote_memory_limit_mib=remote_memory_limit_mib,
             reporter=reporter,
         )
     except GitSyncError as exc:
@@ -213,13 +242,15 @@ def run_git_sync_status(
     *,
     device_name: str,
     branch: str | None = None,
+    remote_memory_limit_mib: int | None = None,
     reporter: Reporter | None = None,
     as_json: bool = False,
 ) -> int:
     reporter = reporter or Reporter(json_events=as_json)
     try:
         status = git_sync_status_result(
-            config, device_name=device_name, branch=branch, reporter=reporter)
+            config, device_name=device_name, branch=branch,
+            remote_memory_limit_mib=remote_memory_limit_mib, reporter=reporter)
     except GitSyncError as exc:
         reporter.event("git_sync_error", message=str(exc), exit_code=exc.exit_code)
         return exc.exit_code
@@ -239,8 +270,11 @@ def install_git_sync_hook(
 ) -> int:
     reporter = reporter or Reporter()
     try:
+        boundary_config = config
         config = _git_sync_config(config)
-        project, project_config = _detect_git_project(config)
+        project, project_config = _detect_git_project(
+            config, boundary_config=boundary_config
+        )
         peers = _resolve_hook_peers(config, project_config, device_name)
         hook_path = _hook_path(project.local_project_root)
         backup_path = hook_path.with_name(hook_path.name + ".remrun-backup")
@@ -273,8 +307,11 @@ def uninstall_git_sync_hook(
 ) -> int:
     reporter = reporter or Reporter()
     try:
+        boundary_config = config
         config = _git_sync_config(config)
-        project, _project_config = _detect_git_project(config)
+        project, _project_config = _detect_git_project(
+            config, boundary_config=boundary_config
+        )
         hook_path = _hook_path(project.local_project_root)
         backup_path = hook_path.with_name(hook_path.name + ".remrun-backup")
         existing = hook_path.read_text(encoding="utf-8") if hook_path.exists() else ""
@@ -302,9 +339,11 @@ def run_git_sync_result(
     dry_run: bool = False,
     branch: str | None = None,
     bootstrap: bool = False,
+    remote_memory_limit_mib: int | None = None,
     reporter: Reporter | None = None,
 ) -> GitSyncResult:
     reporter = reporter or Reporter()
+    boundary_config = config
     config = _git_sync_config(config)
     direction = direction.lower()
     if direction not in {"pull", "push", "both"}:
@@ -315,7 +354,12 @@ def run_git_sync_result(
     if not device.enabled:
         raise GitSyncError(f"device disabled: {device_name}", EXIT_INFRA)
 
-    project, project_config = _detect_git_project(config, require_git=False)
+    project, project_config = _detect_git_project(
+        config, require_git=False, boundary_config=boundary_config
+    )
+    memory_limit_mib = _remote_memory_limit_mib(
+        config, project_config, remote_memory_limit_mib
+    )
     local_root = project.local_project_root
 
     local_is_repo = _is_git_repo(local_root)
@@ -328,7 +372,8 @@ def run_git_sync_result(
         # bootstrap. Seed/recover it from the peer's authoritative history.
         if bootstrap or direction in {"pull", "both"}:
             return _bootstrap_from_peer(
-                config, device_name, project, dry_run=dry_run, reporter=reporter)
+                config, device_name, project, dry_run=dry_run, reporter=reporter,
+                remote_memory_limit_mib=memory_limit_mib)
         raise GitSyncError(
             f"not a git repo: {local_root} (use --pull/--bootstrap to seed it from {device_name})",
             EXIT_INFRA)
@@ -344,7 +389,8 @@ def run_git_sync_result(
     if not probe.reachable:
         raise GitSyncError(f"{device_name} unreachable: {probe.detail}", EXIT_INFRA)
     remote_root = transport.remote_project_path(project)
-    _ensure_remote_git_repo(transport, remote_root)
+    metadata_transport = _bounded_metadata_transport(transport, memory_limit_mib)
+    _ensure_remote_git_repo(metadata_transport, remote_root)
 
     local_ns = _ref_namespace(socket.gethostname() or "LOCAL")
     peer_ns = _ref_namespace(device_name)
@@ -362,6 +408,10 @@ def run_git_sync_result(
         reporter.event("git_sync_dry_run", action="verified repos; no fetch or fast-forward")
         return result
 
+    operation_transport = _repository_scaled_transport(
+        transport, memory_limit_mib, operation=direction
+    )
+
     project_git_sync = project_config.get("git_sync", {}) or {}
     advance_dirty = bool(project_git_sync.get(
         "advance_dirty_worktree",
@@ -369,11 +419,11 @@ def run_git_sync_result(
     ))
     if direction in {"pull", "both"}:
         result.pulled.extend(_pull_from_peer(
-            transport, remote_root, local_root, peer_ns, branch, reporter,
+            operation_transport, remote_root, local_root, peer_ns, branch, reporter,
             advance_dirty_worktree=advance_dirty))
     if direction in {"push", "both"}:
         peer_actions = _push_to_peer(
-            transport, remote_root, local_root, local_ns, branch, reporter,
+            operation_transport, remote_root, local_root, local_ns, branch, reporter,
             advance_dirty_worktree=advance_dirty)
         result.pushed.extend(peer_actions)
 
@@ -392,9 +442,11 @@ def git_sync_status_result(
     *,
     device_name: str,
     branch: str | None = None,
+    remote_memory_limit_mib: int | None = None,
     reporter: Reporter | None = None,
 ) -> GitSyncStatus:
     reporter = reporter or Reporter()
+    boundary_config = config
     config = _git_sync_config(config)
     if device_name not in config.devices:
         raise GitSyncError(f"unknown device: {device_name}", EXIT_INTERNAL)
@@ -402,7 +454,12 @@ def git_sync_status_result(
     if not device.enabled:
         raise GitSyncError(f"device disabled: {device_name}", EXIT_INFRA)
 
-    project, _project_config = _detect_git_project(config, require_git=False)
+    project, project_config = _detect_git_project(
+        config, require_git=False, boundary_config=boundary_config
+    )
+    memory_limit_mib = _remote_memory_limit_mib(
+        config, project_config, remote_memory_limit_mib
+    )
     local_root = project.local_project_root
     local_history_present = (
         _is_git_repo(local_root)
@@ -413,7 +470,11 @@ def git_sync_status_result(
     if not probe.reachable:
         raise GitSyncError(f"{device_name} unreachable: {probe.detail}", EXIT_INFRA)
     remote_root = transport.remote_project_path(project)
-    _ensure_remote_git_repo(transport, remote_root)
+    metadata_transport = _bounded_metadata_transport(transport, memory_limit_mib)
+    _ensure_remote_git_repo(metadata_transport, remote_root)
+    operation_transport = _repository_scaled_transport(
+        transport, memory_limit_mib, operation="status"
+    )
 
     peer_ns = _ref_namespace(device_name)
     with tempfile.TemporaryDirectory(prefix="remrun-gitsync-status-") as td:
@@ -423,14 +484,14 @@ def git_sync_status_result(
         else:
             _local_git_ok(Path.cwd(), ["init", "--bare", str(tmp_repo)])
         local_bundle = Path(td) / "peer.bundle"
-        remote_tmp = transport.remote_temp_dir("remrun-gitsync-status")
-        remote_bundle = transport.native_join(remote_tmp, "peer.bundle")
+        remote_tmp = operation_transport.remote_temp_dir("remrun-gitsync-status")
+        remote_bundle = operation_transport.native_join(remote_tmp, "peer.bundle")
         try:
-            _remote_git_ok(transport, remote_root, ["bundle", "create", remote_bundle,
-                                                   "--branches", "--tags"])
-            transport.pull_file(remote_bundle, local_bundle)
+            _remote_git_ok(operation_transport, remote_root,
+                           ["bundle", "create", remote_bundle, "--branches", "--tags"])
+            operation_transport.pull_file(remote_bundle, local_bundle)
         finally:
-            transport.remove_remote_tree(remote_tmp)
+            operation_transport.remove_remote_tree(remote_tmp)
         _local_git_ok(tmp_repo, ["fetch", "--tags", str(local_bundle),
                                  f"+refs/heads/*:refs/remotes/{peer_ns}/*"])
         branches = (
@@ -444,7 +505,7 @@ def git_sync_status_result(
         if local_history_present
         else WorktreeDirtySummary()
     )
-    remote_summary = _dirty_summary_remote(transport, remote_root)
+    remote_summary = _dirty_summary_remote(operation_transport, remote_root)
     local_dirty = local_summary.dirty
     remote_dirty = remote_summary.dirty
     hook_installed = False
@@ -484,11 +545,41 @@ def git_sync_status_result(
     )
 
 
-def _detect_git_project(config: RemrunConfig, *, require_git: bool = True):
-    try:
-        project = detect_project(Path.cwd(), config)
-    except ProjectDetectionError as exc:
-        raise GitSyncError(str(exc), EXIT_INFRA) from exc
+def _detect_git_project(
+    config: RemrunConfig,
+    *,
+    require_git: bool = True,
+    boundary_config: RemrunConfig | None = None,
+):
+    """Detect one Git-sync project without weakening ordinary project boundaries.
+
+    A broader ``git_sync.project_roots`` changes the stable project ID and peer mapping,
+    not the local project leaf. First detect against the ordinary boundary; if cwd lies
+    outside it (the supported sibling-repository case), fall back to the broader mapping.
+    """
+    cwd = Path.cwd()
+    project = None
+    if boundary_config is not None and boundary_config is not config:
+        try:
+            bounded = detect_project(cwd, boundary_config)
+        except ProjectDetectionError:
+            bounded = None
+        if bounded is not None:
+            try:
+                sync_base = project_root_base(config)
+                project_id = bounded.local_project_root.relative_to(sync_base).as_posix()
+            except (ProjectDetectionError, ValueError) as exc:
+                raise GitSyncError(
+                    f"ordinary project root {bounded.local_project_root} is not under "
+                    f"the configured git-sync root",
+                    EXIT_INFRA,
+                ) from exc
+            project = replace(bounded, project_id=project_id)
+    if project is None:
+        try:
+            project = detect_project(cwd, config)
+        except ProjectDetectionError as exc:
+            raise GitSyncError(str(exc), EXIT_INFRA) from exc
     project_config = load_project_config(find_project_config(project.local_project_root))
     if require_git:
         _ensure_local_git_repo(project.local_project_root)
@@ -514,6 +605,66 @@ def _git_sync_config(config: RemrunConfig) -> RemrunConfig:
         if root:
             devices[name] = replace(device, project_root=root)
     return replace(config, project_roots=normalized, devices=devices)
+
+
+def _remote_memory_limit_mib(
+    config: RemrunConfig,
+    project_config: dict,
+    override: object,
+) -> int | None:
+    """Resolve one explicit hard limit; never reinterpret it as an RSS sample."""
+    if override is not None:
+        raw = override
+    else:
+        project_git_sync = project_config.get("git_sync", {}) or {}
+        if isinstance(project_git_sync, dict) and _REMOTE_MEMORY_LIMIT_KEY in project_git_sync:
+            raw = project_git_sync[_REMOTE_MEMORY_LIMIT_KEY]
+        else:
+            raw = (config.git_sync or {}).get(_REMOTE_MEMORY_LIMIT_KEY)
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise GitSyncError(
+            f"git-sync {_REMOTE_MEMORY_LIMIT_KEY} must be a positive integer MiB value",
+            EXIT_INTERNAL,
+        )
+    return raw
+
+
+def _bounded_metadata_transport(
+    transport: BaseTransport,
+    explicit_limit_mib: int | None,
+) -> BaseTransport:
+    if transport.memory_guard is None:
+        return transport
+    limit_mib = _BOUNDED_GIT_METADATA_LIMIT_MIB
+    if explicit_limit_mib is not None:
+        limit_mib = min(limit_mib, explicit_limit_mib)
+    return _MemoryLimitedGitTransport(
+        transport,
+        limit_mib,
+    )  # type: ignore[return-value]
+
+
+def _repository_scaled_transport(
+    transport: BaseTransport,
+    explicit_limit_mib: int | None,
+    *,
+    operation: str,
+) -> BaseTransport:
+    if transport.memory_guard is None:
+        return transport
+    if explicit_limit_mib is None:
+        raise GitSyncError(
+            f"guarded target {transport.device.name!r} requires [git_sync] "
+            f"{_REMOTE_MEMORY_LIMIT_KEY} or --remote-memory-limit-mib before "
+            f"repository-scaling git-sync work ({operation}); the value is a hard "
+            "per-remote-command process-tree limit, not a learned RSS measurement",
+            EXIT_INFRA,
+        )
+    return _MemoryLimitedGitTransport(
+        transport, explicit_limit_mib
+    )  # type: ignore[return-value]
 
 
 def _root_for_device_os(roots: dict[str, str], os_name: str) -> str | None:
@@ -765,6 +916,7 @@ def _bootstrap_from_peer(
     *,
     dry_run: bool,
     reporter: Reporter,
+    remote_memory_limit_mib: int | None,
 ) -> GitSyncResult:
     """Initialize a repo-less project from a peer's authoritative history.
 
@@ -781,17 +933,22 @@ def _bootstrap_from_peer(
     if not probe.reachable:
         raise GitSyncError(f"{device_name} unreachable: {probe.detail}", EXIT_INFRA)
     remote_root = transport.remote_project_path(project)
-    _ensure_remote_git_repo(transport, remote_root)
+    metadata_transport = _bounded_metadata_transport(
+        transport, remote_memory_limit_mib
+    )
+    _ensure_remote_git_repo(metadata_transport, remote_root)
 
     # Peer must have at least one commit; an unborn/empty peer repo cannot seed us.
-    if _remote_git(transport, remote_root, ["rev-parse", "--verify", "--quiet",
-                                            "HEAD"]).exit_code != 0:
+    if _remote_git(metadata_transport, remote_root,
+                   ["rev-parse", "--verify", "--quiet", "HEAD"]).exit_code != 0:
         raise GitSyncError(
             f"peer {device_name} repo is empty (no commits to bootstrap from): {remote_root}",
             EXIT_INFRA)
 
-    peer_head = _remote_git_ok(transport, remote_root, ["rev-parse", "HEAD"]).stdout.strip()
-    peer_branch = _current_branch_remote(transport, remote_root) or "main"
+    peer_head = _remote_git_ok(
+        metadata_transport, remote_root, ["rev-parse", "HEAD"]
+    ).stdout.strip()
+    peer_branch = _current_branch_remote(metadata_transport, remote_root) or "main"
     peer_ns = _ref_namespace(device_name)
 
     reporter.event(
@@ -815,6 +972,10 @@ def _bootstrap_from_peer(
                 device=device_name, local_project=str(local_root), remote_project=remote_root,
                 branch=peer_branch, head=peer_head, commits_fetched=0, modified=0, untracked=0))
 
+    operation_transport = _repository_scaled_transport(
+        transport, remote_memory_limit_mib, operation="bootstrap"
+    )
+
     git_dir = local_root / ".git"
     created_git_dir = not git_dir.exists()
     _local_git_ok(local_root, ["init", "-q"])
@@ -827,14 +988,14 @@ def _bootstrap_from_peer(
 
         with tempfile.TemporaryDirectory(prefix="remrun-gitsync-boot-") as td:
             local_bundle = Path(td) / "peer.bundle"
-            remote_tmp = transport.remote_temp_dir("remrun-gitsync-boot")
-            remote_bundle = transport.native_join(remote_tmp, "peer.bundle")
+            remote_tmp = operation_transport.remote_temp_dir("remrun-gitsync-boot")
+            remote_bundle = operation_transport.native_join(remote_tmp, "peer.bundle")
             try:
-                _remote_git_ok(transport, remote_root,
+                _remote_git_ok(operation_transport, remote_root,
                                ["bundle", "create", remote_bundle, "--branches", "--tags"])
-                transport.pull_file(remote_bundle, local_bundle)
+                operation_transport.pull_file(remote_bundle, local_bundle)
             finally:
-                transport.remove_remote_tree(remote_tmp)
+                operation_transport.remove_remote_tree(remote_tmp)
             if not local_bundle.is_file() or local_bundle.stat().st_size == 0:
                 raise GitSyncError(
                     "peer bundle pull completed without a non-empty local bundle",
@@ -938,9 +1099,35 @@ def _worktree_counts(repo: Path) -> tuple[int, int]:
 
 
 def _ensure_remote_git_repo(transport: BaseTransport, remote_root: str) -> None:
-    res = _remote_git(transport, remote_root, ["rev-parse", "--is-inside-work-tree"])
-    if res.exit_code != 0 or res.stdout.strip() != "true":
-        raise GitSyncError(f"remote path is not a git repo: {remote_root}", EXIT_INFRA)
+    """Require ``remote_root`` itself to be a healthy worktree root.
+
+    ``--show-prefix`` is empty only at the repository top level. Pairing it with
+    ``--show-toplevel`` gives a two-line Git-owned suffix while tolerating text emitted
+    *before* the command by a login-shell profile. Failures retain exact probe evidence.
+    """
+    argv = ["git", "rev-parse", "--show-prefix", "--show-toplevel"]
+    res = transport.exec(argv, cwd=remote_root)
+    reason: str | None = None
+    if res.exit_code != 0:
+        reason = "git command failed"
+    else:
+        lines = res.stdout.splitlines()
+        if len(lines) < 2 or not lines[-1]:
+            reason = "git returned unexpected output"
+        elif lines[-2]:
+            reason = (
+                "mapped cwd is inside a parent repository "
+                f"(prefix={lines[-2]!r}, top_level={lines[-1]!r})"
+            )
+    if reason is None:
+        return
+    raise GitSyncError(
+        "remote git repository probe failed: "
+        f"reason={reason}; cwd={json.dumps(remote_root)}; "
+        f"argv={json.dumps(argv)}; exit_code={res.exit_code}; "
+        f"stdout_raw={json.dumps(res.stdout)}; stderr_raw={json.dumps(res.stderr)}",
+        EXIT_INFRA,
+    )
 
 
 def _local_git(repo: Path, args: list[str]) -> subprocess.CompletedProcess:
@@ -957,7 +1144,24 @@ def _local_git_ok(repo: Path, args: list[str]) -> subprocess.CompletedProcess:
 
 
 def _remote_git(transport: BaseTransport, remote_root: str, args: list[str]):
-    return transport.exec(["git", *args], cwd=remote_root)
+    result = transport.exec(["git", *args], cwd=remote_root)
+    guard = result.memory_guard
+    if isinstance(guard, dict) and guard.get("status") != "ok":
+        status = str(guard.get("status") or "unknown")
+        reason = str(guard.get("reason") or "unknown")
+        detail = str(guard.get("detail") or "")
+        command_started = guard.get("command_started")
+        started_text = (
+            "true" if command_started is True
+            else "false" if command_started is False
+            else "unknown"
+        )
+        raise GitSyncError(
+            f"remote git {' '.join(args)} memory guard {status}: {reason}: {detail}; "
+            f"command_started={started_text}; command was not retried",
+            EXIT_TRANSFER,
+        )
+    return result
 
 
 def _remote_git_ok(transport: BaseTransport, remote_root: str, args: list[str]):

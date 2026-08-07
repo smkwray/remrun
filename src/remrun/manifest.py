@@ -142,7 +142,17 @@ def build_manifest(
                 continue
             digest = None
             if always_hash or (hash_below_bytes is not None and st.st_size <= hash_below_bytes):
-                digest = sha256_file(path)
+                try:
+                    digest = sha256_file(path)
+                except FileNotFoundError as exc:
+                    # Unlike a pre-stat disappearance, this path was already admitted
+                    # into the snapshot. Dropping it now could manufacture a deletion;
+                    # abort with a retryable explanation instead.
+                    raise ManifestError(
+                        f"file changed while hashing {rel}; retry the command"
+                    ) from exc
+                except OSError as exc:
+                    raise ManifestError(f"cannot hash {rel}: {exc}") from exc
             manifest[rel] = FileEntry(
                 path=rel,
                 kind="file",

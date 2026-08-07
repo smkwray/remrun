@@ -1,10 +1,13 @@
 """fleet CLI input resolution: clipboard -> text/files/folder, and folder-expansion filters."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from remrun.fleet import cli
+from remrun.fleet.models import FleetTask
+from remrun.fleet.queue import FleetQueue
 from remrun.output import Reporter
 
 
@@ -89,6 +92,54 @@ def test_direct_folder_run_uses_one_manifest_item_per_file(tmp_path, monkeypatch
     assert cli.cmd_run(args, Reporter(json_events=False)) == cli.EXIT_OK
     assert [Path(task.inputs[0]).name for task in seen] == ["a.pdf", "b.png"]
     assert all(len(task.inputs) == 1 for task in seen)
+
+
+def test_direct_run_json_preserves_memory_guard_payload(monkeypatch, capsys):
+    guard = {
+        "status": "terminated",
+        "reason": "command_memory_limit",
+        "detail": "limit exceeded",
+        "command_started": True,
+    }
+    args = SimpleNamespace(
+        task_type="cmd", text=None, input=[], clipboard=False,
+        device="MACBOX", engine=None, opt=[], output_root=None,
+        argv=["python", "-c", "pass"], allow_fallback=False, no_lease=True, json=True,
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+    monkeypatch.setattr(cli.executor, "run_group", lambda *_a, **_k: {
+        "ok": False,
+        "phase": "memory_guard",
+        "memory_guard": guard,
+        "error": "memory guard terminated after command start",
+        "no_retry": True,
+    })
+
+    assert cli.cmd_run(args, Reporter(json_events=False)) == cli.EXIT_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["memory_guard"] == guard
+    assert payload["phase"] == "memory_guard"
+    assert payload["no_retry"] is True
+
+
+def test_status_text_surfaces_last_error(tmp_path, monkeypatch, capsys):
+    state = tmp_path / "state"
+    q = FleetQueue(state / "fleet" / "fleet.db")
+    try:
+        jid = q.enqueue(FleetTask(task_type="cmd"))
+        q.set_state(
+            jid,
+            "failed_final",
+            error="memory guard terminated after command start: command_memory_limit",
+        )
+    finally:
+        q.close()
+    monkeypatch.setattr(cli, "default_state_root", lambda: state)
+
+    assert cli.cmd_status(SimpleNamespace(json=False, limit=20), Reporter()) == cli.EXIT_OK
+    stderr = capsys.readouterr().err
+    assert "state=failed_final" in stderr
+    assert 'error="memory guard terminated after command start: command_memory_limit"' in stderr
 
 
 def test_resolve_clipboard_empty():

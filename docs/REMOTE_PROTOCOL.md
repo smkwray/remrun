@@ -65,7 +65,7 @@ Avoid interactive shells. Execute scripts with explicit quoting.
 
 ## Windows backend notes
 
-Use OpenSSH + PowerShell where possible. Convert project paths at the boundary. Avoid assuming POSIX tools exist on Windows. The `ssh-powershell` execution seam requires `pwsh` 7.3+ and supports native executables, cmdlets, aliases, and `.ps1` scripts. It rejects top-level `.cmd`/`.bat` files, including bare names resolved through `PATH`/`PATHEXT`, because the current PowerShell-to-`cmd.exe` seam is proved to corrupt some arguments. This is a narrower surface than POSIX arbitrary-command execution.
+Use OpenSSH + PowerShell where possible. Convert project paths at the boundary. Avoid assuming POSIX tools exist on Windows. The `ssh-powershell` seam requires `pwsh` 7.3+ and supports native applications plus `.ps1` entry points whose following tokens are positional data. It rejects direct PowerShell cmdlets, functions, filters, configurations, and aliases before user code; already-resolvable commands fail during preflight and the target process rechecks after reconciliation. The exact `list[str]` API cannot distinguish named parameters or switches from positional strings. Put named-parameter syntax inside an explicit `.ps1` wrapper, or intentionally invoke `pwsh -NoProfile -Command <source>`. Top-level `.cmd`/`.bat` files, including bare names resolved through `PATH`/`PATHEXT`, remain rejected because the PowerShell-to-`cmd.exe` seam is proved to corrupt some arguments. This is a narrower surface than POSIX arbitrary-command execution.
 
 PowerShell runner should accept JSON run specs and return JSON summaries.
 

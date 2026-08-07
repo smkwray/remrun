@@ -29,6 +29,25 @@ def setup(tmp_path: Path):
     return local, remote_root, transport, backup
 
 
+def test_fresh_local_entry_fails_closed_on_unexplained_inspection_error(
+    tmp_path: Path, monkeypatch
+):
+    import remrun.reconcile as reconcile_mod
+
+    path = tmp_path / "output.bin"
+    path.write_bytes(b"complete output")
+    real_lstat = Path.lstat
+
+    def denied_lstat(self: Path):
+        if self == path:
+            raise PermissionError(13, "scanner denied inspection", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+    with pytest.raises(TransportError, match=r"cannot inspect local file.*scanner denied"):
+        reconcile_mod._fresh_local_entry(path, hash_if_size=path.stat().st_size)
+
+
 def reconcile(local, remote_root, transport, backup, prev_local=None, prev_remote=None):
     return preflight_reconcile(
         transport=transport,

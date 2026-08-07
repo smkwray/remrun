@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 from .config import RemrunConfig, current_os_key, expand_path
@@ -115,6 +116,44 @@ def detect_project(cwd: Path, config: RemrunConfig) -> ProjectContext:
     )
 
 
+def _main_worktree_root(project_root: Path) -> Path | None:
+    """Return Git's main worktree for one linked worktree, without mutating it."""
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", str(project_root), "worktree", "list",
+                "--porcelain", "-z",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    for field in proc.stdout.split(b"\0"):
+        if field.startswith(b"worktree "):
+            path = Path(os.fsdecode(field[len(b"worktree "):])).resolve()
+            return path
+    return None
+
+
 def find_project_config(project_root: Path) -> Path | None:
+    """Resolve project config, inheriting only from a linked worktree's main checkout.
+
+    The linked worktree remains the project root and synchronization surface. A local
+    config always wins. When it is absent and ``.git`` is a worktree pointer file, Git's
+    inspectable worktree registry identifies the main checkout; only its private
+    ``do/remrun/remrun.toml`` is read. Nothing is copied into or tracked by the worktree.
+    """
+    project_root = project_root.resolve()
     candidate = project_root / "do" / "remrun" / "remrun.toml"
-    return candidate if candidate.exists() else None
+    if candidate.exists():
+        return candidate
+    if not (project_root / ".git").is_file():
+        return None
+    main_root = _main_worktree_root(project_root)
+    if main_root is None or main_root == project_root:
+        return None
+    inherited = main_root / "do" / "remrun" / "remrun.toml"
+    return inherited if inherited.exists() else None

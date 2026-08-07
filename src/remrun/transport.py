@@ -20,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from .frame import decode_file_frame, encode_file_frame
 from .job_observation import JobObservation, observation_warning
@@ -124,7 +124,13 @@ def finalize_durable_result(
 
     marker = execution.get("batch_marker")
     if isinstance(marker, str) and marker and marker in stderr:
-        raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+        raise CommandNotStartedError(_WINDOWS_BATCH_UNSUPPORTED)
+    marker = execution.get("powershell_language_marker")
+    if isinstance(marker, str) and marker and marker in stderr:
+        raise CommandNotStartedError(_WINDOWS_POWERSHELL_COMMAND_UNSUPPORTED)
+    marker = execution.get("command_not_found_marker")
+    if isinstance(marker, str) and marker and marker in stderr:
+        raise CommandNotStartedError(_WINDOWS_COMMAND_NOT_FOUND)
 
     guard_token = execution.get("guard_token")
     if isinstance(guard_token, str) and guard_token:
@@ -619,6 +625,18 @@ def _guarded_helper_args(
     return args
 
 
+def _guard_command_start_evidence(guard_result: dict[str, Any]) -> bool | None:
+    """Return only retry-relevant start evidence from a classified guard result."""
+    command_started = guard_result.get("command_started")
+    if command_started is True:
+        return True
+    if guard_result.get("status") == "refused" and command_started is False:
+        return False
+    # A non-refusal claiming it never started is internally inconsistent. Treat
+    # that as unknown rather than using malformed evidence to authorize a retry.
+    return None
+
+
 def _finalize_guarded_result(
     *,
     helper_exit_code: int,
@@ -632,34 +650,50 @@ def _finalize_guarded_result(
     stderr, guard_result, ready = _extract_memory_guard(stderr, token)
     if guard_result is None:
         if ready:
-            raise TransportError(
+            detail = (
                 f"{platform_name} memory guard result missing after guard initialization; "
                 "command completion is unknown"
             )
-        raise TransportError(
-            f"{platform_name} memory guard did not initialize; user command was not confirmed safe"
-        )
+        else:
+            # READY is emitted before the launch gate is released, but an SSH/stream
+            # failure can lose both private markers after argv has begun. Absence is
+            # therefore not affirmative pre-start evidence and must not authorize retry.
+            detail = (
+                f"{platform_name} memory guard emitted no final result and readiness "
+                "could not be established; command completion is unknown"
+            )
+        raise GuardFinalizationError(detail, command_started=None)
     if (
         guard_result.get("max_command_bytes") != reservation.allowance_bytes
         or guard_result.get("min_available_bytes") != reservation.min_available_bytes
     ):
-        raise TransportError(
-            f"{platform_name} memory guard result thresholds do not match the reservation"
+        raise GuardFinalizationError(
+            f"{platform_name} memory guard result thresholds do not match the reservation",
+            command_started=_guard_command_start_evidence(guard_result),
+            memory_guard=guard_result,
         )
     status = guard_result["status"]
     if status == "ok":
         command_code = guard_result.get("command_exit_code")
         if isinstance(command_code, bool) or not isinstance(command_code, int):
-            raise TransportError(f"{platform_name} memory guard omitted command exit code")
+            raise GuardFinalizationError(
+                f"{platform_name} memory guard omitted command exit code",
+                command_started=_guard_command_start_evidence(guard_result),
+                memory_guard=guard_result,
+            )
         if helper_exit_code != command_code:
-            raise TransportError(
-                f"{platform_name} memory guard helper exit disagrees with command exit"
+            raise GuardFinalizationError(
+                f"{platform_name} memory guard helper exit disagrees with command exit",
+                command_started=_guard_command_start_evidence(guard_result),
+                memory_guard=guard_result,
             )
         return ExecResult(command_code, stdout, stderr, telemetry, guard_result)
     if helper_exit_code != _GUARD_HELPER_EXIT:
-        raise TransportError(
+        raise GuardFinalizationError(
             f"{platform_name} memory guard classified a safety stop but helper exited "
-            f"{helper_exit_code}"
+            f"{helper_exit_code}",
+            command_started=_guard_command_start_evidence(guard_result),
+            memory_guard=guard_result,
         )
     # Refusal/termination/fail-safe are deliberate, classified outcomes. The
     # CLI maps them to its distinct guard exit instead of exposing helper 125 as
@@ -777,6 +811,32 @@ class TransportError(RuntimeError):
     pass
 
 
+class GuardFinalizationError(TransportError):
+    """A guard initialized, but the controller cannot safely finalize its attempt.
+
+    ``command_started`` is deliberately tri-state. ``False`` is conclusive
+    pre-start evidence; ``True`` means the workload was attempted; ``None`` means
+    the ready marker proved guard initialization but the result needed to decide
+    whether user code ran is missing. Fleet retry policy must treat both ``True``
+    and ``None`` as unsafe to retry automatically.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        command_started: bool | None,
+        memory_guard: dict | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.command_started = command_started
+        self.memory_guard = dict(memory_guard) if memory_guard is not None else None
+
+
+class CommandNotStartedError(TransportError):
+    """A conclusive ordinary-run refusal before the user's command starts."""
+
+
 class DurablePrestartError(TransportError):
     """A conclusive target-side refusal before the durable supervisor starts."""
 
@@ -808,13 +868,44 @@ class BaseTransport:
             device_os=device.os,
         )
 
+    def validate_command(self, command: list[str]) -> None:
+        """Reject an unsupported argv without target-side command discovery.
+
+        Backends that support every non-empty argv keep the no-op default. A backend
+        with a narrower public command boundary must raise ``CommandNotStartedError``.
+        """
+        del command
+
+    def validate_command_context(
+        self,
+        command: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        path_prepend: list[str] | None = None,
+    ) -> None:
+        """Reject an unsupported argv in its target environment before reconcile.
+
+        The default preserves third-party transports' existing ``validate_command``
+        implementations. Backends whose command type depends on target-side resolution
+        may override this method; successful validation is still rechecked at dispatch.
+        """
+        del env, path_prepend
+        self.validate_command(command)
+
+    def command_start_requires_confirmation(self) -> bool:
+        """Whether dispatch alone cannot prove that the user command started."""
+        return False
+
     def _invoke_memory_admission(
         self, request: dict[str, object]
     ) -> dict[str, object]:
         raise NotImplementedError
 
     def reserve_memory_guard(
-        self, *, predicted_rss_mb: object = None
+        self,
+        *,
+        predicted_rss_mb: object = None,
+        explicit_limit_mib: object = None,
     ) -> MemoryAdmissionResult:
         if self.memory_guard is None:
             return MemoryAdmissionResult.refused(
@@ -827,6 +918,23 @@ class BaseTransport:
             value = float(predicted_rss_mb)
             if value > 0:
                 predicted_bytes = int(math.ceil(value * 1024 * 1024))
+        explicit_limit_bytes: int | None = None
+        if explicit_limit_mib is not None:
+            if (
+                isinstance(explicit_limit_mib, bool)
+                or not isinstance(explicit_limit_mib, int)
+                or explicit_limit_mib <= 0
+            ):
+                return MemoryAdmissionResult.refused(
+                    "invalid_explicit_limit",
+                    "explicit memory limit must be a positive integer MiB value",
+                )
+            explicit_limit_bytes = explicit_limit_mib * 1024 * 1024
+        if predicted_bytes is not None and explicit_limit_bytes is not None:
+            return MemoryAdmissionResult.refused(
+                "ambiguous_allowance",
+                "learned RSS prediction and explicit memory limit are mutually exclusive",
+            )
         try:
             request: dict[str, object] = {
                 "schema": 1,
@@ -835,6 +943,7 @@ class BaseTransport:
                 "lease_id": uuid.uuid4().hex,
                 "lease_token": uuid.uuid4().hex,
                 "predicted_rss_bytes": predicted_bytes,
+                "explicit_limit_bytes": explicit_limit_bytes,
                 "command_limit_fraction": self.memory_guard.command_limit_fraction,
                 "host_reserve_fraction": self.memory_guard.host_reserve_fraction,
                 "max_jobs": self.memory_guard.max_jobs,
@@ -962,6 +1071,53 @@ class BaseTransport:
         ExecResult is authoritative either way.
         """
         raise NotImplementedError
+
+    def exec_with_memory_limit(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        memory_limit_mib: int,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+        telemetry: bool = False,
+        on_stdout: StreamSink | None = None,
+        telemetry_request: TelemetryRequest | None = None,
+    ) -> ExecResult:
+        """Run once under an explicit hard process-tree memory limit.
+
+        This is distinct from ``predicted_rss_mb``: ``memory_limit_mib`` is an
+        operator or product boundary, not a learned measurement. The target still
+        atomically reserves the allowance plus control overhead while preserving
+        the configured host reserve. ``exec`` owns normal lease finalization; this
+        wrapper also performs an idempotent reserved-only release after return so a
+        backend pre-dispatch refusal cannot strand the lease. Claimed/running leases
+        remain owned by the target helper and are not released by this fallback.
+        """
+        if self.memory_guard is None:
+            raise TransportError(
+                "explicit memory limit requires a configured target memory guard"
+            )
+        admission = self.reserve_memory_guard(explicit_limit_mib=memory_limit_mib)
+        if not admission.admitted:
+            return _admission_exec_refusal(self.memory_guard, admission)
+        reservation = admission.reservation
+        assert reservation is not None
+        try:
+            return self.exec(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                path_prepend=path_prepend,
+                telemetry=telemetry,
+                on_stdout=on_stdout,
+                telemetry_request=telemetry_request,
+                memory_reservation=reservation,
+            )
+        finally:
+            self.release_memory_guard(reservation, reserved_only=True)
 
     def exec_observed(
         self,
@@ -1761,7 +1917,10 @@ class _SSHCommon(BaseTransport):
 
 
 _SET_MTIME_PROG = "import os,sys;t=float(sys.argv[2]);os.utime(sys.argv[1],(t,t))"
-_GET_MTIME_PROG = "import os,sys;print(os.stat(sys.argv[1]).st_mtime_ns)"
+_GET_FILE_METADATA_PROG = (
+    "import os,stat,sys;s=os.stat(sys.argv[1]);"
+    "print(s.st_mtime_ns,stat.S_IMODE(s.st_mode))"
+)
 _READ_SMALL_FILE_PROG = (
     "import os,stat,sys\n"
     "path,limit=sys.argv[1],int(sys.argv[2])\n"
@@ -1782,14 +1941,15 @@ _READ_SMALL_FILE_PROG = (
     "sys.stdout.buffer.write(data)\n"
 )
 
-# Remote-side atomic commit (POSIX): set mtime on the temp, fsync it, atomically replace
-# the destination, then best-effort fsync the parent dir. Run as `python -c PROG tmp dest ns`.
+# Remote-side atomic commit (POSIX): set mtime/mode on the temp, fsync it, atomically
+# replace the destination, then best-effort fsync the parent dir. Run as
+# `python -c PROG tmp dest ns mode`.
 _ATOMIC_COMMIT_PROG = (
     "import os,sys\n"
-    "tmp,dest,ns=sys.argv[1],sys.argv[2],int(sys.argv[3])\n"
+    "tmp,dest,ns,mode=sys.argv[1],sys.argv[2],int(sys.argv[3]),int(sys.argv[4])\n"
     "os.utime(tmp,ns=(ns,ns))\n"
     "fd=os.open(tmp,os.O_RDONLY)\n"
-    "try:\n os.fsync(fd)\n"
+    "try:\n os.fchmod(fd,mode)\n os.fsync(fd)\n"
     "finally:\n os.close(fd)\n"
     "os.replace(tmp,dest)\n"
     "try:\n"
@@ -1798,6 +1958,35 @@ _ATOMIC_COMMIT_PROG = (
     " finally:\n  os.close(d)\n"
     "except OSError:\n pass\n"
 )
+
+
+_LOCAL_REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+def _is_retryable_windows_replace_error(exc: OSError) -> bool:
+    """Return whether Windows reported a transient sharing/access lock."""
+    if os.name != "nt":
+        return False
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {
+        5,   # ERROR_ACCESS_DENIED (AV/indexer can transiently hold the temp)
+        32,  # ERROR_SHARING_VIOLATION
+        33,  # ERROR_LOCK_VIOLATION
+    }
+
+
+def _retry_windows_file_lock(operation) -> None:
+    for delay in (*_LOCAL_REPLACE_RETRY_DELAYS, None):
+        try:
+            operation()
+            return
+        except OSError as exc:
+            if delay is None or not _is_retryable_windows_replace_error(exc):
+                raise
+            time.sleep(delay)
+
+
+def _replace_local_with_retry(src: Path, dest: Path) -> None:
+    _retry_windows_file_lock(lambda: os.replace(src, dest))
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -1813,24 +2002,41 @@ def _fsync_dir(directory: Path) -> None:
         pass
 
 
-def _atomic_write_local(dest: Path, fill) -> None:
+def _atomic_write_local(dest: Path, fill, *, mode: int | None = None) -> None:
     """Durably + atomically write a LOCAL file. ``fill(tmp_path)`` fully populates a temp
     file beside ``dest`` (and sets its mtime); we then fsync it and ``os.replace`` it onto
     ``dest`` (atomic on the same filesystem). An interrupted/failed write thus never leaves
-    a partial or truncated ``dest`` — the prior contents survive."""
+    a partial or truncated ``dest`` — the prior contents survive.
+
+    A requested POSIX mode is applied through the already-open temp descriptor immediately
+    before fsync. This preserves read-only/executable modes without making the temp
+    unopenable during finalization.
+    """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.parent / f".remrun-tmp-{dest.name}-{uuid.uuid4().hex}.tmp"
     try:
         fill(tmp)
-        # fsync via a writable handle (Windows os.fsync needs write access, unlike POSIX).
-        with tmp.open("r+b") as f:
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, dest)
+        # Windows scanners can transiently lock a just-closed executable before either
+        # this durability reopen or the replace. Retry both bounded finalization steps.
+        def fsync_tmp() -> None:
+            # fsync via a writable handle (Windows os.fsync needs write access, unlike POSIX).
+            with tmp.open("r+b") as f:
+                f.flush()
+                if mode is not None and os.name == "posix":
+                    os.fchmod(f.fileno(), mode & 0o777)
+                os.fsync(f.fileno())
+
+        _retry_windows_file_lock(fsync_tmp)
+        _replace_local_with_retry(tmp, dest)
         _fsync_dir(dest.parent)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        # Cleanup is best effort. A Windows scanner can hold the very temp that made
+        # replace fail; do not mask the original transfer error with cleanup's lock.
+        try:
+            _retry_windows_file_lock(lambda: tmp.unlink(missing_ok=True))
+        except OSError:
+            pass
         raise
 
 
@@ -1852,6 +2058,17 @@ _WINDOWS_BATCH_UNSUPPORTED = (
     "preserve remrun's exact argv contract; use a native "
     "executable or .ps1 wrapper"
 )
+_WINDOWS_POWERSHELL_COMMAND_UNSUPPORTED = (
+    "unsupported ssh-powershell command: direct PowerShell cmdlets, functions, "
+    "filters, configurations, and aliases cannot preserve named-parameter binding "
+    "through remrun's exact list-of-strings command API; use a .ps1 wrapper that "
+    "accepts positional data, or invoke pwsh -NoProfile -Command with intentional "
+    "PowerShell source"
+)
+_WINDOWS_COMMAND_NOT_FOUND = (
+    "ssh-powershell command was not found at the dispatch boundary; no user "
+    "command was started"
+)
 _WINDOWS_POWERSHELL_UNSUPPORTED = (
     "unsupported ssh-powershell configuration: shell='powershell' uses the "
     "Windows PowerShell 5.1 invocation seam, which cannot preserve arbitrary "
@@ -1867,31 +2084,54 @@ def _windows_command_extension(command_name: str) -> str:
 def _reject_explicit_windows_batch(command: list[str]) -> None:
     """Reject an explicit batch target before address resolution or staging."""
     if command and _windows_command_extension(command[0]) in _WINDOWS_BATCH_EXTENSIONS:
-        raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+        raise CommandNotStartedError(_WINDOWS_BATCH_UNSUPPORTED)
 
 
-def _ps_batch_resolution_guard(command_name: str, marker: str) -> list[str]:
-    """Reject a bare/aliased command that PowerShell resolves to batch.
+def _ps_boundary_markers(nonce: str) -> tuple[str, str, str, str]:
+    base = f"__REMRUN_COMMAND_BOUNDARY_{nonce}__"
+    return base, base + "B;", base + "P;", base + "N;"
 
-    The lookup uses PowerShell's own command-discovery API in the already-running
-    process, so it adds neither an SSH round trip nor a child process. Explicit
-    ``.cmd``/``.bat`` tokens are rejected locally before this guard is needed.
+
+def _ps_command_boundary_guard(
+    command_name: str, *, marker: str, reject_missing: bool
+) -> list[str]:
+    """Classify the top-level command before PowerShell invokes user code.
+
+    ``Application`` is the exact native-argv surface proved on PowerShell 7.3+.
+    ``ExternalScript`` is accepted only for ``.ps1`` and receives positional data.
+    Discovery disables module autoload in a child scope so validation cannot run a
+    module initializer. The compact marker protocol keeps long supported argv below
+    Windows OpenSSH's fixed command-line boundary.
     """
     command = _ps_squote(command_name)
+    missing = (
+        "[Console]::Error.Write($rm+'N;');exit 127"
+        if reject_missing
+        else "$null=$null"
+    )
     return [
+        f"$rm={_ps_squote(marker)}",
         (
-            "$remrunBatch = $ExecutionContext.InvokeCommand.GetCommand("
-            f"{command}, [System.Management.Automation.CommandTypes]::All)"
+            "$ri=&{$PSModuleAutoLoadingPreference='None';"
+            "$ExecutionContext.InvokeCommand.GetCommand("
+            f"{command},[System.Management.Automation.CommandTypes]::All)}}"
+        ),
+        f"if($null -eq $ri){{{missing}}}else{{",
+        (
+            "if($ri.CommandType -eq 'Alias'){"
+            "[Console]::Error.Write($rm+'P;');exit 126}"
         ),
         (
-            "if ($remrunBatch.CommandType -eq 'Alias') { "
-            "$remrunBatch = $remrunBatch.ResolvedCommand }"
+            "if($ri.Path -match '\\.(cmd|bat)$'){"
+            "[Console]::Error.Write($rm+'B;');exit 126}"
         ),
         (
-            "if ($remrunBatch.Path -match '\\.(cmd|bat)$') { "
-            f"[Console]::Error.Write({_ps_squote(marker)}); exit 126 }}"
+            "if($ri.CommandType -ne 'Application' -and "
+            "($ri.CommandType -ne 'ExternalScript' -or $ri.Path -notmatch '\\.ps1$')){"
+            "[Console]::Error.Write($rm+'P;');exit 126}"
         ),
-        "Remove-Variable -Name remrunBatch",
+        "}",
+        "Remove-Variable ri,rm -ErrorAction SilentlyContinue",
     ]
 
 
@@ -1910,15 +2150,14 @@ def _ps_command_argv(
     command: list[str],
     *,
     inherited_path_var: str | None = None,
-    batch_marker: str | None = None,
+    boundary_marker: str | None = None,
 ) -> list[str]:
-    """Run ``command`` through the same PowerShell ``&`` seam as the transport.
+    """Run one supported command through the transport's PowerShell ``&`` seam.
 
-    The Windows Job Object helper can launch only native application images.
-    Passing the user's tokens to it directly therefore breaks cmdlets, aliases,
-    and ``.ps1`` files. A nested encoded PowerShell process is a native image the
-    Job Object can track while PowerShell remains the sole interpreter of the
-    original token list. Top-level batch files are rejected before this seam.
+    The Windows Job Object helper can launch only native application images. A
+    nested encoded PowerShell process keeps the exact native/positional token list
+    intact while the command-type guard rejects unsupported language and batch
+    entry points before user code.
     """
     if not command:
         raise ValueError("PowerShell command must not be empty")
@@ -1936,8 +2175,12 @@ def _ps_command_argv(
                 f"$env:{inherited_path_var} = $null",
             ]
         )
-    if batch_marker is not None:
-        lines.extend(_ps_batch_resolution_guard(command[0], batch_marker))
+    if boundary_marker is not None:
+        lines.extend(
+            _ps_command_boundary_guard(
+                command[0], marker=boundary_marker, reject_missing=True
+            )
+        )
     lines.extend(
         [
             invocation,
@@ -1985,14 +2228,18 @@ def _tar_bytes_from_local(local_root: Path, rel_paths: list[str]) -> bytes:
             st = src.stat()
             info = tarfile.TarInfo(safe)
             info.size = st.st_size
-            info.mode = st.st_mode & 0o777
+            # Windows does not carry POSIX execute semantics. Normalize its archive
+            # mode instead of exporting synthetic st_mode bits to a POSIX target.
+            info.mode = (st.st_mode & 0o777) if os.name == "posix" else 0o644
             info.mtime = st.st_mtime_ns / 1_000_000_000.0
             with src.open("rb") as f:
                 tf.addfile(info, f)
     return buf.getvalue()
 
 
-def _extract_tar_to_local(data: bytes, local_root: Path) -> None:
+def _extract_tar_to_local(
+    data: bytes, local_root: Path, *, preserve_posix_mode: bool = False
+) -> None:
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
         for member in tf.getmembers():
             rel = _safe_rel(member.name)
@@ -2010,7 +2257,12 @@ def _extract_tar_to_local(data: bytes, local_root: Path) -> None:
                     os.utime(tmp, ns=(ns, ns))
                 except (ValueError, OSError):
                     pass
-            _atomic_write_local(dest, fill)
+            install_mode = (
+                member.mode & 0o777
+                if preserve_posix_mode and os.name == "posix"
+                else None
+            )
+            _atomic_write_local(dest, fill, mode=install_mode)
 
 
 _TAR_EXTRACT_PROG = r"""
@@ -2039,6 +2291,8 @@ with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode="r:*") as tf
                 if src is not None:
                     shutil.copyfileobj(src, out)
                 out.flush()
+                if os.name != "nt":
+                    os.fchmod(out.fileno(), member.mode & 0o777)
                 os.fsync(out.fileno())
             ns = int(float(member.mtime) * 1000000000)
             os.utime(tmp, ns=(ns, ns))
@@ -2783,7 +3037,9 @@ class SSHPosixTransport(_SSHCommon):
     def push_file(self, local_path: Path, remote_path: str) -> None:
         address = self._address_or_resolve()
         parent = posixpath.dirname(remote_path) or "."
-        mtime_ns = local_path.stat().st_mtime_ns
+        local_stat = local_path.stat()
+        mtime_ns = local_stat.st_mtime_ns
+        mode = (local_stat.st_mode & 0o777) if os.name == "posix" else 0o644
         # Stream into a temp beside the final path, then atomically commit (replace) it, so
         # an interrupted SSH stream never leaves a partial/truncated destination file.
         tmp = f"{remote_path}.remrun-tmp-{uuid.uuid4().hex}.tmp"
@@ -2798,7 +3054,7 @@ class SSHPosixTransport(_SSHCommon):
             "trap 'rm -f \"$t\"' EXIT && "
             'cat > "$t" && '
             f"{shlex.quote(self.device.remote_python)} -c {shlex.quote(_ATOMIC_COMMIT_PROG)} "
-            f'"$t" {shlex.quote(remote_path)} {mtime_ns} && '
+            f'"$t" {shlex.quote(remote_path)} {mtime_ns} {mode} && '
             "trap - EXIT"
         )
         data = local_path.read_bytes()
@@ -2831,18 +3087,23 @@ class SSHPosixTransport(_SSHCommon):
                 f"pull {remote_path} failed: {proc.stderr.decode('utf-8', 'replace')}"
             )
         data = proc.stdout
-        # Best-effort remote mtime so large (unhashed) files stay "same" for `run`.
+        # Best-effort remote mtime so large (unhashed) files stay "same" for `run`,
+        # plus POSIX mode so a pulled executable does not silently become 0644.
         ns: int | None = None
+        mode: int | None = None
         mt = self._remote(
             address,
-            f"{shlex.quote(self.device.remote_python)} -c {shlex.quote(_GET_MTIME_PROG)} "
+            f"{shlex.quote(self.device.remote_python)} -c "
+            f"{shlex.quote(_GET_FILE_METADATA_PROG)} "
             f"{shlex.quote(remote_path)}",
         )
         if mt.returncode == 0:
             try:
-                ns = int(mt.stdout.decode("utf-8", "replace").strip())
-            except ValueError:
-                ns = None
+                ns_text, mode_text = mt.stdout.decode("utf-8", "replace").split()
+                ns = int(ns_text)
+                mode = int(mode_text)
+            except (ValueError, TypeError):
+                ns = mode = None
 
         def fill(tmp: Path) -> None:
             tmp.write_bytes(data)
@@ -2851,7 +3112,8 @@ class SSHPosixTransport(_SSHCommon):
                     os.utime(tmp, ns=(ns, ns))
                 except OSError:
                     pass
-        _atomic_write_local(local_path, fill)
+        install_mode = mode & 0o777 if mode is not None and os.name == "posix" else None
+        _atomic_write_local(local_path, fill, mode=install_mode)
 
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         limit = _validate_small_file_limit(max_bytes)
@@ -2887,7 +3149,7 @@ class SSHPosixTransport(_SSHCommon):
             raise TransportError(
                 f"pull archive from {remote_root} failed: {proc.stderr.decode('utf-8', 'replace')}"
             )
-        _extract_tar_to_local(proc.stdout, local_root)
+        _extract_tar_to_local(proc.stdout, local_root, preserve_posix_mode=True)
 
     def delete_remote(self, remote_path: str) -> None:
         address = self._address_or_resolve()
@@ -2955,9 +3217,11 @@ class SSHPowerShellTransport(_SSHCommon):
 
     Commands and filesystem ops are sent as PowerShell scripts via
     ``-EncodedCommand`` (base64 UTF-16LE), which protects the remote launcher
-    boundary regardless of the configured OpenSSH default shell. Top-level
-    ``.cmd``/``.bat`` commands are rejected because the current handoff to
-    ``cmd.exe`` is proved to corrupt some argv. File transfers stream base64
+    boundary regardless of the configured OpenSSH default shell. The exact public
+    command surface is native applications and positional-data ``.ps1`` entry
+    points. PowerShell-language commands and top-level ``.cmd``/``.bat`` commands
+    are rejected before user code because their parameter/argv semantics cannot be
+    represented exactly. File transfers stream base64
     over stdin (push) / stdout (pull) so they are binary-safe and
     need no scp.
 
@@ -3033,12 +3297,16 @@ class SSHPowerShellTransport(_SSHCommon):
         telemetry_request: TelemetryRequest | None = None,
         memory_reservation: MemoryReservation | None = None,
     ) -> ExecResult:
-        _reject_explicit_windows_batch(command)
-        marker = f"__REMRUN_BATCH_UNSUPPORTED_{uuid.uuid4().hex}__;"
+        self.validate_command(command)
+        boundary_marker, batch_marker, language_marker, not_found_marker = (
+            _ps_boundary_markers(uuid.uuid4().hex)
+        )
         try:
             state_root, helper = self._ensure_job_observer()
             metadata = observation.encoded()
-            child = _ps_command_argv(self._ps_exe(), command, batch_marker=marker)
+            child = _ps_command_argv(
+                self._ps_exe(), command, boundary_marker=boundary_marker
+            )
         except Exception as exc:
             result = self.exec(
                 command,
@@ -3077,8 +3345,12 @@ class SSHPowerShellTransport(_SSHCommon):
             memory_reservation=memory_reservation,
             _allow_observed_breakaway=True,
         )
-        if marker in result.stderr:
-            raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+        if batch_marker in result.stderr:
+            raise CommandNotStartedError(_WINDOWS_BATCH_UNSUPPORTED)
+        if language_marker in result.stderr:
+            raise CommandNotStartedError(_WINDOWS_POWERSHELL_COMMAND_UNSUPPORTED)
+        if not_found_marker in result.stderr:
+            raise CommandNotStartedError(_WINDOWS_COMMAND_NOT_FOUND)
         return result
 
     def query_observed_jobs(
@@ -3113,6 +3385,65 @@ class SSHPowerShellTransport(_SSHCommon):
         if rel_posix in ("", "."):
             return remote_root.rstrip("\\/")
         return remote_root.rstrip("\\/") + "\\" + rel_posix.strip("/").replace("/", "\\")
+
+    def validate_command(self, command: list[str]) -> None:
+        if self._ps_exe().lower() == "powershell":
+            raise CommandNotStartedError(_WINDOWS_POWERSHELL_UNSUPPORTED)
+        _reject_explicit_windows_batch(command)
+
+    def validate_command_context(
+        self,
+        command: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        path_prepend: list[str] | None = None,
+    ) -> None:
+        """Resolve a bare Windows command before reconciliation mutates either tree.
+
+        Missing commands are deferred because reconciliation may install an explicit
+        project executable or script. The same guard runs again in the dispatching
+        process and then treats a still-missing command as conclusively not started.
+        """
+        self.validate_command(command)
+        if not command:
+            raise CommandNotStartedError("ssh-powershell command must not be empty")
+        address = self._address_or_resolve()
+        boundary_marker, batch_marker, language_marker, _not_found_marker = (
+            _ps_boundary_markers(uuid.uuid4().hex)
+        )
+        lines = ["$ErrorActionPreference = 'Stop'"]
+        for key, value in (env or {}).items():
+            lines.append(f"$env:{key} = {_ps_squote(self._expand_remote(str(value)))}")
+        if path_prepend:
+            joined = ";".join(self._expand_remote(path) for path in path_prepend) + ";"
+            lines.append(f"$env:PATH = {_ps_squote(joined)} + $env:PATH")
+        lines.extend(
+            _ps_command_boundary_guard(
+                command[0], marker=boundary_marker, reject_missing=False
+            )
+        )
+        lines.append("exit 0")
+        proc = self._ps_remote(address, "\n".join(lines), timeout=30.0)
+        stderr = proc.stderr.decode("utf-8", "replace")
+        if batch_marker in stderr:
+            raise CommandNotStartedError(_WINDOWS_BATCH_UNSUPPORTED)
+        if language_marker in stderr:
+            raise CommandNotStartedError(_WINDOWS_POWERSHELL_COMMAND_UNSUPPORTED)
+        if proc.returncode == 255:
+            raise TransportError(
+                "ssh connection failed during PowerShell command validation: "
+                + stderr.strip()
+            )
+        if proc.returncode != 0:
+            raise TransportError(
+                "PowerShell command validation failed: "
+                + (stderr.strip() or f"exit {proc.returncode}")
+            )
+
+    def command_start_requires_confirmation(self) -> bool:
+        # A bare token is resolved inside the target PowerShell process. Until the
+        # command-type guard returns, dispatch does not prove user code started.
+        return True
 
     def _ps_remote(self, address: str, script: str, input_bytes: bytes | None = None,
                    timeout: float | None = None,
@@ -3274,15 +3605,17 @@ class SSHPowerShellTransport(_SSHCommon):
     ) -> tuple[dict[str, object], dict[str, object]]:
         if self.memory_guard is not None or memory_reservation is not None:
             raise TransportError("schema-2 memory guard is unsupported on ssh-powershell")
-        if self._ps_exe().lower() == "powershell":
-            raise TransportError(_WINDOWS_POWERSHELL_UNSUPPORTED)
-        _reject_explicit_windows_batch(command)
+        self.validate_command_context(
+            command, env=env, path_prepend=path_prepend
+        )
         root, observer = self._ensure_job_observer()
         durable_root, _durable = self._ensure_durable_runner()
         if durable_root != root:
             raise TransportError("durable and observer state roots disagree")
         ready_path = self.native_join(root, "durable-runs", run_id, "observer-ready.json")
-        marker = f"__REMRUN_BATCH_UNSUPPORTED_{uuid.uuid4().hex}__;"
+        boundary_marker, batch_marker, language_marker, not_found_marker = (
+            _ps_boundary_markers(uuid.uuid4().hex)
+        )
         lines = [
             "$ErrorActionPreference = 'Stop'",
             "$PSNativeCommandUseErrorActionPreference = $false",
@@ -3293,7 +3626,11 @@ class SSHPowerShellTransport(_SSHCommon):
             joined = ";".join(self._expand_remote(p) for p in path_prepend) + ";"
             lines.append(f"$env:PATH = {_ps_squote(joined)} + $env:PATH")
         lines.append(f"Set-Location -LiteralPath {_ps_squote(self._expand_remote(cwd))}")
-        lines.extend(_ps_batch_resolution_guard(command[0], marker))
+        lines.extend(
+            _ps_command_boundary_guard(
+                command[0], marker=boundary_marker, reject_missing=True
+            )
+        )
         lines.append("& " + " ".join(_ps_squote(token) for token in command))
         lines.extend([
             "$remrunCommandSucceeded = $?",
@@ -3327,8 +3664,11 @@ class SSHPowerShellTransport(_SSHCommon):
             ]
             telemetry_kind = "detailed" if telemetry_request is not None else "legacy"
         execution: dict[str, object] = {
-            "platform": "Windows", "telemetry": telemetry_kind,
-            "batch_marker": marker,
+            "platform": "Windows",
+            "telemetry": telemetry_kind,
+            "batch_marker": batch_marker,
+            "powershell_language_marker": language_marker,
+            "command_not_found_marker": not_found_marker,
         }
         spec = {
             "schema": 1, "run_id": run_id, "resume_token": resume_token,
@@ -3407,9 +3747,7 @@ class SSHPowerShellTransport(_SSHCommon):
              _allow_observed_breakaway: bool = False) -> ExecResult:
         if self.memory_guard is not None or memory_reservation is not None:
             raise TransportError("memory guard schema 2 is not proved on Windows")
-        if self._ps_exe().lower() == "powershell":
-            raise TransportError(_WINDOWS_POWERSHELL_UNSUPPORTED)
-        _reject_explicit_windows_batch(command)
+        self.validate_command(command)
         try:
             address = self._address_or_resolve()
         except TransportError as exc:
@@ -3432,8 +3770,14 @@ class SSHPowerShellTransport(_SSHCommon):
             lines.append(f"$env:PATH = {_ps_squote(joined)} + $env:PATH")
         lines.append(f"Set-Location -LiteralPath {_ps_squote(self._expand_remote(cwd))}")
         private_nonce = uuid.uuid4().hex
-        batch_marker = f"__REMRUN_BATCH_UNSUPPORTED_{private_nonce}__;"
-        lines.extend(_ps_batch_resolution_guard(command[0], batch_marker))
+        boundary_marker, batch_marker, language_marker, not_found_marker = (
+            _ps_boundary_markers(private_nonce)
+        )
+        lines.extend(
+            _ps_command_boundary_guard(
+                command[0], marker=boundary_marker, reject_missing=True
+            )
+        )
         cmd_tokens = " ".join(_ps_squote(c) for c in command)
         exit_marker = f"__REMRUN_EXIT_{private_nonce}__"
         exit_lines = [
@@ -3552,7 +3896,11 @@ class SSHPowerShellTransport(_SSHCommon):
         stdout = proc.stdout.decode("utf-8", "replace")
         stderr = proc.stderr.decode("utf-8", "replace")
         if batch_marker in stderr:
-            raise TransportError(_WINDOWS_BATCH_UNSUPPORTED)
+            raise CommandNotStartedError(_WINDOWS_BATCH_UNSUPPORTED)
+        if language_marker in stderr:
+            raise CommandNotStartedError(_WINDOWS_POWERSHELL_COMMAND_UNSUPPORTED)
+        if not_found_marker in stderr:
+            raise CommandNotStartedError(_WINDOWS_COMMAND_NOT_FOUND)
         stderr, exact_exit_code = _extract_windows_exit_marker(stderr, exit_marker)
         helper_exit_code = proc.returncode if exact_exit_code is None else exact_exit_code
 

@@ -30,8 +30,8 @@ from .planner import make_run_plan
 from .project import ProjectDetectionError, detect_project, find_project_config
 from .profile import (
     LOCAL_DEVICE, WorkloadObservation, command_key, device_profile, load_job_costs,
-    load_profiles, merge_job_costs, predict_job, recommend_offload, update_profile,
-    update_workload_profile,
+    load_profiles, merge_job_costs, predict_job, profile_project_id,
+    recommend_offload, update_profile, update_workload_profile,
 )
 from .scheduler import pick_by_load
 from .reconcile import postrun_pullback, preflight_reconcile
@@ -77,8 +77,8 @@ from .state import (
     write_unknown_completion_hazard,
 )
 from .transport import (
-    DurablePrestartError, DurableStateError, TelemetryRequest, TransportError,
-    finalize_durable_result, make_transport,
+    CommandNotStartedError, DurablePrestartError, DurableStateError, TelemetryRequest,
+    TransportError, finalize_durable_result, make_transport,
 )
 
 KNOWN_COMMANDS = {
@@ -93,6 +93,7 @@ EXIT_CONFLICT = 2
 EXIT_TRANSFER = 3
 EXIT_INFRA = 4
 EXIT_GUARD = 5
+EXIT_CANCELLED = 130
 RUN_CONTEXT_ENV = "REMRUN_RUN_CONTEXT"
 
 
@@ -262,6 +263,11 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_resolve_unknown(args, reporter)
         parser.print_help()
         return EXIT_INTERNAL
+    except KeyboardInterrupt:
+        reporter.event(
+            "cancelled", message="interrupted by user", exit_code=EXIT_CANCELLED
+        )
+        return EXIT_CANCELLED
     except Exception as exc:  # Keep agent-visible error concise.
         reporter.event("error", type=type(exc).__name__, message=str(exc))
         return EXIT_INTERNAL
@@ -394,6 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="verify both repos but do not fetch or fast-forward")
     p.add_argument("--status", action="store_true",
                    help="report branch state, dirty flags, hook, and diagnostics without mutating")
+    p.add_argument(
+        "--remote-memory-limit-mib",
+        type=int,
+        help=("hard per-command process-tree limit for repository-scaling Git work on "
+              "a guarded target; overrides [git_sync].remote_memory_limit_mib"),
+    )
     hook = p.add_mutually_exclusive_group()
     hook.add_argument("--install-hook", action="store_true",
                       help="install a non-blocking post-commit push hook")
@@ -632,55 +644,30 @@ def cmd_runner(args: argparse.Namespace, reporter: Reporter) -> int:
     return EXIT_OK
 
 
-def _probe_candidates(plan: RunPlan, config, *, check_git: bool) -> list[dict]:
-    """Live per-candidate readiness for an orchestrator choosing a device.
-
-    OPT-IN and never on the run path: probing costs a round-trip per device (the POSIX
-    utilization sample uses a bounded interval counter), which is why `plan` stays
-    probe-free by default.
-
-    Reports, per candidate: reachability, live CPU busy %, static capacity, and the
-    derived spare perf-core-equivalents that `pick_by_load` actually ranks on — so the
-    caller sees the same number the scheduler would use, not a raw percentage it would
-    have to re-derive. Optionally adds git divergence.
-
-    Every field is independently nullable: an unreachable device, a backend that cannot
-    sample load, and a project with no git all degrade to `null` on that field alone
-    rather than dropping the candidate. `null` means UNKNOWN, never "fine".
-    """
-    sched = scheduler_config(config)
+def _candidate_probe_entry(device, sched: dict) -> dict:
     eff_w = float(sched.get("eff_core_weight", 1.0))
-    out: list[dict] = []
-    for device in plan.candidates:
-        entry: dict = {
-            "name": device.name,
-            "perf_cores": device.perf_cores,
-            "eff_cores": device.eff_cores,
-            "ram_gb": device.ram_gb,
-            "capacity_perf_core_equiv": round(device.cpu_capacity(eff_w), 2) or None,
-            "reachable": None, "cpu_busy_pct": None, "spare_perf_core_equiv": None,
-            "max_jobs": device.max_jobs,
-        }
-        try:
-            transport = make_transport(device)
-            probe = transport.probe()
-            entry["reachable"] = bool(probe.reachable)
-            if not probe.reachable:
-                entry["detail"] = probe.detail
-            else:
-                busy = transport.sample_load()
-                entry["cpu_busy_pct"] = busy
-                cap = device.cpu_capacity(eff_w)
-                if busy is not None and cap:
-                    entry["spare_perf_core_equiv"] = round(
-                        cap * (1.0 - min(max(busy, 0.0), 100.0) / 100.0), 2)
-                if check_git:
-                    entry["git"] = _candidate_git_state(transport, device, plan)
-        except (TransportError, OSError) as exc:
-            entry["reachable"] = False
-            entry["detail"] = str(exc)
-        out.append(entry)
-    return out
+    capacity = device.cpu_capacity(eff_w)
+    return {
+        "name": device.name,
+        "perf_cores": device.perf_cores,
+        "eff_cores": device.eff_cores,
+        "ram_gb": device.ram_gb,
+        "capacity_perf_core_equiv": round(capacity, 2) or None,
+        "reachable": None, "cpu_busy_pct": None, "spare_perf_core_equiv": None,
+        "max_jobs": device.max_jobs,
+        "recommended": False,
+    }
+
+
+def _job_prediction(config, plan: RunPlan) -> dict | None:
+    """Read the exact learned inputs used by ordinary ``run --auto`` placement."""
+    profiles = load_profiles(default_state_root())
+    profile_id = profile_project_id(plan.project.project_id)
+    profile_key = command_key(plan.command)
+    if _import_legacy_job_costs(config):
+        profiles = merge_job_costs(
+            profiles, profile_id, load_job_costs(plan.project.local_project_root))
+    return predict_job(profiles, profile_id, profile_key)
 
 
 def _candidate_git_state(transport, device, plan: RunPlan) -> dict:
@@ -728,25 +715,42 @@ def _candidate_git_state(transport, device, plan: RunPlan) -> dict:
 def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
     config = load_config()
     command = normalize_cmd(args.cmd)
+    target_name = "auto" if args.auto else args.target
     plan = make_run_plan(
         cwd=Path.cwd(),
         config=config,
-        target_name="auto" if args.auto else args.target,
+        target_name=target_name,
         command=command,
         scope_name=args.scope,
         json_events=args.json,
         requested_workload=args.workload,
     )
-    candidates = (_probe_candidates(plan, config, check_git=args.check_git)
-                  if (args.probe or args.check_git) else None)
+    candidates = None
+    target_reason = None
+    if args.probe or args.check_git:
+        candidates = []
+        selection = _resolve_targets(
+            plan, target_name, scheduler_config(config), reporter,
+            _job_prediction(config, plan), diagnostics=candidates,
+            check_git=args.check_git, emit_events=False)
+        if selection:
+            plan = replace(plan, target=selection[0][0])
+            target_reason = selection[0][3]
+        else:
+            target_reason = "unreachable"
     if args.json:
         payload = plan.as_dict()
         if candidates is not None:
+            payload["target_reason"] = target_reason
             payload["candidates_probed"] = candidates
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         reporter.event("project", project_id=plan.project.project_id, relative_cwd=plan.project.relative_cwd)
-        reporter.event("target", name=plan.target.name, kind=plan.target.kind)
+        if target_reason is None:
+            reporter.event("target", name=plan.target.name, kind=plan.target.kind)
+        else:
+            reporter.event("target", name=plan.target.name, kind=plan.target.kind,
+                           reason=target_reason)
         reporter.event("command", argv=plan.command)
         reporter.event("transfer_mode", mode=plan.transfer_mode)
         reporter.event("write_scope", name=plan.write_scope or "project",
@@ -758,7 +762,8 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
             reporter.event("candidate_probe", **entry)
         reporter.event("project_config", path=str(plan.project_config_path) if plan.project_config_path else None)
         rec = recommend_offload(
-            load_profiles(default_state_root()), plan.project.project_id,
+            load_profiles(default_state_root()),
+            profile_project_id(plan.project.project_id),
             command_key(plan.command), devices=[d.name for d in plan.candidates],
             bias=float(scheduler_config(config).get("offload_bias", 1.25)))
         if rec.get("recommend") != "unknown":
@@ -780,24 +785,68 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
 
 
 def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, reporter: Reporter,
-                     prediction: dict | None = None):
-    """Probe candidates and rank the run targets, best first.
+                     prediction: dict | None = None, *, diagnostics: list[dict] | None = None,
+                     check_git: bool = False, emit_events: bool = True):
+    """Probe and rank once for both ``run`` and opt-in, read-only ``plan`` diagnostics.
 
-    Explicit target → probe it; reachable or fail (never fails over), so the list
-    is at most one long. For --auto, optionally narrow candidates by a job's
-    learned RAM profile, walk them in preference order, probe reachability (and
-    CPU load when load_balance is on), then order via pick_by_load. Returns
-    ``[(device, transport, probe, reason), ...]`` — the caller runs the first and
-    may fall through to the rest when a candidate fails *before mutating anything*
-    (see ``cmd_run``). Empty if nothing is reachable.
+    Returns ``[(device, transport, probe, reason), ...]``. Diagnostics only record
+    observations from this path; they never choose or mutate a target.
     """
+    entries: dict[str, dict] = {}
+    if diagnostics is not None:
+        for device in plan.candidates:
+            entry = _candidate_probe_entry(device, sched)
+            entries[device.name] = entry
+            diagnostics.append(entry)
+
+    def event(event_name: str, **fields) -> None:
+        if emit_events:
+            reporter.event(event_name, **fields)
+
+    def record(device, transport, probe, busy) -> None:
+        entry = entries.get(device.name)
+        if entry is None:
+            return
+        entry["reachable"] = bool(probe.reachable)
+        entry["cpu_busy_pct"] = busy
+        cap = device.cpu_capacity(float(sched.get("eff_core_weight", 1.0)))
+        if busy is not None and cap:
+            entry["spare_perf_core_equiv"] = round(
+                cap * (1.0 - min(max(busy, 0.0), 100.0) / 100.0), 2)
+        if check_git and probe.reachable:
+            entry["git"] = _candidate_git_state(transport, device, plan)
+
+    def probe_failure(device, exc) -> bool:
+        entry = entries.get(device.name)
+        if entry is None:
+            return False
+        entry["reachable"] = False
+        entry["detail"] = str(exc)
+        return True
+
     if target_name and target_name != "auto":
         device = plan.target
-        transport = make_transport(device)
-        probe = transport.probe()
-        if not probe.reachable:
-            reporter.event("unreachable", target=device.name, detail=probe.detail)
+        try:
+            transport = make_transport(device)
+            probe = transport.probe()
+        except (TransportError, OSError) as exc:
+            if not probe_failure(device, exc):
+                raise
             return []
+        if not probe.reachable:
+            record(device, transport, probe, None)
+            entries.get(device.name, {})["detail"] = probe.detail
+            event("unreachable", target=device.name, detail=probe.detail)
+            return []
+        busy = None
+        if diagnostics is not None:
+            try:
+                busy = transport.sample_load()
+            except (TransportError, OSError) as exc:
+                entries[device.name]["detail"] = f"load probe failed: {exc}"
+        record(device, transport, probe, busy)
+        if device.name in entries:
+            entries[device.name]["recommended"] = True
         return [(device, transport, probe, "explicit")]
 
     prefer_reachable = bool(sched.get("prefer_reachable_primary", True))
@@ -814,35 +863,58 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
         if fits and len(fits) < len(candidates):
             for d in candidates:
                 if d not in fits:
-                    reporter.event("candidate_skipped", name=d.name, reason="insufficient_ram",
-                                   detail=f"predicted ~{pred_rss}MB > {frac:.0%} of {d.ram_gb}GB")
+                    detail = f"predicted ~{pred_rss}MB > {frac:.0%} of {d.ram_gb}GB"
+                    event("candidate_skipped", name=d.name, reason="insufficient_ram",
+                          detail=detail)
+                    if d.name in entries:
+                        entries[d.name]["detail"] = detail
             candidates = fits
         elif not fits:
-            reporter.event("ram_warning",
-                           detail=f"predicted ~{pred_rss}MB exceeds all candidates; using largest-RAM")
+            event("ram_warning",
+                  detail=f"predicted ~{pred_rss}MB exceeds all candidates; using largest-RAM")
             candidates = sorted(candidates, key=lambda d: d.ram_gb, reverse=True)
     if pred_dur is not None and pred_dur < float(sched.get("trivial_job_seconds", 30)):
         if load_balance:
-            reporter.event("trivial_job", predicted_dur_s=pred_dur,
-                           note="skipping load probe/reallocation")
+            event("trivial_job", predicted_dur_s=pred_dur,
+                  note="skipping load probe/reallocation")
         load_balance = False
 
-    reachable: list = []  # (device, transport, probe, busy%)
+    reachable: list = []  # (device, transport, probe, busy used by scheduler)
     for device in candidates:
-        transport = make_transport(device)
-        probe = transport.probe()
-        if not probe.reachable:
-            reporter.event("candidate_skipped", name=device.name, reason="unreachable",
-                           detail=probe.detail)
+        try:
+            transport = make_transport(device)
+            probe = transport.probe()
+        except (TransportError, OSError) as exc:
+            if not probe_failure(device, exc):
+                raise
             continue
-        busy = transport.sample_load() if load_balance else None
-        reporter.event("candidate", name=device.name, cpu_busy_pct=busy,
-                       perf_cores=device.perf_cores, eff_cores=device.eff_cores)
+        if not probe.reachable:
+            record(device, transport, probe, None)
+            entries.get(device.name, {})["detail"] = probe.detail
+            event("candidate_skipped", name=device.name, reason="unreachable",
+                  detail=probe.detail)
+            continue
+        busy = None
+        if load_balance or diagnostics is not None:
+            try:
+                observed_busy = transport.sample_load()
+            except (TransportError, OSError) as exc:
+                if diagnostics is None:
+                    raise
+                entries[device.name]["detail"] = f"load probe failed: {exc}"
+                observed_busy = None
+            record(device, transport, probe, observed_busy)
+            if load_balance:
+                busy = observed_busy
+        else:
+            record(device, transport, probe, None)
+        event("candidate", name=device.name, cpu_busy_pct=busy,
+              perf_cores=device.perf_cores, eff_cores=device.eff_cores)
         reachable.append((device, transport, probe, busy))
 
     if not reachable:
         first = plan.candidates[0].name if plan.candidates else "?"
-        reporter.event("unreachable", target=first, detail="no candidate reachable")
+        event("unreachable", target=first, detail="no candidate reachable")
         return []
 
     ranked = [(d, busy) for (d, _t, _pr, busy) in reachable]
@@ -851,6 +923,8 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
     reason = balance_reason
     if reason == "auto" and plan.candidates and device is not plan.candidates[0]:
         reason = "auto-failover"  # preferred candidate was unreachable
+    if device.name in entries:
+        entries[device.name]["recommended"] = True
     # pick_by_load names the winner; the rest stay in preference order behind it as
     # fallbacks. Their reason is "auto-failover": reaching them means the winner
     # failed for a candidate-local reason.
@@ -1294,13 +1368,11 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
     sched = scheduler_config(config)
     # When explicitly enabled, placement overlays the project's PORTABLE job costs so
     # --auto can use prior measurements from another controller.
-    profiles = load_profiles(default_state_root())
-    if _import_legacy_job_costs(config):
-        profiles = merge_job_costs(profiles, plan.project.project_id,
-                                   load_job_costs(plan.project.local_project_root))
-    prediction = predict_job(profiles, plan.project.project_id, command_key(plan.command))
+    profile_id = profile_project_id(plan.project.project_id)
+    profile_key = command_key(plan.command)
+    prediction = _job_prediction(config, plan)
     if prediction:
-        reporter.event("job_profile", key=command_key(plan.command),
+        reporter.event("job_profile", project_id=profile_id, key=profile_key,
                        predicted_rss_mb=prediction.get("rss_mb"),
                        predicted_dur_s=prediction.get("dur_s"))
     selection = _resolve_targets(plan, target_name, sched, reporter, prediction)
@@ -1418,6 +1490,14 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                         "error": "no safe target capacity",
                         "phase": "memory_admission",
                         "memory_admission": admission.payload,
+                        "job_profile": {
+                            "status": "learned" if prediction else "unprofiled",
+                            "project_id": profile_id,
+                            "key": profile_key,
+                            "predicted_rss_mb": (
+                                prediction.get("rss_mb") if prediction else None
+                            ),
+                        },
                         "plan": plan.as_dict(),
                     },
                 )
@@ -1464,6 +1544,23 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             reporter.event("candidate_skipped", name=plan.target.name,
                            reason="preflight_conflict", detail=exc.detail,
                            conflict_state=str(exc.conflict_dir))
+        except KeyboardInterrupt:
+            checkpoint = read_json(summary_path) or {"run_id": run_id}
+            checkpoint.update({
+                "error": "cancelled by user",
+                "terminal": True,
+                "ended_at": utc_now_iso(),
+            })
+            completion_state = checkpoint.get("completion_state")
+            if completion_state == "command_complete":
+                # The command's checkpoint remains authoritative: cancellation while
+                # finalizing must never turn a completed mutating command into a retry.
+                checkpoint["completion_state"] = "finalization_failed"
+            elif completion_state != "unknown":
+                checkpoint["completion_state"] = "cancelled"
+                checkpoint["command_started"] = False
+            write_json(summary_path, checkpoint)
+            raise
         except Exception as exc:
             # Normal Python finalization failures must still terminate the durable
             # receipt. BaseException deliberately escapes: an interrupted/killed
@@ -1518,6 +1615,52 @@ def _run_locked(
     prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
     backup_root = conflict_dir(run_id) / "backup"
 
+    # Validate a backend's declared argv boundary before reconciliation can mutate
+    # either tree and before an UNKNOWN fence can be installed. PowerShell command
+    # discovery depends on the resolved target PATH/environment, while direct
+    # transport APIs still recheck the boundary at their own dispatch seam.
+    runenv = resolve_run_env(
+        device=plan.target, project=plan.project, project_config=plan.project_config
+    )
+    try:
+        transport.validate_command_context(
+            plan.command, env=runenv.env, path_prepend=runenv.path_prepend
+        )
+    except CommandNotStartedError as exc:
+        reporter.event("command_rejected", phase="preflight", message=str(exc))
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "ended_at": utc_now_iso(),
+            "error": str(exc),
+            "phase": "preflight",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "plan": plan.as_dict(),
+        })
+        return EXIT_INFRA
+    except TransportError as exc:
+        reporter.event("transfer_error", phase="command_validation", message=str(exc))
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "ended_at": utc_now_iso(),
+            "error": str(exc),
+            "phase": "command_validation",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "plan": plan.as_dict(),
+        })
+        return EXIT_TRANSFER
+
     # --- preflight reconcile -------------------------------------------------
     def report_preflight_progress(
         completed: int, total: int, action_totals: dict[str, int]
@@ -1545,8 +1688,20 @@ def _run_locked(
         )
     except TransportError as exc:
         reporter.event("transfer_error", phase="preflight", message=str(exc))
-        write_json(summary_path, {"run_id": run_id, "error": str(exc), "phase": "preflight",
-                                  "plan": plan.as_dict()})
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "ended_at": utc_now_iso(),
+            "error": str(exc),
+            "phase": "preflight",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "plan": plan.as_dict(),
+        })
         return EXIT_TRANSFER
 
     if pre.has_conflicts:
@@ -1598,9 +1753,6 @@ def _run_locked(
         )
 
     # --- execute -------------------------------------------------------------
-    runenv = resolve_run_env(
-        device=plan.target, project=plan.project, project_config=plan.project_config
-    )
     if runenv.venv:
         reporter.event("venv", path=runenv.venv)
     exec_env = runenv.env
@@ -1640,7 +1792,10 @@ def _run_locked(
         reporter.event("run_env", vars=sorted(exec_env), path_prepend=len(runenv.path_prepend))
     telemetry_on = telemetry_default and not args.no_telemetry
     transport.ensure_remote_dir(remote_cwd)
-    guarded_dispatch = getattr(transport, "memory_guard", None) is not None
+    guarded_dispatch = (
+        getattr(transport, "memory_guard", None) is not None
+        or transport.command_start_requires_confirmation()
+    )
     # Fence before dispatch, not after a transport exception. A controller can be
     # killed without Python regaining control; in that case the remote start/result
     # is unknowable and an automatic retry is unsafe.
@@ -1708,6 +1863,36 @@ def _run_locked(
                 observation=observation,
                 **exec_kwargs,
             )
+    except CommandNotStartedError as exc:
+        # The same target process that resolves a bare Windows command can prove it
+        # refused the unsupported entry point before invoking user code. Remove the
+        # conservative fence rather than manufacturing UNKNOWN.
+        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        reporter.event("command_rejected", phase="exec", message=str(exc))
+        rejected_summary = {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "ended_at": utc_now_iso(),
+            "error": str(exc),
+            "phase": "exec",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "plan": plan.as_dict(),
+        }
+        if plan.workload is not None and workload_runtime is not None:
+            rejected_summary["workload"] = plan.workload.as_dict()
+            rejected_summary["run_context"] = {
+                "staged": workload_runtime.context_staged,
+                "remote_path": workload_runtime.remote_context_path,
+                "retained": True,
+            }
+            rejected_summary["resource_envelope"] = workload_runtime.resources
+        write_json(summary_path, rejected_summary)
+        return EXIT_INFRA
     except TransportError as exc:
         reporter.event("exec_error", message=str(exc))
         reporter.event("completion_unknown", guidance=guidance)
@@ -1790,6 +1975,13 @@ def _run_locked(
         else result.exit_code
     )
     reported_exit_code = EXIT_GUARD if guard_failed else result.exit_code
+    if guarded_dispatch and guard_result is None:
+        reporter.event(
+            "command_started",
+            run_id=run_id,
+            command=" ".join(plan.command),
+            confirmed_by="transport_result",
+        )
     if guard_result is not None:
         if guard_result.get("command_started") is True:
             reporter.event(
@@ -1847,6 +2039,10 @@ def _run_locked(
                 "command_exit_code": command_exit_code,
                 "error": str(exc),
                 "phase": "pullback",
+                "completion_state": "finalization_failed",
+                "command_started": guarded_started,
+                "terminal": True,
+                "ended_at": utc_now_iso(),
                 "plan": plan.as_dict(),
             }
             if plan.workload is not None and workload_runtime is not None:
@@ -1969,7 +2165,7 @@ def _run_locked(
                 profile_exec_s = float(target_wall)
             update_profile(
                 default_state_root(),
-                plan.project.project_id,
+                profile_project_id(plan.project.project_id),
                 ckey,
                 plan.target.name,
                 peak_rss_mb=tel.get("peak_rss_mb"),
@@ -2126,6 +2322,7 @@ def cmd_bench(args: argparse.Namespace, reporter: Reporter) -> int:
     if _report_unknown_completion_hazard(project.project_id, reporter):
         return EXIT_INTERNAL
     key = command_key(command)
+    profile_id = profile_project_id(project.project_id)
     state_root = default_state_root()
 
     # 1. Local baseline (timed wall on this machine) — unless --no-local.
@@ -2142,7 +2339,7 @@ def cmd_bench(args: argparse.Namespace, reporter: Reporter) -> int:
             rc = None
         local_s = round(time.monotonic() - t0, 3)
         if rc == 0:
-            update_profile(state_root, project.project_id, key, LOCAL_DEVICE,
+            update_profile(state_root, profile_id, key, LOCAL_DEVICE,
                            exec_s=local_s, trip_s=local_s, now=utc_now_iso())
             reporter.event("bench_local", exec_s=local_s, exit_code=rc)
         else:
@@ -2179,9 +2376,9 @@ def cmd_bench(args: argparse.Namespace, reporter: Reporter) -> int:
     if skip_local:
         # No local baseline to compare against: recommend the fastest measured
         # target outright (the explicit point of --no-local).
-        rec = _best_remote_verdict(profiles, project.project_id, key, ran)
+        rec = _best_remote_verdict(profiles, profile_id, key, ran)
     else:
-        rec = recommend_offload(profiles, project.project_id, key, devices=ran, bias=bias)
+        rec = recommend_offload(profiles, profile_id, key, devices=ran, bias=bias)
     reporter.event("bench_verdict", **rec)
     # If no remote leg completed, the bench gathered no remote data — report failure.
     return EXIT_OK if ran else EXIT_INFRA
@@ -2252,6 +2449,7 @@ def cmd_git_sync(args: argparse.Namespace, reporter: Reporter) -> int:
             config,
             device_name=args.device,
             branch=args.branch,
+            remote_memory_limit_mib=args.remote_memory_limit_mib,
             reporter=reporter,
             as_json=args.json,
         )
@@ -2265,6 +2463,7 @@ def cmd_git_sync(args: argparse.Namespace, reporter: Reporter) -> int:
         dry_run=args.dry_run,
         branch=args.branch,
         bootstrap=args.bootstrap,
+        remote_memory_limit_mib=args.remote_memory_limit_mib,
         reporter=reporter,
         as_json=args.json,
     )
@@ -2442,7 +2641,34 @@ def _finalize_durable_run(
     execution = record.get("execution")
     if not isinstance(execution, dict):
         raise UnknownCompletionHazardError("saved durable execution metadata is missing")
-    result = finalize_durable_result(payload, execution)
+    try:
+        result = finalize_durable_result(payload, execution)
+    except CommandNotStartedError as exc:
+        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        reporter.event("command_rejected", phase="durable_exec", message=str(exc))
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": record["started_at"],
+            "ended_at": utc_now_iso(),
+            "error": str(exc),
+            "phase": "durable_exec",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "exit_code": EXIT_INFRA,
+            "durable": True,
+            "plan": plan.as_dict(),
+        })
+        try:
+            transport.durable_cleanup(run_id, str(record["resume_token"]))
+        except TransportError as cleanup_exc:
+            reporter.event(
+                "durable_cleanup_deferred", run_id=run_id, message=str(cleanup_exc)
+            )
+        return EXIT_INFRA
 
     command_exit_code_checkpoint = (
         result.memory_guard.get("command_exit_code")
@@ -2847,6 +3073,28 @@ def _run_durable_locked(
             telemetry_request=None,
             memory_reservation=memory_reservation,
         )
+    except CommandNotStartedError as exc:
+        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        reporter.event(
+            "durable_prestart_refused", run_id=run_id, target=plan.target.name,
+            detail=str(exc),
+        )
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "phase": "durable_prestart_refused",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "exit_code": EXIT_INFRA,
+            "error": str(exc),
+            "durable": True,
+            "plan": plan.as_dict(),
+        })
+        return EXIT_INFRA
     except DurablePrestartError as exc:
         clear_unknown_completion_hazard(plan.project.project_id, run_id)
         reporter.event(

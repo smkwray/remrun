@@ -12,6 +12,8 @@ default = "~/projects"
 # [git_sync]
 # peers = ["macbox"]
 # advance_dirty_worktree = false  # opt-in history-hub mode; preserves worktree bytes
+# Guarded targets require a selected hard per-command limit for repository-scaling Git.
+# remote_memory_limit_mib = 2048  # illustrative only; no default is inferred
 # [git_sync.project_roots]
 # macos = "~/work"
 # windows = 'C:\work'

@@ -35,9 +35,9 @@ max_jobs = 2
 kind = "ssh-powershell"
 os = "windows"
 # Windows PowerShell 5.1 is rejected because it cannot preserve arbitrary
-# native argv. Use PowerShell 7.3 or newer. Top-level .cmd/.bat commands are
-# also rejected because the current seam is not exact; use a native executable
-# or .ps1 wrapper.
+# native argv. Use PowerShell 7.3 or newer. Direct PowerShell-language commands
+# and top-level .cmd/.bat commands are also rejected: use a native application,
+# a .ps1 wrapper that accepts positional data, or an explicit pwsh -Command.
 shell = "pwsh"
 address_candidates = ["winbox.local", "winbox"]
 project_root = "C:\\Users\\you\\projects"
@@ -83,9 +83,27 @@ min(max_jobs, floor((physical_ram - host_reserve) / command_ceiling))
 ```
 
 For a command without a learned RSS profile, remrun reserves the full command
-ceiling. With a positive learned profile, it reserves predicted RSS plus 25%
-headroom, rounded upward to MiB, and refuses rather than clipping when that
-allowance exceeds the command ceiling.
+ceiling as an **unprofiled allowance**. This is a capacity commitment, not a claim
+that the command requires that much memory. With a positive learned profile, it
+reserves the observed process-tree RSS high-water mark plus 25% headroom, rounded
+upward to MiB, and refuses rather than clipping when that allowance exceeds the
+command ceiling. Admission receipts label the allowance basis and byte counts so
+the ceiling cannot be mistaken for a measurement.
+
+A tool-owned command may instead request an explicit positive whole-MiB hard limit through
+the generic transport seam. That allowance is recorded as
+`explicit_command_limit`, receives no prediction headroom, and remains subject to the same
+target-derived per-command ceiling, atomic lease transaction, `max_jobs`, and host reserve.
+It is a configured safety boundary, not an observed or predicted RSS value. Git-sync uses
+this seam: its fixed repository-root probe is capped at no more than 128 MiB, while guarded
+status/pull/push/bootstrap require `[git_sync].remote_memory_limit_mib` or the CLI override
+because bundle and worktree operations can scale with repository size.
+
+Recognized nested agent worktrees share the logical repository's profile namespace,
+but resource-shaping command details remain distinct. In particular, pytest-xdist
+profiles include the explicit worker value (`-n 4`, `-n 10`, and the configured
+default are separate). This lets measurements follow a project across worktrees
+without letting a low-parallelism run authorize a higher-parallelism one.
 
 Before project reconciliation or user code, `run --auto` asks each ranked
 POSIX candidate to atomically create a bounded lease under

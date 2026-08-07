@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,11 +33,108 @@ MAX_WORKLOAD_METADATA_BYTES = 16 * 1024
 _RECEIPT_STATUSES = frozenset({"applied", "fallback", "no_op", "blocked"})
 _EVALUATIONS = frozenset({"baseline", "trial", "accepted", "fallback"})
 _LEGACY_PROFILE_FIELDS = frozenset(
-    {"n", "rss_mb", "cpu_pct", "dur_s", "exec_s", "trip_s", "overhead_s", "updated"}
+    {
+        "n",
+        "rss_mb",
+        "rss_high_mb",
+        "cpu_pct",
+        "dur_s",
+        "exec_s",
+        "trip_s",
+        "overhead_s",
+        "updated",
+    }
 )
 _LEGACY_NUMERIC_FIELDS = _LEGACY_PROFILE_FIELDS - {"n", "updated"}
 
 _SCRIPT_EXTS = (".py", ".r", ".jl", ".sh", ".do", ".rb", ".pl", ".js", ".ts")
+_WORKTREE_MARKERS = (
+    (".worktrees",),
+    (".claude", "worktrees"),
+    (".delegate-worktrees",),
+)
+_PYTHON_NAME = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?$", re.IGNORECASE)
+_SHELL_META = re.compile(r"[|&;<>()\n]")
+
+
+def profile_project_id(project_id: str) -> str:
+    """Return the stable profile namespace for a project checkout.
+
+    A nested agent worktree is a separate reconciliation tree, but its measured job
+    costs belong to the same logical repository.  Only the profile namespace is
+    collapsed; run IDs, locks, transfer paths, and completion fences keep the exact
+    project identity.
+    """
+    parts = project_id.replace("\\", "/").split("/")
+    for marker in _WORKTREE_MARKERS:
+        width = len(marker)
+        for index in range(1, len(parts) - width + 1):
+            if tuple(parts[index : index + width]) == marker:
+                return "/".join(parts[:index])
+    return project_id
+
+
+def _profile_tokens(command: list[str]) -> list[str]:
+    """Conservatively unwrap common launchers without interpreting shell code."""
+    tokens = [token for token in command if token]
+    for _depth in range(3):
+        if not tokens:
+            return tokens
+        lead = Path(tokens[0]).name.lower()
+        if lead in {"sh", "bash", "zsh"} and len(tokens) == 3 and tokens[1] in {
+            "-c",
+            "-lc",
+        }:
+            payload = tokens[2]
+            if _SHELL_META.search(payload):
+                break
+            try:
+                parsed = shlex.split(payload)
+            except ValueError:
+                break
+            if not parsed:
+                break
+            tokens = parsed
+            continue
+        if lead in {"uv", "uv.exe"} and len(tokens) >= 3 and tokens[1] == "run":
+            rest = tokens[2:]
+            if rest and rest[0] == "--":
+                rest = rest[1:]
+            # Unknown uv-run options may consume a following value.  Keep the outer
+            # key rather than risk assigning the run to the wrong executable.
+            if rest and not rest[0].startswith("-"):
+                tokens = rest
+                continue
+        break
+    return tokens
+
+
+def _pytest_xdist_value(tokens: list[str]) -> str:
+    for index, token in enumerate(tokens):
+        if token in {"-n", "--numprocesses"}:
+            if index + 1 < len(tokens) and tokens[index + 1]:
+                return tokens[index + 1].lower()
+            return "missing"
+        if token.startswith("--numprocesses="):
+            return token.split("=", 1)[1].lower() or "missing"
+        if token.startswith("-n") and len(token) > 2:
+            return token[2:].lower()
+    return "default"
+
+
+def _python_module(tokens: list[str]) -> str | None:
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if token in {"-c", "--"} or not token.startswith("-"):
+            return None
+        if token in {"-W", "-X"}:
+            index += 2
+        else:
+            index += 1
+    return None
 
 
 def command_key(command: list[str]) -> str:
@@ -46,10 +145,18 @@ def command_key(command: list[str]) -> str:
     -> "python:run.py". Falls back to the first non-flag arg, else the leading
     token. Intentionally fuzzy — same script over different data shares a key.
     """
-    tokens = [t for t in command if t]
+    tokens = _profile_tokens(command)
     if not tokens:
         return "?"
     lead = Path(tokens[0]).name
+    python_lead = _PYTHON_NAME.fullmatch(lead) is not None
+    module = _python_module(tokens) if python_lead else None
+    is_pytest = lead.lower() in {"pytest", "pytest.exe"} or (
+        python_lead and module in {"pytest", "py.test"}
+    )
+    if is_pytest:
+        return f"python:pytest[xdist={_pytest_xdist_value(tokens)}]"
+
     script = None
     for t in tokens[1:]:
         if t.startswith("-"):
@@ -332,6 +439,15 @@ def _ewma(old, new, alpha: float):
     return round(alpha * float(new) + (1.0 - alpha) * float(old), 3)
 
 
+def _high_water(old, new):
+    """Keep a monotone observed maximum for safety-sensitive admission."""
+    if new is None:
+        return old
+    if old is None:
+        return round(float(new), 3)
+    return round(max(float(old), float(new)), 3)
+
+
 def _devmap(profiles: dict, project_id: str, key: str) -> dict[str, dict]:
     """The ``{device: entry}`` map for (project, command-key).
 
@@ -353,15 +469,20 @@ def device_profile(profiles: dict, project_id: str, key: str, device: str) -> di
 def predict_job(profiles: dict, project_id: str, key: str) -> dict | None:
     """Device-agnostic estimate for scheduler pre-selection.
 
-    ``rss_mb`` = max observed peak RSS (a job property, roughly device-independent;
-    take the max for safe RAM-headroom placement). ``dur_s`` = min remote ``exec_s``
-    (best-case "is this quick?" for trivial-skip; ``LOCAL`` excluded). Returns None
-    when nothing is known.
+    ``rss_mb`` = max observed RSS high-water mark (a job property, roughly
+    device-independent).  Older rows without ``rss_high_mb`` fall back to their
+    rolling ``rss_mb`` estimate. ``dur_s`` = min remote ``exec_s`` (best-case "is
+    this quick?" for trivial-skip; ``LOCAL`` excluded). Returns None when nothing
+    is known.
     """
     devs = _devmap(profiles, project_id, key)
     if not devs:
         return None
-    rss_vals = [e["rss_mb"] for e in devs.values() if e.get("rss_mb") is not None]
+    rss_vals = [
+        e.get("rss_high_mb", e.get("rss_mb"))
+        for e in devs.values()
+        if e.get("rss_high_mb", e.get("rss_mb")) is not None
+    ]
     remote = {d: e for d, e in devs.items() if d != LOCAL_DEVICE}
     exec_src = remote or devs
     exec_vals = [e["exec_s"] for e in exec_src.values() if e.get("exec_s") is not None]
@@ -793,8 +914,10 @@ def update_profile(state_root: Path, project_id: str, key: str, device: str, *,
                    now: str = "", alpha: float = DEFAULT_ALPHA,
                    max_entries: int = DEFAULT_MAX_ENTRIES) -> None:
     """Fold one run's observed cost for (project, command-key, device) into the
-    store (EWMA, bounded). ``overhead_s`` is derived as ``trip_s - exec_s`` when
-    both are present. Best-effort; never raises."""
+    store (bounded). Typical cost/timing remains an EWMA; ``rss_high_mb`` is a
+    monotone observed maximum for safety-sensitive admission. ``overhead_s`` is
+    derived as ``trip_s - exec_s`` when both are present. Best-effort; never
+    raises."""
     if (
         any(
             not isinstance(value, str) or not value
@@ -839,6 +962,9 @@ def update_profile(state_root: Path, project_id: str, key: str, device: str, *,
     node[device] = {
         "n": int(prev.get("n", 0)) + 1,
         "rss_mb": _ewma(prev.get("rss_mb"), peak_rss_mb, alpha),
+        "rss_high_mb": _high_water(
+            prev.get("rss_high_mb", prev.get("rss_mb")), peak_rss_mb
+        ),
         "cpu_pct": _ewma(prev.get("cpu_pct"), avg_cpu_pct, alpha),
         "exec_s": _ewma(prev.get("exec_s"), exec_s, alpha),
         "trip_s": _ewma(prev.get("trip_s"), trip_s, alpha),

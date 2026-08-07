@@ -23,7 +23,7 @@ from typing import Any
 from ..config import RemrunConfig
 from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, iso_plus_seconds, utc_now_iso
-from ..transport import TransportError, make_transport
+from ..transport import GuardFinalizationError, TransportError, make_transport
 from . import adapters, placement, probes, profiles
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
@@ -33,6 +33,57 @@ BATCH_MANIFEST_NAME = "remrun_batch.json"
 BATCH_METRICS_NAME = "batch_metrics.json"
 DONE_JSON_NAME = "done.json"
 RESERVED_OUTPUTS_KEY = "_reserved_outputs"
+
+
+def _guard_outcome_fields(memory_guard: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one classified guard outcome for fleet callers and queue policy."""
+    status = str(memory_guard.get("status") or "unknown")
+    command_started = memory_guard.get("command_started")
+    if status == "ok":
+        return {}
+    prestart_refusal = status == "refused" and command_started is False
+    phase = "memory_admission" if prestart_refusal else "memory_guard"
+    if prestart_refusal:
+        boundary = "before command start"
+    elif command_started is True:
+        boundary = "after command start"
+    else:
+        boundary = "with unknown command-start state"
+    reason = str(memory_guard.get("reason") or "unspecified")
+    detail = str(memory_guard.get("detail") or "")
+    label = "memory admission" if phase == "memory_admission" else "memory guard"
+    error = f"{label} {status} {boundary}: {reason}"
+    if detail:
+        error += f": {detail}"
+    fields: dict[str, Any] = {"phase": phase, "error": error}
+    # A positive or unknown start state can include user-code/output mutation.
+    # Only a conclusive pre-start refusal is safe for ordinary retry/fallback.
+    if not prestart_refusal:
+        fields["no_retry"] = True
+    return fields
+
+
+def _admission_guard_payload(transport: Any, admission: Any) -> dict[str, Any]:
+    """Represent controller-side target admission refusal in the guard result schema."""
+    guard = transport.memory_guard
+    return {
+        "schema": 1,
+        "status": "refused",
+        "reason": admission.reason,
+        "detail": admission.detail,
+        "command_started": False,
+        "command_exit_code": None,
+        "helper_exit_code": 125,
+        "max_command_bytes": None,
+        "min_available_bytes": None,
+        "command_limit_fraction": getattr(guard, "command_limit_fraction", None),
+        "host_reserve_fraction": getattr(guard, "host_reserve_fraction", None),
+        "peak_command_bytes": None,
+        "min_host_available_bytes": None,
+        "sample_count": 0,
+        "platform": "controller",
+        "memory_admission": admission.payload,
+    }
 
 
 def _choose_device(task: FleetTask, features, config: RemrunConfig, fcfg: dict,
@@ -295,11 +346,41 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
         "REMRUN_STAGE_IN": stage_in,
         "REMRUN_OUTPUT_ROOT": output_root,
     }
+    # Size the memory guard to what this batch actually needs. Left to itself the
+    # transport reserves the device's configured MAXIMUM as an unprofiled ceiling,
+    # because only the ordinary `remrun run` path passes a prediction. That ceiling
+    # is a fraction of total RAM, not a measured need, so a worker with a ~5 GB peak
+    # claims ~20 GB on a 64 GiB box and is refused whenever the device cannot also
+    # preserve its host reserve. The fleet already knows this batch's peak RSS
+    # (seeded in fleet_costs.toml, refined by the local EWMA store), and a batch is
+    # ONE worker invocation paying ONE cold model load (Invariant 0), so the head
+    # task's profile is the whole batch's figure. A missing/zero profile stays None
+    # and keeps the conservative unprofiled ceiling.
+    reservation = None
+    if getattr(transport, "memory_guard", None) is not None:
+        predicted_rss_mb = placement.predicted_resources(
+            head, device_name, load_costs(config, state_root))[0]
+        admission = transport.reserve_memory_guard(
+            predicted_rss_mb=predicted_rss_mb or None)
+        if not admission.admitted:
+            if cleanup:
+                _safe_delete(transport, stage)
+            memory_guard = _admission_guard_payload(transport, admission)
+            return {
+                "ok": False,
+                "device": device_name,
+                "staged": staged,
+                "memory_guard": memory_guard,
+                **_guard_outcome_fields(memory_guard),
+            }
+        reservation = admission.reservation
+
     t0 = time.monotonic()
     try:
         observed_exec = getattr(transport, "exec_observed", None)
         if not active_job_observation_enabled() or observed_exec is None:
-            res = transport.exec(command, cwd=stage, telemetry=True, env=exec_env)
+            res = transport.exec(command, cwd=stage, telemetry=True, env=exec_env,
+                                 memory_reservation=reservation)
         else:
             observed_id = observation_id
             if not observed_id:
@@ -315,8 +396,34 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
                 member_count=len(tasks),
             )
             res = observed_exec(
-                command, cwd=stage, telemetry=True, env=exec_env, observation=observation
+                command, cwd=stage, telemetry=True, env=exec_env, observation=observation,
+                memory_reservation=reservation
             )
+    except GuardFinalizationError as exc:
+        prestart = exc.command_started is False
+        # A true/unknown start may still be using staged inputs or writing an
+        # output_root that is the stage itself. Preserve that evidence instead of
+        # deleting under a possibly live or partially completed workload.
+        cleanup_deferred = bool(cleanup and not prestart)
+        if cleanup and prestart:
+            _safe_delete(transport, stage)
+        result = {
+            "ok": False,
+            "device": device_name,
+            "staged": staged,
+            "phase": ("memory_admission" if prestart else "memory_guard"),
+            "completion_state": ("not_started" if prestart else "unknown"),
+            "command_started": exc.command_started,
+            "error": f"exec failed: {exc}",
+        }
+        if exc.memory_guard is not None:
+            result["memory_guard"] = exc.memory_guard
+        if cleanup_deferred:
+            result["cleanup_deferred"] = True
+            result["stage_dir"] = stage
+        if not prestart:
+            result["no_retry"] = True
+        return result
     except TransportError as exc:
         if cleanup:
             _safe_delete(transport, stage)
@@ -366,6 +473,9 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
         "batch_metrics": batch_metrics, "item_results": item_results,
         "stdout_tail": (res.stdout or "")[-500:], "stderr_tail": (res.stderr or "")[-500:],
     }
+    if res.memory_guard is not None:
+        result["memory_guard"] = res.memory_guard
+        result.update(_guard_outcome_fields(res.memory_guard))
     if completion_evidence is not None:
         result["completion_evidence"] = completion_evidence
     if evidence_error:

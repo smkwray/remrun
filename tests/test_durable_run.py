@@ -710,6 +710,7 @@ def test_windows_transport_builds_noninteractive_observed_durable_spec(tmp_path:
     transport = SSHPowerShellTransport(device)
     captured: dict[str, object] = {}
     monkeypatch.setattr(transport, "_ps_exe", lambda: "pwsh")
+    monkeypatch.setattr(transport, "validate_command_context", lambda *a, **k: None)
     monkeypatch.setattr(transport, "_ensure_job_observer", lambda: (r"C:\\state", r"C:\\observer.py"))
     monkeypatch.setattr(transport, "_ensure_durable_runner", lambda: (r"C:\\state", r"C:\\durable.py"))
     monkeypatch.setattr(transport, "_ensure_remote_helper_exact", lambda source, target: None)

@@ -378,8 +378,15 @@ def cmd_status(args, reporter: Reporter) -> int:
     reporter.event("queue_counts", **counts)
     reporter.event("active_by_device", **active)
     for j in recent:
-        reporter.event("job", job_id=j["job_id"], task_type=j["task_type"],
-                       state=j["state"], device=j.get("assigned_device") or "-")
+        fields = {
+            "job_id": j["job_id"],
+            "task_type": j["task_type"],
+            "state": j["state"],
+            "device": j.get("assigned_device") or "-",
+        }
+        if j.get("last_error"):
+            fields["error"] = j["last_error"]
+        reporter.event("job", **fields)
     return EXIT_OK
 
 
@@ -399,7 +406,8 @@ def cmd_run(args, reporter: Reporter) -> int:
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
     else:
         reporter.event("fleet_run", **{k: v for k, v in result.items()
-                                       if k not in ("stdout_tail", "stderr_tail", "telemetry")})
+                                       if k not in ("stdout_tail", "stderr_tail", "telemetry",
+                                                    "memory_guard")})
     return EXIT_OK if result.get("ok") else EXIT_ERROR
 
 
