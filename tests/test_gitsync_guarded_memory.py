@@ -352,7 +352,7 @@ def test_explicit_limit_is_labeled_as_limit_not_learned_measurement(
     monkeypatch.setattr(telemetry, "_host_memory", lambda: (total, 60 * GIB))
     monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 128 * MIB)
     request = {
-        "schema": 1,
+        "schema": 2,
         "op": "reserve",
         "state_root": str(tmp_path / "state"),
         "lease_id": "a" * 32,
@@ -384,7 +384,7 @@ def test_explicit_limit_above_target_ceiling_is_refused_without_a_lease(
     monkeypatch.setattr(telemetry, "_host_memory", lambda: (total, 60 * GIB))
     monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 128 * MIB)
     request = {
-        "schema": 1,
+        "schema": 2,
         "op": "reserve",
         "state_root": str(tmp_path / "state"),
         "lease_id": "c" * 32,
@@ -472,7 +472,7 @@ def test_generic_explicit_limit_seam_cleans_reserved_lease_on_dispatch_exception
             "cache_root": str(tmp_path / "cache"),
             "max_jobs": 1,
             "memory_guard": {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": command_fraction,
                 "host_reserve_fraction": reserve_fraction,
             },
@@ -516,7 +516,7 @@ def test_generic_explicit_limit_seam_cleans_reserved_lease_on_returned_prestart_
             "cache_root": str(tmp_path / "cache"),
             "max_jobs": 1,
             "memory_guard": {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": command_fraction,
                 "host_reserve_fraction": reserve_fraction,
             },
@@ -566,7 +566,7 @@ def test_generic_explicit_limit_seam_runs_once_and_reports_exact_cap(tmp_path: P
             "cache_root": str(tmp_path / "cache"),
             "max_jobs": 1,
             "memory_guard": {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": command_fraction,
                 "host_reserve_fraction": reserve_fraction,
             },

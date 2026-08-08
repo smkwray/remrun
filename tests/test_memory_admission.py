@@ -38,7 +38,7 @@ def _request(
     ttl: float = 120.0,
 ) -> dict[str, object]:
     return {
-        "schema": 1,
+        "schema": 2,
         "op": op,
         "state_root": str(state_root),
         "lease_id": lease_id or uuid.uuid4().hex,
@@ -56,7 +56,7 @@ def _lease_request(reserved: dict[str, object], *, op: str = "renew") -> dict[st
     policy = reserved["policy"]
     assert isinstance(lease, dict) and isinstance(policy, dict)
     return {
-        "schema": 1,
+        "schema": 2,
         "op": op,
         "state_root": lease["state_root"],
         "lease_id": lease["lease_id"],
@@ -83,6 +83,44 @@ def _guard_result(stderr: str, token: str) -> dict[str, object]:
     return json.loads(stderr.rsplit(marker, 1)[1].splitlines()[0])
 
 
+@pytest.mark.parametrize(
+    ("total_gib", "reserve_gib"),
+    [(16, 4), (24, 6), (32, 8), (64, 16), (128, 16)],
+)
+def test_automatic_host_reserve_is_proportional_and_bounded(
+    total_gib: int, reserve_gib: int
+):
+    policy = telemetry._policy_from_request(
+        {
+            "command_limit_fraction": 0.25,
+            "max_jobs": 2,
+            "reservation_ttl_seconds": 120.0,
+        },
+        total_gib * GIB,
+    )
+
+    assert policy["host_reserve_basis"] == "auto_v1"
+    assert policy["host_reserve_fraction"] is None
+    assert policy["host_reserve_bytes"] == reserve_gib * GIB
+
+
+def test_empty_schema_one_ledger_upgrades_but_active_one_fails_closed(tmp_path: Path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text('{"schema":1,"policy":null,"leases":[]}', encoding="utf-8")
+    assert telemetry._read_ledger(ledger) == {
+        "schema": 2,
+        "policy": None,
+        "leases": [],
+    }
+
+    ledger.write_text(
+        '{"schema":1,"policy":{},"leases":[{"lease_id":"old"}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="requires leases to finish"):
+        telemetry._read_ledger(ledger)
+
+
 def test_admission_labels_unprofiled_allowance_separately_from_learned_need(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -91,11 +129,19 @@ def test_admission_labels_unprofiled_allowance_separately_from_learned_need(
     state_root = tmp_path / "state"
 
     unknown = telemetry._handle_admission_request(_request(state_root))
-    assert unknown["status"] == "refused"
-    assert unknown["detail"] == "unprofiled allowance cannot preserve host reserve"
-    assert unknown["capacity"]["allowance_basis"] == "unprofiled_command_ceiling"
-    assert unknown["capacity"]["allowance_bytes"] == 16 * GIB
+    assert unknown["status"] == "admitted"
+    assert unknown["detail"] == (
+        "unprofiled live-capacity allowance reserved before mutation"
+    )
+    assert unknown["capacity"]["allowance_basis"] == (
+        "unprofiled_available_backed"
+    )
+    assert unknown["capacity"]["allowance_bytes"] == 13823 * MIB
+    assert unknown["capacity"]["allowance_bytes"] < 16 * GIB
     assert unknown["capacity"]["predicted_rss_bytes"] is None
+
+    released = telemetry._handle_admission_request(_lease_request(unknown, op="release"))
+    assert released["status"] == "released"
 
     learned = telemetry._handle_admission_request(
         _request(state_root, predicted_rss_bytes=8 * GIB)
@@ -107,6 +153,71 @@ def test_admission_labels_unprofiled_allowance_separately_from_learned_need(
     )
     assert learned["capacity"]["allowance_bytes"] == 10 * GIB
     assert learned["capacity"]["predicted_rss_bytes"] == 8 * GIB
+
+
+def test_unprofiled_refusal_requires_actual_live_headroom_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        telemetry,
+        "_host_memory",
+        lambda: (TOTAL, 16 * GIB + CONTROL + MIB // 2),
+    )
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+
+    result = telemetry._handle_admission_request(_request(tmp_path / "state"))
+
+    assert result["status"] == "refused"
+    assert result["reason"] == "insufficient_live_memory"
+    assert result["detail"] == (
+        "unprofiled command cannot receive the minimum live allowance while preserving host reserve"
+    )
+    assert result["capacity"]["allowance_basis"] == (
+        "unprofiled_available_backed"
+    )
+    assert result["capacity"]["allowance_bytes"] < MIB
+
+
+def test_unprofiled_admission_commits_all_available_backed_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 30 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    state_root = tmp_path / "state"
+
+    first = telemetry._handle_admission_request(_request(state_root))
+    second = telemetry._handle_admission_request(_request(state_root))
+
+    assert first["status"] == "admitted"
+    assert int(first["lease"]["allowance_bytes"]) == 13823 * MIB
+    assert second["status"] == "refused"
+    assert second["reason"] == "insufficient_live_memory"
+
+
+def test_actual_commitments_not_policy_ceiling_control_concurrency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 60 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    state_root = tmp_path / "state"
+
+    def request() -> dict[str, object]:
+        return _request(
+            state_root,
+            predicted_rss_bytes=4 * GIB,
+            command_fraction=0.50,
+            reserve_fraction=0.25,
+            max_jobs=2,
+        )
+
+    first = telemetry._handle_admission_request(request())
+    second = telemetry._handle_admission_request(request())
+    third = telemetry._handle_admission_request(request())
+
+    assert first["status"] == "admitted"
+    assert second["status"] == "admitted"
+    assert third["status"] == "refused"
+    assert third["reason"] == "guarded_job_limit"
 
 
 def test_falling_live_memory_at_final_renewal_releases_and_later_controller_reclaims(
@@ -122,7 +233,9 @@ def test_falling_live_memory_at_final_renewal_releases_and_later_controller_recl
     monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
     state_root = tmp_path / "state"
 
-    reserved = telemetry._handle_admission_request(_request(state_root))
+    reserved = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
     assert reserved["status"] == "admitted"
 
     renewal = telemetry._handle_admission_request(_lease_request(reserved))
@@ -131,7 +244,9 @@ def test_falling_live_memory_at_final_renewal_releases_and_later_controller_recl
     assert renewal["lease_released"] is True
     assert _ledger_leases(state_root) == []
 
-    later = telemetry._handle_admission_request(_request(state_root))
+    later = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
     assert later["status"] == "admitted"
 
 
@@ -151,7 +266,9 @@ def test_falling_live_memory_at_helper_claim_never_releases_gate_and_reclaims(
     state_root = tmp_path / "state"
     sentinel = tmp_path / "argv-started"
 
-    reserved = telemetry._handle_admission_request(_request(state_root))
+    reserved = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
     assert reserved["status"] == "admitted"
     renewed = telemetry._handle_admission_request(_lease_request(reserved))
     assert renewed["status"] == "admitted"
@@ -183,7 +300,9 @@ def test_falling_live_memory_at_helper_claim_never_releases_gate_and_reclaims(
     assert not sentinel.exists()
     assert _ledger_leases(state_root) == []
 
-    later = telemetry._handle_admission_request(_request(state_root))
+    later = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
     assert later["status"] == "admitted"
 
 
@@ -435,7 +554,7 @@ def test_local_transport_guarded_exit_uses_reserved_lease_end_to_end(tmp_path: P
         cache_root=str(tmp_path / "cache"),
         max_jobs=1,
         memory_guard={
-            "schema": 2,
+            "schema": 3,
             "command_limit_fraction": tiny_fraction,
             "host_reserve_fraction": tiny_fraction,
         },

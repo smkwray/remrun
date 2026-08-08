@@ -567,7 +567,22 @@ def test_target_corrupt_or_missing_state_fails_closed(tmp_path: Path):
         input_bytes=json.dumps(spec, separators=(",", ":")).encode(),
     )
     assert launch.returncode == 0
+    # Launch acknowledgement intentionally precedes detached completion. Wait
+    # until the supervisor has made its final legitimate write before corrupting
+    # the durable record; otherwise the test races that write and may observe a
+    # newly valid status instead of the injected corruption.
     status_path = root / "durable-runs" / "run-b" / "status.json"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            settled_status = json.loads(status_path.read_text(encoding="utf-8"))
+            if settled_status.get("state") == "complete":
+                break
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        time.sleep(0.05)
+    else:
+        pytest.fail("durable supervisor did not reach terminal state")
     status_path.write_text("{corrupt", encoding="utf-8")
     corrupt = _helper_call(
         helper, "status", "--state-root", str(root), "--run-id", "run-b",
@@ -645,7 +660,7 @@ def _posix_device(tmp_path: Path, *, guarded: bool = False) -> Device:
     raw_guard = None
     if guarded:
         raw_guard = {
-            "schema": 2,
+            "schema": 3,
             "command_limit_fraction": 0.5,
             "host_reserve_fraction": 0.1,
         }

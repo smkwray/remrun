@@ -13,7 +13,7 @@ from remrun.transport import LocalSimTransport
 def test_valid_guard_is_strict_relative_policy():
     guard = parse_memory_guard(
         {
-            "schema": 2,
+            "schema": 3,
             "command_limit_fraction": 0.3125,
             "host_reserve_fraction": 0.3125,
         },
@@ -29,7 +29,7 @@ def test_valid_guard_is_strict_relative_policy():
     assert guard.host_reserve_fraction == 0.3125
     assert guard.max_jobs == 2
     assert guard.as_dict() == {
-        "schema": 2,
+        "schema": 3,
         "command_limit_fraction": 0.3125,
         "host_reserve_fraction": 0.3125,
     }
@@ -38,10 +38,9 @@ def test_valid_guard_is_strict_relative_policy():
 @pytest.mark.parametrize(
     ("raw", "max_jobs", "kind", "os_name", "match"),
     [
-        ({"schema": 2, "command_limit_fraction": 0.25}, 2, "ssh-posix", "macos", "missing key"),
         (
             {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": 0.25,
                 "host_reserve_fraction": 0.25,
                 "disable": True,
@@ -60,11 +59,11 @@ def test_valid_guard_is_strict_relative_policy():
             2,
             "ssh-posix",
             "macos",
-            "schema must be 2",
+            "schema must be 3",
         ),
         (
             {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": True,
                 "host_reserve_fraction": 0.25,
             },
@@ -75,7 +74,7 @@ def test_valid_guard_is_strict_relative_policy():
         ),
         (
             {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": 0.75,
                 "host_reserve_fraction": 0.50,
             },
@@ -86,7 +85,7 @@ def test_valid_guard_is_strict_relative_policy():
         ),
         (
             {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": 0.25,
                 "host_reserve_fraction": 0.25,
             },
@@ -97,7 +96,7 @@ def test_valid_guard_is_strict_relative_policy():
         ),
         (
             {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": 0.25,
                 "host_reserve_fraction": 0.25,
             },
@@ -140,6 +139,23 @@ def test_load_config_rejects_old_absolute_schema(tmp_path: Path):
         load_config(root)
 
 
+def test_schema_3_defaults_to_automatic_host_reserve():
+    guard = parse_memory_guard(
+        {"schema": 3, "command_limit_fraction": 0.25},
+        device_name="RUNNER",
+        max_jobs=2,
+        device_kind="ssh-posix",
+        device_os="macos",
+    )
+
+    assert guard is not None
+    assert guard.host_reserve_fraction is None
+    assert guard.as_dict() == {
+        "schema": 3,
+        "command_limit_fraction": 0.25,
+    }
+
+
 def test_directly_constructed_transport_cannot_bypass_guard_validation(tmp_path: Path):
     device = Device(
         name="RUNNER",
@@ -156,5 +172,5 @@ def test_directly_constructed_transport_cannot_bypass_guard_validation(tmp_path:
         memory_guard={"schema": 2, "command_limit_fraction": 0.25},
     )
 
-    with pytest.raises(MemoryGuardConfigError, match="missing key"):
+    with pytest.raises(MemoryGuardConfigError, match="schema must be 3"):
         LocalSimTransport(device)

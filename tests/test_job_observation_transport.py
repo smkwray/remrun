@@ -367,7 +367,7 @@ def test_posix_observer_remains_inside_schema2_guard_with_one_login_shell(monkey
         "shell": "bash", "remote_python": "python3", "login_shell": True,
         "max_jobs": 1,
         "memory_guard": {
-            "schema": 2, "command_limit_fraction": 0.25,
+            "schema": 3, "command_limit_fraction": 0.25,
             "host_reserve_fraction": 0.25,
         },
     })

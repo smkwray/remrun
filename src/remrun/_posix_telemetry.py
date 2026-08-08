@@ -38,11 +38,12 @@ PRESSURE_SAMPLE_INTERVAL_S = 1.0
 GPU_SAMPLE_INTERVAL_S = 5.0 if sys.platform == "darwin" else 1.0
 DESCENDANT_GRACE_S = 1.0
 MIB = 1024 * 1024
+GIB = 1024 * MIB
 PREDICTION_HEADROOM_FACTOR = 1.25
 CONTROL_OVERHEAD_HEADROOM_FACTOR = 2.0
 DEFAULT_RESERVATION_TTL_S = 30 * 60
-_ADMISSION_SCHEMA = 1
-_LEDGER_SCHEMA = 1
+_ADMISSION_SCHEMA = 2
+_LEDGER_SCHEMA = 2
 _DARWIN_HOST_PORT: int | None = None
 _DARWIN_TOTAL_MEMORY: int | None = None
 _DARWIN_LIBSYSTEM = None
@@ -565,6 +566,9 @@ def _floor_mib(value: float) -> int:
     return max(MIB, int(math.floor(value / MIB)) * MIB)
 
 
+MIN_UNPROFILED_ALLOWANCE_BYTES = MIB
+
+
 def _control_overhead_budget_bytes() -> int:
     """Measure and reserve bounded capacity for the pre-exec control process.
 
@@ -594,27 +598,36 @@ def _strict_fraction(value: object, name: str) -> float:
 
 
 def _policy_from_request(request: dict[str, object], host_total: int) -> dict[str, object]:
+    if host_total <= 0:
+        raise ValueError("physical RAM must be positive")
     command_fraction = _strict_fraction(
         request.get("command_limit_fraction"), "command_limit_fraction"
     )
-    reserve_fraction = _strict_fraction(
-        request.get("host_reserve_fraction"), "host_reserve_fraction"
-    )
-    if command_fraction + reserve_fraction > 1.0:
-        raise ValueError("command limit plus host reserve exceeds physical RAM")
+    reserve_value = request.get("host_reserve_fraction")
+    if reserve_value is None:
+        reserve_fraction = None
+        reserve_basis = "auto_v1"
+        reserve_bytes = _ceil_mib(
+            min(max(4 * GIB, host_total * 0.25), 16 * GIB)
+        )
+    else:
+        reserve_fraction = _strict_fraction(
+            reserve_value, "host_reserve_fraction"
+        )
+        reserve_basis = "explicit_fraction"
+        reserve_bytes = _ceil_mib(host_total * reserve_fraction)
+        if command_fraction + reserve_fraction > 1.0:
+            raise ValueError("command limit plus host reserve exceeds physical RAM")
     max_jobs = request.get("max_jobs")
     if isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs <= 0:
         raise ValueError("max_jobs must be a positive integer")
-    if host_total <= 0:
-        raise ValueError("physical RAM must be positive")
-    reserve_bytes = _ceil_mib(host_total * reserve_fraction)
     max_command_bytes = _floor_mib(host_total * command_fraction)
     if reserve_bytes + max_command_bytes > host_total:
         raise ValueError("rounded command limit plus reserve exceeds physical RAM")
-    safe_by_memory = (host_total - reserve_bytes) // max_command_bytes
-    safe_concurrency = min(max_jobs, int(safe_by_memory))
-    if safe_concurrency <= 0:
-        raise ValueError("relative memory policy permits no guarded command")
+    # The policy ceiling is a per-command upper bound, not a commitment made by
+    # every job. Concurrency is bounded independently by max_jobs and the exact
+    # live ledger transaction for each actual allowance.
+    safe_concurrency = max_jobs
     ttl = request.get("reservation_ttl_seconds", DEFAULT_RESERVATION_TTL_S)
     if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
         raise ValueError("reservation_ttl_seconds must be numeric")
@@ -622,14 +635,18 @@ def _policy_from_request(request: dict[str, object], host_total: int) -> dict[st
     if not math.isfinite(ttl_seconds) or not 1.0 <= ttl_seconds <= 24 * 60 * 60:
         raise ValueError("reservation_ttl_seconds must be between 1 and 86400")
     return {
-        "schema": 2,
+        "schema": 3,
         "command_limit_fraction": command_fraction,
         "host_reserve_fraction": reserve_fraction,
+        "host_reserve_basis": reserve_basis,
         "max_jobs": max_jobs,
         "host_total_bytes": host_total,
         "max_command_bytes": max_command_bytes,
+        "policy_command_ceiling_bytes": max_command_bytes,
         "min_available_bytes": reserve_bytes,
+        "host_reserve_bytes": reserve_bytes,
         "safe_concurrency": safe_concurrency,
+        "job_limit": max_jobs,
         "reservation_ttl_seconds": ttl_seconds,
     }
 
@@ -639,6 +656,7 @@ def _policy_signature(policy: dict[str, object]) -> tuple[object, ...]:
         policy.get("schema"),
         policy.get("command_limit_fraction"),
         policy.get("host_reserve_fraction"),
+        policy.get("host_reserve_basis"),
         policy.get("max_jobs"),
         policy.get("host_total_bytes"),
         policy.get("max_command_bytes"),
@@ -687,11 +705,19 @@ def _read_ledger(path: Path) -> dict[str, object]:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"memory admission ledger is invalid: {exc}") from exc
-    if not isinstance(data, dict) or data.get("schema") != _LEDGER_SCHEMA:
+    if not isinstance(data, dict):
         raise RuntimeError("memory admission ledger schema is invalid")
     leases = data.get("leases")
     if not isinstance(leases, list) or any(not isinstance(item, dict) for item in leases):
         raise RuntimeError("memory admission ledger leases are invalid")
+    if data.get("schema") == 1:
+        if leases:
+            raise RuntimeError(
+                "active schema-1 memory admission ledger requires leases to finish"
+            )
+        return _empty_ledger()
+    if data.get("schema") != _LEDGER_SCHEMA:
+        raise RuntimeError("memory admission ledger schema is invalid")
     policy = data.get("policy")
     if policy is not None and not isinstance(policy, dict):
         raise RuntimeError("memory admission ledger policy is invalid")
@@ -1015,12 +1041,18 @@ def _admission_result(
             "lease_token": lease_token,
             "state_root": state_root,
             "allowance_bytes": lease["allowance_bytes"],
+            "enforced_command_limit_bytes": lease["allowance_bytes"],
+            "allowance_basis": lease.get("allowance_basis"),
             "control_overhead_bytes": lease["control_overhead_bytes"],
             "capacity_bytes": lease["capacity_bytes"],
             "max_command_bytes": policy["max_command_bytes"] if policy else None,
+            "policy_command_ceiling_bytes": policy["max_command_bytes"] if policy else None,
             "min_available_bytes": policy["min_available_bytes"] if policy else None,
+            "host_reserve_bytes": policy["min_available_bytes"] if policy else None,
+            "host_reserve_basis": policy.get("host_reserve_basis") if policy else None,
             "host_total_bytes": policy["host_total_bytes"] if policy else None,
             "safe_concurrency": policy["safe_concurrency"] if policy else None,
+            "job_limit": policy["safe_concurrency"] if policy else None,
             "expires_at": lease["expires_at"],
         }
     return payload
@@ -1028,7 +1060,7 @@ def _admission_result(
 
 def _validated_admission_request(request: object) -> dict[str, object]:
     if not isinstance(request, dict) or request.get("schema") != _ADMISSION_SCHEMA:
-        raise ValueError("memory admission request schema must be 1")
+        raise ValueError(f"memory admission request schema must be {_ADMISSION_SCHEMA}")
     op = request.get("op")
     if op not in {"reserve", "renew", "release"}:
         raise ValueError("memory admission operation is invalid")
@@ -1075,8 +1107,18 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 active_leases=len(leases),
                 stale_reaped=stale_reaped,
             )
+        if len(leases) >= int(policy["safe_concurrency"]):
+            return _admission_result(
+                "refused",
+                "guarded_job_limit",
+                "target already has the maximum safe number of guarded leases",
+                policy=policy,
+                active_leases=len(leases),
+                stale_reaped=stale_reaped,
+            )
         predicted = request.get("predicted_rss_bytes")
         explicit_limit = request.get("explicit_limit_bytes")
+        allowance_details: dict[str, object] = {}
         if predicted is not None and explicit_limit is not None:
             raise ValueError(
                 "predicted_rss_bytes and explicit_limit_bytes are mutually exclusive"
@@ -1100,10 +1142,59 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                     stale_reaped=stale_reaped,
                 )
         elif predicted is None:
-            allowance = int(policy["max_command_bytes"])
-            allowance_basis = "unprofiled_command_ceiling"
+            # A hard per-command ceiling is not evidence that an unknown command
+            # will consume that much memory. Size its first guarded run from
+            # capacity that is live and safe now. This allowance is the run's hard
+            # process-tree limit; its measured peak becomes later profile input.
+            base_total, base_capacity = _capacity_transaction(
+                leases, reserve_bytes=int(policy["min_available_bytes"])
+            )
+            if base_total != host_total:
+                raise RuntimeError(
+                    "physical-memory total changed while sizing unprofiled work"
+                )
+            available_for_new = (
+                int(base_capacity["available_floor_bytes"])
+                - int(base_capacity["required_available_bytes"])
+                - control_overhead
+                - MIB
+            )
+            available_backed = (
+                int(math.floor(available_for_new / MIB)) * MIB
+                if available_for_new > 0
+                else 0
+            )
+            allowance = min(int(policy["max_command_bytes"]), available_backed)
+            minimum_unprofiled_allowance = min(
+                MIN_UNPROFILED_ALLOWANCE_BYTES,
+                int(policy["max_command_bytes"]),
+            )
+            allowance_basis = "unprofiled_available_backed"
             predicted_value = None
             explicit_limit_value = None
+            allowance_details = {
+                "minimum_unprofiled_allowance_bytes": minimum_unprofiled_allowance,
+            }
+            base_capacity.update(
+                {
+                    "allowance_basis": allowance_basis,
+                    "allowance_bytes": max(0, allowance),
+                    "control_overhead_bytes": control_overhead,
+                    "predicted_rss_bytes": None,
+                    "explicit_limit_bytes": None,
+                    **allowance_details,
+                }
+            )
+            if not base_capacity["safe"] or allowance < minimum_unprofiled_allowance:
+                return _admission_result(
+                    "refused",
+                    "insufficient_live_memory",
+                    "unprofiled command cannot receive the minimum live allowance while preserving host reserve",
+                    policy=policy,
+                    capacity=base_capacity,
+                    active_leases=len(leases),
+                    stale_reaped=stale_reaped,
+                )
         else:
             if isinstance(predicted, bool) or not isinstance(predicted, (int, float)):
                 raise ValueError("predicted_rss_bytes must be numeric or null")
@@ -1132,20 +1223,12 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 active_leases=len(leases),
                 stale_reaped=stale_reaped,
             )
-        if len(leases) >= int(policy["safe_concurrency"]):
-            return _admission_result(
-                "refused",
-                "guarded_job_limit",
-                "target already has the maximum safe number of guarded leases",
-                policy=policy,
-                active_leases=len(leases),
-                stale_reaped=stale_reaped,
-            )
         expires_at = now + float(policy["reservation_ttl_seconds"])
         lease: dict[str, object] = {
             "lease_id": lease_id,
             "token_hash": token_hash,
             "allowance_bytes": allowance,
+            "allowance_basis": allowance_basis,
             "control_overhead_bytes": control_overhead,
             "capacity_bytes": capacity_bytes,
             "state": "reserved",
@@ -1163,6 +1246,7 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 "control_overhead_bytes": control_overhead,
                 "predicted_rss_bytes": predicted_value,
                 "explicit_limit_bytes": explicit_limit_value,
+                **allowance_details,
             }
         )
         if transaction_total != host_total:
@@ -1181,7 +1265,7 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 "refused",
                 "insufficient_live_memory",
                 (
-                    "unprofiled allowance cannot preserve host reserve"
+                    "unprofiled live allowance cannot preserve host reserve"
                     if predicted is None and explicit_limit is None
                     else "explicit command limit cannot preserve host reserve"
                     if explicit_limit is not None
@@ -1200,7 +1284,7 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
             "admitted",
             "reserved",
             (
-                "unprofiled maximum allowance reserved before mutation"
+                "unprofiled live-capacity allowance reserved before mutation"
                 if predicted is None and explicit_limit is None
                 else "explicit command limit reserved before mutation"
                 if explicit_limit is not None

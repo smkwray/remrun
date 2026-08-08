@@ -988,15 +988,15 @@ def test_versioned_runner_install_and_rpc_use_framed_stdin(monkeypatch):
     assert "'rpc'" in rpc_script and "D:\\remrun\\state" in rpc_script
 
 
-def test_memory_guard_schema_two_is_explicitly_unsupported_on_windows():
+def test_memory_guard_schema_three_is_explicitly_unsupported_on_windows():
     with pytest.raises(
-        MemoryGuardConfigError, match="memory_guard schema 2 is not proved on Windows"
+        MemoryGuardConfigError, match="memory_guard schema 3 is not proved on Windows"
     ):
         SSHPowerShellTransport(
             device(
                 ram_gb=64,
                 memory_guard={
-                    "schema": 2,
+                    "schema": 3,
                     "command_limit_fraction": 0.25,
                     "host_reserve_fraction": 0.25,
                 },

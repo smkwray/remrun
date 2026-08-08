@@ -63,32 +63,40 @@ ram_gb = 64 # scheduler/display metadata; not the protection authority
 max_jobs = 2
 
 [devices.macbox.memory_guard]
-schema = 2
+schema = 3
 command_limit_fraction = 0.3125
-host_reserve_fraction = 0.25
 ```
 
-Both fractions must be finite, greater than zero, below one, and their sum may
-not exceed one. Unknown keys are rejected. Schema 2 is an intentional
-compatibility break: the former schema-1 absolute `max_command_mib` and
-`min_available_mib` fields are rejected rather than silently reinterpreted.
-Windows targets are explicitly rejected while the same schema-2 semantics are
+The command fraction must be finite, greater than zero, and below one. Unknown
+keys are rejected. By default, the host reserve is 25% of physical RAM, bounded
+to 4--16 GiB and rounded upward to MiB. An explicit
+`host_reserve_fraction` remains available; when present, both fractions must sum
+to no more than one. Schema 3 is an intentional compatibility break: prior
+schemas are rejected rather than silently reinterpreted. Windows targets are
+explicitly rejected while the same schema-3 semantics are
 unproved there. Physical RAM is sampled on the target under the
-admission-ledger lock. The host reserve is rounded upward to MiB; the
-per-command ceiling is rounded downward to MiB. `max_jobs` independently caps
-guarded leases. The policy-only concurrency ceiling is:
+admission-ledger lock. The per-command ceiling is rounded downward to MiB.
+`max_jobs` independently caps
+guarded leases. Policy maxima do not reserve capacity for jobs that did not ask
+for it. Concurrency has two independent gates:
 
 ```text
-min(max_jobs, floor((physical_ram - host_reserve) / command_ceiling))
+active guarded leases < max_jobs
+the exact live ledger transaction fits each requested allowance
 ```
 
-For a command without a learned RSS profile, remrun reserves the full command
-ceiling as an **unprofiled allowance**. This is a capacity commitment, not a claim
-that the command requires that much memory. With a positive learned profile, it
-reserves the observed process-tree RSS high-water mark plus 25% headroom, rounded
-upward to MiB, and refuses rather than clipping when that allowance exceeds the
-command ceiling. Admission receipts label the allowance basis and byte counts so
-the ceiling cannot be mistaken for a measurement.
+For a command without a learned RSS profile, remrun derives an
+**unprofiled live-capacity allowance** from current available memory after the host
+reserve, existing guarded commitments, measured control overhead, and a one-MiB
+strict-comparison margin. It caps that capacity at the per-command ceiling and
+requires at least 1 MiB. A missing
+profile therefore does not commit the ceiling or cause refusal while ordinary live
+headroom exists. The granted allowance is the first run's hard process-tree limit;
+a job that reaches it is terminated and its measured peak informs later profiles.
+With a positive learned profile, remrun instead reserves the observed process-tree
+RSS high-water mark plus 25% headroom, rounded upward to MiB, and refuses rather
+than clipping when that evidence-based allowance exceeds the command ceiling.
+Admission receipts label the allowance basis and byte counts.
 
 A tool-owned command may instead request an explicit positive whole-MiB hard limit through
 the generic transport seam. That allowance is recorded as

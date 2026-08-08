@@ -346,16 +346,13 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
         "REMRUN_STAGE_IN": stage_in,
         "REMRUN_OUTPUT_ROOT": output_root,
     }
-    # Size the memory guard to what this batch actually needs. Left to itself the
-    # transport reserves the device's configured MAXIMUM as an unprofiled ceiling,
-    # because only the ordinary `remrun run` path passes a prediction. That ceiling
-    # is a fraction of total RAM, not a measured need, so a worker with a ~5 GB peak
-    # claims ~20 GB on a 64 GiB box and is refused whenever the device cannot also
-    # preserve its host reserve. The fleet already knows this batch's peak RSS
+    # Size the memory guard to what this batch actually needs. Without a prediction
+    # the transport uses the generic first-run live-capacity allowance. The fleet
+    # already knows this batch's peak RSS
     # (seeded in fleet_costs.toml, refined by the local EWMA store), and a batch is
     # ONE worker invocation paying ONE cold model load (Invariant 0), so the head
     # task's profile is the whole batch's figure. A missing/zero profile stays None
-    # and keeps the conservative unprofiled ceiling.
+    # and keeps the unprofiled live-capacity path.
     reservation = None
     if getattr(transport, "memory_guard", None) is not None:
         predicted_rss_mb = placement.predicted_resources(

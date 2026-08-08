@@ -364,7 +364,7 @@ def test_required_memory_guard_helper_missing_refuses_without_user_code(
             "cache_root": str(tmp_path / "cache"),
             "ram_gb": 8,
             "memory_guard": {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": 0.05,
                 "host_reserve_fraction": 0.05,
             },
@@ -412,7 +412,7 @@ def test_guarded_localsim_rejects_empty_state_root_without_writing_cwd(
             "state_root": "",
             "cache_root": str(tmp_path / "cache"),
             "memory_guard": {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": 0.05,
                 "host_reserve_fraction": 0.05,
             },

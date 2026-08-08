@@ -376,7 +376,7 @@ def _guard_request(
     assert 0 < reserve_fraction < 1
     assert command_fraction + reserve_fraction < 1
     return {
-        "schema": 1,
+        "schema": 2,
         "op": "reserve",
         "state_root": str(state_root),
         "lease_id": uuid.uuid4().hex,
@@ -394,7 +394,7 @@ def _lease_request(payload: dict[str, object], *, op: str = "renew") -> dict[str
     policy = payload["policy"]
     assert isinstance(lease, dict) and isinstance(policy, dict)
     return {
-        "schema": 1,
+        "schema": 2,
         "op": op,
         "state_root": lease["state_root"],
         "lease_id": lease["lease_id"],

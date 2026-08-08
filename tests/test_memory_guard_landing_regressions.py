@@ -22,7 +22,7 @@ MIB = 1024**2
 
 def _request(state_root: Path, *, lease_id: str | None = None, token: str | None = None):
     return {
-        "schema": 1,
+        "schema": 2,
         "op": "reserve",
         "state_root": str(state_root),
         "lease_id": lease_id or uuid.uuid4().hex,
@@ -40,7 +40,7 @@ def _lease_request(result: dict[str, object], *, op: str) -> dict[str, object]:
     policy = result["policy"]
     assert isinstance(lease, dict) and isinstance(policy, dict)
     request: dict[str, object] = {
-        "schema": 1,
+        "schema": 2,
         "op": op,
         "state_root": lease["state_root"],
         "lease_id": lease["lease_id"],
@@ -156,7 +156,7 @@ def test_small_user_allowance_does_not_include_python_gate_overhead(tmp_path: Pa
         cache_root=str(tmp_path / "cache"),
         max_jobs=1,
         memory_guard={
-            "schema": 2,
+            "schema": 3,
             "command_limit_fraction": tiny_fraction,
             "host_reserve_fraction": tiny_fraction,
         },
@@ -199,7 +199,7 @@ def test_blank_local_state_root_is_refused_without_writing_in_cwd(
         cache_root=str(tmp_path / "cache"),
         max_jobs=1,
         memory_guard={
-            "schema": 2,
+            "schema": 3,
             "command_limit_fraction": 0.10,
             "host_reserve_fraction": 0.05,
         },

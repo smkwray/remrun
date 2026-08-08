@@ -113,7 +113,7 @@ def configure_memory_guard(
     devices.write_text(
         devices.read_text(encoding="utf-8")
         + "\n[devices.LOCAL_SIM.memory_guard]\n"
-        + "schema = 2\n"
+        + "schema = 3\n"
         + f"command_limit_fraction = {command_fraction!r}\n"
         + f"host_reserve_fraction = {reserve_fraction!r}\n",
         encoding="utf-8",
@@ -2135,7 +2135,7 @@ def _enable_relative_guards_for_two_sim_devices(env: dict) -> None:
         for name in ("SIM_A", "SIM_B"):
             handle.write(
                 f"\n[devices.{name}.memory_guard]\n"
-                "schema = 2\n"
+                "schema = 3\n"
                 "command_limit_fraction = 0.25\n"
                 "host_reserve_fraction = 0.25\n"
             )

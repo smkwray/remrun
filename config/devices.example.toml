@@ -69,9 +69,8 @@ vram_gb = 0
 # max_jobs also caps concurrent guarded leases. The guard remains active for
 # ordinary runs, workload runs, and --no-telemetry.
 [devices.macbox.memory_guard]
-schema = 2
+schema = 3
 command_limit_fraction = 0.3125
-host_reserve_fraction = 0.25
 
 # Resource adaptation is opt-in from project config. This explicit interactive
 # policy applies only after a workload is selected. On unified-memory Macs the
@@ -114,7 +113,7 @@ eff_cores = 8
 ram_gb = 64
 vram_gb = 12
 
-# Memory-guard schema 2 is intentionally unconfigured on Windows until the
+# Memory-guard schema 3 is intentionally unconfigured on Windows until the
 # same target-local lease and process-boundary semantics are proved there.
 
 # Remote access never implies unattended use. Choose this mode only when the

@@ -19,11 +19,12 @@ safe project reconciliation and pullback, conflict preservation, target scheduli
 resource telemetry, external-tree `sync`, commit-only `git-sync`, allowlisted target
 actions, and optional fleet dispatch with live resource, job, and SSH-mesh views.
 POSIX targets can opt into a RAM-relative hard memory guard that admits work before
-project mutation and terminates only the protected command tree if its configured
-limit or host reserve is breached. An unknown command receives the configured maximum
-allowance; that is a conservative capacity commitment, not an estimated requirement.
-Learned commands use their observed process-tree RSS high-water mark plus guard
-headroom. The guard cannot govern GPU or unified-memory allocations that the operating
+project mutation and terminates only the protected command tree if its granted limit
+or host reserve is breached. An unknown command receives capacity that is live and
+fully backed at launch, bounded by the configured per-command maximum; it is not
+charged the maximum merely because no profile exists. Learned commands use their
+observed process-tree RSS high-water mark plus guard headroom. The guard cannot govern
+GPU or unified-memory allocations that the operating
 system does not attribute to process-tree RSS; do not use it as containment for those
 workloads. The Windows `ssh-powershell` command surface requires `pwsh` 7.3+ and supports
 native applications plus `.ps1` entry points with every following token preserved as

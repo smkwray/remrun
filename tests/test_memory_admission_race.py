@@ -24,12 +24,15 @@ def _reserve_worker(
     telemetry._processes = lambda: {}
     telemetry._control_overhead_budget_bytes = lambda: 64 * 1024**2
     request = {
-        "schema": 1,
+        "schema": 2,
         "op": "reserve",
         "state_root": state_root,
         "lease_id": uuid.uuid4().hex,
         "lease_token": uuid.uuid4().hex,
-        "predicted_rss_bytes": None,
+        "predicted_rss_bytes": int(
+            (64 * GIB * command_fraction - 2 * 1024**2)
+            / telemetry.PREDICTION_HEADROOM_FACTOR
+        ),
         "command_limit_fraction": command_fraction,
         "host_reserve_fraction": 0.20,
         "max_jobs": 2,

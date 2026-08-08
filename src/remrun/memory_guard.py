@@ -6,8 +6,10 @@ from typing import Mapping
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
-_SCHEMA = 2
+_SCHEMA = 3
 _KEYS = frozenset({"schema", "command_limit_fraction", "host_reserve_fraction"})
+_REQUIRED_KEYS = frozenset({"schema", "command_limit_fraction"})
+_ADMISSION_SCHEMA = 2
 PREDICTION_HEADROOM_FACTOR = 1.25
 RESERVATION_TTL_SECONDS = 30 * 60
 
@@ -21,16 +23,18 @@ class MemoryGuard:
     """Validated relative memory policy for one guarded POSIX target."""
 
     command_limit_fraction: float
-    host_reserve_fraction: float
+    host_reserve_fraction: float | None
     max_jobs: int
     schema: int = _SCHEMA
 
     def as_dict(self) -> dict[str, int | float]:
-        return {
+        result: dict[str, int | float] = {
             "schema": self.schema,
             "command_limit_fraction": self.command_limit_fraction,
-            "host_reserve_fraction": self.host_reserve_fraction,
         }
+        if self.host_reserve_fraction is not None:
+            result["host_reserve_fraction"] = self.host_reserve_fraction
+        return result
 
 
 @dataclass(frozen=True)
@@ -123,7 +127,7 @@ class MemoryAdmissionResult:
 
     @classmethod
     def from_payload(cls, payload: object) -> "MemoryAdmissionResult":
-        if not isinstance(payload, dict) or payload.get("schema") != 1:
+        if not isinstance(payload, dict) or payload.get("schema") != _ADMISSION_SCHEMA:
             raise ValueError("memory admission returned an invalid schema")
         status = payload.get("status")
         if status not in {"admitted", "refused", "released"}:
@@ -146,7 +150,7 @@ class MemoryAdmissionResult:
     @classmethod
     def refused(cls, reason: str, detail: str) -> "MemoryAdmissionResult":
         payload: dict[str, object] = {
-            "schema": 1,
+            "schema": _ADMISSION_SCHEMA,
             "status": "refused",
             "reason": reason,
             "detail": detail,
@@ -192,7 +196,7 @@ def parse_memory_guard(
         )
 
     keys = set(raw)
-    missing = _KEYS - keys
+    missing = _REQUIRED_KEYS - keys
     unknown = keys - _KEYS
     if missing:
         raise MemoryGuardConfigError(
@@ -218,20 +222,22 @@ def parse_memory_guard(
     os_name = str(device_os).lower()
     if kind == "ssh-powershell" or os_name.startswith("win"):
         raise MemoryGuardConfigError(
-            f"device {device_name!r} memory_guard schema 2 is not proved on Windows"
+            f"device {device_name!r} memory_guard schema 3 is not proved on Windows"
         )
     if kind and kind not in {"local-sim", "ssh-posix"}:
         raise MemoryGuardConfigError(
-            f"device {device_name!r} memory_guard schema 2 requires a POSIX transport"
+            f"device {device_name!r} memory_guard schema 3 requires a POSIX transport"
         )
 
     command_fraction = _fraction(
         raw["command_limit_fraction"], "command_limit_fraction", device_name
     )
-    reserve_fraction = _fraction(
-        raw["host_reserve_fraction"], "host_reserve_fraction", device_name
+    reserve_fraction = (
+        _fraction(raw["host_reserve_fraction"], "host_reserve_fraction", device_name)
+        if "host_reserve_fraction" in raw
+        else None
     )
-    if command_fraction + reserve_fraction > 1.0:
+    if reserve_fraction is not None and command_fraction + reserve_fraction > 1.0:
         raise MemoryGuardConfigError(
             f"device {device_name!r} memory guard command limit plus host reserve exceeds RAM"
         )

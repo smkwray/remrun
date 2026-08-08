@@ -331,10 +331,9 @@ def test_run_batch_reserves_memory_with_the_profiled_peak_rss(tmp_path, monkeypa
     """A guarded device must be asked for the batch's MEASURED peak RSS.
 
     Fleet exec used to reach `transport.exec` with no reservation, and exec's own
-    fallback reserves with no prediction — the device's configured maximum as an
-    unprofiled ceiling. A worker whose measured peak is ~5 GB therefore claimed a
-    fraction of total RAM (20 GiB on a 64 GiB box) and was refused whenever that
-    could not sit alongside the host reserve, even with tens of GB free.
+    fallback reserves with no prediction through the generic first-run
+    live-capacity path. The fleet already has a measured peak, so it must pass that
+    evidence rather than discard it.
     """
     from remrun.fleet import profiles
     from remrun.memory_guard import MemoryAdmissionResult
@@ -371,7 +370,7 @@ def test_run_batch_reserves_memory_with_the_profiled_peak_rss(tmp_path, monkeypa
                      output_root=str(out), options={"argv": ["python", "-c", "pass"]})
     res = executor.run_batch("LOCAL_SIM", [task], config, state_root=state)
 
-    # The learned figure, not None (which the guard reads as "unprofiled -> ceiling").
+    # The learned figure, not None (which selects live-capacity first-run sizing).
     assert calls == [5000.0]
     # And a refusal is surfaced as its own phase rather than an opaque exit code.
     assert res["ok"] is False and res["phase"] == "memory_admission"

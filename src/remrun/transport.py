@@ -539,8 +539,8 @@ def _extract_memory_admission(stdout: str) -> dict[str, object] | None:
 
 
 def _lease_request(guard: MemoryGuard, reservation: MemoryReservation) -> dict[str, object]:
-    return {
-        "schema": 1,
+    request: dict[str, object] = {
+        "schema": 2,
         "state_root": reservation.state_root,
         "lease_id": reservation.lease_id,
         "lease_token": reservation.lease_token,
@@ -548,10 +548,12 @@ def _lease_request(guard: MemoryGuard, reservation: MemoryReservation) -> dict[s
         "control_overhead_bytes": reservation.control_overhead_bytes,
         "capacity_bytes": reservation.capacity_bytes,
         "command_limit_fraction": guard.command_limit_fraction,
-        "host_reserve_fraction": guard.host_reserve_fraction,
         "max_jobs": guard.max_jobs,
         "reservation_ttl_seconds": RESERVATION_TTL_SECONDS,
     }
+    if guard.host_reserve_fraction is not None:
+        request["host_reserve_fraction"] = guard.host_reserve_fraction
+    return request
 
 
 def _controller_guard_refusal(
@@ -937,7 +939,7 @@ class BaseTransport:
             )
         try:
             request: dict[str, object] = {
-                "schema": 1,
+                "schema": 2,
                 "op": "reserve",
                 "state_root": self._memory_guard_state_root(),
                 "lease_id": uuid.uuid4().hex,
@@ -945,10 +947,13 @@ class BaseTransport:
                 "predicted_rss_bytes": predicted_bytes,
                 "explicit_limit_bytes": explicit_limit_bytes,
                 "command_limit_fraction": self.memory_guard.command_limit_fraction,
-                "host_reserve_fraction": self.memory_guard.host_reserve_fraction,
                 "max_jobs": self.memory_guard.max_jobs,
                 "reservation_ttl_seconds": RESERVATION_TTL_SECONDS,
             }
+            if self.memory_guard.host_reserve_fraction is not None:
+                request["host_reserve_fraction"] = (
+                    self.memory_guard.host_reserve_fraction
+                )
             result = MemoryAdmissionResult.from_payload(
                 self._invoke_memory_admission(request)
             )
@@ -3604,7 +3609,7 @@ class SSHPowerShellTransport(_SSHCommon):
         memory_reservation: MemoryReservation | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         if self.memory_guard is not None or memory_reservation is not None:
-            raise TransportError("schema-2 memory guard is unsupported on ssh-powershell")
+            raise TransportError("schema-3 memory guard is unsupported on ssh-powershell")
         self.validate_command_context(
             command, env=env, path_prepend=path_prepend
         )
@@ -3746,7 +3751,7 @@ class SSHPowerShellTransport(_SSHCommon):
              memory_reservation: MemoryReservation | None = None,
              _allow_observed_breakaway: bool = False) -> ExecResult:
         if self.memory_guard is not None or memory_reservation is not None:
-            raise TransportError("memory guard schema 2 is not proved on Windows")
+            raise TransportError("memory guard schema 3 is not proved on Windows")
         self.validate_command(command)
         try:
             address = self._address_or_resolve()

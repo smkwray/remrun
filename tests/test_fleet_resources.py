@@ -243,7 +243,7 @@ def test_guarded_device_uses_unguarded_fixed_resource_probe(monkeypatch):
             "ram_gb": 64,
             "max_jobs": 2,
             "memory_guard": {
-                "schema": 2,
+                "schema": 3,
                 "command_limit_fraction": 0.3125,
                 "host_reserve_fraction": 0.25,
             },
