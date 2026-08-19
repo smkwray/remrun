@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +19,7 @@ from remrun.gitsync import (
     GitSyncError,
     _ensure_remote_git_repo,
     _parse_dirty_summary,
+    _ref_namespace,
     git_sync_status_result,
     install_git_sync_hook,
     run_git_sync,
@@ -315,6 +317,27 @@ def test_bootstrap_empty_peer_reports_cleanly(tmp_path, monkeypatch):
     assert not (local / ".git").exists()  # no half-initialized repo left behind
 
 
+def test_branch_scoped_bootstrap_fetches_only_named_branch(bootstrap_repos):
+    cfg, local, remote, _peer_head = bootstrap_repos
+    git(remote, "checkout", "-b", "side")
+    side_head = commit(remote, "side.txt", "side")
+    git(remote, "checkout", "main")
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="pull", branch="side",
+        reporter=Reporter(),
+    )
+
+    assert result.bootstrap is not None
+    assert result.bootstrap.branch == "side"
+    assert result.bootstrap.head == side_head
+    assert git(local, "rev-parse", "--abbrev-ref", "HEAD") == "side"
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/main"],
+        cwd=str(local), capture_output=True, text=True,
+    ).returncode != 0
+
+
 def test_bootstrap_recovers_existing_unborn_repo(bootstrap_repos):
     cfg, local, _remote, peer_head = bootstrap_repos
     subprocess.run(["git", "init", "-b", "master"], cwd=str(local), check=True,
@@ -565,6 +588,66 @@ def test_branch_option_limits_fast_forward(repos):
 
     assert git(local, "rev-parse", "side") == side_head
     assert git(local, "rev-parse", "main") != main_head
+    assert subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/remotes/LOCAL_SIM/main"],
+        cwd=str(local), capture_output=True, text=True,
+    ).returncode != 0
+
+
+def test_branch_option_limits_push_bundle_and_remote_fetch(repos):
+    cfg, local, remote = repos
+    git(local, "checkout", "-b", "side")
+    commit(local, "side-base.txt", "side base")
+    git(local, "checkout", "main")
+    subprocess.run(
+        ["git", "fetch", str(local), "side:side"], cwd=str(remote), check=True,
+        capture_output=True, text=True,
+    )
+    git(local, "checkout", "side")
+    side_head = commit(local, "side.txt", "side")
+    git(local, "checkout", "main")
+    main_head = commit(local, "main.txt", "main")
+
+    assert sync(cfg, direction="push", branch="side") == EXIT_OK
+
+    assert git(remote, "rev-parse", "side") == side_head
+    assert git(remote, "rev-parse", "main") != main_head
+    local_ns = _ref_namespace(socket.gethostname() or "LOCAL")
+    assert subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/remotes/{local_ns}/main"],
+        cwd=str(remote), capture_output=True, text=True,
+    ).returncode != 0
+
+
+def test_status_branch_scope_uses_single_branch_bundle_and_fetch(repos, monkeypatch):
+    cfg, _local, _remote = repos
+    remote_calls = []
+    local_calls = []
+    real_remote = gitsync_module._remote_git_ok
+    real_local = gitsync_module._local_git_ok
+
+    def record_remote(transport, cwd, args):
+        remote_calls.append(list(args))
+        return real_remote(transport, cwd, args)
+
+    def record_local(cwd, args):
+        local_calls.append(list(args))
+        return real_local(cwd, args)
+
+    monkeypatch.setattr(gitsync_module, "_remote_git_ok", record_remote)
+    monkeypatch.setattr(gitsync_module, "_local_git_ok", record_local)
+
+    status = git_sync_status_result(
+        cfg, device_name="LOCAL_SIM", branch="main", reporter=Reporter(),
+    )
+
+    assert status.exit_code == EXIT_OK
+    bundle = next(args for args in remote_calls if args[:2] == ["bundle", "create"])
+    assert "refs/heads/main" in bundle
+    assert "--branches" not in bundle
+    fetch = next(args for args in local_calls if args and args[0] == "fetch")
+    assert "+refs/heads/main:refs/remotes/LOCAL_SIM/main" in fetch
+    assert not any("refs/heads/*" in arg for arg in fetch)
 
 
 def test_install_hook_uses_project_config_peers(repos):

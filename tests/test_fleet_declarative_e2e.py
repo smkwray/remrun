@@ -1,15 +1,19 @@
 """One arbitrary configured workflow through every supported fleet boundary."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from remrun.config import RemrunConfig
-from remrun.fleet import adapters, dispatcher, placement, probes
+from remrun.fleet import adapters, cli, dispatcher, placement, probes
 from remrun.fleet.models import DeviceSnapshot
 from remrun.fleet.prepared import as_fleet_task, prepare_task_job
 from remrun.fleet.queue import FleetQueue
+from remrun.fleet.resources import ResourceView
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.models import Device
+from remrun.output import Reporter
+from remrun.transport import ExecResult
 
 
 def _definition(worker: Path, output_root: Path) -> dict:
@@ -124,19 +128,123 @@ def test_novel_name_submits_claims_executes_closes_and_validates(
 
 
 class _CapabilityTransport:
-    def remote_path_exists(self, path: str) -> bool:
-        if path == "/raises":
-            raise OSError("probe failed")
-        return path == "/present"
+    def __init__(self) -> None:
+        self.calls = []
+
+    def exec(self, command, cwd, **kwargs):
+        self.calls.append((command, cwd, kwargs))
+        paths = json.loads(command[3])
+        values = {
+            "/present": True,
+            "/missing": False,
+            "/raises": None,
+        }
+        return ExecResult(0, json.dumps([values[path] for path in paths]), "")
 
 
 def test_capability_probe_preserves_mixed_per_engine_outcomes() -> None:
-    status = probes._capability_engines(_CapabilityTransport(), [
+    transport = _CapabilityTransport()
+    device = Device.from_mapping("REMOTE", {
+        "kind": "ssh-posix", "os": "posix", "address": "example.invalid",
+        "project_root": "/work", "cache_root": "/cache",
+    })
+    status = probes._capability_engines(transport, [
         {"engine": "yes", "capability_paths": ["/present"]},
         {"engine": "no", "capability_paths": ["/missing"]},
         {"engine": "maybe", "capability_paths": ["/raises"]},
         {"engine": "unprobed", "capability_paths": []},
-    ])
+    ], device=device)
     assert status == {
         "yes": "present", "no": "absent", "maybe": "unknown", "unprobed": "unknown",
     }
+    assert len(transport.calls) == 1
+    assert transport.calls[0][2]["telemetry"] is False
+
+
+def test_json_submit_enqueues_without_speculative_route_probe(
+    tmp_path, monkeypatch, capsys,
+) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text("pass\n", encoding="utf-8")
+    definition = _definition(worker, tmp_path / "outputs")
+    config = _config(tmp_path, definition)
+    spec = resolve_task_spec(
+        "zotomatic", definition, devices=config.devices, repo_root=tmp_path,
+    )
+    source = tmp_path / "sample.zot"
+    source.write_bytes(b"zot")
+    prepared = prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    task = as_fleet_task(prepared, spec)
+    state_root = tmp_path / "state"
+
+    monkeypatch.setattr(cli, "load_config", lambda _repo_root=None: config)
+    monkeypatch.setattr(cli, "default_state_root", lambda: state_root)
+    monkeypatch.setattr(cli, "_prepare_configured", lambda _args, _config: (
+        spec, [prepared], [task],
+    ))
+
+    def unexpected_preview(*_args, **_kwargs):
+        raise AssertionError("queue-only JSON submission must not probe placement")
+
+    monkeypatch.setattr(cli, "_route_preview", unexpected_preview)
+    args = cli.build_parser().parse_args([
+        "submit", "zotomatic", "--input", str(source), "--json",
+    ])
+
+    assert cli.cmd_submit(args, Reporter()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["queued_total"] == 1
+    assert payload["route_preview"] is False
+    assert "device_busy" not in payload
+
+    monkeypatch.setattr(
+        cli, "_route_preview",
+        lambda *_args, **_kwargs: {
+            "device": "LOCAL_SIM", "device_busy": False,
+            "active_on_device": 0, "estimated_finish_s": 1.0,
+        },
+    )
+    preview_args = cli.build_parser().parse_args([
+        "submit", "zotomatic", "--input", str(source), "--json", "--preview-route",
+    ])
+    assert cli.cmd_submit(preview_args, Reporter()) == 0
+    preview_payload = json.loads(capsys.readouterr().out)
+    assert preview_payload["route_preview"] is True
+    assert preview_payload["device"] == "LOCAL_SIM"
+
+
+def test_configured_controller_snapshot_is_local_and_never_uses_ssh(
+    tmp_path, monkeypatch,
+) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text("pass\n", encoding="utf-8")
+    device = Device.from_mapping("SELF", {
+        "kind": "ssh-posix", "os": "posix", "address_candidates": ["localhost"],
+        "project_root": str(tmp_path), "cache_root": str(tmp_path / "cache"),
+        "max_jobs": 2,
+    })
+
+    class NoSSH:
+        def __getattr__(self, name):
+            raise AssertionError(f"self snapshot attempted transport operation {name}")
+
+    monkeypatch.setattr(
+        "remrun.fleet.local_resources.local_view",
+        lambda name="", timeout=20.0: ResourceView(
+            name=name, reachable=True, detail="local controller", cpu_busy_pct=12.5,
+            ram_free_mb=8192, ram_total_mb=16384, is_local=True,
+        ),
+    )
+    snapshot = probes.build_snapshot(
+        device, NoSSH(), {"pools": {"gpu": 1}}, active_jobs=1,
+        pool_used={"gpu": 1},
+        adapter_specs=[{"engine": "zot-engine", "capability_paths": [str(worker)]}],
+    )
+
+    assert snapshot.reachable is True
+    assert snapshot.cpu_busy_pct == 12.5
+    assert snapshot.ram_free_mb == 8192
+    assert snapshot.active_jobs == 1
+    assert snapshot.pool_free == {"gpu": 0}
+    assert snapshot.engine_status == {"zot-engine": "present"}
+    assert snapshot.detail == "local controller"

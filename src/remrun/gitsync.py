@@ -414,7 +414,7 @@ def run_git_sync_result(
         if bootstrap or direction in {"pull", "both"}:
             return _bootstrap_from_peer(
                 config, device_name, project, dry_run=dry_run, reporter=reporter,
-                remote_memory_limit_mib=memory_limit_mib)
+                remote_memory_limit_mib=memory_limit_mib, branch=branch)
         raise GitSyncError(
             f"not a git repo: {local_root} (use --pull/--bootstrap to seed it from {device_name})",
             EXIT_INFRA)
@@ -528,13 +528,17 @@ def git_sync_status_result(
         remote_tmp = operation_transport.remote_temp_dir("remrun-gitsync-status")
         remote_bundle = operation_transport.native_join(remote_tmp, "peer.bundle")
         try:
-            _remote_git_ok(operation_transport, remote_root,
-                           ["bundle", "create", remote_bundle, "--branches", "--tags"])
+            _remote_git_ok(
+                operation_transport, remote_root,
+                ["bundle", "create", remote_bundle, *_bundle_selection(branch)],
+            )
             operation_transport.pull_file(remote_bundle, local_bundle)
         finally:
             operation_transport.remove_remote_tree(remote_tmp)
-        _local_git_ok(tmp_repo, ["fetch", "--tags", str(local_bundle),
-                                 f"+refs/heads/*:refs/remotes/{peer_ns}/*"])
+        _local_git_ok(
+            tmp_repo,
+            ["fetch", "--tags", str(local_bundle), _fetch_refspec(peer_ns, branch)],
+        )
         branches = (
             _status_branches(tmp_repo, peer_ns, branch)
             if local_history_present
@@ -872,6 +876,19 @@ def _bootstrap_status_branches(
     return actions
 
 
+def _bundle_selection(branch: str | None) -> list[str]:
+    """Select all tags plus the explicitly named branch when one was requested."""
+    if branch:
+        return ["--tags", f"refs/heads/{branch}"]
+    return ["--branches", "--tags"]
+
+
+def _fetch_refspec(namespace: str, branch: str | None) -> str:
+    if branch:
+        return f"+refs/heads/{branch}:refs/remotes/{namespace}/{branch}"
+    return f"+refs/heads/*:refs/remotes/{namespace}/*"
+
+
 def _pull_from_peer(
     transport: BaseTransport,
     remote_root: str,
@@ -887,13 +904,17 @@ def _pull_from_peer(
         remote_tmp = transport.remote_temp_dir("remrun-gitsync")
         remote_bundle = transport.native_join(remote_tmp, "peer.bundle")
         try:
-            _remote_git_ok(transport, remote_root, ["bundle", "create", remote_bundle,
-                                                   "--branches", "--tags"])
+            _remote_git_ok(
+                transport, remote_root,
+                ["bundle", "create", remote_bundle, *_bundle_selection(branch)],
+            )
             transport.pull_file(remote_bundle, local_bundle)
         finally:
             transport.remove_remote_tree(remote_tmp)
-        _local_git_ok(local_root, ["fetch", "--tags", str(local_bundle),
-                                   f"+refs/heads/*:refs/remotes/{peer_ns}/*"])
+        _local_git_ok(
+            local_root,
+            ["fetch", "--tags", str(local_bundle), _fetch_refspec(peer_ns, branch)],
+        )
     actions = _fast_forward_local(
         local_root, peer_ns, branch,
         advance_dirty_worktree=advance_dirty_worktree)
@@ -913,13 +934,18 @@ def _push_to_peer(
 ) -> list[BranchAction]:
     with tempfile.TemporaryDirectory(prefix="remrun-gitsync-") as td:
         local_bundle = Path(td) / "local.bundle"
-        _local_git_ok(local_root, ["bundle", "create", str(local_bundle), "--branches", "--tags"])
+        _local_git_ok(
+            local_root,
+            ["bundle", "create", str(local_bundle), *_bundle_selection(branch)],
+        )
         remote_tmp = transport.remote_temp_dir("remrun-gitsync")
         remote_bundle = transport.native_join(remote_tmp, "local.bundle")
         try:
             transport.push_file(local_bundle, remote_bundle)
-            _remote_git_ok(transport, remote_root, ["fetch", "--tags", remote_bundle,
-                                                   f"+refs/heads/*:refs/remotes/{local_ns}/*"])
+            _remote_git_ok(
+                transport, remote_root,
+                ["fetch", "--tags", remote_bundle, _fetch_refspec(local_ns, branch)],
+            )
             actions = _fast_forward_remote(
                 transport, remote_root, local_ns, branch,
                 advance_dirty_worktree=advance_dirty_worktree)
@@ -958,6 +984,7 @@ def _bootstrap_from_peer(
     dry_run: bool,
     reporter: Reporter,
     remote_memory_limit_mib: int | None,
+    branch: str | None,
 ) -> GitSyncResult:
     """Initialize a repo-less project from a peer's authoritative history.
 
@@ -986,10 +1013,24 @@ def _bootstrap_from_peer(
             f"peer {device_name} repo is empty (no commits to bootstrap from): {remote_root}",
             EXIT_INFRA)
 
-    peer_head = _remote_git_ok(
-        metadata_transport, remote_root, ["rev-parse", "HEAD"]
-    ).stdout.strip()
-    peer_branch = _current_branch_remote(metadata_transport, remote_root) or "main"
+    if branch:
+        branch_ref = f"refs/heads/{branch}"
+        if _remote_git(
+            metadata_transport, remote_root,
+            ["show-ref", "--verify", "--quiet", branch_ref],
+        ).exit_code != 0:
+            raise GitSyncError(
+                f"peer {device_name} has no branch {branch!r}", EXIT_INFRA,
+            )
+        peer_branch = branch
+        peer_head = _remote_git_ok(
+            metadata_transport, remote_root, ["rev-parse", branch_ref]
+        ).stdout.strip()
+    else:
+        peer_head = _remote_git_ok(
+            metadata_transport, remote_root, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+        peer_branch = _current_branch_remote(metadata_transport, remote_root) or "main"
     peer_ns = _ref_namespace(device_name)
 
     reporter.event(
@@ -1032,8 +1073,10 @@ def _bootstrap_from_peer(
             remote_tmp = operation_transport.remote_temp_dir("remrun-gitsync-boot")
             remote_bundle = operation_transport.native_join(remote_tmp, "peer.bundle")
             try:
-                _remote_git_ok(operation_transport, remote_root,
-                               ["bundle", "create", remote_bundle, "--branches", "--tags"])
+                _remote_git_ok(
+                    operation_transport, remote_root,
+                    ["bundle", "create", remote_bundle, *_bundle_selection(branch)],
+                )
                 operation_transport.pull_file(remote_bundle, local_bundle)
             finally:
                 operation_transport.remove_remote_tree(remote_tmp)
@@ -1043,8 +1086,10 @@ def _bootstrap_from_peer(
                     EXIT_TRANSFER,
                 )
             _local_git_ok(local_root, ["bundle", "verify", str(local_bundle)])
-            _local_git_ok(local_root, ["fetch", "--tags", str(local_bundle),
-                                       f"+refs/heads/*:refs/remotes/{peer_ns}/*"])
+            _local_git_ok(
+                local_root,
+                ["fetch", "--tags", str(local_bundle), _fetch_refspec(peer_ns, branch)],
+            )
 
         # Do not trust the fetch exit code alone: require the discovered peer
         # commit and checked-out branch ref to have arrived before creating heads.

@@ -274,7 +274,10 @@ def cmd_submit(args, reporter: Reporter) -> int:
     spec, records, tasks = _prepare_configured(args, config)
     state_root = default_state_root()
     route_line = getattr(args, "route_line", False)
-    need_route = bool(args.json or route_line)
+    # Enqueue is a durable local database operation. A JSON representation of
+    # that result must not silently turn it into a live fleet scan. Route
+    # previews remain available when a caller explicitly asks for one.
+    need_route = bool(getattr(args, "preview_route", False) or route_line)
     q = FleetQueue(state_root / "fleet" / "fleet.db")
     route: dict = {}
     preview_multi = None
@@ -292,7 +295,7 @@ def cmd_submit(args, reporter: Reporter) -> int:
             records, spec=spec, priority=getattr(args, "priority", 0),
             current_spec_id=current_spec_id,
         )
-        queued_total = q.counts().get("queued", 0) if need_route else 0
+        queued_total = q.counts().get("queued", 0) if (args.json or need_route) else 0
         if need_route and len(tasks) == 1:
             will_run = (bool(route.get("device")) and not route.get("device_busy")
                         and queued_total <= 1)
@@ -304,10 +307,12 @@ def cmd_submit(args, reporter: Reporter) -> int:
               _route_line_multi(spec["task_name"], preview_multi or {}, queued_total))
     elif args.json:
         payload = {"job_ids": jids, "task": spec["task_name"],
-                   "spec_id": spec["spec_id"], "queued_total": queued_total}
+                   "spec_id": spec["spec_id"], "queued_total": queued_total,
+                   "route_preview": need_route}
         if records and "limits" in records[0]:
             payload["limits"] = records[0]["limits"]
-        payload.update(route if len(tasks) == 1 else (preview_multi or {}))
+        if need_route:
+            payload.update(route if len(tasks) == 1 else (preview_multi or {}))
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     else:
         for jid, record in zip(jids, records):
@@ -851,6 +856,10 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("submit", help="enqueue a job")
     add_common(ps)
     ps.add_argument("--priority", type=int, default=0)
+    ps.add_argument(
+        "--preview-route", action="store_true",
+        help="probe live placement before enqueue and include the non-binding preview in JSON",
+    )
     ps.add_argument("--allow-fallback", action="store_true",
                     help="when used with --device, retry later attempts with automatic placement "
                          "if the forced device fails")

@@ -90,7 +90,7 @@ remrun bench [targets] --no-local -- <cmd>   # skip local leg and assume offload
 remrun sync <tree>/<sub> macbox     # project-less folder sync (pull-biased; see below)
 remrun sync outputs/reports macbox --pull --dry-run   # only pull remote-newer; show plan, change nothing
 remrun git-sync macbox              # sync Git commits with a peer without syncing .git/
-remrun git-sync winbox --pull --branch main    # arrival pull; fast-forward only
+remrun git-sync winbox --pull --branch main    # transfer main + tags; fast-forward main only
 remrun git-sync winbox --pull       # on a repo-less project: bootstrap from the peer's history
 remrun git-sync winbox --bootstrap  # same, explicit (working tree left untouched)
 remrun git-sync macbox --status     # non-mutating branch/dirty/hook diagnostics
@@ -142,6 +142,8 @@ remrun fleet mesh [--no-hops]                  # measured SSH reachability matri
 remrun fleet plan zotomatic --input items/      # arbitrary configured name; preview only
 remrun fleet run zotomatic --input items/       # synchronous placement + execution
 remrun fleet submit zotomatic --input items/    # durable queue submission
+remrun fleet submit zotomatic --input items/ --json  # queue IDs only; no live device probes
+remrun fleet submit zotomatic --input items/ --json --preview-route  # add non-binding live route
 remrun fleet submit zotomatic --device macbox --memory-limit-mib 8192 --input item.zot
 remrun fleet command run --device macbox --memory-limit-mib 8192 -- tool --flag
 remrun fleet dispatch --drain                   # batch compatible jobs, then exit
