@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/smkwray/remrun/schemas/capabilities.v1.schema.json",
+  "title": "remrun capabilities document v1",
+  "type": "object",
+  "required": ["schema", "version", "protocol", "package_version", "documents", "features", "coordination"],
+  "properties": {
+    "schema": {"const": "remrun.capabilities"},
+    "version": {"const": 1},
+    "protocol": {
+      "type": "object",
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {"type": "integer", "minimum": 1},
+        "minor": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "package_version": {"type": "string"},
+    "documents": {
+      "type": "object",
+      "required": ["requests", "receipts", "errors"],
+      "properties": {
+        "requests": {"$ref": "#/$defs/declarations"},
+        "receipts": {"$ref": "#/$defs/declarations"},
+        "errors": {"$ref": "#/$defs/declarations"}
+      },
+      "additionalProperties": true
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["stable", "experimental", "unavailable"]
+      }
+    },
+    "coordination": {
+      "type": "object",
+      "required": [
+        "scope",
+        "accepted_work_recovery",
+        "unaccepted_queue_recovery",
+        "ambiguous_acceptance_retry_scope",
+        "global_ordering",
+        "global_idempotency",
+        "cross_target_exactly_once"
+      ],
+      "properties": {
+        "scope": {"type": "string"},
+        "accepted_work_recovery": {"type": "string"},
+        "unaccepted_queue_recovery": {"type": "string"},
+        "ambiguous_acceptance_retry_scope": {"type": "string"},
+        "global_ordering": {"type": "boolean"},
+        "global_idempotency": {"type": "boolean"},
+        "cross_target_exactly_once": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "declarations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["schema", "version"],
+        "properties": {
+          "schema": {"type": "string"},
+          "version": {"type": "integer", "minimum": 1}
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

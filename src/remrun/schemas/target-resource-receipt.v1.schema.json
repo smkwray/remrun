@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/smkwray/remrun/schemas/target-resource-receipt.v1.schema.json",
+  "title": "remrun target resource receipt v1",
+  "type": "object",
+  "required": [
+    "schema", "version", "status", "allocation_id", "operation_id", "request_sha256",
+    "resource_keys", "policy_generation", "policy_digest", "fence", "target_boot_id",
+    "reservation_expires_mono_ns", "state", "command_start_state", "owner",
+    "terminal_reason", "updated_at_ns"
+  ],
+  "properties": {
+    "schema": {"const": "remrun.target-resource-receipt"},
+    "version": {"const": 1},
+    "status": {"type": "string"},
+    "allocation_id": {"type": "string"},
+    "operation_id": {"type": "string"},
+    "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "resource_keys": {"type": "array", "items": {"type": "string"}},
+    "policy_generation": {"type": "integer", "minimum": 1},
+    "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "fence": {"type": "integer", "minimum": 1},
+    "target_boot_id": {"type": "string"},
+    "reservation_expires_mono_ns": {"type": "integer", "minimum": 0},
+    "state": {
+      "enum": ["RESERVED", "CLAIMED", "QUARANTINED", "RELEASED", "EXPIRED", "CANCELLED", "REBOOTED"]
+    },
+    "command_start_state": {"enum": ["NO", "MAYBE", "YES"]},
+    "owner": {"type": ["object", "null"]},
+    "terminal_reason": {"type": ["string", "null"]},
+    "updated_at_ns": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": false
+}

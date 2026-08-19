@@ -1,0 +1,66 @@
+# Strict declarative fleet task example. Copy the [fleet.tasks.*] tables into
+# config/devices.toml. The name "zotomatic" is deliberately meaningless: core
+# does not contain or interpret configured workflow names.
+
+[fleet.tasks.zotomatic.input]
+mode = "files"                    # none | text | files | text-or-files
+extensions = [".zot"]             # required for file-capable modes; "*" allows all
+split = "per-item"                # never | per-item
+file_identity = "sha256"          # metadata | sha256
+
+[fleet.tasks.zotomatic.prepare]
+mode = "none"                     # the only shipping preparation mode
+
+[fleet.tasks.zotomatic.routing]
+requirements = ["zot.v1"]         # fixed opaque capability tokens
+# Every allowed value of a mapped option must appear, even when it adds no token.
+requirements_by_option = { quality = { compact = [], archival = ["zot.archive"] } }
+
+[fleet.tasks.zotomatic.execution]
+batching = "compatible"           # never | compatible
+
+[fleet.tasks.zotomatic.cost]
+measure = "input-bytes"           # none | input-bytes | text-codepoints | item-count
+unit = "bytes"                    # absent when measure = "none"
+divisor = 1                       # absent when measure = "none"
+bucket_options = ["quality"]      # isolate behavior/cost-relevant option lanes
+
+[fleet.tasks.zotomatic.output]
+reservation = "content-work-stem-v1"  # none | source-stem-v1 | content-work-stem-v1
+allow_root_override = false
+verification = "mapped-tree-change-v1" # none | mapped-tree-change-v1
+missing_mapping = "final"         # required only for mapped verification
+no_change = "final"               # allow | final
+
+[fleet.tasks.zotomatic.completion]
+protocol = "item-result-v2"       # exit-code-v1 | item-result-v2
+evidence = "always"               # never | multi-item | always
+companion = "forbidden"           # forbidden | optional | required
+allowed_publication = ["produced"] # none | produced | reused
+unstructured_memory = "ignore"    # ignore | patterns-v1
+
+[fleet.tasks.zotomatic.options.quality]
+type = "string"                   # string | integer | number | boolean
+required = false
+default = "compact"
+values = ["compact", "archival"]
+
+[fleet.tasks.zotomatic.adapters.macbox]
+engine = "zot-mac"
+argv = ["~/bin/zot-worker", "{manifest}", "{output_root}", "{opt:quality}"]
+output_root = "~/remrun-outputs/zot"
+pool = "gpu"                      # false means no exclusive pool
+memory_kind = "gpu"               # none | cpu | gpu
+capability_paths = ["~/bin/zot-worker"]
+provides = ["zot.v1", "zot.archive"]
+
+[fleet.tasks.zotomatic.adapters.winbox]
+engine = "zot-win"
+argv = ["pwsh", "-NoProfile", "-File", 'C:\tools\zot-worker.ps1',
+        "-Manifest", "{manifest}", "-OutputRoot", "{output_root}",
+        "-Quality", "{opt:quality}"]
+output_root = 'C:\remrun-outputs\zot'
+pool = "gpu"
+memory_kind = "gpu"
+capability_paths = ['C:\tools\zot-worker.ps1']
+provides = ["zot.v1"]

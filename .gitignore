@@ -1,0 +1,55 @@
+# User/deployment-specific remrun configuration. Public releases ship examples only.
+/config/devices.toml
+/config/fleet_costs.toml
+/config/private_release_patterns.txt
+/config/private_worker_scripts.json
+
+# Agent worktrees and session config. Nested checkouts must never be committed as gitlinks.
+/.worktrees/
+/.claude/
+/.delegate-worktrees/
+/.codex/
+
+# Local environment files may contain device-specific paths or credentials.
+/.env
+/.env.*
+
+# Private continuity / orchestration notes. Public releases ship reusable docs only.
+/AGENTS.md
+/CLAUDE.md
+/HANDOFF.md
+/PLAN.md
+# Private field notes (issues/fixes flagged while using remrun). Never published.
+# Leading slash = repo-root only, so examples/project/do/ stays committed.
+/do/
+/FLEET-*.md
+/GIT-SYNC-PLAN.md
+/OFFLOAD-*.md
+/SYNC-PLAN.md
+/docs/*_HANDOFF.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local remrun state must not be synced/committed here
+state/
+cache/
+logs/
+run-state/
+*.local.toml
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

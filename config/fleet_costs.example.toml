@@ -1,0 +1,12 @@
+# Optional shared measured profiles. Keys use the frozen identity emitted by
+# `remrun fleet plan --json`: spec_id, adapter_id, device, unit, bucket_id,
+# and measurement status. Copy only real observations into fleet_costs.toml;
+# remrun has no workflow-specific or generic time/memory priors.
+
+[costs."sha256:0000000000000000000000000000000000000000000000000000000000000000|sha256:1111111111111111111111111111111111111111111111111111111111111111|macbox|bytes|sha256:2222222222222222222222222222222222222222222222222222222222222222|exact"]
+fixed_load_s = 20.0
+var_per_unit_s = 0.0005
+peak_rss_mb = 1024.0
+peak_vram_mb = 2048.0
+n = 5
+updated = "example-only"

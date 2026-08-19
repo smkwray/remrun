@@ -1,0 +1,194 @@
+# Copy this file to config/devices.toml and replace every path/name/command with
+# values for your own fleet. This file is intentionally schematic: remrun's core
+# does not ship device names, worker names, model names, or workflow paths.
+
+[project_roots]
+macos = "~/projects"
+windows = 'C:\projects'
+default = "~/projects"
+
+# Optional: use a broader root for Git history only. This supports repositories
+# beside the normal project directory without broadening remrun run/plan transfers.
+# [git_sync]
+# peers = ["macbox"]
+# advance_dirty_worktree = false  # opt-in history-hub mode; preserves worktree bytes
+# Guarded targets require a selected hard per-command limit for repository-scaling Git.
+# remote_memory_limit_mib = 2048  # illustrative only; no default is inferred
+# [git_sync.project_roots]
+# macos = "~/work"
+# windows = 'C:\work'
+# default = "~/work"
+
+# Keep legacy until every controller/runner is upgraded and the coordination GO
+# gates pass. `remrun runner install <device>` is inert Step-3 preparation.
+[coordination]
+mode = "legacy"
+# device = "macbox"
+protocol = 1
+
+# Optional named output trees for `remrun sync <tree>/<subpath> <device>`.
+[sync_roots.outputs]
+macos = "~/remrun-outputs"
+windows = 'C:\remrun-outputs'
+default = "~/remrun-outputs"
+
+[offload]
+default = "ask"
+
+# Leave [scheduler].primary/fallback unset in most deployments; remrun derives
+# order from enabled devices in the order they appear below.
+# [scheduler]
+# primary = "macbox"
+# fallback = ["winbox"]
+
+[devices.local]
+enabled = true
+kind = "local-sim"
+os = "default"
+project_root = ""
+state_root = ""
+cache_root = ""
+max_jobs = 1
+
+[devices.macbox]
+enabled = false
+kind = "ssh-posix"
+os = "macos"
+address_candidates = ["macbox.local"]
+project_root = "~/projects"
+state_root = "~/.local/state/remrun"
+cache_root = "~/.cache/remrun"
+remote_python = "python3"
+perf_cores = 8
+eff_cores = 4
+ram_gb = 32
+vram_gb = 0
+
+# Optional POSIX hard execution boundary. Fractions are applied to physical RAM
+# measured on the target; ram_gb remains scheduler/display metadata only.
+# max_jobs also caps concurrent guarded leases. The guard remains active for
+# ordinary runs, workload runs, and --no-telemetry.
+[devices.macbox.memory_guard]
+schema = 3
+command_limit_fraction = 0.3125
+
+# Resource adaptation is opt-in from project config. This explicit interactive
+# policy applies only after a workload is selected. On unified-memory Macs the
+# VRAM fields complete the v1 policy schema but never create a VRAM budget.
+[devices.macbox.resource_policy]
+schema = 1
+mode = "interactive"
+probe_timeout_sec = 5
+cpu_reserve_cores = 4
+cpu_max_fraction = 0.50
+ram_reserve_mib = 8192
+ram_max_fraction = 0.70
+gpu_busy_ceiling_pct = 15
+vram_reserve_mib = 2048
+vram_max_fraction = 0.70
+allow_static_fallback = false
+
+# Best-effort cancel configuration for POSIX targets. Empty/missing lists are no-ops.
+[devices.macbox.cancel]
+process_patterns = ["your-worker-process-regex"]
+lock_paths = ["/tmp/your-worker.lock"]
+
+[devices.winbox]
+enabled = false
+kind = "ssh-powershell"
+os = "windows"
+address_candidates = ["winbox.local"]
+project_root = 'C:\projects'
+state_root = 'C:\remrun-state'
+cache_root = 'C:\remrun-cache'
+remote_python = "python"
+# Windows PowerShell 5.1 cannot preserve arbitrary native argv.
+# remrun requires PowerShell 7.3 or newer for ssh-powershell targets.
+# Top-level .cmd/.bat commands are rejected; the current seam is not exact.
+# Use an .exe or .ps1 wrapper.
+shell = "pwsh"
+login_shell = false
+perf_cores = 8
+eff_cores = 8
+ram_gb = 64
+vram_gb = 12
+
+# Memory-guard schema 3 is intentionally unconfigured on Windows until the
+# same target-local lease and process-boundary semantics are proved there.
+
+# Remote access never implies unattended use. Choose this mode only when the
+# device is genuinely dedicated; an actively used desktop should use
+# mode = "interactive" with its own reserves and fractions.
+[devices.winbox.resource_policy]
+schema = 1
+mode = "unattended"
+probe_timeout_sec = 5
+cpu_reserve_cores = 1
+cpu_max_fraction = 1.00
+ram_reserve_mib = 4096
+ram_max_fraction = 0.90
+gpu_busy_ceiling_pct = 100
+vram_reserve_mib = 1024
+vram_max_fraction = 0.95
+allow_static_fallback = false
+
+# Best-effort cancel configuration for Windows targets. Native process_patterns
+# are matched against CommandLine via PowerShell regex. WSL lists are optional.
+[devices.winbox.cancel]
+process_patterns = ["your-worker-process-regex"]
+lock_paths = ['C:\remrun-state\your-worker.lock']
+wsl_process_patterns = ["your-wsl-worker-regex"]
+wsl_lock_paths = ["/tmp/your-worker.lock"]
+
+# Fleet workflow names and behavior live only in strict task definitions. See
+# config/fleet_tasks.example.toml for every field and valid combination.
+[fleet.tasks.zotomatic.input]
+mode = "files"
+extensions = [".zot"]
+split = "per-item"
+file_identity = "sha256"
+
+[fleet.tasks.zotomatic.prepare]
+mode = "none"
+
+[fleet.tasks.zotomatic.routing]
+requirements = ["zot.v1"]
+requirements_by_option = { quality = { compact = [], archival = ["zot.archive"] } }
+
+[fleet.tasks.zotomatic.execution]
+batching = "compatible"
+
+[fleet.tasks.zotomatic.cost]
+measure = "input-bytes"
+unit = "bytes"
+divisor = 1
+bucket_options = ["quality"]
+
+[fleet.tasks.zotomatic.output]
+reservation = "content-work-stem-v1"
+allow_root_override = false
+verification = "mapped-tree-change-v1"
+missing_mapping = "final"
+no_change = "final"
+
+[fleet.tasks.zotomatic.completion]
+protocol = "item-result-v2"
+evidence = "always"
+companion = "forbidden"
+allowed_publication = ["produced"]
+unstructured_memory = "ignore"
+
+[fleet.tasks.zotomatic.options.quality]
+type = "string"
+required = false
+default = "compact"
+values = ["compact", "archival"]
+
+[fleet.tasks.zotomatic.adapters.macbox]
+engine = "zot-mac"
+argv = ["~/bin/zot-worker", "{manifest}", "{output_root}", "{opt:quality}"]
+output_root = "~/remrun-outputs/zot"
+pool = "gpu"
+memory_kind = "gpu"
+capability_paths = ["~/bin/zot-worker"]
+provides = ["zot.v1", "zot.archive"]

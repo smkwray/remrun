@@ -1,0 +1,182 @@
+# Global remrun defaults. Project configs may narrow these.
+
+[transfer]
+mode = "safe"
+# Do not use .gitignore as the default remrun ignore list. Many generated project
+# outputs are gitignored but still important and synced.
+global_exclude = [
+  ".git/**",
+  ".venv/**",
+  "venv/**",
+  "renv/library/**",
+  "__pycache__/**",
+  "**/__pycache__/**",
+  "*.pyc",
+  "**/*.pyc",
+  "*.pyo",
+  "**/*.pyo",
+  "**/*.egg-info/**",
+  ".ipynb_checkpoints/**",
+  ".Rproj.user/**",
+  "node_modules/**",
+  "**/node_modules/**",
+  ".pytest_cache/**",
+  "**/.pytest_cache/**",
+  ".mypy_cache/**",
+  "**/.mypy_cache/**",
+  ".ruff_cache/**",
+  "**/.ruff_cache/**",
+  ".DS_Store",
+  "**/.DS_Store",
+  "Thumbs.db",
+  "**/Thumbs.db",
+  "*.tmp",
+  "*.lock",
+  # Syncthing's own device-local metadata: folder markers, per-device ignore
+  # files, version archives, and in-progress transfer temp files. These must
+  # NEVER be transferred between devices (esp. relevant to `remrun sync` on the
+  # synced output trees, where every device has its own copy).
+  ".stfolder/**",
+  ".stignore",
+  ".stversions/**",
+  "~syncthing~*",
+  "**/~syncthing~*",
+  # remrun's own transfer scratch: atomic-write temp + backup files and tar staging
+  # (.remrun-tmp-*, .remrun-backup-*, .remrun-tar-*). Private to a single transfer;
+  # must never be treated as project data — e.g. an orphaned Windows .remrun-backup-*.bak
+  # left behind by an interrupted push (audit F4).
+  ".remrun-*",
+  "**/.remrun-*",
+  # Build/compile caches: generated and potentially huge. Keep conventional cache
+  # trees out globally, but leave build/ in-surface because commands commonly put
+  # their requested retained product there (for example build/bin/app.exe).
+  "**/dist/**",
+  "**/target/**",
+  "**/.svelte-kit/**",
+  "src-tauri/gen/**",
+  # Git worktrees created inside a project (e.g. by parallel-agent tooling): a nested
+  # checkout is a near-duplicate of the parent and must never be swept into its surface.
+  # (Running remrun from *inside* a worktree is refused separately.) Cover only explicit
+  # worktree conventions. Do NOT exclude `.codex/**`: that tree also holds project-scoped
+  # config, hooks, and rules, and this glob matcher cannot distinguish those from an
+  # arbitrarily named scratch clone. Transparency wins over guessing. Mirror these safe
+  # worktree exclusions in your syncer's ignore rules too.
+  "**/.worktrees/**",
+  "**/.claude/worktrees/**",
+  "**/.delegate-worktrees/**"
+]
+large_file_warn_above_mb = 2048
+hash_small_files_below_mb = 64
+
+[preflight]
+remote_newer = "pull-and-continue"
+remote_only = "pull-and-continue"
+same_file_conflict = "abort"
+delete_policy = "known-only"
+large_remote_newer = "warn-and-pull"
+
+[postrun]
+pull_changed_outputs = true
+same_file_changed_locally = "abort-save-remote-copy"
+propagate_remote_deletions = "known-only-with-backup"
+
+[scheduler]
+default_target = "auto"
+# Static preference order for `--auto` (project [placement] hints win first, then
+# this scheduler order). Leave primary/fallback unset to derive from devices.toml.
+# Setting them explicitly is worthwhile: derived order follows devices.toml insertion
+# order, which is an accident of editing history, and can easily put a laptop ahead of
+# a dedicated compute box. Prefer dedicated compute first, then shared machines. These
+# are deployment-specific device names, so set them in devices.toml, not here.
+# Availability: when the preferred device is unreachable, fail over to the next
+# reachable candidate instead of erroring. (Explicit `run <DEV>` never fails over.)
+prefer_reachable_primary = true
+# Load balancing (default profile = small CPU jobs; RAM/GPU not yet wired). When
+# on, `--auto` samples each reachable candidate's CPU congestion and reallocates
+# to a much-less-congested device. Metric is a heuristic congestion estimate:
+# load-average-per-core % on POSIX, processor LoadPercentage on Windows.
+load_balance = true
+# Reallocate off the preferred device only when it is at least this busy (%)...
+busy_floor_pct = 40
+# ...AND another device has at least this many more perf-core-equivalents free.
+# spare = (perf_cores + eff_cores*eff_core_weight) * (1 - cpu_busy/100). This is
+# how perf-vs-efficiency cores are weighed; measured CPU usage is the live signal.
+# (Per-device perf_cores/eff_cores live in devices.toml.)
+# eff_core_weight=1.0 (E-core == P-core for capacity): cross-device CPU
+# benchmark showed ~equal aggregate throughput (175 vs 173 Mops/s) despite
+# different P/E splits, so both read as 20-core capacity and live CPU% decides.
+# Lower it toward ~0.5 if a future workload shows E-cores underperforming.
+eff_core_weight = 1.0
+headroom_margin_cores = 4
+# Job-cost-aware placement, using the per-(project,command) profiles remrun learns
+# from each run's telemetry (no profile yet = no effect). Drop a device from
+# --auto when a job's predicted peak RAM won't fit in this % of its total RAM...
+ram_headroom_pct = 80
+# ...and skip the multi-device load probe for jobs predicted shorter than this
+# (the ~2-4s of probing isn't worth it for a quick job).
+trivial_job_seconds = 30
+# Offload recommendation (advisory; see `remrun bench`). Compares a job's measured
+# LOCAL baseline against the best device's full remrun round-trip. Bias tilts toward
+# remote for responsiveness: 1.25 = prefer remote even when its trip is up to 25%
+# slower than running local. Only sets the default; an explicit target / [run] offload
+# / user instruction overrides it.
+offload_bias = 1.25
+one_unknown_writer_per_project = true
+
+# Retention is ACTIVE: after each run remrun prunes its own state folder
+# (%LOCALAPPDATA%\remrun on Windows, ~/.local/state/remrun on POSIX). Per run it
+# stores a small summary.json, three manifest snapshots (~0.2 KB per tracked
+# file), and the command's captured logs. Tiered policy below; `remrun clean`
+# (--older-than / --keep / --dry-run) prunes on demand.
+# State is regenerable and safe to delete; keep it lean. Ordering must hold:
+# full_log_retention_days <= failed_log_retention_days <= summary_retention_days.
+[logging]
+full_log_retention_days = 3     # ok runs: strip logs+manifests after this, keep summary.json
+failed_log_retention_days = 7   # failed/aborted runs: keep heavy artifacts this long (debug)
+summary_retention_days = 7      # delete the whole run dir (tiny summary.json) after this
+max_full_log_mb = 100           # cap a single stdout/stderr log (head+tail kept)
+# Rollback/backup area (conflicts/<id>/backup — full file copies, the main growth risk):
+backup_below_mb = 50            # don't snapshot files larger than this (regenerable; 0 = unlimited)
+backup_retention_days = 3       # delete backup/conflict snapshots older than this
+max_backup_mb = 1024            # HARD size budget for conflicts/: prune oldest over this (0 = off)
+
+[output]
+default_format = "agent-text"
+json_events = false
+status_stream = "stderr"
+remote_output = "passthrough"
+
+# Fleet mode (remrun fleet): project-less orchestration for declarative device work.
+# Configured workers are never kept warm: one exists only while a job or compatible
+# burst runs. No resident worker service or daemon is required.
+[fleet]
+# Idle grace = the ONLY model-amortization window (Invariant 0: no warm pool). A burst
+# shares one cold load, then the model unloads. Keep this window short unless your
+# configured workflow has measured evidence that a larger burst window is safe.
+idle_grace_s = 60          # max seconds a worker may hold a loaded model after the queue drains
+safety_fraction = 0.90     # usable share of free RAM/VRAM when checking if a job fits
+transfer_mbps = 200.0      # pessimistic input-transfer throughput (LAN/Tailscale); refined by measurement
+per_file_overhead_s = 0.05
+ssh_setup_s = 0.6          # ~stage/exec/fetch connection overhead (fleet skips project reconcile)
+# Split hysteresis: prefer one batched device over a split unless the split wins by this
+# much. The margin is max(min_hysteresis_s, hysteresis_finish_frac * best_finish, and for
+# prepared-unit uncertainty). The old fixed `hysteresis_s = 1.0` was removed on
+# 2026-07-25: it had been superseded by these two and could never take effect, so editing
+# it silently did nothing.
+min_hysteresis_s = 5.0        # floor, in seconds
+hysteresis_finish_frac = 0.05 # ...or this fraction of the better finish time, whichever is larger
+# Compact capacity cells by default. Set to "amounts" for used/total GB in the
+# RAM, VRAM, and DISK columns. JSON always includes both exact amounts and %.
+[fleet.resources]
+usage_display = "percent"
+[fleet.pools]
+# One model-heavy job per device. Rename or add pools to match your adapter `pool`
+# fields. Raise only if measured safe for your devices.
+gpu = 1
+
+[telemetry]
+# Record peak RSS and average CPU% for the remote command. CPU% is whole-tree on
+# both backends. Windows Job Objects report whole-tree peak RAM; POSIX getrusage
+# reports the largest single child, so concurrent children can be undercounted.
+# Both are stdlib-only. Disable per run with `remrun run --no-telemetry`.
+enabled = true
