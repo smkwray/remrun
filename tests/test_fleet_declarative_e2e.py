@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 from remrun.config import RemrunConfig
@@ -13,7 +15,7 @@ from remrun.fleet.resources import ResourceView
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.models import Device
 from remrun.output import Reporter
-from remrun.transport import ExecResult
+from remrun.transport import ExecResult, ProbeResult
 
 
 def _definition(worker: Path, output_root: Path) -> dict:
@@ -218,8 +220,12 @@ def test_configured_controller_snapshot_is_local_and_never_uses_ssh(
 ) -> None:
     worker = tmp_path / "worker.py"
     worker.write_text("pass\n", encoding="utf-8")
+    local_windows = os.name == "nt"
+    local_os = "windows" if local_windows else ("macos" if sys.platform == "darwin" else "linux")
     device = Device.from_mapping("SELF", {
-        "kind": "ssh-posix", "os": "posix", "address_candidates": ["localhost"],
+        "role": "controller",
+        "kind": "ssh-powershell" if local_windows else "ssh-posix",
+        "os": local_os, "address_candidates": ["localhost"],
         "project_root": str(tmp_path), "cache_root": str(tmp_path / "cache"),
         "max_jobs": 2,
     })
@@ -248,3 +254,107 @@ def test_configured_controller_snapshot_is_local_and_never_uses_ssh(
     assert snapshot.pool_free == {"gpu": 0}
     assert snapshot.engine_status == {"zot-engine": "present"}
     assert snapshot.detail == "local controller"
+
+
+def test_controller_local_substitution_fails_closed_on_os_collision(
+    tmp_path, monkeypatch,
+) -> None:
+    cross_windows = os.name != "nt"
+    device = Device.from_mapping("SELF", {
+        "role": "controller",
+        "kind": "ssh-powershell" if cross_windows else "ssh-posix",
+        "os": "windows" if cross_windows else "linux",
+        "address_candidates": ["localhost"],
+        "project_root": str(tmp_path), "cache_root": str(tmp_path / "cache"),
+    })
+
+    class RemoteEvidence:
+        def probe(self):
+            return ProbeResult(True, "remote", "remote evidence", device.os)
+
+    monkeypatch.setattr(
+        "remrun.fleet.local_resources.local_view",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-platform target must not use controller evidence")
+        ),
+    )
+    monkeypatch.setattr(probes, "probe_target_resources", lambda *_args, **_kwargs: None)
+
+    snapshot = probes.build_snapshot(device, RemoteEvidence(), {}, adapter_specs=[])
+
+    assert snapshot.reachable is True
+    assert snapshot.detail == "remote evidence"
+
+
+def test_controller_local_substitution_requires_explicit_marker(
+    tmp_path, monkeypatch,
+) -> None:
+    local_windows = os.name == "nt"
+    local_os = "windows" if local_windows else ("macos" if sys.platform == "darwin" else "linux")
+    device = Device.from_mapping("SELF", {
+        "role": "runner",
+        "kind": "ssh-powershell" if local_windows else "ssh-posix",
+        "os": local_os, "address_candidates": ["localhost"],
+        "project_root": str(tmp_path), "cache_root": str(tmp_path / "cache"),
+    })
+
+    class RemoteEvidence:
+        def probe(self):
+            return ProbeResult(True, "remote", "remote evidence", device.os)
+
+    monkeypatch.setattr(
+        "remrun.fleet.local_resources.local_view",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unmarked target must not use controller evidence")
+        ),
+    )
+    monkeypatch.setattr(probes, "probe_target_resources", lambda *_args, **_kwargs: None)
+
+    snapshot = probes.build_snapshot(device, RemoteEvidence(), {}, adapter_specs=[])
+
+    assert snapshot.reachable is True
+    assert snapshot.detail == "remote evidence"
+
+
+def test_fixed_snapshot_probe_strips_memory_guard_before_transport_creation(
+    tmp_path, monkeypatch,
+) -> None:
+    device = Device.from_mapping("REMOTE", {
+        "kind": "ssh-posix", "os": "linux",
+        "address_candidates": ["remote.invalid"],
+        "project_root": str(tmp_path), "cache_root": str(tmp_path / "cache"),
+        "memory_guard": {"schema": 3, "command_limit_fraction": 0.25},
+    })
+    seen = []
+
+    class FixedProbeTransport:
+        def probe(self):
+            return ProbeResult(True, "remote.invalid", "fixed probe", "linux")
+
+    def fake_make_transport(probe_device):
+        seen.append(probe_device)
+        return FixedProbeTransport()
+
+    monkeypatch.setattr(probes, "make_transport", fake_make_transport)
+    monkeypatch.setattr(probes, "probe_target_resources", lambda *_args, **_kwargs: None)
+
+    snapshot = probes.build_snapshot(device, None, {}, adapter_specs=[])
+
+    assert snapshot.reachable is True
+    assert len(seen) == 1
+    assert seen[0].memory_guard is None
+
+
+def test_preview_route_requires_json_before_prepare_or_enqueue(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli, "load_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must fail first")),
+    )
+    args = cli.build_parser().parse_args(["submit", "zotomatic", "--preview-route"])
+
+    try:
+        cli.cmd_submit(args, Reporter())
+    except ValueError as exc:
+        assert str(exc) == "--preview-route requires --json"
+    else:
+        raise AssertionError("preview without JSON must be rejected")

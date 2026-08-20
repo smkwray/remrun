@@ -152,6 +152,13 @@ remrun fleet clear                              # release queue leases/cooldowns
 remrun fleet cancel                             # clear queue and stop configured workers
 ```
 
+`--preview-route` is valid only with `--json`. Fixed placement snapshots use a
+guardless probe transport because they run only remrun-owned resource/capability scripts; they
+do not stage the arbitrary-command memory-guard helper. A device is measured locally only when
+its synced declaration explicitly uses `role = "controller"`, its OS/backend matches this process,
+and its configured identity matches the local host. Otherwise remrun keeps the normal transport
+path; `local-sim` is never replaced by controller evidence.
+
 The controller-side fleet queue requires WAL mode on SQLite 3.51.3 or later, or
 the 3.50.7 / 3.44.6 backports. `remrun doctor` reports the controller's SQLite
 version and queue journal mode. An older runtime may still act as a worker; only
@@ -317,14 +324,23 @@ local Git metadata. A history-hub
 fast-forward that preserves a dirty tree prints the same counts and explicitly warns that the
 peer is not a clean-checkout build surface.
 
+With `--branch NAME`, status, pull, push, and bootstrap bundle/fetch exactly that named
+branch plus tags; no other branch refs are transferred. Without `--branch`, the established
+all-branches-plus-tags behavior remains. An explicit empty or invalid branch name fails before
+transport. For an existing repository, a missing named source branch remains a clean
+`missing_peer_ref` / `skipped_missing_peer_ref` result while tags still transfer; it is not
+reinterpreted as a bundle failure.
+
 **Bootstrapping a repo-less project.** A Syncthing-synced tree (with `.git` excluded)
 arrives on a new device as a full working tree with no Git metadata, while a peer holds
 the authoritative history. `remrun git-sync <peer> --pull` (or the explicit `--bootstrap`)
 on such a project seeds it: `git init` (with `core.autocrlf false`, plus `core.longpaths
 true` on Windows so deep artifact paths >260 chars do not read as phantom modifications),
-a full-history fetch of the peer's branches over the same bundle transport, and then it
-points the local branch at the peer's HEAD with `update-ref` + `symbolic-ref` + `git reset
---mixed`. The working tree is left **byte-for-byte untouched** — never `reset --hard`,
+an all-branch-plus-tags fetch over the same bundle transport by default. With `--branch
+NAME`, bootstrap instead fetches only that named branch plus tags and points the local branch
+at that ref; otherwise it points the local branch at the peer's HEAD. Both paths use
+`update-ref` + `symbolic-ref` + `git reset --mixed`. The working tree is left
+**byte-for-byte untouched** — never `reset --hard`,
 checkout, or clean — because the arriving tree is typically *ahead* of history (uncommitted
 work) and must survive. If the project has a `.githooks/` dir, `core.hooksPath` is set to
 it. The report states: repo created, N commits fetched, HEAD set to `<sha>`, working tree

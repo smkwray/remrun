@@ -79,9 +79,10 @@ task list for that plan invocation. It is not a durable queue job ID. `makespan_
 top-level estimate.
 
 `remrun fleet submit TASK --json` reports the durable queue result and does not probe devices.
-Its `route_preview` field is `false`. Add `--preview-route` only when a non-binding live placement
-hint is worth the extra device probes; then `route_preview` is `true` and the route fields are
-included. The dispatcher still makes the authoritative placement when it claims queued work.
+Its `route_preview` field is `false`. Add `--preview-route` only together with `--json` and only
+when a non-binding live placement hint is worth the extra device probes; then `route_preview` is
+`true` and the route fields are included. The dispatcher still makes the authoritative placement
+when it claims queued work.
 
 When a fleet submission includes `--memory-limit-mib N`, plan and submit JSON include the
 frozen `limits` object. Synchronous execution includes a token-free `memory_limit` receipt.

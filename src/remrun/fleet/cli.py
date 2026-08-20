@@ -109,7 +109,7 @@ def _snapshots(task: FleetTask, config, fcfg, *, active_batches: dict[str, int] 
         dev = config.devices.get(name)
         if dev is not None:
             snaps[name] = probes.build_snapshot(
-                dev, make_transport(dev), fcfg,
+                dev, None, fcfg,
                 active_jobs=active_batches.get(name, 0),
                 adapter_specs=[(task.resolved_spec or {})["adapters"][name]]
                 if task.resolved_spec and name in task.resolved_spec["adapters"] else [],
@@ -214,7 +214,7 @@ def cmd_plan(args, reporter: Reporter) -> int:
         dev = config.devices.get(name)
         if dev is not None:
             snaps[name] = probes.build_snapshot(
-                dev, make_transport(dev), fcfg, active_jobs=active.get(name, 0),
+                dev, None, fcfg, active_jobs=active.get(name, 0),
                 adapter_specs=[task.resolved_spec["adapters"][name]
                                for task in tasks
                                if task.resolved_spec and name in task.resolved_spec["adapters"]])
@@ -270,6 +270,8 @@ def _route_line(task_name: str, route: dict, will_run: bool, queued_total: int) 
 
 
 def cmd_submit(args, reporter: Reporter) -> int:
+    if getattr(args, "preview_route", False) and not getattr(args, "json", False):
+        raise ValueError("--preview-route requires --json")
     config = load_config()
     spec, records, tasks = _prepare_configured(args, config)
     state_root = default_state_root()

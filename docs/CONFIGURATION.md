@@ -23,6 +23,7 @@ This config is safe to sync as long as it does not contain secrets. Tailscale IP
 
 ```toml
 [devices.macbox]
+role = "controller" # explicit opt-in to local snapshot evidence when identity/OS also match
 kind = "ssh-posix"
 os = "macos"
 address_candidates = ["macbox.local", "macbox"]
@@ -45,6 +46,12 @@ state_root = "~\\AppData\\Local\\remrun\\state"
 tags = ["windows", "x64", "fallback"]
 max_jobs = 2
 ```
+
+`role = "controller"` does not make a device globally local. It permits local snapshot
+substitution only on a process whose OS/backend and host identity also match that declaration.
+Every controller-capable device may carry the marker in synced configuration; other machines
+continue to reach it through the configured transport. Omitting the marker fails closed to the
+transport path.
 
 Agents may later add:
 

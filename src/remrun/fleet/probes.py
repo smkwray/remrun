@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 from ..models import Device
 from ..resource_envelope import MIB, Metric
 from ..resource_probe import GPUResourceSnapshot, ResourceSnapshot, probe_target_resources
 from ..scheduler import is_self
-from ..transport import BaseTransport, TransportError
+from ..transport import BaseTransport, TransportError, make_transport
 from . import local_resources
 from .models import DeviceSnapshot
 
@@ -111,6 +113,31 @@ def _local_capability_engines(adapter_specs: list[dict]) -> dict[str, str]:
     return status
 
 
+def _controller_os_matches(device: Device) -> bool:
+    """Require the configured controller marker to agree with this process' OS."""
+    configured = device.os.strip().casefold()
+    if os.name == "nt":
+        return device.is_windows and device.kind == "ssh-powershell"
+    if sys.platform == "darwin":
+        return configured in {"macos", "darwin"} and device.kind == "ssh-posix"
+    return configured in {"linux", "posix"} and device.kind == "ssh-posix"
+
+
+def _is_local_controller(device: Device) -> bool:
+    """Positive local substitution requires explicit and corroborating identity."""
+    return (
+        device.kind != "local-sim"
+        and device.role.strip().casefold() == "controller"
+        and _controller_os_matches(device)
+        and is_self(device)
+    )
+
+
+def _fixed_probe_transport(device: Device) -> BaseTransport:
+    """Transport for fixed read-only probes; never stages the command memory guard."""
+    return make_transport(replace(device, memory_guard=None))
+
+
 def _pool_free(fleet_cfg: dict, pool_used: dict[str, int] | None) -> dict[str, int]:
     caps = dict(fleet_cfg.get("pools", {}))
     used = pool_used or {}
@@ -149,7 +176,7 @@ def _build_local_snapshot(
     )
 
 
-def build_snapshot(device: Device, transport: BaseTransport, fleet_cfg: dict, *,
+def build_snapshot(device: Device, transport: BaseTransport | None, fleet_cfg: dict, *,
                    active_jobs: int = 0, pool_used: dict[str, int] | None = None,
                    probe_capability: bool = True,
                    adapter_specs: list[dict] | None = None) -> DeviceSnapshot:
@@ -159,12 +186,13 @@ def build_snapshot(device: Device, transport: BaseTransport, fleet_cfg: dict, *,
     # SSH alias adds latency and can fail on controller-only key policy. LocalSim
     # remains transport-backed because it is a test target, not the controller.
     specs = list(adapter_specs or [])
-    if device.kind != "local-sim" and is_self(device):
+    if _is_local_controller(device):
         return _build_local_snapshot(
             device, fleet_cfg, active_jobs=active_jobs, pool_used=pool_used,
             probe_capability=probe_capability, adapter_specs=specs,
         )
     try:
+        transport = transport or _fixed_probe_transport(device)
         pr = transport.probe()
     except (TransportError, Exception):  # noqa: BLE001
         return DeviceSnapshot(name=device.name, reachable=False, detail="probe raised")

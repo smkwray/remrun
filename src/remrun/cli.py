@@ -420,10 +420,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only push this repo's commits to the peer")
     p.add_argument("--both", dest="direction", action="store_const", const="both",
                    help="pull then push (default)")
-    p.add_argument("--branch", help="only fast-forward this branch")
+    p.add_argument(
+        "--branch",
+        help="transfer this branch plus tags and only fast-forward this branch",
+    )
     p.add_argument("--bootstrap", action="store_true",
-                   help="seed a repo-less project from the peer's history (git init + "
-                        "full-history fetch); the working tree is left untouched")
+                   help="seed a repo-less project from the selected peer history (git init + "
+                        "branch-plus-tags fetch with --branch, else full-history fetch); "
+                        "the working tree is left untouched")
     p.add_argument("--dry-run", action="store_true",
                    help="verify both repos but do not fetch or fast-forward")
     p.add_argument("--status", action="store_true",

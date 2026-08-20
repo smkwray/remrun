@@ -189,7 +189,7 @@ def _choose_device(task: FleetTask, features: Any, config: RemrunConfig, fcfg: d
             continue
         adapter = ((task.resolved_spec or {}).get("adapters") or {}).get(name)
         snapshots[name] = probes.build_snapshot(
-            device, make_transport(device), fcfg,
+            device, None, fcfg,
             active_jobs=active_batches.get(name, 0),
             adapter_specs=[adapter] if adapter else [],
         )

@@ -762,7 +762,7 @@ def _reclaim_marginal_devices(config: RemrunConfig, groups: list[dict[str, Any]]
             continue
         if name not in snap_cache:
             snap_cache[name] = probes.build_snapshot(
-                dev, make_transport(dev), fcfg,
+                dev, None, fcfg,
                 active_jobs=active_batches.get(name, 0),
                 pool_used=lease_used.get(name, {}),
                 adapter_specs=[head.resolved_spec["adapters"][name]]
@@ -773,7 +773,7 @@ def _reclaim_marginal_devices(config: RemrunConfig, groups: list[dict[str, Any]]
             continue                        # unreachable / unknown / already fits -> no reclaim
         if _run_device_reclaim(dev, reporter):
             snap_cache[name] = probes.build_snapshot(
-                dev, make_transport(dev), fcfg,
+                dev, None, fcfg,
                 active_jobs=active_batches.get(name, 0),
                 pool_used=lease_used.get(name, {}),
                 adapter_specs=[head.resolved_spec["adapters"][name]]
@@ -910,7 +910,7 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                         if dev is None:
                             continue
                         snap_cache[name] = probes.build_snapshot(
-                            dev, make_transport(dev), fcfg,
+                            dev, None, fcfg,
                             active_jobs=active_batches.get(name, 0),
                             pool_used=lease_used.get(name, {}),
                             adapter_specs=_probe_adapter_specs(head, name))
@@ -952,7 +952,7 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                         if dev is None:
                             continue
                         snap_cache[name] = probes.build_snapshot(
-                            dev, make_transport(dev), fcfg,
+                            dev, None, fcfg,
                             active_jobs=active_batches.get(name, 0),
                             pool_used=lease_used.get(name, {}),
                             adapter_specs=_probe_adapter_specs(head, name))

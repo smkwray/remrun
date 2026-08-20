@@ -878,3 +878,101 @@ def test_remote_repo_probe_rejects_parent_repo_and_retains_raw_diagnostics():
     assert "exit_code=0" in message
     assert f"stdout_raw={json.dumps(stdout)}" in message
     assert f"stderr_raw={json.dumps(stderr)}" in message
+
+
+def test_branch_scoped_missing_remote_source_preserves_status_pull_and_tags(repos):
+    cfg, local, remote = repos
+    git(local, "checkout", "-b", "side")
+    commit(local, "side-local.txt", "local side")
+    git(local, "checkout", "main")
+    git(remote, "tag", "remote-tag")
+
+    status = git_sync_status_result(
+        cfg, device_name="LOCAL_SIM", branch="side", reporter=Reporter(),
+    )
+    assert [(a.branch, a.state) for a in status.branches] == [
+        ("side", "missing_peer_ref"),
+    ]
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="pull", branch="side",
+        reporter=Reporter(),
+    )
+    assert [(a.branch, a.state) for a in result.pulled] == [
+        ("side", "skipped_missing_peer_ref"),
+    ]
+    assert git(local, "tag", "--list", "remote-tag") == "remote-tag"
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/remotes/LOCAL_SIM/main"],
+        cwd=str(local), capture_output=True, text=True,
+    ).returncode != 0
+
+
+def test_branch_scoped_missing_local_source_preserves_push_and_tags(repos):
+    cfg, local, remote = repos
+    git(remote, "checkout", "-b", "side")
+    commit(remote, "side-remote.txt", "remote side")
+    git(remote, "checkout", "main")
+    git(local, "tag", "local-tag")
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="push", branch="side",
+        reporter=Reporter(),
+    )
+    assert [(a.branch, a.state) for a in result.pushed] == [
+        ("side", "skipped_missing_peer_ref"),
+    ]
+    assert git(remote, "tag", "--list", "local-tag") == "local-tag"
+    local_ns = _ref_namespace(socket.gethostname() or "LOCAL")
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/{local_ns}/main"],
+        cwd=str(remote), capture_output=True, text=True,
+    ).returncode != 0
+
+
+@pytest.mark.parametrize("branch", ["", "bad..name", "bad name", "*"])
+def test_branch_is_validated_before_transport(repos, monkeypatch, branch):
+    cfg, _local, _remote = repos
+    calls = []
+
+    def unexpected_transport(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("invalid branch must fail before transport")
+
+    monkeypatch.setattr(gitsync_module, "make_transport", unexpected_transport)
+
+    with pytest.raises(GitSyncError) as exc_info:
+        run_git_sync_result(
+            cfg, device_name="LOCAL_SIM", direction="pull", branch=branch,
+            reporter=Reporter(),
+        )
+    assert exc_info.value.exit_code == gitsync_module.EXIT_INTERNAL
+    assert not calls
+
+    with pytest.raises(GitSyncError) as exc_info:
+        git_sync_status_result(
+            cfg, device_name="LOCAL_SIM", branch=branch, reporter=Reporter(),
+        )
+    assert exc_info.value.exit_code == gitsync_module.EXIT_INTERNAL
+    assert not calls
+
+
+def test_branch_scoped_bootstrap_uses_named_branch_when_peer_head_is_invalid(
+    bootstrap_repos,
+):
+    cfg, local, remote, _peer_head = bootstrap_repos
+    git(remote, "branch", "side")
+    side_head = git(remote, "rev-parse", "refs/heads/side")
+    git(remote, "tag", "peer-tag", side_head)
+    (remote / ".git" / "HEAD").write_text("ref: refs/heads/missing\n", encoding="utf-8")
+
+    result = run_git_sync_result(
+        cfg, device_name="LOCAL_SIM", direction="pull", branch="side",
+        reporter=Reporter(),
+    )
+
+    assert result.bootstrap is not None
+    assert result.bootstrap.branch == "side"
+    assert result.bootstrap.head == side_head
+    assert git(local, "rev-parse", "HEAD") == side_head
+    assert git(local, "tag", "--list", "peer-tag") == "peer-tag"
