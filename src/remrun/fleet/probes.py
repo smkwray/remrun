@@ -150,6 +150,9 @@ def _address_is_local(token: str, addresses: set[str]) -> bool:
         address = ipaddress.ip_address(token)
     except ValueError:
         return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+        token = str(address)
     if address.is_unspecified or address.is_multicast:
         return False
     if address.version == 4 and int(address) == (1 << 32) - 1:

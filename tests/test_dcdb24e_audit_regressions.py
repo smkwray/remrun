@@ -139,9 +139,99 @@ def test_local_hostname_dns_answer_must_bind_before_local_substitution(
     assert snapshot.detail == "remote evidence"
 
 
-@pytest.mark.parametrize("token", ["0.0.0.0", "::", "224.0.0.1", "255.255.255.255"])
+@pytest.mark.parametrize(
+    "token",
+    [
+        "0.0.0.0",
+        "::",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::ffff:0.0.0.0",
+        "::ffff:224.0.0.1",
+        "::ffff:255.255.255.255",
+        "0:0:0:0:0:ffff:ffff:ffff",
+    ],
+)
 def test_non_host_literal_is_not_positive_local_identity(token):
     assert not probes._address_is_local(token, set())
+
+
+def test_ipv4_mapped_limited_broadcast_is_rejected_before_bind(monkeypatch):
+    monkeypatch.setattr(
+        probes.socket,
+        "socket",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("limited broadcast reached bind corroboration")
+        ),
+    )
+
+    assert not probes._address_is_local("::ffff:255.255.255.255", set())
+
+
+def test_ipv4_mapped_assigned_address_uses_ipv4_bind_semantics(monkeypatch):
+    calls = []
+
+    class BindableSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def bind(self, bind_address):
+            calls.append(bind_address)
+
+    def socket_for(family, socket_type):
+        assert family == probes.socket.AF_INET
+        assert socket_type == probes.socket.SOCK_DGRAM
+        return BindableSocket()
+
+    monkeypatch.setattr(probes.socket, "socket", socket_for)
+
+    assert probes._address_is_local("::ffff:198.51.100.10", set())
+    assert calls == [("198.51.100.10", 0)]
+
+
+def test_ipv4_mapped_limited_broadcast_cannot_substitute_local_snapshot(
+    tmp_path, monkeypatch,
+):
+    local_os, backend = _local_os_backend()
+    token = "::ffff:255.255.255.255"
+    device = Device.from_mapping("controller", {
+        "role": "controller", "kind": backend, "os": local_os,
+        "address_candidates": [token],
+        "project_root": str(tmp_path), "state_root": str(tmp_path / "state"),
+        "cache_root": str(tmp_path / "cache"),
+    })
+
+    monkeypatch.setattr(probes.socket, "gethostname", lambda: "controller")
+    monkeypatch.setattr(probes.socket, "getfqdn", lambda: "controller.example")
+
+    class BindableSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def bind(self, _address):
+            return None
+
+    monkeypatch.setattr(probes.socket, "socket", lambda *_a, **_k: BindableSocket())
+    monkeypatch.setattr(
+        probes.local_resources, "local_view",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("limited broadcast used local evidence")
+        ),
+    )
+    monkeypatch.setattr(probes, "probe_target_resources", lambda *_a, **_k: None)
+
+    class RemoteEvidence:
+        def probe(self):
+            return ProbeResult(True, token, "remote evidence", device.os)
+
+    snapshot = probes.build_snapshot(device, RemoteEvidence(), {}, adapter_specs=[])
+    assert snapshot.detail == "remote evidence"
 
 
 def test_selected_branch_show_ref_execution_failure_is_not_success(tmp_path, monkeypatch):
