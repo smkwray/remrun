@@ -141,12 +141,6 @@ def _local_host_identity() -> tuple[set[str], set[str]]:
             continue
         aliases.add(token)
         aliases.add(token.split(".", 1)[0])
-        try:
-            infos = socket.getaddrinfo(raw, None)
-        except OSError:
-            continue
-        for info in infos:
-            addresses.add(_normalize_host_token(info[4][0]))
     return aliases, addresses
 
 
@@ -155,6 +149,10 @@ def _address_is_local(token: str, addresses: set[str]) -> bool:
     try:
         address = ipaddress.ip_address(token)
     except ValueError:
+        return False
+    if address.is_unspecified or address.is_multicast:
+        return False
+    if address.version == 4 and int(address) == (1 << 32) - 1:
         return False
     if address.is_loopback or token in addresses:
         return True

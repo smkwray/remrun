@@ -93,6 +93,57 @@ def test_unresolved_alias_is_not_address_evidence(monkeypatch):
     assert not probes._host_token_is_local("controller", {"controller"}, set())
 
 
+def test_local_hostname_dns_answer_must_bind_before_local_substitution(
+    tmp_path, monkeypatch,
+):
+    local_os, backend = _local_os_backend()
+    device = Device.from_mapping("controller", {
+        "role": "controller", "kind": backend, "os": local_os,
+        "address_candidates": ["controller.example"],
+        "project_root": str(tmp_path), "state_root": str(tmp_path / "state"),
+        "cache_root": str(tmp_path / "cache"),
+    })
+
+    monkeypatch.setattr(probes.socket, "gethostname", lambda: "controller")
+    monkeypatch.setattr(probes.socket, "getfqdn", lambda: "controller.example")
+    monkeypatch.setattr(
+        probes.socket,
+        "getaddrinfo",
+        lambda *_a, **_k: [
+            (probes.socket.AF_INET, probes.socket.SOCK_DGRAM, 0, "", ("203.0.113.10", 0))
+        ],
+    )
+
+    class NonlocalSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def bind(self, _address):
+            raise OSError("address is not assigned locally")
+
+    monkeypatch.setattr(probes.socket, "socket", lambda *_a, **_k: NonlocalSocket())
+    monkeypatch.setattr(
+        probes.local_resources, "local_view",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("DNS drift used local evidence")),
+    )
+    monkeypatch.setattr(probes, "probe_target_resources", lambda *_a, **_k: None)
+
+    class RemoteEvidence:
+        def probe(self):
+            return ProbeResult(True, "controller.example", "remote evidence", device.os)
+
+    snapshot = probes.build_snapshot(device, RemoteEvidence(), {}, adapter_specs=[])
+    assert snapshot.detail == "remote evidence"
+
+
+@pytest.mark.parametrize("token", ["0.0.0.0", "::", "224.0.0.1", "255.255.255.255"])
+def test_non_host_literal_is_not_positive_local_identity(token):
+    assert not probes._address_is_local(token, set())
+
+
 def test_selected_branch_show_ref_execution_failure_is_not_success(tmp_path, monkeypatch):
     local_base = tmp_path / "local" / "proj"
     remote_base = tmp_path / "remote"
