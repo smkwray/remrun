@@ -156,8 +156,9 @@ remrun fleet cancel                             # clear queue and stop configure
 guardless probe transport because they run only remrun-owned resource/capability scripts; they
 do not stage the arbitrary-command memory-guard helper. A device is measured locally only when
 its synced declaration explicitly uses `role = "controller"`, its OS/backend matches this process,
-and its configured identity matches the local host. Otherwise remrun keeps the normal transport
-path; `local-sim` is never replaced by controller evidence.
+and both its device key and every configured address alias corroborate the local host. Ambiguous,
+unresolved, or contradictory identity falls back to the normal transport path; `local-sim` is never
+replaced by controller evidence.
 
 The controller-side fleet queue requires WAL mode on SQLite 3.51.3 or later, or
 the 3.50.7 / 3.44.6 backports. `remrun doctor` reports the controller's SQLite
@@ -345,10 +346,12 @@ checkout, or clean — because the arriving tree is typically *ahead* of history
 work) and must survive. If the project has a `.githooks/` dir, `core.hooksPath` is set to
 it. The report states: repo created, N commits fetched, HEAD set to `<sha>`, working tree
 untouched, and M modified / K untracked vs HEAD. Degenerate cases are handled cleanly: an
-unreachable peer, a missing peer repo, or an unborn/empty peer repo all report and leave
-no half-initialized `.git` behind. Bootstrap verifies the transferred bundle, the peer HEAD
-object/ref, the installed local HEAD/branch, and a nonzero commit count before reporting
-success. A later `--pull` also recovers an existing empty/unborn `.git` (for example, one left
+unreachable peer, a missing peer repo, or an empty peer repo all report and leave no
+half-initialized `.git` behind. Without `--branch`, an unborn/invalid peer HEAD also refuses;
+with `--branch`, that named ref remains the authority. Bootstrap verifies the transferred bundle,
+the selected branch object/ref (or peer HEAD when no branch is explicit), the installed local
+HEAD/branch, and a nonzero commit count before reporting success. A later `--pull` also recovers
+an existing empty/unborn `.git` (for example, one left
 by an interrupted older bootstrap) without touching worktree bytes. `--push`-only on a
 repo-less or unborn project refuses (nothing to push); `--bootstrap` on a nonempty existing
 repo refuses.

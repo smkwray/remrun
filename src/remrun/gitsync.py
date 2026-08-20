@@ -857,7 +857,7 @@ def _status_branches(repo: Path, peer_ns: str, branch: str | None) -> list[Branc
     for name in _branches_local(repo, branch):
         local_ref = f"refs/heads/{name}"
         peer_ref = f"refs/remotes/{peer_ns}/{name}"
-        if _local_git(repo, ["show-ref", "--verify", "--quiet", peer_ref]).returncode != 0:
+        if not _local_ref_exists(repo, peer_ref):
             actions.append(BranchAction(name, "missing_peer_ref", detail=peer_ref))
             continue
         action = _classify_local(repo, name, local_ref, peer_ref)
@@ -1403,8 +1403,8 @@ def _remote_git_ok(transport: BaseTransport, remote_root: str, args: list[str]):
 
 
 def _branches_local(repo: Path, branch: str | None) -> list[str]:
-    if branch:
-        if _local_git(repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]).returncode == 0:
+    if branch is not None:
+        if _local_ref_exists(repo, f"refs/heads/{branch}"):
             return [branch]
         return []
     res = _local_git_ok(repo, ["for-each-ref", "--format=%(refname:short)", "refs/heads"])
@@ -1412,9 +1412,8 @@ def _branches_local(repo: Path, branch: str | None) -> list[str]:
 
 
 def _branches_remote(transport: BaseTransport, remote_root: str, branch: str | None) -> list[str]:
-    if branch:
-        if _remote_git(transport, remote_root, ["show-ref", "--verify", "--quiet",
-                                               f"refs/heads/{branch}"]).exit_code == 0:
+    if branch is not None:
+        if _remote_ref_exists(transport, remote_root, f"refs/heads/{branch}"):
             return [branch]
         return []
     res = _remote_git_ok(transport, remote_root,
@@ -1436,7 +1435,7 @@ def _fast_forward_local(
     for name in _branches_local(repo, branch):
         local_ref = f"refs/heads/{name}"
         peer_ref = f"refs/remotes/{peer_ns}/{name}"
-        if _local_git(repo, ["show-ref", "--verify", "--quiet", peer_ref]).returncode != 0:
+        if not _local_ref_exists(repo, peer_ref):
             actions.append(BranchAction(name, "skipped_missing_peer_ref", detail=peer_ref))
             continue
         action = _classify_local(repo, name, local_ref, peer_ref)
@@ -1482,8 +1481,7 @@ def _fast_forward_remote(
     for name in _branches_remote(transport, remote_root, branch):
         local_ref = f"refs/heads/{name}"
         peer_ref = f"refs/remotes/{peer_ns}/{name}"
-        if _remote_git(transport, remote_root, ["show-ref", "--verify", "--quiet",
-                                               peer_ref]).exit_code != 0:
+        if not _remote_ref_exists(transport, remote_root, peer_ref):
             actions.append(BranchAction(name, "skipped_missing_peer_ref", detail=peer_ref))
             continue
         action = _classify_remote(transport, remote_root, name, local_ref, peer_ref)

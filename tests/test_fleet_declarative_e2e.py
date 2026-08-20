@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -222,7 +223,8 @@ def test_configured_controller_snapshot_is_local_and_never_uses_ssh(
     worker.write_text("pass\n", encoding="utf-8")
     local_windows = os.name == "nt"
     local_os = "windows" if local_windows else ("macos" if sys.platform == "darwin" else "linux")
-    device = Device.from_mapping("SELF", {
+    local_host = (socket.gethostname() or "controller").split(".")[0]
+    device = Device.from_mapping(local_host, {
         "role": "controller",
         "kind": "ssh-powershell" if local_windows else "ssh-posix",
         "os": local_os, "address_candidates": ["localhost"],

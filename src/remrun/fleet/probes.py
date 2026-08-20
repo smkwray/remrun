@@ -1,8 +1,10 @@
 """Build live device snapshots with tri-state adapter qualification."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -10,7 +12,6 @@ from pathlib import Path
 from ..models import Device
 from ..resource_envelope import MIB, Metric
 from ..resource_probe import GPUResourceSnapshot, ResourceSnapshot, probe_target_resources
-from ..scheduler import is_self
 from ..transport import BaseTransport, TransportError, make_transport
 from . import local_resources
 from .models import DeviceSnapshot
@@ -123,13 +124,88 @@ def _controller_os_matches(device: Device) -> bool:
     return configured in {"linux", "posix"} and device.kind == "ssh-posix"
 
 
+def _normalize_host_token(value: str) -> str:
+    token = str(value or "").strip().casefold().rstrip(".")
+    if token.startswith("[") and token.endswith("]"):
+        token = token[1:-1]
+    return token.split("%", 1)[0]
+
+
+def _local_host_identity() -> tuple[set[str], set[str]]:
+    """Return local host aliases and addresses for positive controller evidence."""
+    aliases: set[str] = {"localhost", "localhost.localdomain"}
+    addresses: set[str] = {"127.0.0.1", "::1"}
+    for raw in (socket.gethostname(), socket.getfqdn()):
+        token = _normalize_host_token(raw)
+        if not token:
+            continue
+        aliases.add(token)
+        aliases.add(token.split(".", 1)[0])
+        try:
+            infos = socket.getaddrinfo(raw, None)
+        except OSError:
+            continue
+        for info in infos:
+            addresses.add(_normalize_host_token(info[4][0]))
+    return aliases, addresses
+
+
+def _address_is_local(token: str, addresses: set[str]) -> bool:
+    """Return true only when an IP is loopback, resolved local, or locally bindable."""
+    try:
+        address = ipaddress.ip_address(token)
+    except ValueError:
+        return False
+    if address.is_loopback or token in addresses:
+        return True
+    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    bind_address = (token, 0, 0, 0) if family == socket.AF_INET6 else (token, 0)
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as probe:
+            probe.bind(bind_address)
+    except OSError:
+        return False
+    return True
+
+
+def _host_token_is_local(value: str, aliases: set[str], addresses: set[str]) -> bool:
+    token = _normalize_host_token(value)
+    if not token:
+        return False
+    if _address_is_local(token, addresses):
+        return True
+    try:
+        resolved = {
+            _normalize_host_token(info[4][0])
+            for info in socket.getaddrinfo(token, None)
+        }
+    except OSError:
+        return False
+    return bool(resolved) and all(
+        _address_is_local(address, addresses)
+        for address in resolved
+    )
+
+
+def _controller_host_matches(device: Device) -> bool:
+    """Require non-contradictory name and address evidence for this exact host."""
+    aliases, addresses = _local_host_identity()
+    if _normalize_host_token(device.name) not in aliases:
+        return False
+    candidates = device.all_addresses()
+    return bool(candidates) and all(
+        _host_token_is_local(candidate, aliases, addresses)
+        for candidate in candidates
+    )
+
+
 def _is_local_controller(device: Device) -> bool:
     """Positive local substitution requires explicit and corroborating identity."""
     return (
         device.kind != "local-sim"
         and device.role.strip().casefold() == "controller"
         and _controller_os_matches(device)
-        and is_self(device)
+        and _controller_host_matches(device)
     )
 
 

@@ -48,10 +48,10 @@ max_jobs = 2
 ```
 
 `role = "controller"` does not make a device globally local. It permits local snapshot
-substitution only on a process whose OS/backend and host identity also match that declaration.
-Every controller-capable device may carry the marker in synced configuration; other machines
-continue to reach it through the configured transport. Omitting the marker fails closed to the
-transport path.
+substitution only on a process whose OS/backend, device key, and every configured address alias
+corroborate that exact local host. Ambiguous, unresolved, or contradictory identity falls back to
+the configured transport. Every controller-capable device may carry the marker in synced
+configuration; omitting the marker also fails closed to the transport path.
 
 Agents may later add:
 

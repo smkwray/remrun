@@ -860,7 +860,7 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--priority", type=int, default=0)
     ps.add_argument(
         "--preview-route", action="store_true",
-        help="probe live placement before enqueue and include the non-binding preview in JSON",
+        help="requires --json; probe live placement before enqueue and include the non-binding preview",
     )
     ps.add_argument("--allow-fallback", action="store_true",
                     help="when used with --device, retry later attempts with automatic placement "
