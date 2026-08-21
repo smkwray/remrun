@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
+import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -36,7 +39,11 @@ _PREPARED_BASE_FIELDS = {
     "output", "cost", "work_id", "prepared_id",
 }
 _PREPARED_V2_FIELDS = _PREPARED_BASE_FIELDS | {"limits"}
+_PREPARED_V3_FIELDS = _PREPARED_BASE_FIELDS
+_PREPARED_V4_FIELDS = _PREPARED_BASE_FIELDS | {"limits"}
 _MAX_EXPLICIT_MEMORY_LIMIT_MIB = (2**63 - 1) // (1024 * 1024)
+_MAX_MEASURE_OUTPUT_BYTES = 1024 * 1024
+_TEMP_CLEANUP_TIMEOUT_S = 2.0
 
 
 def _resource_limits(memory_limit_mib: int) -> dict[str, Any]:
@@ -55,9 +62,11 @@ def _resource_limits(memory_limit_mib: int) -> dict[str, Any]:
 def prepared_memory_limit_mib(record: Mapping[str, Any]) -> int | None:
     """Return the explicit hard RSS limit; legacy PreparedJobV1 means none."""
     schema = record.get("schema")
-    if schema == 1:
+    if schema in {1, 3}:
+        if "limits" in record:
+            raise PreparationError("prepared resource limits are invalid")
         return None
-    if schema != 2:
+    if schema not in {2, 4}:
         raise PreparationError("unsupported prepared job schema")
     limits = record.get("limits")
     if not isinstance(limits, Mapping):
@@ -263,24 +272,236 @@ def _payload(definition: Mapping[str, Any], *, text: str | None,
     raise PreparationError("this task requires a payload")
 
 
+def _authority_digest(path_value: str) -> dict[str, str]:
+    path = Path(path_value)
+    try:
+        stream, before = _stable_open(path)
+        digest = hashlib.sha256()
+        with stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            _same_open_file(path, before, stream)
+    except OSError as exc:
+        raise PreparationError(f"measurement authority is unreadable: {path}: {exc}") from exc
+    return {"path": str(path), "sha256": "sha256:" + digest.hexdigest()}
+
+
+def _unlink_measure_temp(path: Path) -> None:
+    """Remove a measurement temp file after Windows releases inherited handles."""
+    deadline = time.monotonic() + _TEMP_CLEANUP_TIMEOUT_S
+    while True:
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _revalidate_payload(payload: Mapping[str, Any]) -> None:
+    for item in payload["items"]:
+        current = _identity(
+            Path(item["source_path"]), item["identity"]["mode"], item["index"],
+        )
+        if current != item:
+            raise SourceChangedError(f"source_changed: {item['source_path']}")
+
+
+def _external_measure_identity(contract: Mapping[str, Any]) -> tuple[str, list[dict[str, str]]]:
+    command = contract["command"]
+    authority_before = [_authority_digest(path) for path in command["identity_paths"]]
+    measure_id = sha256_id({
+        "schema": 1,
+        "declaration": dict(contract),
+        "resolved_argv": list(command["argv"]),
+        "identity": authority_before,
+        "unit": contract["unit"],
+    })
+    return measure_id, authority_before
+
+
+def _external_scalar_cost(contract: Mapping[str, Any], payload: Mapping[str, Any],
+                          options: Mapping[str, Any], spec_id: str,
+                          bucket_id: str) -> dict[str, Any]:
+    """Run the narrow read-only PreparedWorkMeasureV1 protocol before enqueue."""
+    command = contract["command"]
+    measure_id, authority_before = _external_measure_identity(contract)
+    request_body = {
+        "schema": 1,
+        "spec_id": spec_id,
+        "payload": payload,
+        "options": dict(options),
+        "bucket_id": bucket_id,
+    }
+    request_id = sha256_id(request_body)
+    request = {"schema": 1, "request_id": request_id,
+               **{key: value for key, value in request_body.items() if key != "schema"}}
+    request_path: Path | None = None
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+    process: subprocess.Popen | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".json", delete=False,
+        ) as stream:
+            request_path = Path(stream.name)
+            os.chmod(request_path, 0o600)
+            stream.write(canonical_json(request))
+        _revalidate_payload(payload)
+        argv = [str(request_path) if token == "{request}" else token
+                for token in command["argv"]]
+        with tempfile.NamedTemporaryFile("w+b", delete=False) as stdout_stream, \
+                tempfile.NamedTemporaryFile("w+b", delete=False) as stderr_stream:
+            stdout_path = Path(stdout_stream.name)
+            stderr_path = Path(stderr_stream.name)
+            process = subprocess.Popen(  # noqa: S603 - strict absolute argv, shell disabled
+                argv, stdin=subprocess.DEVNULL, stdout=stdout_stream, stderr=stderr_stream,
+                shell=False,
+            )
+            deadline = time.monotonic() + float(command["timeout_s"])
+            failure: str | None = None
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    failure = "external work measure timed out"
+                    break
+                if (os.fstat(stdout_stream.fileno()).st_size > _MAX_MEASURE_OUTPUT_BYTES
+                        or os.fstat(stderr_stream.fileno()).st_size > _MAX_MEASURE_OUTPUT_BYTES):
+                    failure = "external work measure exceeded its output limit"
+                    break
+                time.sleep(0.01)
+            if failure is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.0)
+                raise PreparationError(failure)
+            return_code = process.wait()
+        stdout = stdout_path.read_bytes()
+        stderr = stderr_path.read_bytes()
+        if len(stdout) > _MAX_MEASURE_OUTPUT_BYTES or len(stderr) > _MAX_MEASURE_OUTPUT_BYTES:
+            raise PreparationError("external work measure exceeded its output limit")
+        if return_code != 0:
+            detail = stderr.decode("utf-8", errors="replace")[-500:].strip()
+            raise PreparationError(
+                f"external work measure exited {return_code}" + (f": {detail}" if detail else "")
+            )
+        try:
+            text = stdout.decode("utf-8", errors="strict")
+            decoder = json.JSONDecoder()
+            response, end = decoder.raw_decode(text.lstrip())
+            if text.lstrip()[end:].strip():
+                raise ValueError("trailing content")
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise PreparationError("external work measure returned malformed JSON") from exc
+        if not isinstance(response, dict) or set(response) != {"schema", "request_id", "items"}:
+            raise PreparationError("external work measure response has unknown or missing fields")
+        if response["schema"] != 1 or response["request_id"] != request_id:
+            raise PreparationError("external work measure response request identity mismatch")
+        items = response["items"]
+        if not isinstance(items, list):
+            raise PreparationError("external work measure response items must be a list")
+        expected_indices = list(range(len(payload["items"])))
+        values: list[dict[str, float | int]] = []
+        seen: set[int] = set()
+        for row in items:
+            if not isinstance(row, dict) or set(row) != {"index", "value"}:
+                raise PreparationError("external work measure item has unknown or missing fields")
+            index, value = row["index"], row["value"]
+            if (type(index) is not int or index in seen or type(value) not in (int, float)
+                    or not math.isfinite(float(value)) or float(value) < 0):
+                raise PreparationError("external work measure item is invalid")
+            seen.add(index)
+            values.append({"index": index, "value": float(value)})
+        values.sort(key=lambda row: int(row["index"]))
+        if [row["index"] for row in values] != expected_indices:
+            raise PreparationError("external work measure response indices do not match inputs")
+        _revalidate_payload(payload)
+        authority_after = [_authority_digest(path) for path in command["identity_paths"]]
+        if authority_after != authority_before:
+            raise PreparationError("measurement authority changed during preparation")
+        total = sum(float(row["value"]) for row in values)
+        if not math.isfinite(total):
+            raise PreparationError("external work measure total must be finite")
+        return {
+            "status": "exact", "unit": contract["unit"],
+            "value": total,
+            "item_values": values, "relative_uncertainty": 0.0,
+            "provenance": "external-scalar-v1", "measure_id": measure_id,
+            "bucket_id": bucket_id,
+        }
+    except OSError as exc:
+        raise PreparationError(f"external work measure could not run: {exc}") from exc
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        for path in (request_path, stdout_path, stderr_path):
+            if path is not None:
+                _unlink_measure_temp(path)
+
+
 def _cost(definition: Mapping[str, Any], payload: Mapping[str, Any],
-          options: Mapping[str, Any]) -> dict[str, Any]:
+          options: Mapping[str, Any], spec_id: str) -> dict[str, Any]:
     contract = definition["cost"]
     measure = contract["measure"]
     bucket = {name: options[name] for name in contract["bucket_options"] if name in options}
+    bucket_id = sha256_id(bucket)
+    if measure == "external-scalar-v1":
+        return _external_scalar_cost(contract, payload, options, spec_id, bucket_id)
+    measure_id = sha256_id({
+        "schema": 1,
+        "measure": measure,
+        "unit": contract.get("unit"),
+        "divisor": contract.get("divisor"),
+    })
     if measure == "none":
         return {"status": "unestimated", "unit": None, "value": None,
-                "relative_uncertainty": None, "provenance": "none", "bucket_id": None}
+                "item_values": [], "relative_uncertainty": None,
+                "provenance": "none", "measure_id": measure_id, "bucket_id": bucket_id}
+    if measure == "input-bytes":
+        raw_values = [float(item["identity"]["bytes"]) for item in payload["items"]]
+    elif measure == "text-codepoints":
+        raw_values = [float(len(payload["text"] or ""))]
+    else:
+        raw_values = [1.0 for _item in payload["items"]]
+    item_values = [
+        {"index": index, "value": raw / contract["divisor"]}
+        for index, raw in enumerate(raw_values)
+    ]
+    return {"status": "exact", "unit": contract["unit"],
+            "value": sum(item["value"] for item in item_values),
+            "item_values": item_values,
+            "relative_uncertainty": 0.0, "provenance": measure,
+            "measure_id": measure_id, "bucket_id": bucket_id}
+
+
+def _legacy_cost(definition: Mapping[str, Any], payload: Mapping[str, Any],
+                 options: Mapping[str, Any]) -> dict[str, Any]:
+    """Reconstruct the exact pre-WorkUnitsV2 cost shape for frozen V1/V2 rows."""
+    contract = definition["cost"]
+    measure = contract["measure"]
+    if measure == "none":
+        return {
+            "status": "unestimated", "unit": None, "value": None,
+            "relative_uncertainty": None, "provenance": "none", "bucket_id": None,
+        }
+    bucket = {name: options[name] for name in contract["bucket_options"] if name in options}
     if measure == "input-bytes":
         raw = sum(item["identity"]["bytes"] for item in payload["items"])
     elif measure == "text-codepoints":
         raw = len(payload["text"] or "")
-    else:
+    elif measure == "item-count":
         raw = len(payload["items"])
-    return {"status": "exact", "unit": contract["unit"],
-            "value": raw / contract["divisor"],
-            "relative_uncertainty": 0.0, "provenance": measure,
-            "bucket_id": sha256_id(bucket)}
+    else:
+        raise PreparationError("legacy prepared cost uses an unsupported measure")
+    return {
+        "status": "exact", "unit": contract["unit"],
+        "value": raw / contract["divisor"], "relative_uncertainty": 0.0,
+        "provenance": measure, "bucket_id": sha256_id(bucket),
+    }
 
 
 def _source_stem(path: str, index: int) -> str:
@@ -297,8 +518,9 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
                      memory_limit_mib: int | None = None) -> dict[str, Any]:
     """Create one canonical prepared job using an already resolved spec.
 
-    Jobs without an explicit limit retain the exact PreparedJobV1 shape. A
-    submit-explicit hard process-tree RSS limit selects PreparedJobV2.
+    Configured jobs use PreparedJobV3/V4 so the cost identity carries an exact
+    measure implementation, option bucket, and per-item work values. Raw command
+    V1/V2 records remain readable and unchanged.
     """
     verify_id(spec.get("spec_id"), "spec_id")
     definition = spec["definition"]
@@ -318,7 +540,7 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
     caller = list(normalize_capabilities(caller_requirements, "caller requirements"))
     requirements = list(normalize_capabilities(
         [*configured, *caller], "prepared requirements"))
-    cost = _cost(definition, payload, normalized_options)
+    cost = _cost(definition, payload, normalized_options, spec["spec_id"])
     semantic = {
         "spec_id": spec["spec_id"], "payload": payload,
         "options": normalized_options, "requirements": requirements,
@@ -336,7 +558,7 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
             stem = f"{stem}-{work_id.removeprefix('sha256:')}"
             reservations.append({"item_index": item["index"], "stem": stem})
     record: dict[str, Any] = {
-        "schema": 1, "kind": "task", "spec_id": spec["spec_id"],
+        "schema": 3, "kind": "task", "spec_id": spec["spec_id"],
         "payload": payload,
         "task": {"name": spec["task_name"], "options": normalized_options},
         "command": None,
@@ -347,7 +569,7 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
         "cost": cost, "work_id": work_id,
     }
     if memory_limit_mib is not None:
-        record["schema"] = 2
+        record["schema"] = 4
         record["limits"] = _resource_limits(memory_limit_mib)
     record["prepared_id"] = sha256_id(record)
     return record
@@ -409,7 +631,11 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
     if not isinstance(record, Mapping):
         raise PreparationError("prepared job must be an object")
     schema = record.get("schema")
-    fields = _PREPARED_BASE_FIELDS if schema == 1 else _PREPARED_V2_FIELDS if schema == 2 else None
+    fields = (_PREPARED_BASE_FIELDS if schema == 1
+              else _PREPARED_V2_FIELDS if schema == 2
+              else _PREPARED_V3_FIELDS if schema == 3
+              else _PREPARED_V4_FIELDS if schema == 4
+              else None)
     if fields is None or set(record) != fields:
         raise PreparationError("prepared job has unknown or missing fields")
     if record.get("kind") not in {"task", "command"}:
@@ -486,16 +712,28 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
             raise PreparationError("prepared output reservation stem is invalid")
         seen_item_indexes.add(item_index)
     cost = record.get("cost")
-    if not isinstance(cost, Mapping) or set(cost) != {
-            "status", "unit", "value", "relative_uncertainty", "provenance", "bucket_id"}:
+    cost_fields = ({
+        "status", "unit", "value", "relative_uncertainty", "provenance", "bucket_id"
+    } if schema in {1, 2} else {
+        "status", "unit", "value", "item_values", "relative_uncertainty", "provenance",
+        "measure_id", "bucket_id",
+    })
+    if not isinstance(cost, Mapping) or set(cost) != cost_fields:
         raise PreparationError("prepared cost has unknown or missing fields")
     if cost["status"] not in {"exact", "approximate", "unestimated"}:
         raise PreparationError("prepared cost status is invalid")
     if cost["status"] == "unestimated":
-        if any(cost[field] is not None for field in
-               ("unit", "value", "relative_uncertainty", "bucket_id")) \
-                or cost["provenance"] != "none":
+        nullable = ("unit", "value", "relative_uncertainty")
+        if any(cost[field] is not None for field in nullable) or cost["provenance"] != "none":
             raise PreparationError("unestimated prepared cost has invented values")
+        if schema in {1, 2}:
+            if cost["bucket_id"] is not None:
+                raise PreparationError("legacy unestimated cost invented a bucket")
+        else:
+            if cost["item_values"] != []:
+                raise PreparationError("unestimated cost invented item values")
+            verify_id(cost["measure_id"], "prepared cost measure_id")
+            verify_id(cost["bucket_id"], "prepared cost bucket_id")
     else:
         if not isinstance(cost["unit"], str) or not cost["unit"]:
             raise PreparationError("prepared cost unit is invalid")
@@ -507,6 +745,20 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
                 or not 0 <= uncertainty <= 1:
             raise PreparationError("prepared cost uncertainty is invalid")
         verify_id(cost["bucket_id"], "prepared cost bucket_id")
+        if schema in {3, 4}:
+            verify_id(cost["measure_id"], "prepared cost measure_id")
+            item_values = cost["item_values"]
+            if not isinstance(item_values, list) or not item_values:
+                raise PreparationError("prepared cost item values are invalid")
+            total = 0.0
+            for index, item in enumerate(item_values):
+                if not isinstance(item, Mapping) or set(item) != {"index", "value"} \
+                        or item["index"] != index or type(item["value"]) not in (int, float) \
+                        or not math.isfinite(float(item["value"])) or item["value"] < 0:
+                    raise PreparationError("prepared cost item value is invalid")
+                total += float(item["value"])
+            if not math.isclose(total, float(cost["value"]), rel_tol=1e-12, abs_tol=1e-12):
+                raise PreparationError("prepared cost item values do not sum to total")
     verify_id(record.get("work_id"), "prepared work_id")
     if record["kind"] == "command":
         command = record["command"]
@@ -586,9 +838,18 @@ def validate_prepared_against_spec(record: Mapping[str, Any], spec: Mapping[str,
     contract = definition["cost"]
     cost = record["cost"]
     measure = contract["measure"]
+    if record["schema"] in {1, 2}:
+        if cost != _legacy_cost(definition, record["payload"], task["options"]):
+            raise PreparationError("legacy prepared cost disagrees with its frozen authority")
+        return
     if measure == "none":
         if cost["status"] != "unestimated":
             raise PreparationError("prepared cost invents an estimate")
+        expected = _cost(
+            definition, record["payload"], task["options"], record["spec_id"],
+        )
+        if cost != expected:
+            raise PreparationError("prepared unestimated cost identity disagrees")
     else:
         if cost["unit"] != contract["unit"]:
             raise PreparationError("prepared cost unit disagrees with the frozen contract")
@@ -598,9 +859,18 @@ def validate_prepared_against_spec(record: Mapping[str, Any], spec: Mapping[str,
             raise PreparationError("prepared cost bucket disagrees with frozen options")
         if cost["provenance"] != measure:
             raise PreparationError("prepared cost provenance disagrees with frozen authority")
-        expected = _cost(definition, record["payload"], task["options"])
-        if cost != expected:
-            raise PreparationError("prepared core-measured cost disagrees with frozen payload")
+        if measure == "external-scalar-v1":
+            expected_measure_id, _authority = _external_measure_identity(contract)
+            if cost["measure_id"] != expected_measure_id:
+                raise PreparationError(
+                    "prepared external measure identity disagrees with frozen authority"
+                )
+        else:
+            expected = _cost(
+                definition, record["payload"], task["options"], record["spec_id"],
+            )
+            if cost != expected:
+                raise PreparationError("prepared core-measured cost disagrees with frozen payload")
 
 
 def as_fleet_task(record: Mapping[str, Any], spec: Mapping[str, Any]) -> Any:

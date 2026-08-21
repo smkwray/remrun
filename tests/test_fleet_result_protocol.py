@@ -10,6 +10,7 @@ from remrun.fleet.result_protocol import ResultProtocolError, validate_result_en
 SPEC = "sha256:" + "1" * 64
 ADAPTER = "sha256:" + "2" * 64
 PREPARED = "sha256:" + "3" * 64
+MEASURE = "sha256:" + "4" * 64
 
 
 def _completion() -> dict:
@@ -24,7 +25,8 @@ def _item() -> dict:
         "publication": "produced", "work_performed": True,
         "outputs": ["result/out.bin"], "companion": None, "message": None,
         "failure_code": None, "resource": "none",
-        "work_units": {"unit": "pages", "value": 4}, "elapsed_s": 2.5,
+        "work_units": {"unit": "pages", "value": 4, "measure_id": MEASURE},
+        "elapsed_s": 2.5,
         "details": {},
     }
 
@@ -39,6 +41,8 @@ def _validate(envelope: dict) -> list[dict]:
         envelope, batch_id="batch", spec_id=SPEC, adapter_id=ADAPTER,
         expected_items=[{"job_id": "job1", "prepared_id": PREPARED,
                          "index": 0, "cost_unit": "pages",
+                         "cost_status": "exact", "measure_id": MEASURE,
+                         "prepared_value": 4.0, "verify_relative_tolerance": 0.0,
                          "reservations": [{"item_index": 0, "stem": "out"}]}],
         completion=_completion(),
     )
@@ -46,6 +50,22 @@ def _validate(envelope: dict) -> list[dict]:
 
 def test_valid_exact_result_is_accepted() -> None:
     assert _validate(_envelope()) == [_item()]
+
+
+def test_frozen_legacy_work_units_v1_remains_readable() -> None:
+    item = _item()
+    item["work_units"] = {"unit": "pages", "value": 4}
+    rows = validate_result_envelope(
+        _envelope(item), batch_id="batch", spec_id=SPEC, adapter_id=ADAPTER,
+        expected_items=[{
+            "job_id": "job1", "prepared_id": PREPARED, "index": 0,
+            "cost_unit": "pages", "cost_status": "exact", "measure_id": None,
+            "prepared_value": None, "verify_relative_tolerance": 0.0,
+            "reservations": [{"item_index": 0, "stem": "out"}],
+        }],
+        completion=_completion(),
+    )
+    assert rows[0]["work_units"] == {"unit": "pages", "value": 4}
 
 
 @pytest.mark.parametrize(
@@ -60,8 +80,6 @@ def test_valid_exact_result_is_accepted() -> None:
          "requires disposition none"),
         (lambda env: env["items"][0].__setitem__("outputs", ["../escape"]),
          "safe relative path"),
-        (lambda env: env["items"][0].__setitem__("work_units", {"unit": "seconds", "value": 2}),
-         "cost unit"),
         (lambda env: env["items"][0].__setitem__("surprise", True), "unknown or missing"),
     ],
 )
@@ -103,7 +121,7 @@ def test_details_are_optional_but_unknown_fields_are_not() -> None:
     [
         ("message", 42, "message"),
         ("failure_code", "not a token!", "token"),
-        ("work_units", {"unit": None, "value": 1}, "cost unit"),
+        ("work_units", {"unit": None, "value": 1}, "wrong fields"),
         ("outcome", [], "outcome or disposition"),
         ("disposition", {}, "outcome or disposition"),
         ("publication", [], "publication"),
@@ -146,12 +164,29 @@ def test_paths_are_unique_across_rows_and_companions() -> None:
             envelope, batch_id="batch", spec_id=SPEC, adapter_id=ADAPTER,
             expected_items=[
                 {"job_id": "job1", "prepared_id": PREPARED, "index": 0,
-                 "cost_unit": "pages", "reservations": [{"item_index": 0, "stem": "out"}]},
+                 "cost_unit": "pages", "cost_status": "exact", "measure_id": MEASURE,
+                 "prepared_value": 4.0, "verify_relative_tolerance": 0.0,
+                 "reservations": [{"item_index": 0, "stem": "out"}]},
                 {"job_id": "job2", "prepared_id": second["prepared_id"], "index": 1,
-                 "cost_unit": "pages", "reservations": [{"item_index": 0, "stem": "out"}]},
+                 "cost_unit": "pages", "cost_status": "exact", "measure_id": MEASURE,
+                 "prepared_value": 4.0, "verify_relative_tolerance": 0.0,
+                 "reservations": [{"item_index": 0, "stem": "out"}]},
             ],
             completion=_completion(),
         )
+
+
+def test_work_measure_identity_or_value_mismatch_becomes_review() -> None:
+    for work_units in (
+        {"unit": "seconds", "value": 4, "measure_id": MEASURE},
+        {"unit": "pages", "value": 4, "measure_id": "sha256:" + "9" * 64},
+        {"unit": "pages", "value": 5, "measure_id": MEASURE},
+    ):
+        item = _item()
+        item["work_units"] = work_units
+        normalized = _validate(_envelope(item))[0]
+        assert normalized["outcome"] == "review"
+        assert normalized["failure_code"] == "work_measure_mismatch"
 
 
 def test_output_and_companion_cannot_alias_in_one_item() -> None:

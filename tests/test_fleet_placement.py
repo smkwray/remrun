@@ -26,7 +26,7 @@ def _definition() -> dict:
         "input": {"mode": "text", "split": "never"},
         "prepare": {"mode": "none"},
         "routing": {"requirements": ["worker.v1"], "requirements_by_option": {}},
-        "execution": {"batching": "never"},
+        "execution": {"batching": "never", "replay": "at-most-once-v1"},
         "cost": {"measure": "text-codepoints", "unit": "chars", "divisor": 1,
                  "bucket_options": []},
         "output": {"reservation": "none", "allow_root_override": False,
@@ -102,16 +102,19 @@ def test_explicit_device_may_proceed_to_target_preflight_when_unknown(tmp_path) 
     assert result.batches[0].reason == "forced"
 
 
-def test_multiple_devices_without_comparable_profiles_fail_closed(tmp_path) -> None:
+def test_multiple_devices_without_comparable_profiles_calibrate_one_device(tmp_path) -> None:
     task = _task(tmp_path)
     result = placement.plan_jobs(
         [task], [prepared_features(task.prepared)],
         {"A": _snap("A"), "B": _snap("B")}, _profiles(task, A=2.0), _cfg(),
     )
-    assert not result.batches
-    assert set(result.skipped.values()) == {
-        "unestimated; choose an explicit device or supply measured costs"
-    }
+    assert result.skipped == {}
+    assert result.makespan_s is None
+    assert len(result.batches) == 1
+    assert result.batches[0].device == "B"
+    assert result.batches[0].selection_basis == "exploration"
+    assert result.batches[0].estimated_finish_s is None
+    assert result.batches[0].estimate_reason == "uncalibrated"
 
 
 def test_observed_profiles_choose_faster_device_and_include_backlog(tmp_path) -> None:

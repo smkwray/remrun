@@ -32,7 +32,7 @@ from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, utc_now_iso
 from . import adapters, executor, placement, probes, profiles
 from .config import fleet_config, idle_grace_s as configured_idle_grace_s, load_costs, safety_fraction
-from .models import FleetTask
+from .models import DrainResultV1, FleetTask
 from .queue import BatchHeartbeat, FleetQueue
 from .prepared import RAW_COMMAND_SPEC_ID, as_fleet_task, prepared_memory_limit_mib
 from .task_contract import resolve_tasks
@@ -206,15 +206,22 @@ def _cool_if_asked(q: FleetQueue, device: str, engine: str, batch_id: str,
 def _learn_oom_memory(config: RemrunConfig, state_root: Path, device: str, engine: str,
                       task: FleetTask, reporter: Reporter) -> None:
     """Persist a conservative memory-estimate bump after a model OOM."""
-    fcfg = fleet_config(config)
-    common = {
-        "memory_kind": adapters.memory_kind_for(task, device),
-        "factor": float(fcfg.get("oom_memory_raise_factor", 1.25)),
-        "min_delta_mb": float(fcfg.get("oom_memory_raise_min_delta_mb", 512.0)),
-        "now": utc_now_iso(), "base_profiles": load_costs(config, state_root),
-    }
-    field, value = profiles.raise_prepared_memory_estimate(
-        state_root, task, device, **common)
+    try:
+        fcfg = fleet_config(config)
+        common = {
+            "memory_kind": adapters.memory_kind_for(task, device),
+            "factor": float(fcfg.get("oom_memory_raise_factor", 1.25)),
+            "min_delta_mb": float(fcfg.get("oom_memory_raise_min_delta_mb", 512.0)),
+            "now": utc_now_iso(), "base_profiles": load_costs(config, state_root),
+        }
+        field, value = profiles.raise_prepared_memory_estimate(
+            state_root, task, device, **common)
+    except Exception as exc:  # noqa: BLE001 - report cache failure without changing run evidence
+        reporter.event(
+            "dispatch_oom_learning_failed", device=device, engine=engine,
+            task_name=task.task_name, error=f"{type(exc).__name__}: {exc}",
+        )
+        return
     reporter.event("dispatch_oom_learned", device=device, engine=engine,
                    task_name=task.task_name, field=field, value_mb=value)
 
@@ -222,6 +229,98 @@ def _learn_oom_memory(config: RemrunConfig, state_root: Path, device: str, engin
 def _allows_fallback(task: FleetTask) -> bool:
     """Whether a forced job may retry through normal auto placement after this device fails."""
     return bool(task.force_device and task.prepared["routing"]["allow_fallback"])
+
+
+def _profile_observation(tasks: list[FleetTask], device: str, result: dict[str, Any],
+                         result_record: str | None) -> dict[str, Any]:
+    """Build one raw generic observation; eligibility is explicit, never inferred later."""
+    head = tasks[0]
+    configured = bool(tasks) and all(
+        task.prepared and task.prepared["kind"] == "task" for task in tasks
+    )
+    costs = [task.prepared["cost"] for task in tasks if task.prepared]
+    rows = list(result.get("item_results") or [])
+    performed = bool(rows) and all(
+        row.get("outcome") == "succeeded" and row.get("work_performed") is True
+        for row in rows
+    )
+    work_rows = [row.get("work_units") for row in rows]
+    measured = bool(work_rows) and all(isinstance(value, dict) for value in work_rows)
+    observed_units = (sum(float(value["value"]) for value in work_rows)
+                      if measured else None)
+    declared_exact = configured and all(cost.get("status") == "exact" for cost in costs)
+    exact_costs = declared_exact and all(cost.get("measure_id") for cost in costs)
+    prepared_units = (sum(float(cost["value"]) for cost in costs)
+                      if exact_costs and all(cost.get("value") is not None for cost in costs)
+                      else None)
+    elapsed = result.get("elapsed_s")
+    accepted = bool(
+        configured
+        and result.get("ok")
+        and exact_costs
+        and prepared_units is not None
+        and performed
+        and measured
+        and isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and float(elapsed) > 0
+    )
+    if accepted:
+        reject_reason = None
+    elif not configured:
+        reject_reason = "intrinsic_command"
+    elif not declared_exact:
+        reject_reason = "unestimated"
+    elif not exact_costs:
+        reject_reason = "unverified_work_measure"
+    elif not result.get("ok"):
+        reject_reason = "unsuccessful"
+    elif any(row.get("failure_code") == "work_measure_mismatch" for row in rows):
+        reject_reason = "work_measure_mismatch"
+    elif not performed:
+        reject_reason = "partial_or_no_work"
+    elif not measured:
+        reject_reason = "work_measure_missing"
+    else:
+        reject_reason = "elapsed_invalid"
+    telemetry = result.get("telemetry") if isinstance(result.get("telemetry"), dict) else {}
+    item_elapsed = [float(row["elapsed_s"]) for row in rows
+                    if isinstance(row.get("elapsed_s"), (int, float))
+                    and not isinstance(row.get("elapsed_s"), bool)]
+    adapter_id = None
+    profile_key = None
+    family_id = None
+    if configured:
+        adapter = (head.resolved_spec.get("adapters") or {}).get(device) or {}
+        adapter_id = adapter.get("adapter_id")
+        profile_keys = {profiles.prepared_profile_key(task, device) for task in tasks}
+        family_ids = {profiles.prepared_profile_family_id(task) for task in tasks}
+        if len(profile_keys) == len(family_ids) == 1:
+            profile_key = profile_keys.pop()
+            family_id = family_ids.pop()
+        else:
+            accepted = False
+            reject_reason = "mixed_profile_identity"
+    digest_source = result_record or json.dumps(
+        result, sort_keys=True, default=str, separators=(",", ":"),
+    )
+    result_digest = "sha256:" + hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+    return {
+        "profile_key": profile_key,
+        "family_id": family_id,
+        "device": device,
+        "adapter_id": adapter_id,
+        "prepared_units": float(prepared_units) if prepared_units is not None else None,
+        "observed_units": observed_units,
+        "controller_elapsed_s": float(elapsed) if isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool) else None,
+        "worker_elapsed_s": sum(item_elapsed) if item_elapsed else None,
+        "peak_rss_mb": telemetry.get("peak_rss_mb"),
+        "peak_vram_mb": telemetry.get("peak_vram_mb"),
+        "accepted_duration": accepted,
+        "reject_reason": reject_reason,
+        "result_digest": result_digest,
+    }
 
 
 def _has_health_patterns(dev) -> bool:  # noqa: ANN001
@@ -444,9 +543,10 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
     head = btasks[0]
     db_path = state_root / "fleet" / "fleet.db"
     q = FleetQueue(db_path)
-    out = {"ran": 0, "ok": 0, "failed": 0}
+    out = {"ran": 0, "ok": 0, "failed": 0, "review": 0}
     batch_state = "leased"
     attempt_record: str | None = None
+    latest_result: dict[str, Any] = {}
 
     def ownership_lost(stage: str) -> dict[str, Any]:
         reporter.event(
@@ -457,6 +557,9 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
 
     def fail_owned(error: str, **kwargs: Any) -> bool:
         kwargs.setdefault("result_record", attempt_record)
+        kwargs.setdefault(
+            "observation", _profile_observation(btasks, device, latest_result, attempt_record),
+        )
         return q.fail_batch(
             batch_id, error, expected_state=batch_state,
             owner_token=owner_token, **kwargs,
@@ -465,6 +568,9 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
     def complete_items_owned(succeeded: dict[str, str | None],
                              failed: dict[str, str], **kwargs: Any) -> bool:
         kwargs.setdefault("result_record", attempt_record)
+        kwargs.setdefault(
+            "observation", _profile_observation(btasks, device, latest_result, attempt_record),
+        )
         return q.complete_batch_items(
             batch_id, succeeded, failed, expected_state=batch_state,
             owner_token=owner_token, **kwargs,
@@ -492,35 +598,42 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                            device=device, reason=reason)
             return out
         if not q.set_batch_state(
-            batch_id, "running", expected_state=batch_state,
+            batch_id, "staging", expected_state=batch_state,
             owner_token=owner_token,
         ):
-            return ownership_lost("start")
-        batch_state = "running"
-        reporter.event("dispatch_run", batch=batch_id, device=device, jobs=len(btasks), engine=engine)
+            return ownership_lost("stage")
+        batch_state = "staging"
         # run_batch (+ verify) is the slow part and holds NO DB txn. A heartbeat thread (its own
         # connection) keeps the lease fresh for the whole window (Phase 2c); a stage/render bug
         # must fail the batch (releasing its lease), not leak it.
         verify: dict[str, Any] = {"status": "skip", "detail": "run_batch did not succeed"}
         pre_output = _remote_output_mtimes(config, device, head)   # baseline the root BEFORE the run (2b)
         def frozen_launch_gate() -> bool:
+            nonlocal batch_state
             if not head.prepared or head.prepared["kind"] == "command":
-                return True
-            try:
-                current = (resolve_tasks(load_config(config.repo_root))
-                           .get(head.task_name) or {}).get("spec_id")
-            except Exception:  # noqa: BLE001 - unreadable current config revokes launch
-                current = None
-            if current == head.prepared["spec_id"]:
-                return True
-            reason = "definition_missing" if current is None else "definition_changed"
-            revoked = q.revoke_prelaunch_batch(
-                batch_id, owner_token=owner_token, reason=reason,
+                current = head.prepared["spec_id"]
+            else:
+                try:
+                    current = (resolve_tasks(load_config(config.repo_root))
+                               .get(head.task_name) or {}).get("spec_id")
+                except Exception:  # noqa: BLE001 - unreadable current config revokes launch
+                    current = None
+            if current != head.prepared["spec_id"]:
+                reason = "definition_missing" if current is None else "definition_changed"
+                revoked = q.revoke_prelaunch_batch(
+                    batch_id, owner_token=owner_token, reason=reason,
+                )
+                if revoked:
+                    reporter.event("dispatch_definition_drift", batch=batch_id,
+                                   device=device, reason=reason)
+                return False
+            if not heartbeat.transition(q, "running"):
+                return False
+            batch_state = "running"
+            reporter.event(
+                "dispatch_run", batch=batch_id, device=device, jobs=len(btasks), engine=engine,
             )
-            if revoked:
-                reporter.event("dispatch_definition_drift", batch=batch_id,
-                               device=device, reason=reason)
-            return False
+            return True
         try:
             with BatchHeartbeat(
                 db_path, batch_id, owner_token, batch_state, lease_seconds,
@@ -531,7 +644,10 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                     device, btasks, config, state_root=state_root, job_ids=job_ids,
                     observation_id=batch_id, prelaunch_gate=frozen_launch_gate,
                 )
+            latest_result = res
             attempt_record = executor.durable_attempt_record(head, res)
+            if heartbeat.ownership_lost.is_set():
+                return ownership_lost("prelaunch_gate")
             if res.get("definition_drift"):
                 if attempt_record is not None:
                     q.record_revoked_prelaunch_result(
@@ -540,9 +656,6 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                     )
                 out["failed"] = 1
                 return out
-            if heartbeat.ownership_lost.is_set():
-                out["ran"] = 1
-                return ownership_lost("run")
             if res.get("ok"):
                 if not q.set_batch_state(
                     batch_id, "fetching", expected_state=batch_state,
@@ -570,6 +683,22 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                             utc_now_iso(), reporter)
             _health_audit(config, q, device, engine, reporter)
             fallback = _allows_fallback(head)
+            if batch_state in {"running", "fetching"}:
+                unknown = q.mark_completion_unknown(
+                    batch_id, err, expected_state=batch_state, owner_token=owner_token,
+                    result_record=attempt_record,
+                    observation=_profile_observation(
+                        btasks, device, latest_result, attempt_record,
+                    ),
+                )
+                if not unknown:
+                    out["ran"] = 1
+                    return ownership_lost("run_exception")
+                out["ran"] = out["review"] = 1
+                reporter.event(
+                    "dispatch_completion_unknown", batch=batch_id, device=device, error=err,
+                )
+                return out
             if not fail_owned(err, clear_force_device=fallback):
                 out["ran"] = 1
                 return ownership_lost("run_exception")
@@ -580,14 +709,43 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                            fallback=fallback)
             return out
         out["ran"] = 1
+        if (res.get("completion_state") == "unknown"
+                or ("command_started" in res and res.get("command_started") is None)):
+            error = res.get("error") or "completion unknown after launch authorization"
+            _health_audit(config, q, device, engine, reporter)
+            if not q.mark_completion_unknown(
+                batch_id, error, expected_state=batch_state, owner_token=owner_token,
+                result_record=attempt_record,
+                observation=_profile_observation(btasks, device, latest_result, attempt_record),
+            ):
+                return ownership_lost("completion_unknown")
+            out["review"] = 1
+            reporter.event(
+                "dispatch_completion_unknown", batch=batch_id, device=device, error=error,
+            )
+            return out
         if not res.get("ok") and res.get("no_retry"):
             error = res.get("error") or "worker completion evidence is incomplete"
             _health_audit(config, q, device, engine, reporter)
-            if not fail_owned(error, max_attempts=1):
-                return ownership_lost("final_failure")
-            out["failed"] = 1
-            reporter.event("dispatch_failed", batch=batch_id, device=device,
-                           error=error, final=True, retry_suppressed=True)
+            if q.batch_replay_policy(batch_id) == "at-most-once-v1":
+                if not q.mark_completion_unknown(
+                    batch_id, error, expected_state=batch_state, owner_token=owner_token,
+                    result_record=attempt_record,
+                    observation=_profile_observation(
+                        btasks, device, latest_result, attempt_record,
+                    ),
+                ):
+                    return ownership_lost("final_failure")
+                out["review"] = 1
+                reporter.event(
+                    "dispatch_completion_unknown", batch=batch_id, device=device, error=error,
+                )
+            else:
+                if not fail_owned(error):
+                    return ownership_lost("final_failure")
+                out["failed"] = 1
+                reporter.event("dispatch_failed", batch=batch_id, device=device,
+                               error=error, retry_suppressed=False)
             return out
         item_results = res.get("item_results") or []
         if item_results and job_ids:
@@ -623,8 +781,11 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 return ownership_lost("item_completion")
             ok_items = len(succeeded)
             failed_items = max(0, len(job_ids) - ok_items)
+            dispositions = executor.item_dispositions(item_results)
+            review_items = sum(1 for job_id in failed if dispositions.get(job_id) == "review")
             out["ok"] = 1 if ok_items else 0
-            out["failed"] = 1 if failed_items else 0
+            out["review"] = 1 if review_items else 0
+            out["failed"] = 1 if failed_items > review_items else 0
             if fallback:
                 reporter.event("dispatch_fallback", batch=batch_id, from_device=device)
             reporter.event(
@@ -664,6 +825,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
             if not q.complete_batch(
                 batch_id, expected_state=batch_state, owner_token=owner_token,
                 result_record=attempt_record,
+                observation=_profile_observation(btasks, device, latest_result, attempt_record),
             ):
                 return ownership_lost("completion")
             out["ok"] = 1
@@ -681,8 +843,28 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
     except Exception as exc:  # noqa: BLE001 - last-resort guard so one worker can't crash the pool
         if attempt_record is None:
             attempt_record = executor.durable_attempt_record(head, {})
+        error = f"worker crashed: {type(exc).__name__}: {exc}"
+        if batch_state in {"running", "fetching"}:
+            try:
+                held = q.mark_completion_unknown(
+                    batch_id, error, expected_state=batch_state, owner_token=owner_token,
+                    result_record=attempt_record,
+                    observation=_profile_observation(
+                        btasks, device, latest_result, attempt_record,
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - ownership result remains fail closed
+                held = False
+            if not held:
+                out["ran"] = 1
+                return ownership_lost("worker_exception")
+            out["ran"] = out["review"] = 1
+            reporter.event(
+                "dispatch_completion_unknown", batch=batch_id, device=device, error=error,
+            )
+            return out
         try:
-            failed_owned = fail_owned(f"worker crashed: {type(exc).__name__}: {exc}")
+            failed_owned = fail_owned(error)
         except Exception:  # noqa: BLE001
             failed_owned = False
         if not failed_owned:
@@ -796,7 +978,7 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
     fcfg = fleet_config(config)
     q = FleetQueue(state_root / "fleet" / "fleet.db")
     summary: dict[str, Any] = {"recovered": 0, "placed": 0, "ran": 0, "ok": 0,
-                               "failed": 0, "skipped": {}, "cooled": []}
+                               "failed": 0, "review": 0, "skipped": {}, "cooled": []}
     try:
         now0 = utc_now_iso()
         summary["recovered"] = q.recover_stale(now0)
@@ -921,9 +1103,11 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                     )
                     if ok:
                         usable += 1
-                        best = min(best, placement.estimate_finish(
+                        estimate = placement.estimate_finish(
                             list(range(len(g["tasks"]))), name, g["tasks"], g["features"],
-                            profs, fcfg))
+                            profs, fcfg)
+                        if estimate is not None:
+                            best = min(best, estimate)
                 return (usable or 999, best, i)
             orders = [tuple(sorted(range(group_count), key=_constraint_key))]
 
@@ -973,9 +1157,14 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                     global_indices = [g["indices"][i] for i in local_indices]
                     planned.append({"group": g, "batch": batch, "global_indices": global_indices})
                     used_devices.add(batch.device)
-                    timeline[batch.device] = timeline.get(batch.device, 0.0) + batch.estimated_finish_s
+                    current = timeline.get(batch.device, 0.0)
+                    if current is None or batch.estimated_finish_s is None:
+                        timeline[batch.device] = None
+                    else:
+                        timeline[batch.device] = float(current) + batch.estimated_finish_s
             placed_jobs = sum(len(p["global_indices"]) for p in planned)
-            makespan = max((timeline[d] for d in used_devices), default=0.0)
+            makespan = (None if any(timeline[d] is None for d in used_devices)
+                        else max((float(timeline[d]) for d in used_devices), default=0.0))
             return {"planned": planned, "skipped": skipped,
                     "placed_jobs": placed_jobs, "placed_batches": len(planned),
                     "makespan": makespan}
@@ -983,11 +1172,13 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
         best_plan: dict[str, Any] | None = None
         for order in orders:
             plan = _simulate(tuple(order))
-            score = (plan["placed_jobs"], plan["placed_batches"], -plan["makespan"])
-            best_score = ((best_plan or {}).get("placed_jobs", -1),
-                          (best_plan or {}).get("placed_batches", -1),
-                          -(best_plan or {}).get("makespan", float("inf")))
-            if score > best_score:
+            primary = (plan["placed_jobs"], plan["placed_batches"])
+            best_primary = ((best_plan or {}).get("placed_jobs", -1),
+                            (best_plan or {}).get("placed_batches", -1))
+            if (best_plan is None or primary > best_primary
+                    or (primary == best_primary and plan["makespan"] is not None
+                        and best_plan["makespan"] is not None
+                        and plan["makespan"] < best_plan["makespan"])):
                 best_plan = plan
         planned_batches = (best_plan or {"planned": [], "skipped": {}})["planned"]
         summary["skipped"].update((best_plan or {"skipped": {}})["skipped"])
@@ -1046,6 +1237,7 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                 summary["ran"] += o["ran"]
                 summary["ok"] += o["ok"]
                 summary["failed"] += o["failed"]
+                summary["review"] += o.get("review", 0)
 
         q.prune_final()
         return summary
@@ -1058,7 +1250,7 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         until_empty: bool = False, reporter: Reporter | None = None,
         idle_grace_s: float | None = None,
         sleep: Callable[[float], None] = time.sleep,
-        monotonic: Callable[[], float] = time.monotonic) -> int:
+        monotonic: Callable[[], float] = time.monotonic) -> DrainResultV1:
     """Continuous dispatcher: drain ticks until interrupted (or ``max_ticks`` for tests).
     Sleeps ``poll_s`` only when a tick found no work, so a busy queue drains promptly.
 
@@ -1069,45 +1261,95 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
     five minutes."""
     reporter = reporter or Reporter(json_events=False)
     sr = state_root or default_state_root()
-    grace_s = _bounded_idle_grace_s(config, idle_grace_s) if until_empty else 0.0
+    grace_s = 0.0
     idle_deadline: float | None = None
     ticks = 0
-    reporter.event("dispatch_loop_start", poll_s=poll_s, debounce_s=debounce_s,
-                   drain=until_empty, idle_grace_s=grace_s)
-    while max_ticks is None or ticks < max_ticks:
-        summary = drain_once(config, state_root=sr, debounce_s=debounce_s,
-                             lease_seconds=lease_seconds, reporter=reporter, sleep=sleep)
-        ticks += 1
-        if until_empty:
-            q = FleetQueue(sr / "fleet" / "fleet.db")
-            try:
-                queued = q.counts().get("queued", 0)
-                active = sum(q.active_by_device().values())
-            finally:
-                q.close()
-            if queued + active == 0:        # nothing queued and nothing in flight -> done
-                if grace_s <= 0:
-                    reporter.event("dispatch_drain_idle", waited_s=0.0)
-                    return 0
-                now = monotonic()
-                if idle_deadline is None:
-                    idle_deadline = now + grace_s
-                    reporter.event("dispatch_drain_idle_wait", idle_grace_s=grace_s)
-                remaining = idle_deadline - now
-                if remaining <= 0:
-                    reporter.event("dispatch_drain_idle", waited_s=grace_s)
-                    return 0
-                sleep(min(max(poll_s, 0.001), remaining))
-                continue
-            idle_deadline = None
-            if active == 0 and summary["placed"] == 0 and summary["ran"] == 0:
-                # Jobs remain queued but none could be placed this tick and nothing is running to
-                # free a device later -> they are stuck right now (e.g. forced to a device that
-                # can't fit them, or every candidate cooled). Leave them queued for a later
-                # dispatch and exit, instead of spinning the drain forever (the bug that left
-                # orphaned `dispatch --drain` processes after a forced-infeasible submit).
-                reporter.event("dispatch_drain_stuck", queued=queued)
-                return 0
-        if summary["ran"] == 0:
-            sleep(poll_s)
-    return 0
+    totals = {"ran": 0, "ok": 0, "failed": 0, "review": 0}
+    last_skipped: dict[str, str] = {}
+    last_queued = 0
+    last_active = 0
+
+    def queue_counts() -> tuple[int, int]:
+        queue = FleetQueue(sr / "fleet" / "fleet.db")
+        try:
+            return (
+                int(queue.counts().get("queued", 0)),
+                sum(queue.active_by_device().values()),
+            )
+        finally:
+            queue.close()
+
+    def best_effort_counts() -> tuple[int, int]:
+        try:
+            return queue_counts()
+        except Exception:  # noqa: BLE001 - final result must survive a broken queue reader
+            return last_queued, last_active
+
+    try:
+        grace_s = _bounded_idle_grace_s(config, idle_grace_s) if until_empty else 0.0
+        reporter.event("dispatch_loop_start", poll_s=poll_s, debounce_s=debounce_s,
+                       drain=until_empty, idle_grace_s=grace_s)
+        while max_ticks is None or ticks < max_ticks:
+            summary = drain_once(config, state_root=sr, debounce_s=debounce_s,
+                                 lease_seconds=lease_seconds, reporter=reporter, sleep=sleep)
+            ticks += 1
+            for key in totals:
+                totals[key] += int(summary.get(key, 0) or 0)
+            last_skipped = dict(summary.get("skipped") or {})
+            if until_empty:
+                queued, active = queue_counts()
+                last_queued, last_active = queued, active
+                if queued + active == 0:        # nothing queued and nothing in flight -> done
+                    if grace_s <= 0:
+                        reporter.event("dispatch_drain_idle", waited_s=0.0)
+                        return DrainResultV1(
+                            status="drained", queued=0, active=0, skipped={}, error=None,
+                            **totals,
+                        )
+                    now = monotonic()
+                    if idle_deadline is None:
+                        idle_deadline = now + grace_s
+                        reporter.event("dispatch_drain_idle_wait", idle_grace_s=grace_s)
+                    remaining = idle_deadline - now
+                    if remaining <= 0:
+                        reporter.event("dispatch_drain_idle", waited_s=grace_s)
+                        return DrainResultV1(
+                            status="drained", queued=0, active=0, skipped={}, error=None,
+                            **totals,
+                        )
+                    sleep(min(max(poll_s, 0.001), remaining))
+                    continue
+                idle_deadline = None
+                if active == 0 and summary["placed"] == 0 and summary["ran"] == 0:
+                    reporter.event("dispatch_drain_stuck", queued=queued)
+                    return DrainResultV1(
+                        status="stuck_unplaceable", queued=queued, active=0,
+                        skipped=last_skipped, error=None, **totals,
+                    )
+            if summary["ran"] == 0:
+                sleep(poll_s)
+    except KeyboardInterrupt:
+        queued, active = best_effort_counts()
+        return DrainResultV1(
+            status="cancelled", queued=queued, active=active, skipped=last_skipped,
+            error={"kind": "interrupted", "message": "dispatcher interrupted"}, **totals,
+        )
+    except Exception as exc:  # noqa: BLE001 - stable drain error document
+        queued, active = best_effort_counts()
+        return DrainResultV1(
+            status="infrastructure_error", queued=queued, active=active,
+            skipped=last_skipped,
+            error={"kind": type(exc).__name__, "message": str(exc)}, **totals,
+        )
+    try:
+        queued, active = queue_counts()
+    except Exception as exc:  # noqa: BLE001 - stable drain error document
+        return DrainResultV1(
+            status="infrastructure_error", queued=last_queued, active=last_active,
+            skipped=last_skipped,
+            error={"kind": type(exc).__name__, "message": str(exc)}, **totals,
+        )
+    return DrainResultV1(
+        status="drained" if queued + active == 0 else "stuck_unplaceable",
+        queued=queued, active=active, skipped=last_skipped, error=None, **totals,
+    )

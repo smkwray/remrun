@@ -7,6 +7,8 @@ one model), so batch size does not multiply RAM/VRAM.
 """
 from __future__ import annotations
 
+import hashlib
+
 from .adapters import (
     candidate_devices, engine_for, memory_kind_for, option_bucket,
     required_capabilities, task_provided_capabilities,
@@ -14,7 +16,10 @@ from .adapters import (
 from .models import (
     DeviceSnapshot, FleetTask, JobFeatures, PlacedBatch, PlacementResult,
 )
-from .profiles import prepared_profile
+from .profiles import (
+    duration_observation_count, estimate_unavailable_reason, prepared_profile,
+    prepared_profile_family_id, prepared_resource_profile,
+)
 
 
 def _profile(task: FleetTask, device: str, profiles: dict):  # noqa: ANN001
@@ -33,7 +38,7 @@ def transfer_seconds(total_bytes: int, file_count: int, fleet_cfg: dict) -> floa
 
 def estimate_finish(indices: list[int], device: str, tasks: list[FleetTask],
                     features: list[JobFeatures], profiles: dict, fleet_cfg: dict,
-                    input_local: bool = False) -> float:
+                    input_local: bool = False) -> float | None:
     """Estimated wall time to process ``indices`` as one batch on ``device``.
 
     One cold model load + per-job variable compute + (optional) input transfer.
@@ -46,7 +51,11 @@ def estimate_finish(indices: list[int], device: str, tasks: list[FleetTask],
     t0 = tasks[indices[0]]
     prof = _profile(t0, device, profiles)
     if prof is None:
-        return 0.0
+        return None
+    prepared_units = sum(features[i].units() for i in indices)
+    if (prof.min_units is not None and prof.max_units is not None
+            and not prof.min_units <= prepared_units <= prof.max_units):
+        return None
     fixed = float(prof.fixed_load_s or 0.0)
     var_rate = float(prof.var_per_unit_s or 0.0)
     variable = sum(var_rate * features[i].units() for i in indices)
@@ -68,14 +77,22 @@ def _confidence_penalty(profile, fleet_cfg: dict) -> float:  # noqa: ANN001
     cap = max(0.0, float((fleet_cfg or {}).get("confidence_penalty_frac", 0.0)))
     if cap <= 0.0:
         return 0.0
-    n = max(0, int(getattr(profile, "n", 0) or 0))
+    n = max(0, int(getattr(profile, "duration_n", 0) or 0))
     if n <= 0:
         return cap
     return cap / (n ** 0.5)
 
 
+def _exploration_slot(task: FleetTask) -> int:
+    """Stable one-in-four slot for bounded mixed-state calibration."""
+    family = prepared_profile_family_id(task)
+    prepared_id = str(task.prepared.get("prepared_id") or "")
+    digest = hashlib.sha256(f"{family}\0{prepared_id}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % 4
+
+
 def predicted_resources(task: FleetTask, device: str, profiles: dict) -> tuple[float, float]:
-    prof = _profile(task, device, profiles)
+    prof = prepared_resource_profile(profiles, task, device)
     if prof is None:
         return 0.0, 0.0
     return float(prof.peak_rss_mb or 0.0), float(prof.peak_vram_mb or 0.0)
@@ -192,13 +209,32 @@ def _greedy_split(indices: list[int], devices: list[str], tasks, features,
         best_dev, best_makespan = None, float("inf")
         for d in devices:
             trial = assign[d] + [i]
-            f = bl.get(d, 0.0) + estimate_finish(trial, d, tasks, features, profiles, fleet_cfg,
-                                                 input_local_map.get((i, d), False))
-            makespan = max([f] + [bl.get(o, 0.0) + estimate_finish(assign[o], o, tasks, features,
-                                                                   profiles, fleet_cfg, False)
-                                  for o in devices if o != d])
+            own = estimate_finish(
+                trial, d, tasks, features, profiles, fleet_cfg,
+                input_local_map.get((i, d), False),
+            )
+            if own is None or bl.get(d) is None:
+                continue
+            f = float(bl.get(d, 0.0)) + own
+            alternatives = []
+            valid = True
+            for other in devices:
+                if other == d:
+                    continue
+                other_own = estimate_finish(
+                    assign[other], other, tasks, features, profiles, fleet_cfg, False,
+                )
+                if other_own is None or bl.get(other) is None:
+                    valid = False
+                    break
+                alternatives.append(float(bl.get(other, 0.0)) + other_own)
+            if not valid:
+                continue
+            makespan = max([f] + alternatives)
             if makespan < best_makespan:
                 best_dev, best_makespan = d, makespan
+        if best_dev is None:
+            raise ValueError("split requires known estimates and backlog for every device")
         assign[best_dev].append(i)
     return {d: ix for d, ix in assign.items() if ix}
 
@@ -220,7 +256,30 @@ def assign_group(indices: list[int], tasks: list[FleetTask], features: list[JobF
         return estimate_finish(ix, d, tasks, features, profiles, fleet_cfg)
 
     def _eff(ix, d):                 # backlog-adjusted finish — for DEVICE SELECTION only
-        return bl.get(d, 0.0) + _own(ix, d)
+        own = _own(ix, d)
+        backlog = bl.get(d, 0.0)
+        if own is None or backlog is None:
+            return None
+        return float(backlog) + own
+
+    def _batch(d: str, *, reason: str, basis: str) -> PlacedBatch:
+        estimate = _own(indices, d)
+        estimate_reason = None
+        if bl.get(d, 0.0) is None:
+            estimate = None
+            estimate_reason = "backlog_unknown"
+        elif estimate is None:
+            estimate_reason = estimate_unavailable_reason(
+                profiles, t0, d, sum(features[index].units() for index in indices),
+            )
+        return PlacedBatch(
+            d,
+            indices,
+            estimate,
+            reason,
+            basis,
+            estimate_reason,
+        )
 
     forced = {t.force_device for t in (tasks[i] for i in indices) if t.force_device}
     if forced:
@@ -232,27 +291,95 @@ def assign_group(indices: list[int], tasks: list[FleetTask], features: list[JobF
                    if snapshots.get(dev) else (False, "no snapshot"))
         if not ok:
             return [], {dev: f"forced but unavailable: {why}"}
-        return [PlacedBatch(dev, indices, _own(indices, dev), "forced")], skipped
+        return [_batch(dev, reason="forced", basis="forced")], skipped
 
     fitting, skipped = _fitting_devices(t0, snapshots, profiles, sf, fleet_cfg)
     if not fitting:
         return [], skipped
 
-    if t0.prepared and not forced and len(fitting) > 1 and any(
-            prepared_profile(profiles, t0, device) is None for device in fitting):
-        return [], {device: "unestimated; choose an explicit device or supply measured costs"
-                    for device in fitting}
+    prepared_units = sum(features[index].units() for index in indices)
+    estimates = {device: _own(indices, device) for device in fitting}
+    estimable = [device for device in fitting if estimates[device] is not None
+                 and bl.get(device, 0.0) is not None]
+    unestimated = [device for device in fitting if device not in estimable]
+    unavailable_reasons = {
+        device: (
+            "backlog_unknown" if bl.get(device, 0.0) is None
+            else estimate_unavailable_reason(profiles, t0, device, prepared_units)
+        )
+        for device in unestimated
+    }
+
+    if len(fitting) == 1:
+        device = fitting[0]
+        return [_batch(device, reason="batched", basis="sole_qualified")], skipped
+
+    if not estimable:
+        device = min(
+            fitting,
+            key=lambda name: (
+                duration_observation_count(profiles, t0, name),
+                snapshots[name].active_jobs,
+                name,
+            ),
+        )
+        return [_batch(device, reason="batched", basis="cold_start")], skipped
+
+    # Give every otherwise-qualified duration identity four prompt observations.
+    # Unknown backlog is not a calibration gap and therefore never steals work
+    # from an estimable peer.
+    calibration = [
+        device for device in unestimated
+        if unavailable_reasons[device] != "backlog_unknown"
+        if duration_observation_count(profiles, t0, device) < 4
+    ]
+    if calibration:
+        device = min(
+            calibration,
+            key=lambda name: (
+                duration_observation_count(profiles, t0, name),
+                snapshots[name].active_jobs,
+                name,
+            ),
+        )
+        batch = _batch(device, reason="batched", basis="exploration")
+        return [batch], skipped
+
+    # After the prompt budget, only stable slot zero explores an unready model.
+    # Invalid models park at eight accepted observations. A ready model whose
+    # current work is outside its range remains eligible so its range can grow.
+    if _exploration_slot(t0) == 0:
+        bounded = [
+            device for device in unestimated
+            if unavailable_reasons[device] == "out_of_range"
+            or (
+                unavailable_reasons[device] in {"uncalibrated", "model_unfit"}
+                and duration_observation_count(profiles, t0, device) < 8
+            )
+        ]
+        if bounded:
+            device = min(
+                bounded,
+                key=lambda name: (
+                    duration_observation_count(profiles, t0, name),
+                    snapshots[name].active_jobs,
+                    name,
+                ),
+            )
+            return [_batch(device, reason="batched", basis="exploration")], skipped
 
     # Option A: all on one device (one model load). Pick the smallest backlog-adjusted finish.
-    best_d = min(fitting, key=lambda d: _eff(indices, d))
-    same = PlacedBatch(best_d, indices, _own(indices, best_d), "batched")
+    best_d = min(estimable, key=lambda d: _eff(indices, d))
+    same = _batch(best_d, reason="batched", basis="estimated")
     same_eff = _eff(indices, best_d)
-    if len(indices) < 2 or len(fitting) < 2:
+    if len(indices) < 2 or len(estimable) < 2 or unestimated:
         return [same], skipped
 
     # Option B: split across devices (a model load each) -> backlog-adjusted makespan = max.
-    split_assign = _greedy_split(indices, fitting, tasks, features, profiles, fleet_cfg, {}, bl)
-    split_batches = [PlacedBatch(d, ix, _own(ix, d), "split") for d, ix in split_assign.items()]
+    split_assign = _greedy_split(indices, estimable, tasks, features, profiles, fleet_cfg, {}, bl)
+    split_batches = [PlacedBatch(
+        d, ix, _own(ix, d), "split", "estimated", None,
+    ) for d, ix in split_assign.items()]
     split_makespan = max(_eff(ix, d) for d, ix in split_assign.items())
 
     hysteresis = _split_hysteresis(indices, t0, features, profiles, fitting, fleet_cfg,
@@ -306,6 +433,7 @@ def plan_jobs(tasks: list[FleetTask], features: list[JobFeatures],
         batches.extend(b)
         for d, why in sk.items():
             skipped.setdefault(d, why)
-    makespan = max((b.estimated_finish_s for b in batches), default=0.0)
+    makespan = (None if any(batch.estimated_finish_s is None for batch in batches)
+                else max((float(batch.estimated_finish_s) for batch in batches), default=0.0))
     note = "" if batches else "no eligible device for any job"
     return PlacementResult(batches=batches, skipped=skipped, makespan_s=makespan, note=note)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,7 +28,7 @@ def _task() -> dict:
         "routing": {"requirements": ["zot.base"], "requirements_by_option": {
             "flavor": {"plain": [], "spicy": ["zot.spice"]},
         }},
-        "execution": {"batching": "compatible"},
+        "execution": {"batching": "compatible", "replay": "at-most-once-v1"},
         "cost": {
             "measure": "input-bytes",
             "unit": "mib",
@@ -124,6 +125,44 @@ def test_external_preparer_definition_is_rejected_before_resolution(tmp_path: Pa
         resolve_task_spec("zotomatic", raw, devices={"BOX"}, repo_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda command, _script: command.__setitem__("argv", ["python", "{request}"]),
+         "absolute executable"),
+        (lambda command, _script: command.__setitem__(
+            "argv", [sys.executable, "{request}", "{request}"]), "exactly one"),
+        (lambda command, _script: command.__setitem__(
+            "argv", [sys.executable, "x={request}"]), "exactly one"),
+        (lambda command, _script: command.__setitem__(
+            "argv", [sys.executable, "|", "{request}"]), "shell syntax"),
+        (lambda command, _script: command.__setitem__("identity_paths", ["/absent"]),
+         "existing file"),
+        (lambda command, script: command.__setitem__("identity_paths", [str(script)]),
+         "include the resolved executable"),
+        (lambda command, script: command.__setitem__(
+            "identity_paths", [sys.executable, str(script), str(script)]), "duplicates"),
+        (lambda command, _script: command.__setitem__("timeout_s", 301), "<= 300"),
+    ],
+)
+def test_external_scalar_contract_rejects_unsafe_commands(
+    tmp_path: Path, mutate, message: str,
+) -> None:  # noqa: ANN001
+    script = tmp_path / "measure.py"
+    script.write_text("pass\n", encoding="utf-8")
+    raw = _task()
+    raw["cost"] = {
+        "measure": "external-scalar-v1", "unit": "work-v1", "bucket_options": [],
+        "command": {
+            "argv": [sys.executable, str(script), "{request}"], "timeout_s": 1,
+            "identity_paths": [sys.executable, str(script)],
+        },
+    }
+    mutate(raw["cost"]["command"], script)
+    with pytest.raises(TaskContractError, match=message):
+        resolve_task_spec("zotomatic", raw, devices={"BOX"}, repo_root=tmp_path)
+
+
 def test_none_preparer_forbids_process_model() -> None:
     raw = _task()
     raw["prepare"]["process_model"] = "single-v1"
@@ -188,7 +227,7 @@ def test_item_count_rejects_non_file_modalities(mode: str) -> None:
     raw["output"] = {
         "reservation": "none", "allow_root_override": False, "verification": "none",
     }
-    raw["execution"] = {"batching": "never"}
+    raw["execution"] = {"batching": "never", "replay": "at-most-once-v1"}
     raw["completion"] = {
         "protocol": "exit-code-v1", "evidence": "never", "companion": "forbidden",
         "allowed_publication": ["none"], "unstructured_memory": "ignore",

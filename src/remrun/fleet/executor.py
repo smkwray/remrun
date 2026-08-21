@@ -13,7 +13,7 @@ from ..config import RemrunConfig, load_config
 from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, iso_plus_seconds, utc_now_iso
 from ..transport import GuardFinalizationError, TransportError, make_transport
-from . import adapters, placement, probes, profiles
+from . import adapters, placement, probes
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
 from .prepared import (
@@ -576,6 +576,10 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 staged_names.append(name)
                 staged += 1
             job_id = job_ids[index] if job_ids and index < len(job_ids) else f"adhoc-{index}"
+            item_costs = {
+                int(row["index"]): float(row["value"])
+                for row in prepared["cost"].get("item_values", [])
+            }
             manifest_items.append({
                 "index": index, "job_id": job_id,
                 "prepared_id": prepared["prepared_id"], "work_id": prepared["work_id"],
@@ -586,6 +590,16 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             expected.append({
                 "job_id": job_id, "prepared_id": prepared["prepared_id"],
                 "index": index, "cost_unit": prepared["cost"]["unit"],
+                "cost_status": prepared["cost"]["status"],
+                "measure_id": prepared["cost"].get("measure_id"),
+                "prepared_value": (
+                    item_costs.get(0) if len(prepared["payload"]["items"]) == 1
+                    else prepared["cost"]["value"]
+                ),
+                "verify_relative_tolerance": (
+                    spec["definition"]["cost"].get("verify_relative_tolerance", 0.0)
+                    if not is_command else 0.0
+                ),
                 "reservations": prepared["output"]["reservations"],
             })
         output_root = transport.expand_remote(configured_root or stage)
@@ -714,10 +728,10 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             response.update({"cleanup_deferred": True, "stage_dir": stage})
         return response
     except TransportError as exc:
-        if cleanup:
-            _safe_delete(transport, stage)
         return {"ok": False, "device": device_name, "staged": staged,
-                "error": f"exec failed: {exc}"}
+                "error": f"exec failed: {exc}", "completion_state": "unknown",
+                "command_started": None, "cleanup_deferred": bool(cleanup),
+                "stage_dir": stage}
 
     elapsed = round(time.monotonic() - started, 3)
     rows: list[dict[str, Any]] = []
@@ -734,27 +748,6 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                      "error": row["message"]} for row in rows]
         except ResultProtocolError as exc:
             evidence_error = str(exc)
-    if (result.exit_code == 0 and evidence_error is None and rows
-            and all(row["outcome"] == "succeeded" for row in rows)
-            and any(row["work_performed"] for row in rows)):
-        try:
-            observed_units = 0.0
-            for row, task in zip(rows, tasks):
-                if not row["work_performed"]:
-                    continue
-                measured = row.get("work_units")
-                observed_units += (float(measured["value"]) if measured is not None
-                                   else float(task.prepared["cost"]["value"]))
-            telemetry = result.telemetry or {}
-            profiles.update_prepared_profile(
-                state_root, head, device_name,
-                peak_rss_mb=telemetry.get("peak_rss_mb"),
-                peak_vram_mb=telemetry.get("peak_vram_mb"),
-                observed_elapsed_s=elapsed, observed_units=observed_units,
-                now=utc_now_iso(),
-            )
-        except (KeyError, TypeError, ValueError):
-            pass
     if cleanup:
         _safe_delete(transport, stage)
     response = {

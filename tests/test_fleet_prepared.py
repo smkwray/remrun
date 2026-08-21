@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def _task(*, split: str = "per-item") -> dict:
                   "file_identity": "sha256"},
         "prepare": {"mode": "none"},
         "routing": {"requirements": [], "requirements_by_option": {}},
-        "execution": {"batching": "compatible"},
+        "execution": {"batching": "compatible", "replay": "at-most-once-v1"},
         "cost": {"measure": "input-bytes", "unit": "bytes", "divisor": 1,
                  "bucket_options": ["quality"]},
         "output": {"reservation": "content-work-stem-v1", "allow_root_override": False,
@@ -49,6 +50,32 @@ def _spec(tmp_path: Path, raw: dict | None = None) -> dict:
     return resolve_task_spec("zotomatic", raw or _task(), devices={"BOX"}, repo_root=tmp_path)
 
 
+def _external_task(script: Path, *, timeout_s: float = 1.0) -> dict:
+    raw = _task(split="never")
+    raw["execution"]["batching"] = "never"
+    raw["cost"] = {
+        "measure": "external-scalar-v1",
+        "unit": "synthetic-work-v1",
+        "bucket_options": ["quality"],
+        "verify_relative_tolerance": 0.001,
+        "command": {
+            "argv": [sys.executable, str(script), "{request}"],
+            "timeout_s": timeout_s,
+            "identity_paths": [sys.executable, str(script)],
+        },
+    }
+    return raw
+
+
+def _write_measure(script: Path, response_lines: str) -> None:
+    script.write_text(
+        "import json,pathlib,sys,time\n"
+        "request=json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+        + response_lines,
+        encoding="utf-8",
+    )
+
+
 def test_prepare_freezes_payload_options_cost_routing_and_output(tmp_path: Path) -> None:
     source = tmp_path / "item.zot"
     source.write_bytes(b"abc")
@@ -63,10 +90,124 @@ def test_prepare_freezes_payload_options_cost_routing_and_output(tmp_path: Path)
     assert record["routing"]["requirements"] == ["zot.v1"]
     assert record["cost"] == {
         "status": "exact", "unit": "bytes", "value": 3.0,
+        "item_values": [{"index": 0, "value": 3.0}],
         "relative_uncertainty": 0.0, "provenance": "input-bytes",
+        "measure_id": record["cost"]["measure_id"],
         "bucket_id": record["cost"]["bucket_id"],
     }
     assert record["output"]["reservations"][0]["stem"].startswith("item-0000-")
+
+
+def test_external_scalar_measure_is_frozen_and_content_addressed(tmp_path: Path) -> None:
+    script = tmp_path / "measure.py"
+    _write_measure(
+        script,
+        "items=[{'index':i['index'],'value':i['identity']['bytes']*2} "
+        "for i in request['payload']['items']]\n"
+        "print(json.dumps({'schema':1,'request_id':request['request_id'],'items':items}))\n",
+    )
+    first = tmp_path / "a.zot"
+    second = tmp_path / "b.zot"
+    first.write_bytes(b"abc")
+    second.write_bytes(b"12345")
+    spec = _spec(tmp_path, _external_task(script))
+    prepared = prepare_task_job(
+        spec, repo_root=tmp_path, inputs=[str(first), str(second)],
+    )
+    validate_prepared_job(prepared)
+    assert prepared["cost"] == {
+        "status": "exact", "unit": "synthetic-work-v1", "value": 16.0,
+        "item_values": [{"index": 0, "value": 6.0}, {"index": 1, "value": 10.0}],
+        "relative_uncertainty": 0.0, "provenance": "external-scalar-v1",
+        "measure_id": prepared["cost"]["measure_id"],
+        "bucket_id": prepared["cost"]["bucket_id"],
+    }
+    original_measure = prepared["cost"]["measure_id"]
+    script.write_text(script.read_text(encoding="utf-8") + "# authority revision\n",
+                      encoding="utf-8")
+    revised = prepare_task_job(spec, repo_root=tmp_path, inputs=[str(first), str(second)])
+    assert revised["cost"]["measure_id"] != original_measure
+
+
+@pytest.mark.parametrize(
+    ("response_lines", "message"),
+    [
+        ("print('not-json')\n", "malformed JSON"),
+        ("print(json.dumps({'schema':1,'request_id':'sha256:'+'0'*64,'items':[]}))\n",
+         "request identity mismatch"),
+        ("print(json.dumps({'schema':1,'request_id':request['request_id'],"
+         "'items':[{'index':0,'value':1},{'index':0,'value':1}]}))\n", "item is invalid"),
+        ("print(json.dumps({'schema':1,'request_id':request['request_id'],"
+         "'items':[{'index':0,'value':-1}]}))\n", "item is invalid"),
+        ("print('{\"schema\":1,\"request_id\":\"'+request['request_id']+'\",'"
+         "+'\"items\":[{\"index\":0,\"value\":NaN}]}')\n", "item is invalid"),
+        ("print(json.dumps({'schema':1,'request_id':request['request_id'],'items':[]}))\n",
+         "indices do not match"),
+        ("print(json.dumps({'schema':1,'request_id':request['request_id'],"
+         "'items':[{'index':0,'value':1}]})); print('trailing')\n", "malformed JSON"),
+    ],
+)
+def test_external_scalar_rejects_malformed_responses(
+    tmp_path: Path, response_lines: str, message: str,
+) -> None:
+    script = tmp_path / "measure.py"
+    _write_measure(script, response_lines)
+    source = tmp_path / "item.zot"
+    source.write_bytes(b"x")
+    spec = _spec(tmp_path, _external_task(script))
+    with pytest.raises(PreparationError, match=message):
+        prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+
+
+def test_external_scalar_timeout_and_output_limit_fail_before_enqueue(tmp_path: Path) -> None:
+    source = tmp_path / "item.zot"
+    source.write_bytes(b"x")
+    script = tmp_path / "measure.py"
+    _write_measure(script, "time.sleep(1)\n")
+    spec = _spec(tmp_path, _external_task(script, timeout_s=0.05))
+    with pytest.raises(PreparationError, match="timed out"):
+        prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+
+    _write_measure(script, "print('x'*1100000)\n")
+    spec = _spec(tmp_path, _external_task(script))
+    with pytest.raises(PreparationError, match="output limit"):
+        prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    queue = FleetQueue(tmp_path / "not-enqueued.db")
+    try:
+        assert queue.counts().get("queued", 0) == 0
+    finally:
+        queue.close()
+
+
+def test_external_scalar_rejects_nonfinite_aggregate(tmp_path: Path) -> None:
+    script = tmp_path / "measure.py"
+    _write_measure(
+        script,
+        "items=[{'index':i['index'],'value':1e308} for i in request['payload']['items']]\n"
+        "print(json.dumps({'schema':1,'request_id':request['request_id'],'items':items}))\n",
+    )
+    first = tmp_path / "a.zot"
+    second = tmp_path / "b.zot"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    spec = _spec(tmp_path, _external_task(script))
+    with pytest.raises(PreparationError, match="total must be finite"):
+        prepare_task_job(spec, repo_root=tmp_path, inputs=[str(first), str(second)])
+
+
+def test_external_scalar_detects_source_mutation(tmp_path: Path) -> None:
+    source = tmp_path / "item.zot"
+    source.write_bytes(b"before")
+    script = tmp_path / "measure.py"
+    _write_measure(
+        script,
+        "pathlib.Path(request['payload']['items'][0]['source_path']).write_bytes(b'after')\n"
+        "print(json.dumps({'schema':1,'request_id':request['request_id'],"
+        "'items':[{'index':0,'value':1}]}))\n",
+    )
+    spec = _spec(tmp_path, _external_task(script))
+    with pytest.raises(PreparationError, match="source_changed"):
+        prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
 
 
 def test_direct_and_folder_files_obey_same_extension_policy(tmp_path: Path) -> None:
@@ -155,7 +296,9 @@ def test_frozen_input_snapshot_rejects_changed_source(tmp_path: Path,
     source.write_bytes(b"changed!")
     if identity_mode == "metadata":
         frozen = record["payload"]["items"][0]["identity"]["mtime_ns"]
-        os.utime(source, ns=(frozen + 1, frozen + 1))
+        # Windows filesystems need a wider delta than one nanosecond for this
+        # court to prove that the named file no longer has the frozen metadata.
+        os.utime(source, ns=(frozen + 2_000_000_000, frozen + 2_000_000_000))
 
     with pytest.raises(PreparationError, match="source_changed"):
         snapshot_prepared_input(record["payload"]["items"][0])

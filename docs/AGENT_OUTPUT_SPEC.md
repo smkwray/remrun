@@ -76,13 +76,21 @@ Remote command output should remain passthrough unless `--capture-only` is set.
 
 In `remrun fleet plan --json`, each `batches[].jobs` value is a zero-based index into the input
 task list for that plan invocation. It is not a durable queue job ID. `makespan_s` is the planner’s
-top-level estimate.
+top-level estimate. A batch with no honest estimate has `estimated_finish_s=null`, a non-null
+`estimate_reason`, and a `selection_basis` explaining why that target was selected; any such batch
+requires top-level `makespan_s=null`. Never display null as zero. The owner-facing wording is
+`Uncalibrated placement; no duration estimate.` for an uncalibrated cold start.
 
 `remrun fleet submit TASK --json` reports the durable queue result and does not probe devices.
 Its `route_preview` field is `false`. Add `--preview-route` only together with `--json` and only
 when a non-binding live placement hint is worth the extra device probes; then `route_preview` is
 `true` and the route fields are included. The dispatcher still makes the authoritative placement
 when it claims queued work.
+
+`remrun fleet dispatch --drain --json` writes reporter events to stderr and exactly one compact
+`DrainResultV1` document to stdout. Its status is `drained`, `stuck_unplaceable`, `cancelled`, or
+`infrastructure_error`; exit codes are respectively 0/1 (depending on failed or review attempts),
+2, 130, and 4. Parse the final JSON before converting a nonzero process status into an error.
 
 When a fleet submission includes `--memory-limit-mib N`, plan and submit JSON include the
 frozen `limits` object. Synchronous execution includes a token-free `memory_limit` receipt.

@@ -27,7 +27,7 @@ def _definition(worker: Path, output_root: Path) -> dict:
         "routing": {"requirements": ["zot.v1"], "requirements_by_option": {
             "quality": {"compact": [], "archival": ["zot.archive"]},
         }},
-        "execution": {"batching": "compatible"},
+        "execution": {"batching": "compatible", "replay": "at-most-once-v1"},
         "cost": {"measure": "input-bytes", "unit": "bytes", "divisor": 1,
                  "bucket_options": ["quality"]},
         "output": {"reservation": "content-work-stem-v1", "allow_root_override": False,
@@ -75,7 +75,8 @@ def test_novel_name_submits_claims_executes_closes_and_validates(
         "'prepared_id':i['prepared_id'],'index':i['index'],'outcome':'succeeded',"
         "'disposition':'none','retry_after_s':None,'publication':'produced',"
         "'work_performed':True,'outputs':[out],'companion':None,'message':None,"
-        "'failure_code':None,'resource':'none','work_units':{'unit':'bytes','value':3},"
+        "'failure_code':None,'resource':'none','work_units':{'unit':'bytes','value':3,"
+        "'measure_id':i['cost']['measure_id']},"
         "'elapsed_s':0.01,'details':{}}]}\n"
         "pathlib.Path(os.environ['REMRUN_BATCH_METRICS']).write_text(json.dumps(r))\n",
         encoding="utf-8",

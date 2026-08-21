@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sqlite3
 import threading
 import uuid
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS batches (
     task_name    TEXT, engine TEXT, bucket TEXT,
     created_at   TEXT NOT NULL, updated_at TEXT NOT NULL,
     lease_until  TEXT NOT NULL, heartbeat_at TEXT,
-    estimated_finish_s REAL NOT NULL DEFAULT 0,   -- own compute estimate, for backlog-aware placement
+    estimated_finish_s REAL,                      -- NULL means duration is honestly unknown
     error        TEXT
 );
 -- One row per held resource slot. UNIQUE(device,pool) makes a configured pool a
@@ -89,6 +90,25 @@ CREATE TABLE IF NOT EXISTS prepared_output_reservations (
     stem           TEXT PRIMARY KEY,
     work_id        TEXT NOT NULL,
     created_at     TEXT NOT NULL
+);
+-- Raw execution observations are authoritative and are committed atomically
+-- with the queue's terminal transition. Derived profile caches are rebuildable.
+CREATE TABLE IF NOT EXISTS fleet_profile_observations (
+    batch_id             TEXT PRIMARY KEY,
+    profile_key          TEXT,
+    family_id            TEXT,
+    device               TEXT NOT NULL,
+    adapter_id           TEXT,
+    prepared_units       REAL,
+    observed_units       REAL,
+    controller_elapsed_s REAL,
+    worker_elapsed_s     REAL,
+    peak_rss_mb          REAL,
+    peak_vram_mb         REAL,
+    accepted_duration    INTEGER NOT NULL,
+    reject_reason        TEXT,
+    result_digest        TEXT,
+    recorded_at          TEXT NOT NULL
 );
 """
 
@@ -172,6 +192,7 @@ class FleetQueue:
             self.db.execute("PRAGMA busy_timeout=5000")
             self.db.executescript(_SCHEMA)
             self._migrate()
+            self._migrate_nullable_batch_estimates()
             self._migrate_prepared_output_reservations()
         except BaseException:
             self.db.close()
@@ -211,7 +232,7 @@ class FleetQueue:
                 self.db.execute("ALTER TABLE batches ADD COLUMN owner_token TEXT")
             if "estimated_finish_s" not in have_batches:
                 self.db.execute(
-                    "ALTER TABLE batches ADD COLUMN estimated_finish_s REAL NOT NULL DEFAULT 0")
+                    "ALTER TABLE batches ADD COLUMN estimated_finish_s REAL")
 
             duplicate_rows = self.db.execute(
                 f"SELECT idempotency_key, job_id, state FROM jobs "
@@ -282,6 +303,46 @@ class FleetQueue:
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_jobs_state ON jobs(state)")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_jobs_batch ON jobs(batch_id)")
             self.db.execute(_active_idempotency_index_sql())
+
+    def _migrate_nullable_batch_estimates(self) -> None:
+        """Rebuild only the local batch ledger when its old ETA column is NOT NULL.
+
+        SQLite cannot remove a NOT NULL constraint in place. Queue history is
+        copied exactly; zero remains a real historical value, while new unknown
+        estimates can be stored as NULL.
+        """
+        columns = self.db.execute("PRAGMA table_info(batches)").fetchall()
+        eta = next((row for row in columns if row["name"] == "estimated_finish_s"), None)
+        if eta is None or not int(eta["notnull"]):
+            return
+        with self._immediate():
+            self.db.execute("DROP TABLE IF EXISTS batches_nullable")
+            self.db.execute("""
+                CREATE TABLE batches_nullable (
+                    batch_id TEXT PRIMARY KEY,
+                    owner_token TEXT,
+                    state TEXT NOT NULL,
+                    device TEXT NOT NULL,
+                    task_name TEXT,
+                    engine TEXT,
+                    bucket TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_until TEXT NOT NULL,
+                    heartbeat_at TEXT,
+                    estimated_finish_s REAL,
+                    error TEXT
+                )
+            """)
+            names = (
+                "batch_id,owner_token,state,device,task_name,engine,bucket,created_at,"
+                "updated_at,lease_until,heartbeat_at,estimated_finish_s,error"
+            )
+            self.db.execute(
+                f"INSERT INTO batches_nullable ({names}) SELECT {names} FROM batches"
+            )
+            self.db.execute("DROP TABLE batches")
+            self.db.execute("ALTER TABLE batches_nullable RENAME TO batches")
 
     def _migrate_prepared_output_reservations(self) -> None:
         """Backfill the durable namespace or fail closed on historical collisions."""
@@ -544,7 +605,7 @@ class FleetQueue:
             "GROUP BY assigned_device").fetchall()
         return {r["d"]: r["c"] for r in rows}
 
-    def active_backlog(self, now: str | None = None) -> dict[str, float]:
+    def active_backlog(self, now: str | None = None) -> dict[str, float | None]:
         """Per-device REMAINING compute (seconds) of in-flight batches — the backlog the scheduler
         adds to a new job's finish estimate so it won't pile onto a busy device when an idle one
         would finish sooner. Per batch: max(0, estimated_finish_s - elapsed_since_claim).
@@ -552,17 +613,22 @@ class FleetQueue:
         device for that pool, so these do not double-count a shared wait."""
         now = now or utc_now_iso()
         now_t = _parse_iso(now)
-        out: dict[str, float] = {}
+        out: dict[str, float | None] = {}
         rows = self.db.execute(
             "SELECT device, created_at, estimated_finish_s FROM batches "
             "WHERE state IN ('leased','staging','running','fetching')").fetchall()
         for r in rows:
-            est = float(r["estimated_finish_s"] or 0.0)
-            if est <= 0:
+            if r["estimated_finish_s"] is None:
+                out[r["device"]] = None
+                continue
+            est = float(r["estimated_finish_s"])
+            if est < 0:
                 continue
             started = _parse_iso(r["created_at"])
             elapsed = max(0.0, now_t - started) if (now_t and started) else 0.0
-            out[r["device"]] = out.get(r["device"], 0.0) + max(0.0, est - elapsed)
+            if r["device"] in out and out[r["device"]] is None:
+                continue
+            out[r["device"]] = float(out.get(r["device"], 0.0)) + max(0.0, est - elapsed)
         return out
 
     # --- state transitions ------------------------------------------------
@@ -596,7 +662,7 @@ class FleetQueue:
     # --- batch + resource-lease primitives (dispatcher) -------------------
     def claim_many(self, job_ids: list[str], device: str, *, batch_id: str,
                    lease_until: str, pool: str | None = "gpu", task_name: str = "",
-                   engine: str = "", bucket: str = "", estimated_finish_s: float = 0.0,
+                   engine: str = "", bucket: str = "", estimated_finish_s: float | None = 0.0,
                    now: str | None = None,
                    current_spec_ids: dict[str, str | None] |
                    Callable[[], dict[str, str | None]] | None = None,
@@ -700,7 +766,8 @@ class FleetQueue:
                     "created_at,updated_at,lease_until,heartbeat_at,estimated_finish_s) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (batch_id, owner_token, "leased", device, task_name, engine, bucket, now, now,
-                     lease_until, now, float(estimated_finish_s)))
+                     lease_until, now,
+                     None if estimated_finish_s is None else float(estimated_finish_s)))
                 if pool:
                     self.db.execute(
                         "INSERT INTO resource_leases (device,pool,batch_id,lease_until) "
@@ -815,7 +882,8 @@ class FleetQueue:
 
     def complete_batch(self, batch_id: str, *, expected_state: str,
                        owner_token: str, now: str | None = None,
-                       result_record: str | None = None) -> bool:
+                       result_record: str | None = None,
+                       observation: dict[str, Any] | None = None) -> bool:
         """Mark a batch done only for its current, unexpired owner."""
         now = now or utc_now_iso()
         with self._immediate():
@@ -833,6 +901,7 @@ class FleetQueue:
                             "last_error=NULL, last_result=?, updated_at=? "
                             "WHERE batch_id=? AND state=?",
                             (result_record, now, batch_id, expected_state))
+            self._insert_profile_observation(batch_id, observation, now)
             self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
             return True
 
@@ -843,7 +912,8 @@ class FleetQueue:
                              clear_force_device: bool = False,
                              dispositions: dict[str, str] | None = None,
                              results: dict[str, str] | None = None,
-                             result_record: str | None = None) -> bool:
+                             result_record: str | None = None,
+                             observation: dict[str, Any] | None = None) -> bool:
         """Finish an ACTIVE batch from per-item worker results.
 
         ``succeeded`` maps job_id -> optional output_manifest JSON; those jobs become ``done``.
@@ -901,8 +971,110 @@ class FleetQueue:
                     failed.get(jid) or "missing item result",
                     dispositions.get(jid, "retry"), results.get(jid), now,
                     max_attempts, clear_force_device)
+            self._insert_profile_observation(batch_id, observation, now)
             self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
             return True
+
+    @staticmethod
+    def _finite_optional(value: Any, name: str) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"profile observation {name} must be numeric or null")
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"profile observation {name} must be finite and nonnegative")
+        return number
+
+    def _insert_profile_observation(self, batch_id: str,
+                                    observation: dict[str, Any] | None,
+                                    recorded_at: str) -> None:
+        """Insert one raw observation inside the caller's terminal transaction."""
+        if observation is None:
+            return
+        expected = {
+            "profile_key", "family_id", "device", "adapter_id", "prepared_units",
+            "observed_units", "controller_elapsed_s", "worker_elapsed_s", "peak_rss_mb",
+            "peak_vram_mb", "accepted_duration", "reject_reason", "result_digest",
+        }
+        if not isinstance(observation, dict) or set(observation) != expected:
+            raise ValueError("profile observation has unknown or missing fields")
+        device = observation["device"]
+        if not isinstance(device, str) or not device:
+            raise ValueError("profile observation device must be non-empty")
+        accepted = observation["accepted_duration"]
+        if type(accepted) is not bool:
+            raise ValueError("profile observation accepted_duration must be boolean")
+        values = {
+            name: self._finite_optional(observation[name], name)
+            for name in (
+                "prepared_units", "observed_units", "controller_elapsed_s", "worker_elapsed_s",
+                "peak_rss_mb", "peak_vram_mb",
+            )
+        }
+        digest = observation["result_digest"]
+        is_digest = lambda value: (  # noqa: E731
+            isinstance(value, str) and len(value) == 71 and value.startswith("sha256:")
+            and all(char in "0123456789abcdef" for char in value[7:])
+        )
+        if digest is not None and not is_digest(digest):
+            raise ValueError("profile observation result_digest must be a sha256 identity or null")
+        if accepted and (
+                values["prepared_units"] is None
+                or values["observed_units"] is None
+                or values["controller_elapsed_s"] is None
+                or values["controller_elapsed_s"] <= 0
+                or not is_digest(observation["profile_key"])
+                or not is_digest(observation["family_id"])
+                or not is_digest(observation["adapter_id"])
+                or observation["reject_reason"] is not None):
+            raise ValueError(
+                "accepted duration requires verified work, profile identities, and positive elapsed time"
+            )
+        if not accepted and (not isinstance(observation["reject_reason"], str)
+                             or not observation["reject_reason"]):
+            raise ValueError("rejected duration requires a reason")
+        self.db.execute(
+            "INSERT INTO fleet_profile_observations ("
+            "batch_id,profile_key,family_id,device,adapter_id,prepared_units,observed_units,"
+            "controller_elapsed_s,worker_elapsed_s,peak_rss_mb,peak_vram_mb,accepted_duration,"
+            "reject_reason,result_digest,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                batch_id,
+                observation["profile_key"],
+                observation["family_id"],
+                device,
+                observation["adapter_id"],
+                values["prepared_units"],
+                values["observed_units"],
+                values["controller_elapsed_s"],
+                values["worker_elapsed_s"],
+                values["peak_rss_mb"],
+                values["peak_vram_mb"],
+                1 if accepted else 0,
+                observation["reject_reason"],
+                observation["result_digest"],
+                recorded_at,
+            ),
+        )
+
+    def profile_observations(self, *, batch_id: str | None = None,
+                             profile_key: str | None = None) -> list[dict[str, Any]]:
+        """Read retained raw observations for deterministic profile rebuilding."""
+        clauses: list[str] = []
+        values: list[str] = []
+        if batch_id is not None:
+            clauses.append("batch_id=?")
+            values.append(batch_id)
+        if profile_key is not None:
+            clauses.append("profile_key=?")
+            values.append(profile_key)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.db.execute(
+            "SELECT * FROM fleet_profile_observations" + where + " ORDER BY recorded_at,batch_id",
+            tuple(values),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def _finish_failed_item(self, row: sqlite3.Row, batch_id: str, error: str,
                             disposition: str, record: str | None, now: str,
@@ -957,7 +1129,8 @@ class FleetQueue:
                    owner_token: str, now: str | None = None,
                    max_attempts: int = MAX_ATTEMPTS,
                    clear_force_device: bool = False,
-                   result_record: str | None = None) -> bool:
+                   result_record: str | None = None,
+                   observation: dict[str, Any] | None = None) -> bool:
         """Fail a batch atomically only for its current, unexpired owner.
 
         Requeue jobs that have attempts left (clearing their batch + device),
@@ -976,6 +1149,32 @@ class FleetQueue:
             self._finish_batch_failure(
                 batch_id, error, now, max_attempts, clear_force_device, result_record,
             )
+            self._insert_profile_observation(batch_id, observation, now)
+            return True
+
+    def mark_completion_unknown(self, batch_id: str, error: str, *, expected_state: str,
+                                owner_token: str, now: str | None = None,
+                                result_record: str | None = None,
+                                observation: dict[str, Any] | None = None) -> bool:
+        """Fence ambiguous post-launch work without authorizing an automatic replay."""
+        if expected_state not in {"running", "fetching"}:
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            cur = self.db.execute(
+                "UPDATE batches SET state='failed',error=?,updated_at=? WHERE batch_id=? "
+                "AND state=? AND owner_token=? AND lease_until>?",
+                (error, now, batch_id, expected_state, owner_token, now),
+            )
+            if not cur.rowcount:
+                return False
+            self.db.execute(
+                "UPDATE jobs SET state='completion_unknown',leased_until=NULL,last_error=?,"
+                "last_result=?,updated_at=? WHERE batch_id=? AND state=?",
+                (error, result_record, now, batch_id, expected_state),
+            )
+            self._insert_profile_observation(batch_id, observation, now)
+            self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
             return True
 
     def _finish_batch_failure(self, batch_id: str, error: str, now: str,
@@ -999,18 +1198,63 @@ class FleetQueue:
     def _expire_batch(self, batch_id: str, *, now: str,
                       max_attempts: int = MAX_ATTEMPTS) -> bool:
         """Recovery-only transition authorized solely by an expired lease."""
-        active = ",".join("?" * len(_BATCH_ACTIVE))
         error = "lease expired (stale recovery)"
         with self._immediate():
+            row = self.db.execute(
+                "SELECT state FROM batches WHERE batch_id=? AND lease_until<?",
+                (batch_id, now),
+            ).fetchone()
+            if row is None or row["state"] not in _BATCH_ACTIVE:
+                return False
+            state = str(row["state"])
             cur = self.db.execute(
-                f"UPDATE batches SET state='failed', error=?, updated_at=? WHERE batch_id=? "
-                f"AND state IN ({active}) AND lease_until<?",
-                (error, now, batch_id, *_BATCH_ACTIVE, now),
+                "UPDATE batches SET state='failed', error=?, updated_at=? WHERE batch_id=? "
+                "AND state=? AND lease_until<?",
+                (error, now, batch_id, state, now),
             )
             if not cur.rowcount:
                 return False
-            self._finish_batch_failure(batch_id, error, now, max_attempts)
+            if state in {"leased", "staging"}:
+                # Launch was never authorized, so bounded retry is safe.
+                self._finish_batch_failure(batch_id, error, now, max_attempts)
+            elif self._batch_replay_policy(batch_id) == "idempotent-v1":
+                self._finish_batch_failure(batch_id, error, now, max_attempts)
+            else:
+                # Running/fetching means launch happened or may have happened.
+                # Without a target-side deduplication receipt, replay could repeat
+                # external effects. Hold the idempotency key until explicit review.
+                self.db.execute(
+                    "UPDATE jobs SET state='completion_unknown',leased_until=NULL,"
+                    "last_error=?,updated_at=? WHERE batch_id=? "
+                    "AND state IN ('running','fetching')",
+                    ("completion unknown after lease expiry", now, batch_id),
+                )
+                self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
             return True
+
+    def _batch_replay_policy(self, batch_id: str) -> str:
+        """Frozen replay policy for a compatible batch; commands are at-most-once."""
+        row = self.db.execute(
+            "SELECT j.spec_id,s.canonical_json FROM jobs j "
+            "LEFT JOIN prepared_specs s ON s.spec_id=j.spec_id "
+            "WHERE j.batch_id=? LIMIT 1",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            return "at-most-once-v1"
+        try:
+            spec = json.loads(row["canonical_json"] or "{}")
+            if spec.get("kind") == "command":
+                return "at-most-once-v1"
+            replay = spec["definition"]["execution"]["replay"]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return "at-most-once-v1"
+        return replay if replay in {"at-most-once-v1", "idempotent-v1"} \
+            else "at-most-once-v1"
+
+    def batch_replay_policy(self, batch_id: str) -> str:
+        """Return the frozen replay declaration for one claimed batch."""
+        return self._batch_replay_policy(batch_id)
 
     def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
@@ -1155,19 +1399,37 @@ class BatchHeartbeat:
         )
         self._stop = threading.Event()
         self.ownership_lost = threading.Event()
+        self._state_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     def _renew(self, queue: FleetQueue) -> bool:
-        now = utc_now_iso()
-        # Queue timestamps have one-second resolution. A two-second floor keeps
-        # a deliberately tiny one-second test lease from becoming equal to
-        # ``now`` at the next tick before the sub-second heartbeat can advance it.
-        extension = max(2, self.lease_seconds)
-        return queue.heartbeat(
-            self.batch_id, iso_plus_seconds(now, extension),
-            expected_state=self.expected_state,
-            owner_token=self.owner_token, now=now,
-        )
+        with self._state_lock:
+            now = utc_now_iso()
+            # Queue timestamps have one-second resolution. A two-second floor keeps
+            # a deliberately tiny one-second test lease from becoming equal to
+            # ``now`` at the next tick before the sub-second heartbeat can advance it.
+            extension = max(2, self.lease_seconds)
+            return queue.heartbeat(
+                self.batch_id, iso_plus_seconds(now, extension),
+                expected_state=self.expected_state,
+                owner_token=self.owner_token, now=now,
+            )
+
+    def transition(self, queue: FleetQueue, state: str) -> bool:
+        """Move the fenced batch and heartbeat expectation as one local critical section."""
+        with self._state_lock:
+            if self.ownership_lost.is_set():
+                return False
+            if not queue.set_batch_state(
+                self.batch_id,
+                state,
+                expected_state=self.expected_state,
+                owner_token=self.owner_token,
+            ):
+                self.ownership_lost.set()
+                return False
+            self.expected_state = state
+            return True
 
     def __enter__(self) -> "BatchHeartbeat":
         queue: FleetQueue | None = None

@@ -18,9 +18,10 @@ requirements_by_option = { quality = { compact = [], archival = ["zot.archive"] 
 
 [fleet.tasks.zotomatic.execution]
 batching = "compatible"           # never | compatible
+replay = "at-most-once-v1"        # at-most-once-v1 | idempotent-v1
 
 [fleet.tasks.zotomatic.cost]
-measure = "input-bytes"           # none | input-bytes | text-codepoints | item-count
+measure = "input-bytes"           # none | input-bytes | text-codepoints | item-count | external-scalar-v1
 unit = "bytes"                    # absent when measure = "none"
 divisor = 1                       # absent when measure = "none"
 bucket_options = ["quality"]      # isolate behavior/cost-relevant option lanes

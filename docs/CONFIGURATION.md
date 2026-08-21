@@ -250,9 +250,42 @@ usage from their primary-volume metadata.
 Configured work is defined only under `[fleet.tasks.<name>]` in the private
 `config/devices.toml`; start from `config/fleet_tasks.example.toml`. Each definition
 declares accepted input, typed options, fixed and option-derived capability requirements,
-batching, exact cost units (or an honest `none`), output reservation and verification,
+batching and replay policy, exact cost units (or an honest `none`), output reservation and verification,
 completion evidence, and one or more device adapters. Unknown fields and unsafe
 combinations are rejected before enqueue.
+
+Every configured task declares `execution.replay = "at-most-once-v1"` or
+`"idempotent-v1"`. The latter is truthful only for a target worker with a durable atomic ledger
+keyed by the frozen `work_id`; producing the same filename is not deduplication. Stale work whose
+launch was authorized is held as `completion_unknown` under at-most-once execution.
+
+Missing timing evidence never weakens capability, pool, concurrency, or memory qualification.
+When several devices qualify but none has a usable in-range duration profile, remrun selects one
+stable cold-start target, returns a null ETA with `estimate_reason="uncalibrated"`, and learns from
+later distinct jobs. It never runs the submitted job on multiple devices as a benchmark.
+
+When built-in input bytes, text codepoints, or item count cannot express the natural work amount,
+the optional `external-scalar-v1` cost measure runs a narrow read-only controller-side command
+before enqueue:
+
+```toml
+[fleet.tasks.zotomatic.cost]
+measure = "external-scalar-v1"
+unit = "zot-work-v1"
+bucket_options = ["quality"]
+verify_relative_tolerance = 0.001
+
+[fleet.tasks.zotomatic.cost.command]
+argv = ["/opt/zot/bin/measure-work", "{request}"]
+timeout_s = 30
+identity_paths = ["/opt/zot/bin/measure-work", "/opt/zot/share/work-rules.v1.json"]
+```
+
+The executable and every authority file must exist at absolute paths and are content-hashed into
+`measure_id`. Exactly one whole-token `{request}` is allowed; there is no shell. Any timeout,
+oversized or malformed response, input mutation, authority mutation, or identity mismatch aborts
+preparation and enqueues nothing. Successful performed work returns `WorkUnitsV2` with the same
+unit, measure ID, and value (within at most 1% configured tolerance).
 
 The configured name is opaque to remrun. Adding a new workflow never requires a source
 enum, classifier, extension table, output rule, or cost prior. Controller-side executable
@@ -271,7 +304,8 @@ explicit target may continue to the worker's immediate preflight when qualificat
 unknown.
 
 Compatible multi-item workers return `ResultEnvelopeV2` rows matching the frozen manifest.
-Malformed or unattributed evidence is terminal and is never used for cost learning. The
+Malformed or unattributed post-launch evidence is held for review and is never used for duration
+learning. The
 intrinsic `fleet command` family remains exact, nonbatchable argv passthrough and does not
 use a configured task named `cmd`.
 

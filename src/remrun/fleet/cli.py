@@ -28,6 +28,9 @@ from ..transport import make_transport, _posix_cancel_script, _powershell_cancel
 
 EXIT_OK = 0
 EXIT_ERROR = 1
+EXIT_STUCK = 2
+EXIT_INFRA = 4
+EXIT_CANCELLED = 130
 
 # No console-window flash on Windows when invoked from a GUI trigger; 0 elsewhere.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -159,7 +162,9 @@ def _route_preview(task: FleetTask, config, q: FleetQueue, state_root) -> dict:
     busy = active > 0 or _pool_lease_count(q, task, b.device) > 0
     return {"device": b.device, "engine": adapters.engine_for(task, b.device),
             "variant": task.options.get("_variant"), "device_busy": busy,
-            "active_on_device": active, "estimated_finish_s": b.estimated_finish_s}
+            "active_on_device": active, "estimated_finish_s": b.estimated_finish_s,
+            "selection_basis": b.selection_basis,
+            "estimate_reason": b.estimate_reason}
 
 
 def _route_preview_multi(tasks: list[FleetTask], config, q: FleetQueue, state_root) -> dict:
@@ -227,7 +232,11 @@ def cmd_plan(args, reporter: Reporter) -> int:
         "cost": [record["cost"] for record in records],
         "batches": [{"device": batch.device, "jobs": batch.job_indices,
                      "estimated_finish_s": batch.estimated_finish_s,
-                     "reason": batch.reason} for batch in result.batches],
+                     "reason": batch.reason,
+                     "selection_basis": batch.selection_basis,
+                     "estimate_reason": batch.estimate_reason}
+                    for batch in result.batches],
+        "makespan_s": result.makespan_s,
         "skipped": result.skipped, "note": result.note,
     }
     if records and "limits" in records[0]:
@@ -241,10 +250,18 @@ def cmd_plan(args, reporter: Reporter) -> int:
             event["memory_limit_mib"] = records[0]["limits"]["process_tree_rss_mib"]
         reporter.event("fleet_task", **event)
         for batch in result.batches:
-            reporter.event("placement", device=batch.device,
-                           jobs=len(batch.job_indices),
-                           estimated_finish_s=batch.estimated_finish_s,
-                           reason=batch.reason)
+            fields = {
+                "device": batch.device,
+                "jobs": len(batch.job_indices),
+                "estimated_finish_s": batch.estimated_finish_s,
+                "reason": batch.reason,
+                "selection_basis": batch.selection_basis,
+                "estimate_reason": batch.estimate_reason,
+            }
+            if batch.estimated_finish_s is None \
+                    and batch.estimate_reason == "uncalibrated":
+                fields["message"] = "Uncalibrated placement; no duration estimate."
+            reporter.event("placement", **fields)
         for device, reason in sorted(result.skipped.items()):
             reporter.event("skipped", device=device, reason=reason)
     return EXIT_OK if result.batches else EXIT_ERROR
@@ -390,7 +407,10 @@ def cmd_command(args, reporter: Reporter) -> int:
         "estimate": {"status": "unestimated", "estimated_seconds": None},
         "batches": [{"device": batch.device, "jobs": batch.job_indices,
                      "estimated_finish_s": batch.estimated_finish_s,
-                     "reason": batch.reason} for batch in result.batches],
+                     "reason": batch.reason,
+                     "selection_basis": batch.selection_basis,
+                     "estimate_reason": batch.estimate_reason}
+                    for batch in result.batches],
         "skipped": result.skipped,
     }
     if "limits" in record:
@@ -461,9 +481,15 @@ def cmd_dispatch(args, reporter: Reporter) -> int:
         else:
             reporter.event("dispatch_tick", **{k: v for k, v in summary.items() if k != "skipped"})
         return EXIT_OK
-    dispatcher.run(config, poll_s=args.poll, debounce_s=args.debounce,
-                   until_empty=getattr(args, "drain", False), reporter=reporter)
-    return EXIT_OK
+    result = dispatcher.run(
+        config, poll_s=args.poll, debounce_s=args.debounce,
+        until_empty=getattr(args, "drain", False), reporter=reporter,
+    )
+    if args.json:
+        print(json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")))
+    else:
+        reporter.event("dispatch_final", **result.to_dict())
+    return result.exit_code
 
 
 def cmd_clear(args, reporter: Reporter) -> int:
@@ -957,7 +983,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
-    reporter = Reporter(json_events=False)
+    reporter = Reporter(json_events=bool(
+        args.fleet_command == "dispatch" and getattr(args, "json", False)
+    ))
     try:
         if args.fleet_command == "plan":
             return cmd_plan(args, reporter)

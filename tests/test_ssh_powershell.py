@@ -847,7 +847,7 @@ def test_exec_ssh_255_is_infra_error(monkeypatch):
 
 def test_workers_running_uses_native_and_wsl_patterns(monkeypatch):
     t = SSHPowerShellTransport(device(cancel={
-        "process_patterns": ["tts-worker"],
+        "process_patterns": ["alpha-worker"],
         "wsl_process_patterns": ["vllm-worker"],
     }))
     t._address = "winbox"
@@ -856,7 +856,7 @@ def test_workers_running_uses_native_and_wsl_patterns(monkeypatch):
     assert t.workers_running() is True
     script = decoded(rec.commands[-1])
     assert "Win32_Process" in script
-    assert "tts-worker" in script
+    assert "alpha-worker" in script
     assert "wsl.exe -- bash -lc" in script
     assert "ps ax -o pid= -o command=" in script
     assert "grep -v __REMRUN_WORKERS__" in script

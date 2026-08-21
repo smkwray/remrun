@@ -137,13 +137,43 @@ def _validate_item(item: Any, expected: Mapping[str, Any], completion: Mapping[s
         raise ResultProtocolError("failure_code must be null or a token")
     work_units = item["work_units"]
     if work_units is not None:
-        if not isinstance(work_units, dict) or set(work_units) != {"unit", "value"}:
-            raise ResultProtocolError("work_units has the wrong fields")
-        if (not isinstance(work_units["unit"], str) or not work_units["unit"]
+        if expected.get("measure_id") is None:
+            if not isinstance(work_units, dict) or set(work_units) != {"unit", "value"}:
+                raise ResultProtocolError("legacy work_units has the wrong fields")
+            if (not isinstance(work_units["unit"], str) or not work_units["unit"]
+                    or expected.get("cost_unit") is None
+                    or work_units["unit"] != expected.get("cost_unit")):
+                raise ResultProtocolError("work_units unit does not match prepared cost unit")
+            _finite(work_units["value"], "work_units.value")
+        else:
+            if not isinstance(work_units, dict) \
+                    or set(work_units) != {"unit", "value", "measure_id"}:
+                raise ResultProtocolError("work_units has the wrong fields")
+            _result_id(work_units["measure_id"], "work_units.measure_id")
+            value = _finite(work_units["value"], "work_units.value")
+            prepared_value = expected.get("prepared_value")
+            mismatch = (
+                not isinstance(work_units["unit"], str)
+                or not work_units["unit"]
                 or expected.get("cost_unit") is None
-                or work_units["unit"] != expected.get("cost_unit")):
-            raise ResultProtocolError("work_units unit does not match prepared cost unit")
-        _finite(work_units["value"], "work_units.value")
+                or work_units["unit"] != expected.get("cost_unit")
+                or work_units["measure_id"] != expected.get("measure_id")
+            )
+            if prepared_value is not None:
+                tolerance = float(expected.get("verify_relative_tolerance") or 0.0)
+                difference = abs(value - float(prepared_value))
+                allowed = (0.0 if float(prepared_value) == 0
+                           else abs(float(prepared_value)) * tolerance)
+                mismatch = mismatch or difference > allowed
+            if mismatch:
+                outcome = item["outcome"] = "review"
+                disposition = item["disposition"] = "none"
+                item["retry_after_s"] = None
+                item["failure_code"] = "work_measure_mismatch"
+                item["message"] = "worker work measure does not match frozen prepared work"
+    elif (outcome == "succeeded" and item["work_performed"]
+          and expected.get("cost_status") == "exact"):
+        raise ResultProtocolError("successful performed work requires WorkUnitsV2")
     elapsed = item["elapsed_s"]
     if elapsed is not None:
         _finite(elapsed, "elapsed_s")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -24,6 +25,7 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RESERVED_OPTIONS = {"argv", "spec_id", "prepared_id", "work_id"}
 _PLACEHOLDERS = {"{stage}", "{manifest}", "{output_root}"}
+_MAX_MEASURE_TIMEOUT_S = 300.0
 
 
 def canonical_json(value: Any) -> str:
@@ -253,11 +255,15 @@ def _validate_options(raw: Any) -> dict[str, Any]:
 def _validate_cost(raw: Any, input_spec: Mapping[str, Any],
                    options: Mapping[str, Any]) -> dict[str, Any]:
     table = _table(raw, "cost")
-    allowed = {"measure", "unit", "divisor", "bucket_options"}
+    allowed = {
+        "measure", "unit", "divisor", "bucket_options", "verify_relative_tolerance",
+        "command",
+    }
     _closed(table, allowed, "cost")
     _required(table, {"measure", "bucket_options"}, "cost")
     measure = _enum(table["measure"],
-                    {"none", "input-bytes", "text-codepoints", "item-count"},
+                    {"none", "input-bytes", "text-codepoints", "item-count",
+                     "external-scalar-v1"},
                     "cost.measure")
     bucket = table["bucket_options"]
     if not isinstance(bucket, list) or any(not isinstance(name, str) for name in bucket):
@@ -278,14 +284,82 @@ def _validate_cost(raw: Any, input_spec: Mapping[str, Any],
         raise TaskContractError("text-codepoints requires text-capable input")
     if measure == "item-count" and mode not in {"files", "text-or-files"}:
         raise TaskContractError("item-count requires file-capable input")
+    if measure == "external-scalar-v1" and mode != "files":
+        raise TaskContractError("external-scalar-v1 requires input.mode=files")
     out: dict[str, Any] = {"measure": measure, "bucket_options": bucket}
     if measure == "none":
-        if "unit" in table or "divisor" in table:
-            raise TaskContractError("cost unit/divisor forbidden when measure=none")
+        if set(table) & {"unit", "divisor", "verify_relative_tolerance", "command"}:
+            raise TaskContractError("cost unit/divisor/verification/command forbidden when measure=none")
+    elif measure == "external-scalar-v1":
+        _required(table, {"unit", "command"}, "cost")
+        if "divisor" in table:
+            raise TaskContractError("cost.divisor is forbidden for external-scalar-v1")
+        out["unit"] = _token(table["unit"], "cost.unit")
+        out["verify_relative_tolerance"] = _number(
+            table.get("verify_relative_tolerance", 0.0),
+            "cost.verify_relative_tolerance", minimum=0.0, maximum=0.01,
+        )
+        command = _table(table["command"], "cost.command")
+        _closed(command, {"argv", "timeout_s", "identity_paths"}, "cost.command")
+        _required(command, {"argv", "timeout_s", "identity_paths"}, "cost.command")
+        argv = _argv(command["argv"], "cost.command.argv")
+        executable = Path(argv[0]).expanduser()
+        if not executable.is_absolute():
+            raise TaskContractError("cost.command.argv[0] must be an absolute executable")
+        executable = executable.resolve()
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise TaskContractError("cost.command.argv[0] must resolve to an executable file")
+        if argv.count("{request}") != 1:
+            raise TaskContractError(
+                "cost.command.argv requires exactly one whole-token {request} placeholder"
+            )
+        shell_chars = set("|;&<>`\n\r")
+        for token in argv:
+            if (token != "{request}" and ("{" in token or "}" in token)):
+                raise TaskContractError(
+                    "cost.command.argv placeholders must occupy one whole token"
+                )
+            if any(char in token for char in shell_chars):
+                raise TaskContractError("cost.command.argv must not contain shell syntax")
+        raw_paths = command["identity_paths"]
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise TaskContractError("cost.command.identity_paths must be a non-empty path list")
+        identity_paths: list[str] = []
+        for index, raw_path in enumerate(raw_paths):
+            if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+                raise TaskContractError(
+                    f"cost.command.identity_paths[{index}] must be a path string"
+                )
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute() or not path.is_file():
+                raise TaskContractError(
+                    f"cost.command.identity_paths[{index}] must resolve to an existing file"
+                )
+            identity_paths.append(str(path.resolve()))
+        if len(set(identity_paths)) != len(identity_paths):
+            raise TaskContractError("cost.command.identity_paths contains duplicates")
+        if str(executable) not in identity_paths:
+            raise TaskContractError(
+                "cost.command.identity_paths must include the resolved executable"
+            )
+        out["command"] = {
+            "argv": [str(executable), *argv[1:]],
+            "timeout_s": _number(
+                command["timeout_s"], "cost.command.timeout_s",
+                minimum=0.001, maximum=_MAX_MEASURE_TIMEOUT_S,
+            ),
+            "identity_paths": identity_paths,
+        }
     else:
         _required(table, {"unit", "divisor"}, "cost")
+        if "command" in table:
+            raise TaskContractError("cost.command requires measure=external-scalar-v1")
         out["unit"] = _token(table["unit"], "cost.unit")
         out["divisor"] = _number(table["divisor"], "cost.divisor", minimum=1e-300)
+        out["verify_relative_tolerance"] = _number(
+            table.get("verify_relative_tolerance", 0.0),
+            "cost.verify_relative_tolerance", minimum=0.0, maximum=0.01,
+        )
     return out
 
 
@@ -422,10 +496,12 @@ def validate_task_definition(name: str, raw: Any, devices: Iterable[str]) -> dic
     input_spec = _validate_input(table["input"])
     prepare = _validate_prepare(table["prepare"])
     execution = _table(table["execution"], "execution")
-    _closed(execution, {"batching"}, "execution")
-    _required(execution, {"batching"}, "execution")
+    _closed(execution, {"batching", "replay"}, "execution")
+    _required(execution, {"batching", "replay"}, "execution")
     batching = _enum(execution["batching"], {"never", "compatible"},
                      "execution.batching")
+    replay = _enum(execution["replay"], {"at-most-once-v1", "idempotent-v1"},
+                   "execution.replay")
     options = _validate_options(table.get("options"))
     routing = _validate_routing(table["routing"], options)
     cost = _validate_cost(table["cost"], input_spec, options)
@@ -436,7 +512,7 @@ def validate_task_definition(name: str, raw: Any, devices: Iterable[str]) -> dic
         "input": input_spec,
         "prepare": prepare,
         "routing": routing,
-        "execution": {"batching": batching},
+        "execution": {"batching": batching, "replay": replay},
         "cost": cost,
         "output": output,
         "completion": completion,

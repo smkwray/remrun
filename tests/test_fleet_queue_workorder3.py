@@ -205,7 +205,7 @@ def test_expired_recovered_batch_cannot_be_revived_or_completed(tmp_path) -> Non
         "revive", expected_state="running", owner_token=owner, now=_NOW,
     )
     assert queue.get_batch("revive")["state"] == "failed"
-    assert queue.get(job_id)["state"] == "queued"
+    assert queue.get(job_id)["state"] == "completion_unknown"
     queue.close()
 
 

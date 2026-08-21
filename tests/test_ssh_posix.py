@@ -35,7 +35,7 @@ def device(**over) -> Device:
         "state_root": "~/.local/state/remrun",
         "cache_root": "~/.cache/remrun",
         "cancel": {
-            "process_patterns": ["tts-worker", "ocr-worker"],
+            "process_patterns": ["alpha-worker", "beta-worker"],
             "lock_paths": ["/tmp/remrun-test-worker.lock"],
         },
     }
@@ -84,7 +84,7 @@ def test_kill_workers_pkills_workers_and_releases_lock(monkeypatch):
     assert t.kill_workers() is True
     script = rec.scripts[-1]
     assert "pkill -f" in script
-    assert "tts-worker" in script and "ocr-worker" in script
+    assert "alpha-worker" in script and "beta-worker" in script
     assert "rm -rf -- /tmp/remrun-test-worker.lock" in script
 
 
@@ -97,7 +97,7 @@ def test_workers_running_uses_configured_patterns(monkeypatch):
     script = rec.scripts[-1]
     assert "ps ax -o pid= -o command=" in script
     assert "grep -v __REMRUN_WORKERS__" in script
-    assert "tts-worker" in script and "ocr-worker" in script
+    assert "alpha-worker" in script and "beta-worker" in script
     assert "__REMRUN_WORKERS__" in script
 
 

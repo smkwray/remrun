@@ -157,6 +157,7 @@ requirements_by_option = { quality = { compact = [], archival = ["zot.archive"] 
 
 [fleet.tasks.zotomatic.execution]
 batching = "compatible"
+replay = "at-most-once-v1"
 
 [fleet.tasks.zotomatic.cost]
 measure = "input-bytes"

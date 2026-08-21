@@ -38,7 +38,7 @@ def _definition(worker: str, output_root: str) -> dict:
                   "file_identity": "sha256"},
         "prepare": {"mode": "none"},
         "routing": {"requirements": [], "requirements_by_option": {}},
-        "execution": {"batching": "compatible"},
+        "execution": {"batching": "compatible", "replay": "at-most-once-v1"},
         "cost": {"measure": "item-count", "unit": "items", "divisor": 1,
                  "bucket_options": []},
         "output": {"reservation": "content-work-stem-v1", "allow_root_override": False,
@@ -114,7 +114,8 @@ def test_configured_task_executes_frozen_manifest_and_result_v2(tmp_path) -> Non
         "'prepared_id':i['prepared_id'],'index':i['index'],'outcome':'succeeded',"
         "'disposition':'none','retry_after_s':None,'publication':'produced',"
         "'work_performed':True,'outputs':[out],'companion':None,'message':None,"
-        "'failure_code':None,'resource':'none','work_units':{'unit':'items','value':1},"
+        "'failure_code':None,'resource':'none','work_units':{'unit':'items','value':1,"
+        "'measure_id':i['cost']['measure_id']},"
         "'elapsed_s':0.01,'details':{}}]}\n"
         "pathlib.Path(os.environ['REMRUN_BATCH_METRICS']).write_text(json.dumps(r))\n",
         encoding="utf-8",
@@ -136,7 +137,9 @@ def test_configured_task_executes_frozen_manifest_and_result_v2(tmp_path) -> Non
     assert result["ok"] is True and result["completion_evidence"] == "complete"
     assert result["item_results"][0]["prepared_id"] == prepared["prepared_id"]
     assert (output_root / result["item_results"][0]["outputs"][0]).read_text() == "done"
-    assert profiles.prepared_profile_key(task, "LOCAL_SIM") in profiles.load_profiles(
+    # Raw execution evidence is admitted only by the queue's atomic terminal
+    # transition, never by the executor on its own.
+    assert profiles.prepared_profile_key(task, "LOCAL_SIM") not in profiles.load_profiles(
         tmp_path / "state"
     )
 
@@ -153,7 +156,7 @@ def test_exit_code_worker_is_not_asked_for_structured_metrics(tmp_path) -> None:
         encoding="utf-8",
     )
     definition = _definition(str(worker), str(output_root))
-    definition["execution"] = {"batching": "never"}
+    definition["execution"] = {"batching": "never", "replay": "at-most-once-v1"}
     definition["output"] = {
         "reservation": "none", "allow_root_override": False, "verification": "none",
     }
@@ -193,7 +196,8 @@ def test_malformed_result_digest_is_terminal_and_not_learned(tmp_path) -> None:
         "'disposition':'none','retry_after_s':None,'publication':'produced',"
         "'work_performed':True,'outputs':[i['reservations'][0]['stem']+'.bin'],"
         "'companion':None,'message':None,'failure_code':None,'resource':'none',"
-        "'work_units':{'unit':'items','value':1},'elapsed_s':0.01,'details':{}}]}\n"
+        "'work_units':{'unit':'items','value':1,'measure_id':i['cost']['measure_id']},"
+        "'elapsed_s':0.01,'details':{}}]}\n"
         "pathlib.Path(os.environ['REMRUN_BATCH_METRICS']).write_text(json.dumps(r))\n",
         encoding="utf-8",
     )

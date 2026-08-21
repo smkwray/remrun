@@ -1,21 +1,22 @@
 """Fleet cost-profile store, keyed by frozen prepared-task identity.
 
-Reuses remrun's profile mechanics (EWMA, atomic replace, bounded retention) but a
-fleet-specific key and schema — there is NO warm-model field (Invariant 0); the
-only fixed term is the cold model load. Local, regenerable, never synced.
+Uses a fleet-specific key and a SQLite raw-observation journal; there is NO
+warm-model field (Invariant 0). Derived fits and the small local memory-correction
+cache are regenerable and never synced.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ..profile import _ewma
 from .models import FleetProfile
+from .task_contract import sha256_id
 
 FLEET_PROFILE_FILE = "fleet_profiles.json"
-DEFAULT_ALPHA = 0.4
 DEFAULT_MAX_ENTRIES = 256
 
 _COST_FIELDS = ("fixed_load_s", "var_per_unit_s", "peak_rss_mb", "peak_vram_mb")
@@ -24,36 +25,93 @@ _COST_FIELDS = ("fixed_load_s", "var_per_unit_s", "peak_rss_mb", "peak_vram_mb")
 def prepared_profile_key(task, device: str) -> str:  # noqa: ANN001
     """Exact learned-cost identity for frozen prepared work."""
     prepared = task.prepared
-    adapter = task.resolved_spec["adapters"][device]
+    adapter = (task.resolved_spec.get("adapters") or {}).get(device) or {}
     cost = prepared["cost"]
-    return "|".join([
-        prepared["spec_id"], adapter["adapter_id"], device,
-        cost.get("unit") or "none",
-        cost.get("bucket_id") or "none", cost.get("status") or "unestimated",
-    ])
+    return sha256_id({
+        "spec_id": prepared["spec_id"],
+        "adapter_id": adapter.get("adapter_id") or "raw-command",
+        "device": device,
+        "unit": cost.get("unit"),
+        "measure_id": cost.get("measure_id") or "legacy",
+        "bucket_id": cost.get("bucket_id"),
+    })
+
+
+def prepared_profile_family_id(task) -> str:  # noqa: ANN001
+    """Comparable-work identity; device and adapter are intentionally excluded."""
+    prepared = task.prepared
+    cost = prepared["cost"]
+    return sha256_id({
+        "spec_id": prepared["spec_id"],
+        "unit": cost.get("unit"),
+        "measure_id": cost.get("measure_id") or "legacy",
+        "bucket_id": cost.get("bucket_id"),
+    })
 
 
 def prepared_profile(profiles: dict, task, device: str) -> FleetProfile | None:  # noqa: ANN001
     if not task.prepared or task.prepared["cost"]["status"] == "unestimated":
         return None
     value = profiles.get(prepared_profile_key(task, device))
-    if not isinstance(value, dict) or value.get("fixed_load_s") is None:
+    if (not isinstance(value, dict) or value.get("fixed_load_s") is None
+            or value.get("model_ready") is False):
         return None
     return FleetProfile(
         fixed_load_s=value.get("fixed_load_s"), var_per_unit_s=value.get("var_per_unit_s"),
         peak_rss_mb=value.get("peak_rss_mb"), peak_vram_mb=value.get("peak_vram_mb"),
-        n=int(value.get("n", 0)), updated=str(value.get("updated", "")),
+        n=int(value.get("n", 0)), duration_n=int(value.get("duration_n", value.get("t_n", 0))),
+        resource_n=int(value.get("resource_n", value.get("n", 0))),
+        min_units=value.get("min_units"), max_units=value.get("max_units"),
+        normalized_rmse=value.get("normalized_rmse"), updated=str(value.get("updated", "")),
     )
 
 
-def merge_costs(local: dict, shared: dict) -> dict:
-    """Field-level merge of the local EWMA store over the shared measured costs.
+def prepared_resource_profile(profiles: dict, task, device: str) -> FleetProfile | None:  # noqa: ANN001
+    """Return resource evidence even while the duration model is unavailable."""
+    if not task.prepared:
+        return None
+    value = profiles.get(prepared_profile_key(task, device))
+    if not isinstance(value, dict):
+        return None
+    return FleetProfile(
+        fixed_load_s=value.get("fixed_load_s"), var_per_unit_s=value.get("var_per_unit_s"),
+        peak_rss_mb=value.get("peak_rss_mb"), peak_vram_mb=value.get("peak_vram_mb"),
+        n=int(value.get("n", 0)), duration_n=int(value.get("duration_n", value.get("t_n", 0))),
+        resource_n=int(value.get("resource_n", value.get("n", 0))),
+        min_units=value.get("min_units"), max_units=value.get("max_units"),
+        normalized_rmse=value.get("normalized_rmse"), updated=str(value.get("updated", "")),
+    )
 
-    For each key/field, a real local observation wins; otherwise optional shared
-    measured costs are used. This is the "don't forget" mechanism: a fresh
-    controller with no local store can still estimate from shared costs, while
-    local runs only *refine* (memory peaks today; fixed/slope if a regression is
-    added later). Returns a dict in the same schema placement reads."""
+
+def duration_observation_count(profiles: dict, task, device: str) -> int:  # noqa: ANN001
+    """Accepted duration observations for deterministic calibration ordering."""
+    value = profiles.get(prepared_profile_key(task, device))
+    if not isinstance(value, dict):
+        return 0
+    return max(0, int(value.get("duration_n", value.get("t_n", 0)) or 0))
+
+
+def estimate_unavailable_reason(profiles: dict, task, device: str,
+                                prepared_units: float) -> str:  # noqa: ANN001
+    value = profiles.get(prepared_profile_key(task, device))
+    if not isinstance(value, dict) or duration_observation_count(profiles, task, device) < 4:
+        return "uncalibrated"
+    if value.get("model_ready") is False:
+        return "model_unfit"
+    low, high = value.get("min_units"), value.get("max_units")
+    if low is not None and high is not None and not float(low) <= prepared_units <= float(high):
+        return "out_of_range"
+    return "uncalibrated"
+
+
+def merge_costs(local: dict, shared: dict, observed: dict | None = None) -> dict:
+    """Merge local resource corrections, shared seeds, and observation-derived fits.
+
+    A local resource correction wins over an optional shared seed. A fit rebuilt
+    from the SQLite observation journal then supplies duration evidence and may
+    only increase retained peak-memory evidence. Returns the schema placement
+    reads; no queue completion mutates this JSON cache directly.
+    """
     local = local or {}
     shared = shared or {}
     out: dict[str, dict] = {}
@@ -64,6 +122,121 @@ def merge_costs(local: dict, shared: dict) -> dict:
         row["n"] = int(loc.get("n", 0))
         row["updated"] = loc.get("updated") or s.get("updated", "")
         out[key] = row
+    for key, raw in (observed or {}).items():
+        if not isinstance(raw, dict):
+            continue
+        prior = out.get(key, {})
+        row = dict(prior)
+        row.update(raw)
+        for field in ("peak_rss_mb", "peak_vram_mb"):
+            values = [value for value in (prior.get(field), raw.get(field)) if value is not None]
+            row[field] = max(values) if values else None
+        out[key] = row
+    return out
+
+
+def _distinct_positive_levels(values: list[float]) -> int:
+    levels: list[float] = []
+    for value in sorted(item for item in values if item > 0):
+        if not levels or value > levels[-1] * 1.01:
+            levels.append(value)
+    return len(levels)
+
+
+def _duration_fit(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    """Conservative linear fit over the most recent 32 accepted observations."""
+    recent = rows[-32:]
+    units = [float(row["prepared_units"]) for row in recent]
+    elapsed = [float(row["controller_elapsed_s"]) for row in recent]
+    out: dict[str, Any] = {
+        "duration_n": len(recent),
+        "min_units": min(units) if units else None,
+        "max_units": max(units) if units else None,
+        "fixed_load_s": None,
+        "var_per_unit_s": None,
+        "normalized_rmse": None,
+        "model_ready": False,
+        "model_reason": "uncalibrated",
+    }
+    if len(recent) < 4:
+        return out
+    positive = [value for value in units if value > 0]
+    if (_distinct_positive_levels(units) < 3 or not positive
+            or max(positive) / min(positive) < 2.0):
+        out["model_reason"] = "model_unfit"
+        return out
+    count = float(len(units))
+    su = sum(units)
+    se = sum(elapsed)
+    suu = sum(value * value for value in units)
+    sue = sum(value * duration for value, duration in zip(units, elapsed))
+    denominator = count * suu - su * su
+    if denominator <= 1e-12:
+        out["model_reason"] = "model_unfit"
+        return out
+    slope = (count * sue - su * se) / denominator
+    intercept = (se - slope * su) / count
+    if not all(math.isfinite(value) and value >= 0 for value in (slope, intercept)):
+        out["model_reason"] = "model_unfit"
+        return out
+    residual = [
+        duration - (intercept + slope * value)
+        for value, duration in zip(units, elapsed)
+    ]
+    mean_elapsed = se / count
+    nrmse = ((sum(value * value for value in residual) / count) ** 0.5 / mean_elapsed
+             if mean_elapsed > 0 else float("inf"))
+    out["normalized_rmse"] = nrmse
+    if not math.isfinite(nrmse) or nrmse > 0.25:
+        out["model_reason"] = "model_unfit"
+        return out
+    out.update({
+        "fixed_load_s": round(intercept, 6),
+        "var_per_unit_s": round(slope, 6),
+        "model_ready": True,
+        "model_reason": None,
+    })
+    return out
+
+
+def load_observation_profiles(db_path: Path) -> dict[str, dict[str, Any]]:
+    """Derive placement profiles from the authoritative SQLite observation journal."""
+    path = Path(db_path)
+    if not path.exists():
+        return {}
+    uri = f"file:{path}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT * FROM fleet_profile_observations ORDER BY recorded_at,batch_id"
+        ).fetchall()
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    resources: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        key = row["profile_key"]
+        if not key:
+            continue
+        resources.setdefault(key, []).append(row)
+        if row["accepted_duration"]:
+            grouped.setdefault(key, []).append(row)
+    out: dict[str, dict[str, Any]] = {}
+    for key in set(resources) | set(grouped):
+        fit = _duration_fit(grouped.get(key, []))
+        resource_rows = resources.get(key, [])
+        rss = [float(row["peak_rss_mb"]) for row in resource_rows
+               if row["peak_rss_mb"] is not None]
+        vram = [float(row["peak_vram_mb"]) for row in resource_rows
+                if row["peak_vram_mb"] is not None]
+        fit.update({
+            "resource_n": sum(1 for row in resource_rows
+                              if row["peak_rss_mb"] is not None
+                              or row["peak_vram_mb"] is not None),
+            "peak_rss_mb": max(rss) if rss else None,
+            "peak_vram_mb": max(vram) if vram else None,
+            "n": len(resource_rows),
+            "updated": str(resource_rows[-1]["recorded_at"]) if resource_rows else "",
+        })
+        out[key] = fit
     return out
 
 
@@ -75,11 +248,10 @@ def load_profiles(state_root: Path) -> dict[str, Any]:
     p = _path(state_root)
     if not p.exists():
         return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, OSError, ValueError):
-        return {}
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"fleet profile cache must contain an object: {p}")
+    return data
 
 
 def _write_profiles(state_root: Path, profiles: dict[str, Any]) -> None:
@@ -88,56 +260,6 @@ def _write_profiles(state_root: Path, profiles: dict[str, Any]) -> None:
     tmp = p.with_suffix(p.suffix + f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(profiles, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, p)
-
-
-MIN_FIT_N = 3   # least-squares needs a few points (with spread in units) before it's trustworthy
-
-
-def update_prepared_profile(state_root: Path, task, device: str, *,  # noqa: ANN001
-                            peak_rss_mb=None, peak_vram_mb=None,
-                            observed_elapsed_s=None, observed_units=None,
-                            now: str = "", alpha: float = DEFAULT_ALPHA,
-                            max_entries: int = DEFAULT_MAX_ENTRIES) -> None:
-    """Fold one successful structured observation into its exact frozen key."""
-    data = load_profiles(state_root)
-    key = prepared_profile_key(task, device)
-    prev = data.get(key) if isinstance(data.get(key), dict) else {}
-    entry = {
-        "n": int(prev.get("n", 0)) + 1,
-        "fixed_load_s": prev.get("fixed_load_s"),
-        "var_per_unit_s": prev.get("var_per_unit_s"),
-        "peak_rss_mb": _ewma(prev.get("peak_rss_mb"), peak_rss_mb, alpha),
-        "peak_vram_mb": _ewma(prev.get("peak_vram_mb"), peak_vram_mb, alpha),
-        "updated": now,
-        "t_n": int(prev.get("t_n", 0)), "t_su": float(prev.get("t_su", 0.0)),
-        "t_se": float(prev.get("t_se", 0.0)), "t_suu": float(prev.get("t_suu", 0.0)),
-        "t_sue": float(prev.get("t_sue", 0.0)),
-    }
-    if observed_elapsed_s is not None and observed_units is not None:
-        units, elapsed = float(observed_units), float(observed_elapsed_s)
-        entry["t_n"] += 1
-        entry["t_su"] += units
-        entry["t_se"] += elapsed
-        entry["t_suu"] += units * units
-        entry["t_sue"] += units * elapsed
-        count = entry["t_n"]
-        denominator = count * entry["t_suu"] - entry["t_su"] ** 2
-        if count >= MIN_FIT_N and denominator > 1e-6:
-            slope = (count * entry["t_sue"] - entry["t_su"] * entry["t_se"]) / denominator
-            intercept = (entry["t_se"] - slope * entry["t_su"]) / count
-            if slope >= 0.0 and intercept >= 0.0:
-                entry["var_per_unit_s"] = round(slope, 4)
-                entry["fixed_load_s"] = round(intercept, 3)
-    data[key] = entry
-    if len(data) > max_entries:
-        ordered = sorted(data.items(), key=lambda pair: pair[1].get("updated", "")
-                         if isinstance(pair[1], dict) else "")
-        for old_key, _ in ordered[:len(data) - max_entries]:
-            data.pop(old_key, None)
-    try:
-        _write_profiles(state_root, data)
-    except OSError:
-        pass
 
 
 def raise_prepared_memory_estimate(
@@ -172,8 +294,5 @@ def raise_prepared_memory_estimate(
                          if isinstance(pair[1], dict) else "")
         for old_key, _ in ordered[:len(profiles) - max_entries]:
             profiles.pop(old_key, None)
-    try:
-        _write_profiles(state_root, profiles)
-    except OSError:
-        pass
+    _write_profiles(state_root, profiles)
     return field, round(raised, 3)

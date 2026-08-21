@@ -20,8 +20,9 @@ def load_fleet_costs(config: RemrunConfig) -> dict[str, dict]:
 
     Portable across controllers in one deployment (device costs don't depend on
     who dispatched), so a new controller can avoid starting cost-blind. Public
-    releases should ship an example file, not private measured costs. The local
-    per-controller EWMA store refines on top (see ``profiles.merge_costs``).
+    releases should ship an example file, not private measured costs. Local
+    resource corrections and the controller's SQLite observation journal refine
+    them through ``profiles.merge_costs``.
     """
     doc = load_toml(Path(config.repo_root) / "config" / "fleet_costs.toml")
     costs = doc.get("costs", {})
@@ -29,9 +30,12 @@ def load_fleet_costs(config: RemrunConfig) -> dict[str, dict]:
 
 
 def load_costs(config: RemrunConfig, state_root: Path) -> dict:
-    """Placement's cost view: shared measured costs merged under the local EWMA store."""
+    """Placement's view of shared seeds, local corrections, and journal-derived fits."""
     from . import profiles
-    return profiles.merge_costs(profiles.load_profiles(state_root), load_fleet_costs(config))
+    observed = profiles.load_observation_profiles(Path(state_root) / "fleet" / "fleet.db")
+    return profiles.merge_costs(
+        profiles.load_profiles(state_root), load_fleet_costs(config), observed,
+    )
 
 
 def fleet_config(config: RemrunConfig) -> dict[str, Any]:

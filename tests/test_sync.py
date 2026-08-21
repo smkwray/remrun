@@ -56,10 +56,10 @@ def test_device_os_key():
 def test_resolve_named_tree_picks_device_os_base():
     cfg = _config(sync_roots={"outputs": {"windows": "C:\\w\\outputs", "macos": "/m/outputs",
                                        "default": "/d/outputs"}})
-    m = resolve_sync_paths(cfg, "outputs/ocr", Device.from_mapping("MACBOX", {"os": "macos"}))
-    assert m.remote_base == "/m/outputs" and m.remote_sub == "ocr" and m.tree == "outputs"
-    w = resolve_sync_paths(cfg, "outputs/ocr", Device.from_mapping("WINBOX", {"os": "windows"}))
-    assert w.remote_base == "C:\\w\\outputs" and w.remote_sub == "ocr"
+    m = resolve_sync_paths(cfg, "outputs/alpha", Device.from_mapping("MACBOX", {"os": "macos"}))
+    assert m.remote_base == "/m/outputs" and m.remote_sub == "alpha" and m.tree == "outputs"
+    w = resolve_sync_paths(cfg, "outputs/alpha", Device.from_mapping("WINBOX", {"os": "windows"}))
+    assert w.remote_base == "C:\\w\\outputs" and w.remote_sub == "alpha"
 
 
 def test_resolve_authority_default_remote_and_override():
@@ -75,7 +75,7 @@ def test_resolve_authority_default_remote_and_override():
 def test_resolve_rejects_traversal_subpath():
     cfg = _config(sync_roots={"outputs": {"default": "/d/outputs"}})
     with pytest.raises(SyncError):
-        resolve_sync_paths(cfg, "outputs/../tts", Device.from_mapping("MACBOX", {"os": "macos"}))
+        resolve_sync_paths(cfg, "outputs/../beta", Device.from_mapping("MACBOX", {"os": "macos"}))
 
 
 def test_resolve_explicit_remote_override(tmp_path: Path):
@@ -97,38 +97,38 @@ def test_resolve_unknown_tree_raises():
 def test_remote_spec_to_tree_maps_adapter_output_roots():
     cfg = _config(sync_roots={
         "outputs": {"windows": "D:\\shared\\outputs", "macos": "~/shared/outputs", "default": "~/shared/outputs"},
-        "tts": {"windows": "D:\\shared\\tts", "macos": "~/shared/tts", "default": "~/shared/tts"},
+        "media": {"windows": "D:\\shared\\media", "macos": "~/shared/media", "default": "~/shared/media"},
     })
     mac = Device.from_mapping("MACBOX", {"os": "macos"})
     win = Device.from_mapping("WINBOX", {"os": "windows"})
     # the real adapter output roots map back to (tree, sub)
-    assert remote_spec_to_tree(cfg, mac, "~/shared/outputs/ocr") == ("outputs", "ocr")
-    assert remote_spec_to_tree(cfg, win, "D:\\shared\\outputs\\ocr") == ("outputs", "ocr")
-    assert remote_spec_to_tree(cfg, mac, "~/shared/tts") == ("tts", "")       # tree root, empty sub
-    assert remote_spec_to_tree(cfg, win, "D:\\shared\\tts") == ("tts", "")
+    assert remote_spec_to_tree(cfg, mac, "~/shared/outputs/alpha") == ("outputs", "alpha")
+    assert remote_spec_to_tree(cfg, win, "D:\\shared\\outputs\\alpha") == ("outputs", "alpha")
+    assert remote_spec_to_tree(cfg, mac, "~/shared/media") == ("media", "")  # tree root, empty sub
+    assert remote_spec_to_tree(cfg, win, "D:\\shared\\media") == ("media", "")
     assert remote_spec_to_tree(cfg, mac, "~/elsewhere/out") is None         # no tree contains it
 
 
 def test_remote_spec_to_tree_longest_base_wins():
     cfg = _config(sync_roots={
         "outputs": {"default": "/sync/outputs"},
-        "outputs_ocr": {"default": "/sync/outputs/ocr"},   # deeper base must win the prefix race
+        "outputs_alpha": {"default": "/sync/outputs/alpha"},  # deeper base wins prefix race
     })
     dev = Device.from_mapping("P", {"os": "posix"})
-    assert remote_spec_to_tree(cfg, dev, "/sync/outputs/ocr/doc") == ("outputs_ocr", "doc")
+    assert remote_spec_to_tree(cfg, dev, "/sync/outputs/alpha/doc") == ("outputs_alpha", "doc")
 
 
 def test_remote_spec_to_tree_windows_is_case_insensitive_but_keeps_sub_case():
     cfg = _config(sync_roots={"outputs": {"windows": "D:\\shared\\outputs"}})
     win = Device.from_mapping("WINBOX", {"os": "windows"})
     # different case + forward slashes still maps; the returned subpath keeps its original case
-    assert remote_spec_to_tree(cfg, win, "d:/SHARED/outputs/OCR/Doc") == ("outputs", "OCR/Doc")
+    assert remote_spec_to_tree(cfg, win, "d:/SHARED/outputs/ALPHA/Doc") == ("outputs", "ALPHA/Doc")
 
 
 def test_remote_spec_to_tree_no_base_for_os_returns_none():
     cfg = _config(sync_roots={"outputs": {"windows": "D:\\shared\\outputs"}})   # no macos/default base
     mac = Device.from_mapping("MACBOX", {"os": "macos"})
-    assert remote_spec_to_tree(cfg, mac, "~/shared/outputs/ocr") is None
+    assert remote_spec_to_tree(cfg, mac, "~/shared/outputs/alpha") is None
 
 
 # --- run_sync_result reports remote_files (Phase 2b output verification) ------

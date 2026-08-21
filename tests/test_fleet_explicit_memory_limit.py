@@ -60,7 +60,7 @@ def _compatible_definition(tmp_path: Path) -> dict:
         "input": {"mode": "text", "split": "never"},
         "prepare": {"mode": "none"},
         "routing": {"requirements": [], "requirements_by_option": {}},
-        "execution": {"batching": "compatible"},
+        "execution": {"batching": "compatible", "replay": "at-most-once-v1"},
         "cost": {"measure": "none", "bucket_options": []},
         "output": {"reservation": "none", "allow_root_override": False,
                    "verification": "none"},
@@ -233,7 +233,7 @@ def test_v2_limits_are_closed_and_unsupported_schemas_fail_closed() -> None:
     with pytest.raises(PreparationError, match="unknown or missing fields"):
         prepared_memory_limit_mib(unknown)
     with pytest.raises(PreparationError, match="unsupported prepared job schema"):
-        prepared_memory_limit_mib({"schema": 3})
+        prepared_memory_limit_mib({"schema": 5})
 
 
 def test_explicit_v2_round_trips_through_durable_queue(
@@ -260,7 +260,7 @@ def test_explicit_v2_round_trips_through_durable_queue(
     assert json.loads(row["prepared_json"])["limits"] == record["limits"]
 
 
-def test_hard_limit_does_not_make_unestimated_work_automatically_placeable(
+def test_hard_limit_preserves_unestimated_cold_start_without_inventing_eta(
         tmp_path: Path) -> None:
     definition = _compatible_definition(tmp_path)
     adapter = next(iter(definition["adapters"].values()))
@@ -289,10 +289,12 @@ def test_hard_limit_does_not_make_unestimated_work_automatically_placeable(
         [as_fleet_task(unforced, spec)], [prepared_features(unforced)],
         snapshots, {}, fcfg,
     )
-    assert not automatic.batches
-    assert set(automatic.skipped.values()) == {
-        "unestimated; choose an explicit device or supply measured costs"
-    }
+    assert automatic.skipped == {}
+    assert automatic.makespan_s is None
+    assert [batch.device for batch in automatic.batches] == ["A"]
+    assert automatic.batches[0].selection_basis == "cold_start"
+    assert automatic.batches[0].estimated_finish_s is None
+    assert automatic.batches[0].estimate_reason == "uncalibrated"
 
     forced = prepare_task_job(
         spec, repo_root=tmp_path, text="same", force_device="A",
@@ -518,14 +520,14 @@ def test_durable_dispatcher_path_persists_poststart_limit_receipt_without_retry(
         _config(tmp_path), state_root=state_root, max_parallel=1,
     )
 
-    assert result["placed"] == 1 and result["ran"] == 1 and result["failed"] == 1
+    assert result["placed"] == 1 and result["ran"] == 1 and result["review"] == 1
     queue = FleetQueue(db_path)
     try:
         row = queue.get(job_id)
     finally:
         queue.close()
     assert row is not None
-    assert row["state"] == "failed_final"
+    assert row["state"] == "completion_unknown"
     assert row["attempts"] == 1
     receipt = json.loads(row["last_result"])
     assert receipt["kind"] == "fleet-attempt-receipt"

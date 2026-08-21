@@ -165,6 +165,11 @@ the 3.50.7 / 3.44.6 backports. `remrun doctor` reports the controller's SQLite
 version and queue journal mode. An older runtime may still act as a worker; only
 commands that open its local fleet queue are refused.
 
+An otherwise qualified task with no duration profile is placed on exactly one
+deterministically selected device and reports `Uncalibrated placement; no duration estimate.`
+Unknown time is JSON `null`, never zero. `fleet dispatch --drain --json` always emits one final
+`DrainResultV1` document; unplaceable queued work exits 2 rather than silently succeeding.
+
 `fleet resources`, `fleet jobs`, and `fleet mesh` are read-only. Resource probes read
 bounded operating-system metadata rather than scanning files. Interactive resource
 tables add rows as devices answer; JSON and redirected output remain deterministic.
@@ -176,8 +181,10 @@ one-minute runnable demand per core (`x`), so the two are related congestion sig
 not numerically identical.
 
 Per-item submissions may share one compatible device invocation while retaining one
-manifest and result row per prepared job. A worker that omits or mismatches required
-evidence fails terminally and is not retried automatically, avoiding duplicate outputs.
+manifest and result row per prepared job. A post-launch loss of completion evidence becomes
+`completion_unknown` and holds the idempotency key for explicit review; it is never replayed
+automatically under `at-most-once-v1`. A verified work-measure mismatch also enters review and
+is excluded from duration learning.
 
 `--memory-limit-mib N` is an operator-owned hard sampled process-tree RSS ceiling, not a
 cost or demand estimate. It is available on configured `fleet plan`, `submit`, and `run`,
