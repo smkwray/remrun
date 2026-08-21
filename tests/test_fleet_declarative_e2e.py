@@ -48,6 +48,7 @@ def _definition(worker: Path, output_root: Path) -> dict:
 def _config(tmp_path: Path, task: dict) -> RemrunConfig:
     device = Device.from_mapping("LOCAL_SIM", {
         "kind": "local-sim", "os": "posix", "address_candidates": ["localhost"],
+        "remote_python": sys.executable,
         "project_root": str(tmp_path / "remote"), "cache_root": str(tmp_path / "cache"),
         "state_root": str(tmp_path / "device-state"), "max_jobs": 1,
     })
