@@ -145,6 +145,9 @@ remrun fleet submit zotomatic --input items/    # durable queue submission
 remrun fleet submit zotomatic --input items/ --json  # queue IDs only; no live device probes
 remrun fleet submit zotomatic --input items/ --json --preview-route  # add non-binding live route
 remrun fleet submit zotomatic --device macbox --memory-limit-mib 8192 --input item.zot
+remrun fleet run zotomatic --input item.zot --return-root ./returned
+remrun fleet storage enroll /path/to/shared/root
+remrun fleet storage bind --device winbox 'Z:\shared-root'
 remrun fleet command run --device macbox --memory-limit-mib 8192 -- tool --flag
 remrun fleet dispatch --drain                   # batch compatible jobs, then exit
 remrun fleet status                             # queue state and recent jobs

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import time
@@ -13,7 +14,7 @@ from ..config import RemrunConfig, load_config
 from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, iso_plus_seconds, utc_now_iso
 from ..transport import GuardFinalizationError, TransportError, make_transport
-from . import adapters, placement, probes, profiles
+from . import adapters, placement, probes, profiles, storage
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
 from .prepared import (
@@ -582,6 +583,10 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
         return {"ok": False, "device": device_name, "error": f"stage failed: {exc}"}
 
     batch_id = observation_id or f"batch-{uuid.uuid4().hex[:12]}"
+    try:
+        storage_registry = storage.load_registry(state_root)
+    except storage.StorageError:
+        storage_registry = {"schema": 1, "roots": {}}
     used: set[str] = set()
     manifest_items: list[dict[str, Any]] = []
     expected: list[dict[str, Any]] = []
@@ -607,9 +612,25 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 staged += 1
             for item in payload["items"]:
                 name = _unique_name(Path(item["source_path"]).name, used)
-                receipt = materialize_prepared_input(
-                    transport, item, transport.native_join(stage_in, name),
-                )
+                remote_input = transport.native_join(stage_in, name)
+                shared = None
+                if item.get("storage_ref") is not None:
+                    shared = storage.device_candidate(
+                        storage_registry, device_name, item["storage_ref"], transport,
+                    )
+                if shared is not None:
+                    root, candidate = shared
+                    try:
+                        receipt = transport.materialize_shared_input(
+                            root, candidate, remote_input,
+                            storage_id=item["storage_ref"]["storage_id"],
+                            expected_bytes=item["identity"]["bytes"],
+                            expected_sha256=item["identity"]["sha256"].removeprefix("sha256:"),
+                        )
+                    except (OSError, TransportError):
+                        receipt = materialize_prepared_input(transport, item, remote_input)
+                else:
+                    receipt = materialize_prepared_input(transport, item, remote_input)
                 verified_inputs.append({"index": item["index"], **receipt})
                 staged_names.append(name)
                 staged += 1
@@ -799,6 +820,7 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             )
             rows = [{**row, "ok": row["outcome"] == "succeeded",
                      "error": row["message"]} for row in rows]
+            rows = _return_outputs(tasks, rows, output_root, transport, job_ids)
         except ResultProtocolError as exc:
             evidence_error = str(exc)
     if cleanup:
@@ -848,6 +870,72 @@ def item_result_maps(item_results: list[dict[str, Any]]) -> tuple[dict[str, str 
             failed[job_id] = (item.get("message") or item.get("error") or
                               "worker reported item failure")
     return succeeded, failed
+
+
+def _return_outputs(
+    tasks: list[FleetTask], rows: list[dict[str, Any]], output_root: str,
+    transport: Any, job_ids: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Opt-in verified delivery; a failure preserves remote publication for review."""
+    task_by_job = {
+        (job_ids[index] if job_ids and index < len(job_ids) else f"adhoc-{index}"): task
+        for index, task in enumerate(tasks)
+    }
+    delivered: list[dict[str, Any]] = []
+    for original in rows:
+        row = dict(original)
+        task = task_by_job.get(str(row.get("job_id")))
+        return_root = (task.prepared["output"].get("return_root")
+                       if task is not None and task.prepared is not None else None)
+        if not return_root or row.get("publication") not in {"produced", "reused"}:
+            delivered.append(row)
+            continue
+        rel_paths = list(row.get("outputs") or [])
+        if row.get("companion") is not None:
+            rel_paths.append(row["companion"])
+        receipts = []
+        try:
+            for rel in rel_paths:
+                components = rel.split("/")
+                remote_path = transport.native_join(output_root, *components)
+                local_path = _confined_return_path(Path(return_root), components)
+                receipts.append({"path": rel, **transport.fetch_output(remote_path, local_path)})
+        except (OSError, TransportError) as exc:
+            row.update({
+                "ok": False, "outcome": "review", "disposition": "none",
+                "retry_after_s": None, "failure_code": "output_return_failed",
+                "message": f"output return failed: {exc}",
+                "error": f"output return failed: {exc}",
+            })
+            details = dict(row.get("details") or {})
+            details["output_return"] = {"status": "failed", "receipts": receipts}
+            row["details"] = details
+        else:
+            row["delivery"] = {
+                "schema": "output-delivery-v1", "status": "complete",
+                "root": return_root, "receipts": receipts,
+            }
+        delivered.append(row)
+    return delivered
+
+
+def _confined_return_path(root: Path, components: list[str]) -> Path:
+    """Resolve a prepared safe-relative output without traversing mutable links/mounts."""
+    root = root.resolve(strict=False)
+    cursor = root
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    for component in components[:-1]:
+        cursor = cursor / component
+        if cursor.is_symlink() or is_junction(cursor) or (cursor.exists() and os.path.ismount(cursor)):
+            raise TransportError("output return path crosses a link or mount boundary")
+        if cursor.exists() and not cursor.is_dir():
+            raise TransportError("output return parent is not a directory")
+        if cursor.exists():
+            try:
+                cursor.resolve(strict=True).relative_to(root)
+            except ValueError as exc:
+                raise TransportError("output return path escapes its prepared root") from exc
+    return root.joinpath(*components)
 
 
 def item_records(item_results: list[dict[str, Any]]) -> dict[str, str]:

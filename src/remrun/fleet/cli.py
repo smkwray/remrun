@@ -23,6 +23,7 @@ from .prepared import (
     RAW_COMMAND_SPEC, RAW_COMMAND_SPEC_ID, as_fleet_task, parse_option_assignments,
     prepare_raw_command, prepare_task_jobs,
 )
+from .storage import bind_device_root, enroll_local_root, load_registry
 from .task_contract import resolve_tasks
 from ..transport import make_transport, _posix_cancel_script, _powershell_cancel_script
 
@@ -71,6 +72,8 @@ def _prepare_configured(args, config):  # noqa: ANN001
         engine=getattr(args, "engine", None),
         output_root=getattr(args, "output_root", None),
         memory_limit_mib=getattr(args, "memory_limit_mib", None),
+        storage_registry=load_registry(default_state_root()),
+        return_root=getattr(args, "return_root", None),
     )
     # Preparation may be slow. Re-resolve immediately before the caller opens
     # its queue transaction so authority/config changes insert zero rows.
@@ -97,6 +100,27 @@ def _read_clipboard() -> str:
         except (OSError, subprocess.SubprocessError):
             continue
     return ""
+
+
+def cmd_storage(args, reporter: Reporter) -> int:  # noqa: ANN001
+    state_root = default_state_root()
+    if args.storage_action == "enroll":
+        result = enroll_local_root(state_root, Path(args.root))
+    elif args.storage_action == "bind":
+        config = load_config()
+        device = config.devices.get(args.device)
+        if device is None:
+            raise ValueError(f"unknown device {args.device!r}")
+        result = bind_device_root(
+            state_root, args.device, args.root, make_transport(device),
+        )
+    else:
+        result = load_registry(state_root)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        reporter.event("storage_" + args.storage_action, **result)
+    return EXIT_OK
 
 
 def _candidate_devices(task: FleetTask, config) -> list[str]:
@@ -871,6 +895,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--opt", action="append", help="task option key=value (repeatable)")
         sp.add_argument("--output-root", dest="output_root", help="override output folder")
         sp.add_argument(
+            "--return-root", dest="return_root",
+            help="opt in to verified output return under this controller-local folder",
+        )
+        sp.add_argument(
             "--memory-limit-mib", type=int,
             help="explicit hard sampled process-tree RSS ceiling in whole MiB; "
                  "the selected target still admits it against its own reserve and policy",
@@ -978,6 +1006,19 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--connect-timeout", dest="connect_timeout", type=int, default=8,
                     help="ssh ConnectTimeout in seconds (default 8)")
     pm.add_argument("--json", action="store_true")
+    pstorage = sub.add_parser(
+        "storage", help="enroll and bind shared roots used only as verified input optimizations",
+    )
+    storage_sub = pstorage.add_subparsers(dest="storage_action", required=True)
+    pse = storage_sub.add_parser("enroll", help="create/read a marker and enroll this local root")
+    pse.add_argument("root")
+    pse.add_argument("--json", action="store_true")
+    psb = storage_sub.add_parser("bind", help="bind a target-visible root by reading its marker")
+    psb.add_argument("--device", required=True)
+    psb.add_argument("root")
+    psb.add_argument("--json", action="store_true")
+    psl = storage_sub.add_parser("list", help="show this controller's verified bindings")
+    psl.add_argument("--json", action="store_true")
     return p
 
 
@@ -1009,6 +1050,8 @@ def main(argv: list[str]) -> int:
             return cmd_jobs(args, reporter)
         if args.fleet_command == "mesh":
             return cmd_mesh(args, reporter)
+        if args.fleet_command == "storage":
+            return cmd_storage(args, reporter)
     except Exception as exc:  # noqa: BLE001 - keep agent-visible error concise
         reporter.event("error", type=type(exc).__name__, message=str(exc))
         return EXIT_ERROR

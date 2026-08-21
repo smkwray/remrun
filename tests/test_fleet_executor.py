@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from remrun.config import RemrunConfig
 from remrun.fleet import executor, profiles
 from remrun.fleet.prepared import (
@@ -78,7 +80,9 @@ def test_prepared_raw_command_runs_exact_argv_once_per_submission(tmp_path) -> N
     ]
 
 
-def test_materialize_input_reads_in_bounded_chunks_and_returns_receipt(tmp_path) -> None:
+def test_materialize_input_reads_in_bounded_chunks_and_returns_receipt(
+    tmp_path, monkeypatch,
+) -> None:
     payload = b"z" * (3 * 1024 * 1024 + 17)
 
     class ChunkOnly(io.BytesIO):
@@ -98,6 +102,25 @@ def test_materialize_input_reads_in_bounded_chunks_and_returns_receipt(tmp_path)
         "schema": "verified-input-v1", "route": "stream", "bytes": len(payload),
         "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
     }
+
+    remote_output = tmp_path / "remote-output.bin"
+    remote_output.write_bytes(b"new result")
+    conflicting = tmp_path / "controller" / "result.bin"
+    conflicting.parent.mkdir()
+    conflicting.write_bytes(b"local edit")
+    with pytest.raises(TransportError, match="different bytes"):
+        transport.fetch_output(str(remote_output), conflicting)
+    assert conflicting.read_bytes() == b"local edit"
+
+    return_root = tmp_path / "return-root"
+    return_root.mkdir()
+    linked = return_root / "linked"
+    linked.mkdir()
+    monkeypatch.setattr(
+        executor.os.path, "isjunction", lambda path: Path(path) == linked, raising=False,
+    )
+    with pytest.raises(TransportError, match="link or mount"):
+        executor._confined_return_path(return_root, ["linked", "result.bin"])
 
 
 def test_prepared_source_change_stops_before_worker_launch(tmp_path) -> None:
@@ -144,13 +167,18 @@ def test_configured_task_executes_frozen_manifest_and_result_v2(tmp_path) -> Non
         "pathlib.Path(os.environ['REMRUN_BATCH_METRICS']).write_text(json.dumps(r))\n",
         encoding="utf-8",
     )
+    definition = _definition(str(worker), str(output_root))
+    definition["output"]["allow_return"] = True
     spec = resolve_task_spec(
-        "zotomatic", _definition(str(worker), str(output_root)),
+        "zotomatic", definition,
         devices={"LOCAL_SIM"}, repo_root=tmp_path,
     )
     source = tmp_path / "input.zot"
     source.write_text("payload", encoding="utf-8")
-    prepared = prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    return_root = tmp_path / "returned"
+    prepared = prepare_task_job(
+        spec, repo_root=tmp_path, inputs=[str(source)], return_root=str(return_root),
+    )
     task = as_fleet_task(prepared, spec)
 
     result = executor.run_batch(
@@ -160,7 +188,10 @@ def test_configured_task_executes_frozen_manifest_and_result_v2(tmp_path) -> Non
 
     assert result["ok"] is True and result["completion_evidence"] == "complete"
     assert result["item_results"][0]["prepared_id"] == prepared["prepared_id"]
-    assert (output_root / result["item_results"][0]["outputs"][0]).read_text() == "done"
+    output = result["item_results"][0]["outputs"][0]
+    assert (output_root / output).read_text() == "done"
+    assert (return_root / output).read_text() == "done"
+    assert result["item_results"][0]["delivery"]["status"] == "complete"
     # Raw execution evidence is admitted only by the queue's atomic terminal
     # transition, never by the executor on its own.
     assert profiles.prepared_profile_key(task, "LOCAL_SIM") not in profiles.load_profiles(

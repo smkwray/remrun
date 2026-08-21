@@ -45,6 +45,8 @@ _PREPARED_BASE_FIELDS = {
 _PREPARED_V2_FIELDS = _PREPARED_BASE_FIELDS | {"limits"}
 _PREPARED_V3_FIELDS = _PREPARED_BASE_FIELDS
 _PREPARED_V4_FIELDS = _PREPARED_BASE_FIELDS | {"limits"}
+_PREPARED_V5_FIELDS = _PREPARED_BASE_FIELDS
+_PREPARED_V6_FIELDS = _PREPARED_BASE_FIELDS | {"limits"}
 _MAX_EXPLICIT_MEMORY_LIMIT_MIB = (2**63 - 1) // (1024 * 1024)
 _MAX_MEASURE_OUTPUT_BYTES = 1024 * 1024
 _TEMP_CLEANUP_TIMEOUT_S = 2.0
@@ -68,11 +70,11 @@ def _resource_limits(memory_limit_mib: int) -> dict[str, Any]:
 def prepared_memory_limit_mib(record: Mapping[str, Any]) -> int | None:
     """Return the explicit hard RSS limit; legacy PreparedJobV1 means none."""
     schema = record.get("schema")
-    if schema in {1, 3}:
+    if schema in {1, 3, 5}:
         if "limits" in record:
             raise PreparationError("prepared resource limits are invalid")
         return None
-    if schema not in {2, 4}:
+    if schema not in {2, 4, 6}:
         raise PreparationError("unsupported prepared job schema")
     limits = record.get("limits")
     if not isinstance(limits, Mapping):
@@ -631,7 +633,9 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
                      caller_requirements: list[str] | tuple[str, ...] = (),
                      force_device: str | None = None, allow_fallback: bool = False,
                      engine: str | None = None, output_root: str | None = None,
-                     memory_limit_mib: int | None = None) -> dict[str, Any]:
+                     memory_limit_mib: int | None = None,
+                     storage_registry: Mapping[str, Any] | None = None,
+                     return_root: str | None = None) -> dict[str, Any]:
     """Create one canonical prepared job using an already resolved spec.
 
     Configured jobs use PreparedJobV3/V4 so the cost identity carries an exact
@@ -641,6 +645,25 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
     verify_id(spec.get("spec_id"), "spec_id")
     definition = spec["definition"]
     payload = _payload(definition, text=text, inputs=inputs)
+    if return_root == "":
+        raise PreparationError("return-root must not be empty")
+    if return_root is not None:
+        if not definition["output"]["allow_return"]:
+            raise PreparationError("this task forbids output return")
+        return_root = str(Path(return_root).expanduser().resolve(strict=False))
+        storage_registry = storage_registry or {"schema": 1, "roots": {}}
+    if storage_registry is not None:
+        from .storage import storage_ref_for_path
+        for item in payload["items"]:
+            item["storage_ref"] = (
+                storage_ref_for_path(storage_registry, Path(item["source_path"]))
+                if item["identity"]["mode"] == "sha256" else None
+            )
+        if return_root is None and not any(
+                item["storage_ref"] is not None for item in payload["items"]):
+            for item in payload["items"]:
+                item.pop("storage_ref")
+            storage_registry = None
     normalized_options = _typed_options(definition, options)
     if output_root == "":
         raise PreparationError("output-root override must not be empty")
@@ -662,6 +685,8 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
         "options": normalized_options, "requirements": requirements,
         "output_root": output_root,
     }
+    if storage_registry is not None:
+        semantic["return_root"] = return_root
     work_id = sha256_id(semantic)
     reservations: list[dict[str, Any]] = []
     reservation = definition["output"]["reservation"]
@@ -674,18 +699,22 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
             stem = f"{stem}-{work_id.removeprefix('sha256:')}"
             reservations.append({"item_index": item["index"], "stem": stem})
     record: dict[str, Any] = {
-        "schema": 3, "kind": "task", "spec_id": spec["spec_id"],
+        "schema": 5 if storage_registry is not None else 3,
+        "kind": "task", "spec_id": spec["spec_id"],
         "payload": payload,
         "task": {"name": spec["task_name"], "options": normalized_options},
         "command": None,
         "routing": {"requirements": requirements, "force_device": force_device,
                     "allow_fallback": bool(allow_fallback),
                     "engine": engine},
-        "output": {"root_override": output_root, "reservations": reservations},
+        "output": {
+            "root_override": output_root, "reservations": reservations,
+            **({"return_root": return_root} if storage_registry is not None else {}),
+        },
         "cost": cost, "work_id": work_id,
     }
     if memory_limit_mib is not None:
-        record["schema"] = 4
+        record["schema"] = 6 if storage_registry is not None else 4
         record["limits"] = _resource_limits(memory_limit_mib)
     record["prepared_id"] = sha256_id(record)
     return record
@@ -751,6 +780,8 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
               else _PREPARED_V2_FIELDS if schema == 2
               else _PREPARED_V3_FIELDS if schema == 3
               else _PREPARED_V4_FIELDS if schema == 4
+              else _PREPARED_V5_FIELDS if schema == 5
+              else _PREPARED_V6_FIELDS if schema == 6
               else None)
     if fields is None or set(record) != fields:
         raise PreparationError("prepared job has unknown or missing fields")
@@ -775,7 +806,10 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
             or (payload["mode"] == "files") != bool(payload["items"])):
         raise PreparationError("prepared payload union is inconsistent")
     for index, item in enumerate(payload["items"]):
-        if not isinstance(item, Mapping) or set(item) != {"index", "source_path", "identity"}:
+        item_fields = ({"index", "source_path", "identity"}
+                       if schema in {1, 2, 3, 4}
+                       else {"index", "source_path", "identity", "storage_ref"})
+        if not isinstance(item, Mapping) or set(item) != item_fields:
             raise PreparationError("prepared payload item has unknown or missing fields")
         if item["index"] != index or not Path(item["source_path"]).is_absolute():
             raise PreparationError("prepared payload item index or source path is invalid")
@@ -792,6 +826,23 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
                 raise PreparationError("prepared metadata identity is invalid")
         else:
             verify_id(identity["sha256"], "prepared source sha256")
+        if schema in {5, 6} and item["storage_ref"] is not None:
+            storage_ref = item["storage_ref"]
+            if identity["mode"] != "sha256" or not isinstance(storage_ref, Mapping) \
+                    or set(storage_ref) != {"schema", "storage_id", "relative_components"} \
+                    or storage_ref["schema"] != 1 \
+                    or not isinstance(storage_ref["storage_id"], str) \
+                    or len(storage_ref["storage_id"]) != 32 \
+                    or not isinstance(storage_ref["relative_components"], list) \
+                    or not storage_ref["relative_components"] \
+                    or any(not isinstance(value, str) or not value or value in {".", ".."}
+                           or "/" in value or "\\" in value
+                           for value in storage_ref["relative_components"]):
+                raise PreparationError("prepared storage reference is invalid")
+            try:
+                int(storage_ref["storage_id"], 16)
+            except ValueError as exc:
+                raise PreparationError("prepared storage identity is invalid") from exc
     routing = record.get("routing")
     if not isinstance(routing, Mapping) or set(routing) != {
             "requirements", "force_device", "allow_fallback", "engine"}:
@@ -810,11 +861,18 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
                                            or not routing[field]):
             raise PreparationError(f"prepared routing {field} is invalid")
     output = record.get("output")
-    if not isinstance(output, Mapping) or set(output) != {"root_override", "reservations"} \
+    output_fields = ({"root_override", "reservations"}
+                     if schema in {1, 2, 3, 4}
+                     else {"root_override", "reservations", "return_root"})
+    if not isinstance(output, Mapping) or set(output) != output_fields \
             or not isinstance(output["reservations"], list):
         raise PreparationError("prepared output has unknown or missing fields")
     if output["root_override"] is not None and not isinstance(output["root_override"], str):
         raise PreparationError("prepared output root override is invalid")
+    if schema in {5, 6} and output["return_root"] is not None \
+            and (not isinstance(output["return_root"], str)
+                 or not Path(output["return_root"]).is_absolute()):
+        raise PreparationError("prepared return root is invalid")
     seen_item_indexes: set[int] = set()
     for reservation in output["reservations"]:
         if not isinstance(reservation, Mapping) or set(reservation) != {"item_index", "stem"}:
@@ -861,7 +919,7 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
                 or not 0 <= uncertainty <= 1:
             raise PreparationError("prepared cost uncertainty is invalid")
         verify_id(cost["bucket_id"], "prepared cost bucket_id")
-        if schema in {3, 4}:
+        if schema in {3, 4, 5, 6}:
             verify_id(cost["measure_id"], "prepared cost measure_id")
             item_values = cost["item_values"]
             if not isinstance(item_values, list) or not item_values:
@@ -895,6 +953,8 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
         semantic = {"spec_id": record["spec_id"], "payload": payload,
                     "options": task["options"], "requirements": routing["requirements"],
                     "output_root": output["root_override"]}
+        if schema in {5, 6}:
+            semantic["return_root"] = output["return_root"]
     if record["work_id"] != sha256_id(semantic):
         raise PreparationError("work_id does not match prepared semantic work")
     canonical_json(record)
@@ -937,6 +997,9 @@ def validate_prepared_against_spec(record: Mapping[str, Any], spec: Mapping[str,
     root = record["output"]["root_override"]
     if root is not None and (not root or not definition["output"]["allow_root_override"]):
         raise PreparationError("prepared output-root override violates the frozen contract")
+    return_root = record["output"].get("return_root")
+    if return_root is not None and not definition["output"]["allow_return"]:
+        raise PreparationError("prepared output return violates the frozen contract")
     policy = definition["output"]["reservation"]
     reservations = record["output"]["reservations"]
     if (policy == "none") != (not reservations):

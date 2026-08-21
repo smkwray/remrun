@@ -214,6 +214,32 @@ def _verified_input_receipt(
     return receipt
 
 
+def _shared_input_receipt(
+    proc: subprocess.CompletedProcess, remote_path: str, expected_bytes: int,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise TransportError(
+            f"shared-view materialize {remote_path} failed: "
+            f"{detail or f'exit {proc.returncode}'}"
+        )
+    try:
+        receipt = json.loads(proc.stdout.decode("utf-8", "strict"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise TransportError(f"shared-view materialize {remote_path} returned invalid receipt") \
+            from exc
+    expected = {
+        "schema": "verified-input-v1", "route": "shared-view",
+        "bytes": expected_bytes, "sha256": "sha256:" + expected_sha256,
+    }
+    if receipt != expected:
+        raise TransportError(
+            f"shared-view materialize {remote_path} receipt disagrees with frozen identity"
+        )
+    return receipt
+
+
 def _stream_spawn_kwargs() -> dict[str, object]:
     """Spawn streamed commands in a group remrun can terminate as one unit."""
     if os.name == "posix":
@@ -1333,6 +1359,13 @@ class BaseTransport:
         """Stream one frozen input into a target-private file and return VerifiedInputV1."""
         raise NotImplementedError
 
+    def materialize_shared_input(
+        self, storage_root: str, source_path: str, remote_path: str, *,
+        storage_id: str, expected_bytes: int, expected_sha256: str,
+    ) -> dict[str, Any]:
+        """Copy a verified target-visible candidate into the same private input boundary."""
+        raise NotImplementedError
+
     def pull_file(self, remote_path: str, local_path: Path) -> None:
         raise NotImplementedError
 
@@ -1673,6 +1706,25 @@ class LocalSimTransport(BaseTransport):
             "sha256": "sha256:" + actual,
         }
 
+    def materialize_shared_input(
+        self, storage_root: str, source_path: str, remote_path: str, *,
+        storage_id: str, expected_bytes: int, expected_sha256: str,
+    ) -> dict[str, Any]:
+        root = Path(storage_root).resolve(strict=True)
+        source = Path(source_path).resolve(strict=True)
+        try:
+            source.relative_to(root)
+        except ValueError as exc:
+            raise TransportError("shared candidate escapes its storage root") from exc
+        marker = json.loads((root / ".remrun-storage-root-v1.json").read_text(encoding="utf-8"))
+        if marker != {"schema": 1, "storage_id": storage_id}:
+            raise TransportError("shared storage marker identity mismatch")
+        if not source.is_file() or source.is_symlink() or source.stat().st_size != expected_bytes \
+                or sha256_file(source) != expected_sha256:
+            raise TransportError("shared candidate disagrees with frozen input identity")
+        receipt = self.fetch_output(str(source), Path(remote_path))
+        return {**receipt, "schema": "verified-input-v1", "route": "shared-view"}
+
     def pull_file(self, remote_path: str, local_path: Path) -> None:
         src = Path(remote_path)
 
@@ -1684,11 +1736,13 @@ class LocalSimTransport(BaseTransport):
     def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
         source = Path(remote_path)
         remote_digest = sha256_file(source)
-        if local_path.is_file() and sha256_file(local_path) == remote_digest:
-            return {
-                "schema": "verified-output-v1", "route": "reused",
-                "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-            }
+        if local_path.exists() or local_path.is_symlink():
+            if local_path.is_file() and sha256_file(local_path) == remote_digest:
+                return {
+                    "schema": "verified-output-v1", "route": "reused",
+                    "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+                }
+            raise TransportError("output return destination already exists with different bytes")
 
         def fill(tmp: Path) -> None:
             with source.open("rb") as incoming, tmp.open("wb") as target:
@@ -2178,6 +2232,48 @@ _MATERIALIZE_INPUT_PROG = (
     "  finally:os.close(d)\n"
     " except OSError:pass\n"
     " print(json.dumps({'schema':'verified-input-v1','route':'stream','bytes':count,'sha256':'sha256:'+digest},sort_keys=True))\n"
+    "except BaseException:\n"
+    " try:os.unlink(tmp)\n"
+    " except OSError:pass\n"
+    " raise\n"
+)
+
+_MATERIALIZE_SHARED_INPUT_PROG = (
+    "import hashlib,json,os,stat,sys,tempfile\n"
+    "root,source,dest,storage_id,size,expected=sys.argv[1:];size=int(size)\n"
+    "marker_name='.remrun-storage-root-v1.json'\n"
+    "root=os.path.abspath(root);source=os.path.abspath(source)\n"
+    "real_root=os.path.realpath(root);real_source=os.path.realpath(source)\n"
+    "if os.path.commonpath([real_root,real_source])!=real_root:raise ValueError('candidate escapes storage root')\n"
+    "relative=os.path.relpath(source,root)\n"
+    "if relative=='..' or relative.startswith('..'+os.sep):raise ValueError('candidate escapes storage root')\n"
+    "cursor=root\n"
+    "for component in relative.split(os.sep):\n"
+    " cursor=os.path.join(cursor,component)\n"
+    " junction=getattr(os.path,'isjunction',lambda p:False)(cursor)\n"
+    " if os.path.islink(cursor) or junction or (cursor!=source and os.path.ismount(cursor)):\n"
+    "  raise ValueError('shared candidate crosses a link or mount boundary')\n"
+    "with open(os.path.join(root,marker_name),'rb') as marker_file:\n"
+    " marker_bytes=marker_file.read(4097)\n"
+    "if len(marker_bytes)>4096:raise ValueError('storage marker is oversized')\n"
+    "marker=json.loads(marker_bytes.decode('utf-8'))\n"
+    "if marker!={'schema':1,'storage_id':storage_id}:raise ValueError('storage marker identity mismatch')\n"
+    "info=os.stat(source,follow_symlinks=False)\n"
+    "if not stat.S_ISREG(info.st_mode):raise ValueError('shared candidate is not a regular file')\n"
+    "parent=os.path.dirname(dest) or '.';os.makedirs(parent,exist_ok=True)\n"
+    "fd,tmp=tempfile.mkstemp(prefix='.remrun-input-',suffix='.tmp',dir=parent)\n"
+    "h=hashlib.sha256();count=0\n"
+    "try:\n"
+    " with open(source,'rb') as incoming,os.fdopen(fd,'wb') as out:\n"
+    "  while True:\n"
+    "   block=incoming.read(1048576)\n"
+    "   if not block:break\n"
+    "   out.write(block);h.update(block);count+=len(block)\n"
+    "  out.flush();os.fsync(out.fileno())\n"
+    " digest=h.hexdigest()\n"
+    " if count!=size or digest!=expected:raise ValueError('shared candidate identity mismatch')\n"
+    " os.replace(tmp,dest)\n"
+    " print(json.dumps({'schema':'verified-input-v1','route':'shared-view','bytes':count,'sha256':'sha256:'+digest},sort_keys=True))\n"
     "except BaseException:\n"
     " try:os.unlink(tmp)\n"
     " except OSError:pass\n"
@@ -3302,6 +3398,19 @@ class SSHPosixTransport(_SSHCommon):
         proc, copied, digest = self._remote_file(address, script, source)
         return _verified_input_receipt(proc, copied, digest, remote_path)
 
+    def materialize_shared_input(
+        self, storage_root: str, source_path: str, remote_path: str, *,
+        storage_id: str, expected_bytes: int, expected_sha256: str,
+    ) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        script = shlex.join([
+            self.device.remote_python or "python3", "-S", "-c",
+            _MATERIALIZE_SHARED_INPUT_PROG, storage_root, source_path, remote_path,
+            storage_id, str(expected_bytes), expected_sha256,
+        ])
+        proc = self._remote(address, script)
+        return _shared_input_receipt(proc, remote_path, expected_bytes, expected_sha256)
+
     def push_files(self, local_root: Path, remote_root: str, rel_paths: list[str]) -> None:
         if len(rel_paths) < 2:
             return super().push_files(local_root, remote_root, rel_paths)
@@ -3356,11 +3465,13 @@ class SSHPosixTransport(_SSHCommon):
     def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
         address = self._address_or_resolve()
         remote_digest = self.hash_file(remote_path)
-        if local_path.is_file() and sha256_file(local_path) == remote_digest:
-            return {
-                "schema": "verified-output-v1", "route": "reused",
-                "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-            }
+        if local_path.exists() or local_path.is_symlink():
+            if local_path.is_file() and sha256_file(local_path) == remote_digest:
+                return {
+                    "schema": "verified-output-v1", "route": "reused",
+                    "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+                }
+            raise TransportError("output return destination already exists with different bytes")
 
         def fill(tmp: Path) -> None:
             proc = self._remote_to_local_file(address, f"cat {shlex.quote(remote_path)}", tmp)
@@ -4251,6 +4362,20 @@ class SSHPowerShellTransport(_SSHCommon):
         proc, copied, digest = self._remote_file(address, command, source)
         return _verified_input_receipt(proc, copied, digest, remote_path)
 
+    def materialize_shared_input(
+        self, storage_root: str, source_path: str, remote_path: str, *,
+        storage_id: str, expected_bytes: int, expected_sha256: str,
+    ) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        argv = [
+            self.device.remote_python or "python", "-S", "-c",
+            _MATERIALIZE_SHARED_INPUT_PROG, storage_root, source_path, remote_path,
+            storage_id, str(expected_bytes), expected_sha256,
+        ]
+        script = "& " + " ".join(_ps_squote(token) for token in argv) + "; exit $LASTEXITCODE"
+        proc = self._ps_remote(address, script)
+        return _shared_input_receipt(proc, remote_path, expected_bytes, expected_sha256)
+
     def push_files(self, local_root: Path, remote_root: str, rel_paths: list[str]) -> None:
         if len(rel_paths) < 2:
             return super().push_files(local_root, remote_root, rel_paths)
@@ -4301,11 +4426,13 @@ class SSHPowerShellTransport(_SSHCommon):
     def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
         address = self._address_or_resolve()
         remote_digest = self.hash_file(remote_path)
-        if local_path.is_file() and sha256_file(local_path) == remote_digest:
-            return {
-                "schema": "verified-output-v1", "route": "reused",
-                "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-            }
+        if local_path.exists() or local_path.is_symlink():
+            if local_path.is_file() and sha256_file(local_path) == remote_digest:
+                return {
+                    "schema": "verified-output-v1", "route": "reused",
+                    "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+                }
+            raise TransportError("output return destination already exists with different bytes")
 
         argv = [
             self.device.remote_python or "python", "-S", "-c",

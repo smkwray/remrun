@@ -365,8 +365,8 @@ def _validate_cost(raw: Any, input_spec: Mapping[str, Any],
 
 def _validate_output(raw: Any, input_spec: Mapping[str, Any]) -> dict[str, Any]:
     table = _table(raw, "output")
-    allowed = {"reservation", "allow_root_override", "verification", "missing_mapping",
-               "no_change"}
+    allowed = {"reservation", "allow_root_override", "allow_return", "verification",
+               "missing_mapping", "no_change"}
     _closed(table, allowed, "output")
     _required(table, {"reservation", "allow_root_override", "verification"}, "output")
     reservation = _enum(table["reservation"],
@@ -377,6 +377,8 @@ def _validate_output(raw: Any, input_spec: Mapping[str, Any]) -> dict[str, Any]:
     out = {"reservation": reservation,
            "allow_root_override": _bool(table["allow_root_override"],
                                         "output.allow_root_override"),
+           "allow_return": _bool(table.get("allow_return", False),
+                                 "output.allow_return"),
            "verification": verification}
     if reservation != "none" and input_spec["mode"] not in {"files", "text-or-files"}:
         raise TaskContractError("output reservation requires file-capable input")

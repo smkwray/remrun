@@ -168,6 +168,7 @@ bucket_options = ["quality"]
 [fleet.tasks.zotomatic.output]
 reservation = "content-work-stem-v1"
 allow_root_override = false
+allow_return = false
 verification = "mapped-tree-change-v1"
 missing_mapping = "final"
 no_change = "final"

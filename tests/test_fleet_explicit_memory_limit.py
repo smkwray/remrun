@@ -235,7 +235,7 @@ def test_v2_limits_are_closed_and_unsupported_schemas_fail_closed() -> None:
     with pytest.raises(PreparationError, match="unknown or missing fields"):
         prepared_memory_limit_mib(unknown)
     with pytest.raises(PreparationError, match="unsupported prepared job schema"):
-        prepared_memory_limit_mib({"schema": 5})
+        prepared_memory_limit_mib({"schema": 7})
 
 
 def test_explicit_v2_round_trips_through_durable_queue(

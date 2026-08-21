@@ -254,6 +254,22 @@ batching and replay policy, exact cost units (or an honest `none`), output reser
 completion evidence, and one or more device adapters. Unknown fields and unsafe
 combinations are rejected before enqueue.
 
+File inputs always end in a target-private verified copy. The default route streams one
+stable-open controller source in bounded chunks. A shared root is only an optimization:
+`fleet storage enroll ROOT` creates or reads its opaque marker, and `fleet storage bind
+--device NAME ROOT` verifies that same marker from the target before recording a
+controller-local binding. A prepared `StorageRefV1` contains only the marker identity and
+relative components. The target rejects escaping links, junctions, and nested mount points,
+copies the candidate into the same private boundary, and verifies its frozen digest. Any
+missing, stale, placeholder, or otherwise unusable shared candidate falls back to streaming
+on the already-selected device; it never makes the device ineligible.
+
+`output.allow_return = true` permits a caller to opt in with `--return-root DIR`. Successful
+ResultEnvelopeV2 output and companion paths are streamed back with target/controller SHA-256
+agreement before atomic local visibility. An equal existing destination is reused; different
+existing bytes are preserved and the job is held for review. Without `--return-root`, mapped
+shared-output verification and external synchronization behave exactly as before.
+
 Every configured task declares `execution.replay = "at-most-once-v1"` or
 `"idempotent-v1"`. The latter is truthful only for a target worker with a durable atomic ledger
 keyed by the frozen `work_id`; producing the same filename is not deduplication. Stale work whose

@@ -29,6 +29,7 @@ bucket_options = ["quality"]      # isolate behavior/cost-relevant option lanes
 [fleet.tasks.zotomatic.output]
 reservation = "content-work-stem-v1"  # none | source-stem-v1 | content-work-stem-v1
 allow_root_override = false
+allow_return = false                   # caller may opt in with --return-root
 verification = "mapped-tree-change-v1" # none | mapped-tree-change-v1
 missing_mapping = "final"         # required only for mapped verification
 no_change = "final"               # allow | final

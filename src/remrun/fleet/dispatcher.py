@@ -8,9 +8,9 @@ worker invocation (one cold model load — Invariant 0's only amortization).
 v1 (this module): **pre-launch coalescing** only — group the jobs already waiting (plus a
 short debounce window for late arrivals), place ONE compatible group, claim it all-or-
 nothing (acquiring the configured resource lease when needed), run it,
-complete/fail. No resident/warm model and no worker drain-loop. Output delivery is
-verify-only for mapped shared-output trees; the user's sync tool or explicit sync
-command delivers the files locally.
+complete/fail. No resident/warm model and no worker drain-loop. Mapped shared-output
+trees remain verify-only unless a prepared task explicitly opts into controller return;
+that separate route is digest-verified and conflict-safe.
 """
 from __future__ import annotations
 
