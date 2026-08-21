@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
+import hashlib
 import io
 import json
 import math
@@ -20,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Iterable
+from typing import Any, BinaryIO, Callable, Iterable
 
 from .frame import decode_file_frame, encode_file_frame
 from .job_observation import JobObservation, observation_warning
@@ -185,6 +186,32 @@ def _small_file_remote_error(
     return TransportError(
         f"read small file {remote_path} failed: {detail or f'exit {returncode}'}"
     )
+
+
+def _verified_input_receipt(
+    proc: subprocess.CompletedProcess, copied: int, local_sha256: str,
+    remote_path: str,
+) -> dict[str, Any]:
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        if proc.returncode == 47 or _INPUT_IDENTITY_MISMATCH in detail:
+            raise MaterializationIdentityError(
+                f"materialized input disagrees with its frozen identity: {remote_path}"
+            )
+        raise TransportError(
+            f"materialize {remote_path} failed: {detail or f'exit {proc.returncode}'}"
+        )
+    try:
+        receipt = json.loads(proc.stdout.decode("utf-8", "strict"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise TransportError(f"materialize {remote_path} returned invalid receipt") from exc
+    expected = {
+        "schema": "verified-input-v1", "route": "stream", "bytes": copied,
+        "sha256": "sha256:" + local_sha256,
+    }
+    if receipt != expected:
+        raise TransportError(f"materialize {remote_path} receipt disagrees with streamed bytes")
+    return receipt
 
 
 def _stream_spawn_kwargs() -> dict[str, object]:
@@ -372,6 +399,54 @@ def _stream_process(
     if reader_errors:
         raise reader_errors[0]
     return proc.returncode, stdout, stderr
+
+
+def _stream_file_process(
+    proc: subprocess.Popen,
+    source: BinaryIO,
+    timeout: float | None = None,
+) -> tuple[subprocess.CompletedProcess, int, str]:
+    """Pump one already-open file to a process without buffering it in memory."""
+    writer_errors: list[BaseException] = []
+    digest = hashlib.sha256()
+    copied = 0
+
+    def write_source() -> None:
+        nonlocal copied
+        try:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                proc.stdin.write(block)
+                copied += len(block)
+                digest.update(block)
+            proc.stdin.close()
+        except BaseException as exc:
+            writer_errors.append(exc)
+            _kill_stream_process(proc, process_group=True)
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    writer = threading.Thread(
+        target=write_source, name="remrun-file-writer", daemon=True,
+    )
+    writer.start()
+    code, stdout, stderr = _stream_process(
+        proc, None, timeout, process_group=True,
+    )
+    writer.join(timeout=0.2)
+    if writer.is_alive():
+        _kill_stream_process(proc, process_group=True)
+        raise TransportError("file stream writer did not stop after transport exit")
+    if writer_errors:
+        raise TransportError(f"file stream failed: {writer_errors[0]}") from writer_errors[0]
+    completed = subprocess.CompletedProcess(
+        proc.args, code, stdout.encode("utf-8"), stderr.encode("utf-8"),
+    )
+    return completed, copied, digest.hexdigest()
 
 
 # Stdlib-only POSIX sampler: runs the wrapped command, then reads
@@ -836,6 +911,10 @@ class TransportError(RuntimeError):
     pass
 
 
+class MaterializationIdentityError(TransportError):
+    """The target refused streamed bytes that did not match the frozen identity."""
+
+
 class GuardFinalizationError(TransportError):
     """A guard initialized, but the controller cannot safely finalize its attempt.
 
@@ -1243,6 +1322,17 @@ class BaseTransport:
     def push_file(self, local_path: Path, remote_path: str) -> None:
         raise NotImplementedError
 
+    def materialize_input(
+        self,
+        source: BinaryIO,
+        remote_path: str,
+        *,
+        expected_bytes: int,
+        expected_sha256: str | None,
+    ) -> dict[str, Any]:
+        """Stream one frozen input into a target-private file and return VerifiedInputV1."""
+        raise NotImplementedError
+
     def pull_file(self, remote_path: str, local_path: Path) -> None:
         raise NotImplementedError
 
@@ -1548,6 +1638,36 @@ class LocalSimTransport(BaseTransport):
             shutil.copyfile(local_path, tmp)
             shutil.copystat(local_path, tmp)   # preserve mtime/mode (like copy2)
         _atomic_write_local(Path(remote_path), fill)
+
+    def materialize_input(
+        self, source: BinaryIO, remote_path: str, *, expected_bytes: int,
+        expected_sha256: str | None,
+    ) -> dict[str, Any]:
+        digest = hashlib.sha256()
+        copied = 0
+
+        def fill(tmp: Path) -> None:
+            nonlocal copied
+            with tmp.open("wb") as target:
+                while True:
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    target.write(block)
+                    digest.update(block)
+                    copied += len(block)
+            actual = digest.hexdigest()
+            if copied != expected_bytes or (expected_sha256 and actual != expected_sha256):
+                raise MaterializationIdentityError(
+                    "materialized input disagrees with its frozen identity"
+                )
+
+        _atomic_write_local(Path(remote_path), fill)
+        actual = digest.hexdigest()
+        return {
+            "schema": "verified-input-v1", "route": "stream", "bytes": copied,
+            "sha256": "sha256:" + actual,
+        }
 
     def pull_file(self, remote_path: str, local_path: Path) -> None:
         src = Path(remote_path)
@@ -1893,6 +2013,20 @@ class _SSHCommon(BaseTransport):
         return self._run([*self._ssh_base(address), script], input_bytes, timeout,
                          on_stdout=on_stdout)
 
+    def _remote_file(
+        self, address: str, script: str, source: BinaryIO,
+        timeout: float | None = None,
+    ) -> tuple[subprocess.CompletedProcess, int, str]:
+        argv = [*self._ssh_base(address), script]
+        try:
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                **_stream_spawn_kwargs(),
+            )
+            return _stream_file_process(proc, source, timeout)
+        except FileNotFoundError as exc:
+            raise TransportError(f"ssh executable not found: {exc}") from exc
+
     def kill_workers(self) -> bool:
         """Best-effort: run this device's configured cancel actions.
 
@@ -1978,6 +2112,38 @@ _ATOMIC_COMMIT_PROG = (
     " try:\n  os.fsync(d)\n"
     " finally:\n  os.close(d)\n"
     "except OSError:\n pass\n"
+)
+
+# Target-side half of VerifiedInputV1. Raw stdin is copied in fixed chunks into a
+# target-private temp file, hashed while written, fsynced, then atomically committed.
+_INPUT_IDENTITY_MISMATCH = "__REMRUN_INPUT_IDENTITY_MISMATCH__"
+_MATERIALIZE_INPUT_PROG = (
+    "import hashlib,json,os,sys,tempfile\n"
+    "dest,size,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]\n"
+    "parent=os.path.dirname(dest) or '.';os.makedirs(parent,exist_ok=True)\n"
+    "fd,tmp=tempfile.mkstemp(prefix='.remrun-input-',suffix='.tmp',dir=parent)\n"
+    "h=hashlib.sha256();count=0\n"
+    "try:\n"
+    " with os.fdopen(fd,'wb') as out:\n"
+    "  while True:\n"
+    "   block=sys.stdin.buffer.read(1048576)\n"
+    "   if not block:break\n"
+    "   out.write(block);h.update(block);count+=len(block)\n"
+    "  out.flush();os.fsync(out.fileno())\n"
+    " digest=h.hexdigest()\n"
+    " if count!=size or (expected and digest!=expected):\n"
+    f"  sys.stderr.write('{_INPUT_IDENTITY_MISMATCH}\\n');raise SystemExit(47)\n"
+    " os.replace(tmp,dest)\n"
+    " try:\n"
+    "  d=os.open(parent,os.O_RDONLY)\n"
+    "  try:os.fsync(d)\n"
+    "  finally:os.close(d)\n"
+    " except OSError:pass\n"
+    " print(json.dumps({'schema':'verified-input-v1','route':'stream','bytes':count,'sha256':'sha256:'+digest},sort_keys=True))\n"
+    "except BaseException:\n"
+    " try:os.unlink(tmp)\n"
+    " except OSError:pass\n"
+    " raise\n"
 )
 
 
@@ -3085,6 +3251,19 @@ class SSHPosixTransport(_SSHCommon):
                 f"push {remote_path} failed: {proc.stderr.decode('utf-8', 'replace')}"
             )
 
+    def materialize_input(
+        self, source: BinaryIO, remote_path: str, *, expected_bytes: int,
+        expected_sha256: str | None,
+    ) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        expected = expected_sha256 or ""
+        script = shlex.join([
+            self.device.remote_python or "python3", "-S", "-c",
+            _MATERIALIZE_INPUT_PROG, remote_path, str(expected_bytes), expected,
+        ])
+        proc, copied, digest = self._remote_file(address, script, source)
+        return _verified_input_receipt(proc, copied, digest, remote_path)
+
     def push_files(self, local_root: Path, remote_root: str, rel_paths: list[str]) -> None:
         if len(rel_paths) < 2:
             return super().push_files(local_root, remote_root, rel_paths)
@@ -3993,6 +4172,21 @@ class SSHPowerShellTransport(_SSHCommon):
             raise TransportError(
                 f"push {remote_path} failed: {proc.stderr.decode('utf-8', 'replace')}"
             )
+
+    def materialize_input(
+        self, source: BinaryIO, remote_path: str, *, expected_bytes: int,
+        expected_sha256: str | None,
+    ) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        argv = [
+            self.device.remote_python or "python", "-S", "-c",
+            _MATERIALIZE_INPUT_PROG, remote_path, str(expected_bytes),
+            expected_sha256 or "",
+        ]
+        script = "& " + " ".join(_ps_squote(token) for token in argv) + "; exit $LASTEXITCODE"
+        command = _ps_remote_command(self._ps_exe(), script)
+        proc, copied, digest = self._remote_file(address, command, source)
+        return _verified_input_receipt(proc, copied, digest, remote_path)
 
     def push_files(self, local_root: Path, remote_root: str, rel_paths: list[str]) -> None:
         if len(rel_paths) < 2:

@@ -17,7 +17,7 @@ from . import adapters, placement, probes, profiles
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
 from .prepared import (
-    SourceChangedError, prepared_memory_limit_mib, snapshot_prepared_input,
+    SourceChangedError, materialize_prepared_input, prepared_memory_limit_mib,
 )
 from .queue import BatchHeartbeat, FleetQueue
 from .result_protocol import ResultProtocolError, validate_result_envelope
@@ -560,39 +560,13 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
     record = head.prepared
     spec = head.resolved_spec
     is_command = record["kind"] == "command"
-    verified: dict[tuple[int, int], Path] = {}
-    changed: dict[int, str] = {}
-    for task_index, task in enumerate(tasks):
-        for item in task.prepared["payload"]["items"]:
-            try:
-                verified[(task_index, item["index"])] = snapshot_prepared_input(item)
-            except SourceChangedError as exc:
-                changed[task_index] = str(exc)
-                break
-    if changed:
-        _discard_snapshots(verified)
-        rows = []
-        for index, _task in enumerate(tasks):
-            job_id = job_ids[index] if job_ids and index < len(job_ids) else f"adhoc-{index}"
-            detail = changed.get(index)
-            rows.append({
-                "job_id": job_id, "ok": False,
-                "outcome": "review" if detail else "failed",
-                "disposition": "review" if detail else "retry",
-                "message": detail or "batch staging stopped because a sibling source changed",
-            })
-        return {"ok": False, "device": device_name, "staged": 0,
-                "error": "source_changed", "item_results": rows}
-
     adapter = None if is_command else spec["adapters"].get(device_name)
     if not is_command and adapter is None:
-        _discard_snapshots(verified)
         return {"ok": False, "device": device_name,
                 "error": "frozen spec has no adapter for the selected device"}
     configured_root = adapters.resolve_output_root(head, device_name)
     output_error = _output_root_error(configured_root, device)
     if output_error:
-        _discard_snapshots(verified)
         return {"ok": False, "device": device_name, "phase": "output_root",
                 "error": output_error}
     transport = None
@@ -603,7 +577,6 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
         stage_in = transport.native_join(stage, "in")
         transport.ensure_remote_dir(stage_in)
     except TransportError as exc:
-        _discard_snapshots(verified)
         if cleanup and transport is not None and stage is not None:
             _safe_delete(transport, stage)
         return {"ok": False, "device": device_name, "error": f"stage failed: {exc}"}
@@ -617,6 +590,7 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
         for index, task in enumerate(tasks):
             prepared = task.prepared
             staged_names: list[str] = []
+            verified_inputs: list[dict[str, Any]] = []
             payload = prepared["payload"]
             if payload["mode"] == "text":
                 name = _unique_name(f"item-{index:04d}.txt", used)
@@ -632,12 +606,11 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 staged_names.append(name)
                 staged += 1
             for item in payload["items"]:
-                snapshot = verified.pop((index, item["index"]))
                 name = _unique_name(Path(item["source_path"]).name, used)
-                try:
-                    transport.push_file(snapshot, transport.native_join(stage_in, name))
-                finally:
-                    snapshot.unlink(missing_ok=True)
+                receipt = materialize_prepared_input(
+                    transport, item, transport.native_join(stage_in, name),
+                )
+                verified_inputs.append({"index": item["index"], **receipt})
                 staged_names.append(name)
                 staged += 1
             job_id = job_ids[index] if job_ids and index < len(job_ids) else f"adhoc-{index}"
@@ -649,6 +622,7 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 "index": index, "job_id": job_id,
                 "prepared_id": prepared["prepared_id"], "work_id": prepared["work_id"],
                 "payload": payload, "staged": staged_names,
+                "verified_inputs": verified_inputs,
                 "reservations": prepared["output"]["reservations"],
                 "cost": prepared["cost"],
             })
@@ -679,8 +653,22 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             "device": device_name, "stage": stage, "stage_in": stage_in,
             "output_root": output_root, "items": manifest_items,
         })
+    except SourceChangedError as exc:
+        if cleanup:
+            _safe_delete(transport, stage)
+        rows = []
+        for index, _task in enumerate(tasks):
+            job_id = job_ids[index] if job_ids and index < len(job_ids) else f"adhoc-{index}"
+            rows.append({
+                "job_id": job_id, "ok": False,
+                "outcome": "review" if index == len(manifest_items) else "failed",
+                "disposition": "review" if index == len(manifest_items) else "retry",
+                "message": str(exc) if index == len(manifest_items)
+                else "batch staging stopped because a sibling source changed",
+            })
+        return {"ok": False, "device": device_name, "staged": staged,
+                "error": "source_changed", "item_results": rows}
     except (OSError, TransportError, ValueError) as exc:
-        _discard_snapshots(verified)
         if cleanup:
             _safe_delete(transport, stage)
         return {"ok": False, "device": device_name, "staged": staged,
@@ -944,12 +932,6 @@ def _read_worker_metrics(transport: Any, stage: str, stage_in: str,
             if value is not None:
                 return value
     return None
-
-
-def _discard_snapshots(snapshots: dict[tuple[int, int], Path]) -> None:
-    for snapshot in snapshots.values():
-        snapshot.unlink(missing_ok=True)
-    snapshots.clear()
 
 
 def _safe_delete(transport: Any, remote_dir: str) -> None:

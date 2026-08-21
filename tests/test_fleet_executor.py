@@ -1,6 +1,8 @@
 """Prepared fleet execution end to end through the LOCAL_SIM transport."""
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,7 +18,7 @@ from remrun.fleet.prepared import (
 )
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.models import Device
-from remrun.transport import TransportError
+from remrun.transport import TransportError, make_transport
 
 
 def _config(tmp_path) -> RemrunConfig:  # noqa: ANN001
@@ -74,6 +76,28 @@ def test_prepared_raw_command_runs_exact_argv_once_per_submission(tmp_path) -> N
     assert [json.loads(line) for line in marker.read_text(encoding="utf-8").splitlines()] == [
         hostile, hostile,
     ]
+
+
+def test_materialize_input_reads_in_bounded_chunks_and_returns_receipt(tmp_path) -> None:
+    payload = b"z" * (3 * 1024 * 1024 + 17)
+
+    class ChunkOnly(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            assert 0 < size <= 1024 * 1024
+            return super().read(size)
+
+    target = tmp_path / "target" / "input.bin"
+    transport = make_transport(_config(tmp_path).devices["LOCAL_SIM"])
+    receipt = transport.materialize_input(
+        ChunkOnly(payload), str(target), expected_bytes=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert target.read_bytes() == payload
+    assert receipt == {
+        "schema": "verified-input-v1", "route": "stream", "bytes": len(payload),
+        "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def test_prepared_source_change_stops_before_worker_launch(tmp_path) -> None:
@@ -220,7 +244,7 @@ def test_malformed_result_digest_is_terminal_and_not_learned(tmp_path) -> None:
     assert profiles.load_profiles(tmp_path / "state") == {}
 
 
-def test_stage_setup_failure_discards_snapshots_and_remote_root(
+def test_stage_setup_failure_removes_remote_root_without_controller_snapshot(
     tmp_path, monkeypatch,
 ) -> None:
     output_root = tmp_path / "prepared-output"
@@ -236,14 +260,6 @@ def test_stage_setup_failure_discards_snapshots_and_remote_root(
     task = as_fleet_task(
         prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)]), spec,
     )
-
-    snapshots: list[Path] = []
-    real_snapshot = executor.snapshot_prepared_input
-
-    def recording_snapshot(item: dict) -> Path:
-        snapshot = real_snapshot(item)
-        snapshots.append(snapshot)
-        return snapshot
 
     stage = str(tmp_path / "remote-stage")
     removed: list[str] = []
@@ -261,7 +277,6 @@ def test_stage_setup_failure_discards_snapshots_and_remote_root(
         def remove_remote_tree(self, path: str) -> None:
             removed.append(path)
 
-    monkeypatch.setattr(executor, "snapshot_prepared_input", recording_snapshot)
     monkeypatch.setattr(executor, "make_transport", lambda _device: FailingTransport())
 
     result = executor.run_batch(
@@ -269,5 +284,4 @@ def test_stage_setup_failure_discards_snapshots_and_remote_root(
     )
 
     assert result["ok"] is False and result["error"].startswith("stage failed:")
-    assert snapshots and all(not snapshot.exists() for snapshot in snapshots)
     assert removed == [stage]

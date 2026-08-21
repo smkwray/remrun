@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import time
@@ -12,10 +13,10 @@ from remrun.fleet import dispatcher, executor, prepared as prepared_mod
 from remrun.fleet.prepared import (
     PreparationError,
     as_fleet_task,
+    materialize_prepared_input,
     prepare_raw_command,
     prepare_task_job,
     prepare_task_jobs,
-    snapshot_prepared_input,
     validate_prepared_job,
 )
 from remrun.fleet.queue import FleetQueue, QueueMigrationError
@@ -358,8 +359,9 @@ def test_prepared_integrity_rejects_changed_bytes(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("identity_mode", ["sha256", "metadata"])
-def test_frozen_input_snapshot_rejects_changed_source(tmp_path: Path,
-                                                      identity_mode: str) -> None:
+def test_frozen_input_materialization_rejects_changed_source(
+    tmp_path: Path, identity_mode: str,
+) -> None:
     source = tmp_path / "item.zot"
     source.write_bytes(b"original")
     raw = _task()
@@ -374,8 +376,18 @@ def test_frozen_input_snapshot_rejects_changed_source(tmp_path: Path,
         # court to prove that the named file no longer has the frozen metadata.
         os.utime(source, ns=(frozen + 2_000_000_000, frozen + 2_000_000_000))
 
+    class RecordingTransport:
+        def materialize_input(self, stream, _remote_path, **_expected):  # noqa: ANN001
+            data = stream.read()
+            return {
+                "schema": "verified-input-v1", "route": "stream", "bytes": len(data),
+                "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+            }
+
     with pytest.raises(PreparationError, match="source_changed"):
-        snapshot_prepared_input(record["payload"]["items"][0])
+        materialize_prepared_input(
+            RecordingTransport(), record["payload"]["items"][0], "target-private",
+        )
 
 
 def test_queue_stores_spec_once_and_dedupes_only_prepared_tasks(tmp_path: Path) -> None:

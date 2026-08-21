@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..transport import MaterializationIdentityError
 from .models import normalize_capabilities
 from .task_contract import canonical_json, sha256_id, verify_id
 
@@ -216,38 +217,36 @@ def _identity(path: Path, mode: str, index: int) -> dict[str, Any]:
     return {"index": index, "source_path": str(resolved), "identity": ident}
 
 
-def snapshot_prepared_input(item: Mapping[str, Any]) -> Path:
-    """Copy only bytes that match a frozen file identity into a private snapshot."""
+def materialize_prepared_input(
+    transport: Any, item: Mapping[str, Any], remote_path: str,
+) -> dict[str, Any]:
+    """Stream frozen source bytes straight into a target-private verified input."""
     source = Path(item["source_path"])
     expected = item["identity"]
-    snapshot: Path | None = None
     try:
         stream, before = _stable_open(source)
         with stream:
-            with tempfile.NamedTemporaryFile("wb", delete=False) as target:
-                snapshot = Path(target.name)
-                digest = hashlib.sha256() if expected["mode"] == "sha256" else None
-                copied = 0
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    target.write(chunk)
-                    copied += len(chunk)
-                    if digest is not None:
-                        digest.update(chunk)
+            receipt = transport.materialize_input(
+                stream,
+                remote_path,
+                expected_bytes=int(expected["bytes"]),
+                expected_sha256=(
+                    str(expected["sha256"]).removeprefix("sha256:")
+                    if expected["mode"] == "sha256" else None
+                ),
+            )
             after = _same_open_file(source, before, stream)
-        matches = copied == after.st_size == expected["bytes"]
-        if expected["mode"] == "metadata":
-            matches = matches and after.st_mtime_ns == expected["mtime_ns"]
-        else:
-            matches = matches and "sha256:" + digest.hexdigest() == expected["sha256"]
-        if not matches:
-            raise SourceChangedError(f"source_changed: {source}")
-        return snapshot
-    except (OSError, SourceChangedError) as exc:
-        if snapshot is not None:
-            snapshot.unlink(missing_ok=True)
-        if isinstance(exc, SourceChangedError):
-            raise
+    except (OSError, MaterializationIdentityError) as exc:
         raise SourceChangedError(f"source_changed: {source}: {exc}") from exc
+
+    matches = after.st_size == expected["bytes"] == receipt.get("bytes")
+    if expected["mode"] == "metadata":
+        matches = matches and after.st_mtime_ns == expected["mtime_ns"]
+    else:
+        matches = matches and receipt.get("sha256") == expected["sha256"]
+    if not matches:
+        raise SourceChangedError(f"source_changed: {source}")
+    return receipt
 
 
 def _payload(definition: Mapping[str, Any], *, text: str | None,

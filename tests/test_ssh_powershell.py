@@ -894,6 +894,35 @@ def test_push_streams_base64_and_sets_mtime(monkeypatch, tmp_path: Path):
     assert "Remove-Item -LiteralPath $backup" in script
 
 
+def test_materialize_input_uses_raw_stream_not_base64(monkeypatch):
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    payload = b"raw\x00bytes"
+    seen: dict[str, object] = {}
+
+    def remote_file(address, command, source, timeout=None):  # noqa: ANN001
+        data = source.read()
+        digest = hashlib.sha256(data).hexdigest()
+        seen.update(address=address, command=command, data=data, timeout=timeout)
+        receipt = json.dumps({
+            "schema": "verified-input-v1", "route": "stream", "bytes": len(data),
+            "sha256": "sha256:" + digest,
+        }).encode()
+        return cp(0, receipt), len(data), digest
+
+    monkeypatch.setattr(t, "_remote_file", remote_file)
+    receipt = t.materialize_input(
+        io.BytesIO(payload), "C:\\stage\\input.bin", expected_bytes=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    script = decoded(seen["command"])
+    assert seen["data"] == payload and seen["address"] == "winbox"
+    assert "sys.stdin.buffer.read(1048576)" in script
+    assert "FromBase64String" not in script
+    assert receipt["sha256"] == "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 def test_push_files_streams_tar_archive(monkeypatch, tmp_path: Path):
     t = SSHPowerShellTransport(device())
     t._address = "winbox"

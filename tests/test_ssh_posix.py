@@ -126,6 +126,33 @@ def test_push_file_handles_spaces_and_commas_in_path(tmp_path, monkeypatch):
     assert "trap 'rm -f '" not in script                   # the broken nested-quote form is gone
 
 
+def test_materialize_input_uses_raw_stream_and_verified_receipt(monkeypatch):
+    t = SSHPosixTransport(device())
+    t._address = "macbox"
+    payload = b"raw\x00bytes"
+    seen: dict[str, object] = {}
+
+    def remote_file(address, script, source, timeout=None):  # noqa: ANN001
+        data = source.read()
+        digest = hashlib.sha256(data).hexdigest()
+        seen.update(address=address, script=script, data=data, timeout=timeout)
+        receipt = json.dumps({
+            "schema": "verified-input-v1", "route": "stream", "bytes": len(data),
+            "sha256": "sha256:" + digest,
+        }).encode()
+        return cp(0, receipt), len(data), digest
+
+    monkeypatch.setattr(t, "_remote_file", remote_file)
+    receipt = t.materialize_input(
+        io.BytesIO(payload), "/tmp/stage/input.bin", expected_bytes=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert seen["data"] == payload and seen["address"] == "macbox"
+    assert "remrun-input-" in seen["script"] and "sys.stdin.buffer.read(1048576)" in seen["script"]
+    assert receipt["sha256"] == "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 def test_read_small_file_caps_remotely_and_returns_binary(monkeypatch):
     payload = b"\x00receipt\xff"
     t = SSHPosixTransport(device())
