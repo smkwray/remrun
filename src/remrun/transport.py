@@ -1336,6 +1336,10 @@ class BaseTransport:
     def pull_file(self, remote_path: str, local_path: Path) -> None:
         raise NotImplementedError
 
+    def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
+        """Stream one remote output into an atomic local destination with digest proof."""
+        raise NotImplementedError
+
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         """Read one bounded remote file without transferring an oversized payload.
 
@@ -1676,6 +1680,27 @@ class LocalSimTransport(BaseTransport):
             shutil.copyfile(src, tmp)
             shutil.copystat(src, tmp)
         _atomic_write_local(local_path, fill)
+
+    def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
+        source = Path(remote_path)
+        remote_digest = sha256_file(source)
+        if local_path.is_file() and sha256_file(local_path) == remote_digest:
+            return {
+                "schema": "verified-output-v1", "route": "reused",
+                "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+            }
+
+        def fill(tmp: Path) -> None:
+            with source.open("rb") as incoming, tmp.open("wb") as target:
+                shutil.copyfileobj(incoming, target, length=1024 * 1024)
+            if sha256_file(tmp) != remote_digest:
+                raise TransportError("fetched output digest disagrees with target")
+
+        _atomic_write_local(local_path, fill)
+        return {
+            "schema": "verified-output-v1", "route": "stream",
+            "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+        }
 
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         limit = _validate_small_file_limit(max_bytes)
@@ -2024,6 +2049,19 @@ class _SSHCommon(BaseTransport):
                 **_stream_spawn_kwargs(),
             )
             return _stream_file_process(proc, source, timeout)
+        except FileNotFoundError as exc:
+            raise TransportError(f"ssh executable not found: {exc}") from exc
+
+    def _remote_to_local_file(
+        self, address: str, script: str, destination: Path,
+    ) -> subprocess.CompletedProcess:
+        argv = [*self._ssh_base(address), script]
+        try:
+            with destination.open("wb") as target:
+                return subprocess.run(
+                    argv, stdin=subprocess.DEVNULL, stdout=target, stderr=subprocess.PIPE,
+                    check=False, creationflags=_NO_WINDOW,
+                )
         except FileNotFoundError as exc:
             raise TransportError(f"ssh executable not found: {exc}") from exc
 
@@ -3315,6 +3353,31 @@ class SSHPosixTransport(_SSHCommon):
         install_mode = mode & 0o777 if mode is not None and os.name == "posix" else None
         _atomic_write_local(local_path, fill, mode=install_mode)
 
+    def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        remote_digest = self.hash_file(remote_path)
+        if local_path.is_file() and sha256_file(local_path) == remote_digest:
+            return {
+                "schema": "verified-output-v1", "route": "reused",
+                "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+            }
+
+        def fill(tmp: Path) -> None:
+            proc = self._remote_to_local_file(address, f"cat {shlex.quote(remote_path)}", tmp)
+            if proc.returncode != 0:
+                detail = proc.stderr.decode("utf-8", "replace").strip()
+                raise TransportError(
+                    f"fetch {remote_path} failed: {detail or f'exit {proc.returncode}'}"
+                )
+            if sha256_file(tmp) != remote_digest:
+                raise TransportError("fetched output digest disagrees with target")
+
+        _atomic_write_local(local_path, fill)
+        return {
+            "schema": "verified-output-v1", "route": "stream",
+            "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+        }
+
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         limit = _validate_small_file_limit(max_bytes)
         address = self._address_or_resolve()
@@ -4234,6 +4297,39 @@ class SSHPowerShellTransport(_SSHCommon):
             except (ValueError, OSError):
                 pass
         _atomic_write_local(local_path, fill)
+
+    def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        remote_digest = self.hash_file(remote_path)
+        if local_path.is_file() and sha256_file(local_path) == remote_digest:
+            return {
+                "schema": "verified-output-v1", "route": "reused",
+                "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+            }
+
+        argv = [
+            self.device.remote_python or "python", "-S", "-c",
+            "import shutil,sys;shutil.copyfileobj(open(sys.argv[1],'rb'),sys.stdout.buffer,1048576)",
+            remote_path,
+        ]
+        script = "& " + " ".join(_ps_squote(token) for token in argv) + "; exit $LASTEXITCODE"
+        command = _ps_remote_command(self._ps_exe(), script)
+
+        def fill(tmp: Path) -> None:
+            proc = self._remote_to_local_file(address, command, tmp)
+            if proc.returncode != 0:
+                detail = proc.stderr.decode("utf-8", "replace").strip()
+                raise TransportError(
+                    f"fetch {remote_path} failed: {detail or f'exit {proc.returncode}'}"
+                )
+            if sha256_file(tmp) != remote_digest:
+                raise TransportError("fetched output digest disagrees with target")
+
+        _atomic_write_local(local_path, fill)
+        return {
+            "schema": "verified-output-v1", "route": "stream",
+            "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
+        }
 
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         limit = _validate_small_file_limit(max_bytes)

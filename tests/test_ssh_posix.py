@@ -153,6 +153,28 @@ def test_materialize_input_uses_raw_stream_and_verified_receipt(monkeypatch):
     assert receipt["sha256"] == "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def test_fetch_output_streams_to_atomic_local_file(monkeypatch, tmp_path):
+    t = SSHPosixTransport(device())
+    t._address = "macbox"
+    payload = b"output\x00bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(t, "hash_file", lambda _path: digest)
+
+    def remote_to_file(address, script, destination):  # noqa: ANN001
+        seen.update(address=address, script=script)
+        destination.write_bytes(payload)
+        return cp(0)
+
+    monkeypatch.setattr(t, "_remote_to_local_file", remote_to_file)
+    destination = tmp_path / "returned" / "output.bin"
+    receipt = t.fetch_output("/remote/output.bin", destination)
+
+    assert destination.read_bytes() == payload and seen["address"] == "macbox"
+    assert seen["script"] == "cat /remote/output.bin"
+    assert receipt["route"] == "stream" and receipt["sha256"] == "sha256:" + digest
+
+
 def test_read_small_file_caps_remotely_and_returns_binary(monkeypatch):
     payload = b"\x00receipt\xff"
     t = SSHPosixTransport(device())

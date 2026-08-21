@@ -923,6 +923,30 @@ def test_materialize_input_uses_raw_stream_not_base64(monkeypatch):
     assert receipt["sha256"] == "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def test_fetch_output_streams_raw_bytes_not_base64(monkeypatch, tmp_path):
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    payload = b"output\x00bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(t, "hash_file", lambda _path: digest)
+
+    def remote_to_file(address, command, destination):  # noqa: ANN001
+        seen.update(address=address, command=command)
+        destination.write_bytes(payload)
+        return cp(0)
+
+    monkeypatch.setattr(t, "_remote_to_local_file", remote_to_file)
+    destination = tmp_path / "returned" / "output.bin"
+    receipt = t.fetch_output("C:\\remote\\output.bin", destination)
+
+    script = decoded(seen["command"])
+    assert destination.read_bytes() == payload and seen["address"] == "winbox"
+    assert "copyfileobj" in script and "ReadAllBytes" not in script
+    assert "ToBase64String" not in script
+    assert receipt["route"] == "stream" and receipt["sha256"] == "sha256:" + digest
+
+
 def test_push_files_streams_tar_archive(monkeypatch, tmp_path: Path):
     t = SSHPowerShellTransport(device())
     t._address = "winbox"
