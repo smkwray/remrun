@@ -791,6 +791,66 @@ def test_synchronous_active_duplicate_is_not_terminalized_when_resource_is_busy(
     assert count == 1
 
 
+def test_synchronous_duplicate_identity_within_one_group_executes_once(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config, _old_spec, ledger, _worker = _dispatch_fixture(tmp_path)
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    definition = config.fleet_tasks["novel-work"]
+    definition["execution"]["batching"] = "compatible"
+    spec = resolve_task_spec(
+        "novel-work", definition, devices=config.devices, repo_root=tmp_path,
+    )
+    task = _exact_task(tmp_path, spec, 3, "sync-same")
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(executor, "load_config", lambda _root=None: config)
+
+    result = executor._run_group_leased(
+        "A", [task, task], config, state_root=state_root, cleanup=True, lease_seconds=60,
+    )
+
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        rows = [dict(row) for row in queue.db.execute(
+            "SELECT state,attempts,idempotency_key FROM jobs"
+        ).fetchall()]
+    finally:
+        queue.close()
+    assert result["ok"] is True, {"result": result, "rows": rows}
+    assert rows == [{
+        "state": "done",
+        "attempts": 1,
+        "idempotency_key": task.prepared["prepared_id"],
+    }]
+    assert ledger.read_text(encoding="utf-8").splitlines() == [
+        json.dumps({"prepared_id": task.prepared["prepared_id"], "device": "A"})
+    ]
+
+
+def test_identical_raw_commands_remain_separately_enqueueable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    prepared = prepare_raw_command(["python", "-c", "pass"], device="A")
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        job_ids = queue.enqueue_prepared_many(
+            [prepared, prepared], spec=None,
+            idempotency_keys=["", ""], job_ids=["raw-a", "raw-b"],
+        )
+        rows = queue.db.execute(
+            "SELECT job_id,state,idempotency_key FROM jobs ORDER BY job_id"
+        ).fetchall()
+    finally:
+        queue.close()
+
+    assert job_ids == ["raw-a", "raw-b"]
+    assert [tuple(row) for row in rows] == [
+        ("raw-a", "queued", ""),
+        ("raw-b", "queued", ""),
+    ]
+
+
 def test_nonbatchable_jobs_each_execute_once_without_benchmark_duplication(
     tmp_path: Path, monkeypatch,
 ) -> None:

@@ -334,6 +334,18 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
             job_ids=requested_job_ids, now=now,
             **kwargs,
         )
+        # One configured submission may contain the same prepared identity more than
+        # once (for example, an explicit file that is also reached through a supplied
+        # directory). The queue correctly converges those records to one job_id; keep
+        # the executable batch equally unique so claim_many sees one row per id. Raw
+        # commands retain distinct job_ids and therefore remain deliberately repeatable.
+        unique_jobs: dict[str, tuple[FleetTask, str]] = {}
+        for job_id, item, requested in zip(
+                job_ids, tasks, requested_job_ids, strict=True):
+            unique_jobs.setdefault(job_id, (item, requested))
+        job_ids = list(unique_jobs)
+        tasks = [item for item, _requested in unique_jobs.values()]
+        requested_job_ids = [requested for _item, requested in unique_jobs.values()]
         newly_enqueued = {
             job_id for job_id, requested in zip(job_ids, requested_job_ids, strict=True)
             if job_id == requested
