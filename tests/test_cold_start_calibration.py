@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from remrun.config import RemrunConfig
-from remrun.fleet import cli, dispatcher, executor, placement, profiles
+from remrun.fleet import cli, dispatcher, executor, placement, profiles, queue as queue_mod
 from remrun.fleet.models import DeviceSnapshot, DrainResultV1, PlacedBatch, PlacementResult
 from remrun.fleet.prepared import as_fleet_task, prepare_raw_command, prepare_task_job, prepared_features
 from remrun.fleet.prepared import validate_prepared_against_spec
@@ -668,6 +668,127 @@ def test_two_dispatchers_cold_start_one_job_only_once_with_one_observation(
         assert queue.profile_observations()[0]["accepted_duration"] == 1
     finally:
         queue.close()
+
+
+def test_synchronous_leased_run_uses_replay_fence_and_commits_observation(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config, spec, _ledger, _worker = _dispatch_fixture(tmp_path)
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    task = _exact_task(tmp_path, spec, 3, "sync")
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(executor, "load_config", lambda _root=None: config)
+    transitions: list[tuple[str, str]] = []
+    original_transition = FleetQueue.set_batch_state
+
+    def traced_transition(self, batch_id, state, *, expected_state, **kwargs):  # noqa: ANN001
+        transitions.append((expected_state, state))
+        return original_transition(
+            self, batch_id, state, expected_state=expected_state, **kwargs,
+        )
+
+    monkeypatch.setattr(FleetQueue, "set_batch_state", traced_transition)
+    result = executor._run_group_leased(
+        "A", [task], config, state_root=state_root, cleanup=True, lease_seconds=60,
+    )
+    assert result["ok"] is True, result
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        row = dict(queue.db.execute(
+            "SELECT state,idempotency_key FROM jobs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone())
+        observations = queue.profile_observations()
+    finally:
+        queue.close()
+    assert transitions[:2] == [("leased", "staging"), ("staging", "running")]
+    assert ("running", "fetching") in transitions
+    assert row == {"state": "done", "idempotency_key": task.prepared["prepared_id"]}
+    assert len(observations) == 1
+    assert observations[0]["accepted_duration"] == 1
+
+
+
+def test_synchronous_ambiguous_configured_run_holds_active_idempotency(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config, spec, _ledger, _worker = _dispatch_fixture(tmp_path)
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    task = _exact_task(tmp_path, spec, 3, "sync-unknown")
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(executor, "load_config", lambda _root=None: config)
+
+    def ambiguous_run(_device, _tasks, _config, **kwargs):  # noqa: ANN001
+        assert kwargs["prelaunch_gate"]() is True
+        return {
+            "ok": False,
+            "device": "A",
+            "completion_state": "unknown",
+            "command_started": None,
+            "error": "simulated ambiguous completion",
+            "elapsed_s": 0.1,
+        }
+
+    monkeypatch.setattr(executor, "run_batch", ambiguous_run)
+    result = executor._run_group_leased(
+        "A", [task], config, state_root=state_root, cleanup=True, lease_seconds=60,
+    )
+    assert result["ok"] is False
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        rows = [dict(row) for row in queue.db.execute(
+            "SELECT job_id,state,idempotency_key,prepared_id FROM jobs"
+        ).fetchall()]
+        assert len(rows) == 1
+        original = rows[0]
+        assert original["state"] == "completion_unknown"
+        assert original["idempotency_key"] == task.prepared["prepared_id"]
+        duplicate = queue.enqueue_prepared(
+            task.prepared,
+            spec=task.resolved_spec,
+            current_spec_id=lambda: task.prepared["spec_id"],
+        )
+        count = queue.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        observations = queue.profile_observations()
+    finally:
+        queue.close()
+    assert duplicate == original["job_id"]
+    assert count == 1
+    assert len(observations) == 1
+    assert observations[0]["accepted_duration"] == 0
+    assert observations[0]["reject_reason"] == "unsuccessful"
+
+
+def test_synchronous_active_duplicate_is_not_terminalized_when_resource_is_busy(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config, spec, _ledger, _worker = _dispatch_fixture(tmp_path)
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    task = _exact_task(tmp_path, spec, 3, "sync-existing")
+    state_root = tmp_path / "state"
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        existing_job_id = queue.enqueue_prepared(
+            task.prepared,
+            spec=task.resolved_spec,
+            current_spec_id=lambda: task.prepared["spec_id"],
+        )
+    finally:
+        queue.close()
+    monkeypatch.setattr(executor, "load_config", lambda _root=None: config)
+    monkeypatch.setattr(FleetQueue, "claim_many", lambda _self, *_args, **_kwargs: None)
+
+    result = executor._run_group_leased(
+        "A", [task], config, state_root=state_root, cleanup=True, lease_seconds=60,
+    )
+    assert result["lease_busy"] is True
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        row = queue.get(existing_job_id)
+        count = queue.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    finally:
+        queue.close()
+    assert row["state"] == "queued"
+    assert count == 1
 
 
 def test_nonbatchable_jobs_each_execute_once_without_benchmark_duplication(

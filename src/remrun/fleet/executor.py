@@ -13,7 +13,7 @@ from ..config import RemrunConfig, load_config
 from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, iso_plus_seconds, utc_now_iso
 from ..transport import GuardFinalizationError, TransportError, make_transport
-from . import adapters, placement, probes
+from . import adapters, placement, probes, profiles
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
 from .prepared import (
@@ -324,13 +324,20 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                     return None
             current_spec = current_gate()
         kwargs = {"current_spec_id": current_gate} if current_gate is not None else {}
+        idempotency_keys = ([""] * len(tasks)
+                            if task.prepared["kind"] == "command" else None)
+        requested_job_ids = [f"adhoc-{uuid.uuid4().hex[:12]}" for _ in tasks]
         job_ids = queue.enqueue_prepared_many(
             [item.prepared for item in tasks],
             spec=None if task.prepared["kind"] == "command" else task.resolved_spec,
-            idempotency_keys=[""] * len(tasks),
-            job_ids=[f"adhoc-{uuid.uuid4().hex[:12]}" for _ in tasks], now=now,
+            idempotency_keys=idempotency_keys,
+            job_ids=requested_job_ids, now=now,
             **kwargs,
         )
+        newly_enqueued = {
+            job_id for job_id, requested in zip(job_ids, requested_job_ids, strict=True)
+            if job_id == requested
+        }
 
         def current_spec_ids() -> dict[str, str | None]:
             live = current_spec if current_gate is None else current_gate()
@@ -344,36 +351,45 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
             current_spec_ids=current_spec_ids,
         )
         if owner_token is None:
-            for job_id in job_ids:
+            # An active idempotent submission can resolve to a row that predates this
+            # synchronous call. A busy resource must not terminalize that owner's row.
+            for job_id in newly_enqueued:
                 queue.finalize_queued(
                     job_id, f"{device_name} {pool or 'capacity'} lease busy",
                     now=utc_now_iso(),
                 )
             return {"ok": False, "device": device_name, "lease_busy": True,
                     "error": f"{device_name} resource is busy; use `fleet submit` to queue"}
+
+        batch_state = "leased"
         if not queue.set_batch_state(
-            batch_id, "running", expected_state="leased", owner_token=owner_token,
+            batch_id, "staging", expected_state=batch_state, owner_token=owner_token,
         ):
             return {"ok": False, "device": device_name, "ownership_lost": True,
-                    "error": "lost batch ownership before remote launch"}
-
-        def launch_gate() -> bool:
-            if task.prepared["kind"] == "command":
-                return True
-            current = current_gate()
-            if current == task.prepared["spec_id"]:
-                return True
-            queue.revoke_prelaunch_batch(
-                batch_id, owner_token=owner_token,
-                reason="definition_missing" if current is None else "definition_changed",
-            )
-            return False
-
+                    "error": "lost batch ownership before staging"}
+        batch_state = "staging"
         heartbeat: BatchHeartbeat | None = None
         attempt_record: str | None = None
+        result: dict[str, Any] = {}
+
+        def launch_gate() -> bool:
+            nonlocal batch_state
+            if task.prepared["kind"] != "command":
+                current = current_gate()
+                if current != task.prepared["spec_id"]:
+                    queue.revoke_prelaunch_batch(
+                        batch_id, owner_token=owner_token,
+                        reason="definition_missing" if current is None else "definition_changed",
+                    )
+                    return False
+            if heartbeat is None or not heartbeat.transition(queue, "running"):
+                return False
+            batch_state = "running"
+            return True
+
         try:
             with BatchHeartbeat(
-                db_path, batch_id, owner_token, "running", lease_seconds,
+                db_path, batch_id, owner_token, batch_state, lease_seconds,
             ) as heartbeat:
                 if heartbeat.ownership_lost.is_set():
                     return {"ok": False, "device": device_name,
@@ -390,12 +406,22 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 return {"ok": False, "device": device_name,
                         "ownership_lost": True,
                         "error": "lost batch ownership during remote run"}
-            attempt_record = durable_attempt_record(task, {})
-            if not queue.fail_batch(
-                batch_id, f"run raised: {type(exc).__name__}: {exc}",
-                expected_state="running", owner_token=owner_token, max_attempts=1,
-                result_record=attempt_record,
-            ):
+            attempt_record = durable_attempt_record(task, result)
+            error = f"run raised: {type(exc).__name__}: {exc}"
+            observation = profiles.profile_observation(
+                tasks, device_name, result, attempt_record,
+            )
+            if batch_state in {"running", "fetching"}:
+                transitioned = queue.mark_completion_unknown(
+                    batch_id, error, expected_state=batch_state, owner_token=owner_token,
+                    result_record=attempt_record, observation=observation,
+                )
+            else:
+                transitioned = queue.fail_batch(
+                    batch_id, error, expected_state=batch_state, owner_token=owner_token,
+                    max_attempts=1, result_record=attempt_record, observation=observation,
+                )
+            if not transitioned:
                 return {"ok": False, "device": device_name,
                         "ownership_lost": True,
                         "error": "lost batch ownership during remote failure"}
@@ -410,32 +436,59 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                     result_record=attempt_record,
                 )
             return result
-        if result.get("item_results") and not result.get("no_retry"):
-            succeeded, failed = item_result_maps(result["item_results"])
-            worker_records = item_records(result["item_results"])
-            terminal_records = {
-                job_id: durable_attempt_record(task, result, record)
-                for job_id, record in worker_records.items()
-            }
-            transitioned = queue.complete_batch_items(
-                batch_id, succeeded, failed, expected_state="running",
-                owner_token=owner_token, max_attempts=1,
-                dispositions=item_dispositions(result["item_results"]),
-                results={job_id: record for job_id, record in terminal_records.items()
-                         if record is not None},
-                result_record=attempt_record,
+
+        observation = profiles.profile_observation(
+            tasks, device_name, result, attempt_record,
+        )
+        if (result.get("completion_state") == "unknown"
+                or ("command_started" in result and result.get("command_started") is None)):
+            transitioned = queue.mark_completion_unknown(
+                batch_id, result.get("error") or "completion unknown after launch authorization",
+                expected_state=batch_state, owner_token=owner_token,
+                result_record=attempt_record, observation=observation,
             )
-        elif result.get("ok"):
-            transitioned = queue.complete_batch(
-                batch_id, expected_state="running", owner_token=owner_token,
-                result_record=attempt_record,
+        elif not result.get("ok") and result.get("no_retry") \
+                and queue.batch_replay_policy(batch_id) == "at-most-once-v1":
+            transitioned = queue.mark_completion_unknown(
+                batch_id, result.get("error") or "worker completion evidence is incomplete",
+                expected_state=batch_state, owner_token=owner_token,
+                result_record=attempt_record, observation=observation,
             )
         else:
-            transitioned = queue.fail_batch(
-                batch_id, result.get("error") or f"exit {result.get('exit_code')}",
-                expected_state="running", owner_token=owner_token, max_attempts=1,
-                result_record=attempt_record,
-            )
+            if result.get("ok"):
+                if not queue.set_batch_state(
+                    batch_id, "fetching", expected_state=batch_state, owner_token=owner_token,
+                ):
+                    return {**_ad_hoc_result(result), "ok": False,
+                            "ownership_lost": True,
+                            "error": "lost batch ownership before recording completion"}
+                batch_state = "fetching"
+            if result.get("item_results") and not result.get("no_retry"):
+                succeeded, failed = item_result_maps(result["item_results"])
+                worker_records = item_records(result["item_results"])
+                terminal_records = {
+                    job_id: durable_attempt_record(task, result, record)
+                    for job_id, record in worker_records.items()
+                }
+                transitioned = queue.complete_batch_items(
+                    batch_id, succeeded, failed, expected_state=batch_state,
+                    owner_token=owner_token, max_attempts=1,
+                    dispositions=item_dispositions(result["item_results"]),
+                    results={job_id: record for job_id, record in terminal_records.items()
+                             if record is not None},
+                    result_record=attempt_record, observation=observation,
+                )
+            elif result.get("ok"):
+                transitioned = queue.complete_batch(
+                    batch_id, expected_state=batch_state, owner_token=owner_token,
+                    result_record=attempt_record, observation=observation,
+                )
+            else:
+                transitioned = queue.fail_batch(
+                    batch_id, result.get("error") or f"exit {result.get('exit_code')}",
+                    expected_state=batch_state, owner_token=owner_token, max_attempts=1,
+                    result_record=attempt_record, observation=observation,
+                )
         if not transitioned:
             return {**_ad_hoc_result(result), "ok": False, "ownership_lost": True,
                     "error": "lost batch ownership before recording completion"}

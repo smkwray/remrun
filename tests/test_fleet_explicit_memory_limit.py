@@ -70,7 +70,9 @@ def _compatible_definition(tmp_path: Path) -> dict:
         "options": {},
         "adapters": {"LOCAL_SIM": {
             "engine": "generic", "argv": ["python", "-c", "raise SystemExit(0)"],
-            "output_root": str(tmp_path / "output"), "pool": False,
+            # LOCAL_SIM deliberately models a POSIX target even when the
+            # controller test runs on Windows, so keep its target path native.
+            "output_root": f"/tmp/{tmp_path.name}-output", "pool": False,
             "memory_kind": "cpu", "capability_paths": [], "provides": [],
         }},
     }
@@ -427,7 +429,7 @@ def test_leased_definition_drift_persists_sanitized_release_receipt(
         ).fetchone())
     finally:
         queue.close()
-    assert result["definition_drift"] is True
+    assert result.get("definition_drift") is True, result
     assert row["state"] == "needs_review"
     assert row["attempts"] == 1
     receipt = json.loads(row["last_result"])
@@ -484,7 +486,7 @@ def test_leased_queue_persists_sanitized_explicit_limit_receipt(
         ).fetchone())
     finally:
         queue.close()
-    assert row["state"] == ("failed_final" if terminate else "done")
+    assert row["state"] == ("completion_unknown" if terminate else "done")
     assert row["attempts"] == 1
     receipt = json.loads(row["last_result"])
     assert receipt["kind"] == "fleet-attempt-receipt"

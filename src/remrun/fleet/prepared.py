@@ -5,8 +5,11 @@ import hashlib
 import json
 import math
 import os
+import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -44,6 +47,8 @@ _PREPARED_V4_FIELDS = _PREPARED_BASE_FIELDS | {"limits"}
 _MAX_EXPLICIT_MEMORY_LIMIT_MIB = (2**63 - 1) // (1024 * 1024)
 _MAX_MEASURE_OUTPUT_BYTES = 1024 * 1024
 _TEMP_CLEANUP_TIMEOUT_S = 2.0
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 
 def _resource_limits(memory_limit_mib: int) -> dict[str, Any]:
@@ -299,6 +304,154 @@ def _unlink_measure_temp(path: Path) -> None:
             time.sleep(0.01)
 
 
+def _measure_spawn_kwargs() -> dict[str, Any]:
+    """Isolate a helper tree so deadline/output failures can stop ordinary descendants."""
+    if os.name == "posix":
+        return {"start_new_session": True}
+    return {"creationflags": _NO_WINDOW | _NEW_PROCESS_GROUP}
+
+
+def _measure_process_argv(argv: list[str]) -> list[str]:
+    """Use the existing suspended Job Object launcher for bounded Windows descendants."""
+    if os.name != "nt":
+        return argv
+    wrapper = Path(__file__).resolve().parents[1] / "_win_telemetry.py"
+    return [sys.executable, str(wrapper), "--bounded-helper", "--", *argv]
+
+
+def _kill_measure_process(process: subprocess.Popen) -> None:
+    """Best-effort bounded termination of the external-measure process tree."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    elif os.name == "nt" and process.poll() is None:
+        try:
+            subprocess.run(  # noqa: S603 - fixed system executable and arguments
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=0.2,
+                creationflags=_NO_WINDOW,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _bounded_measure_process(argv: list[str], timeout_s: float) -> tuple[int, bytes, bytes]:
+    """Run one helper through bounded pipes until direct exit and inherited-output EOF."""
+    process_argv = _measure_process_argv(argv)
+    process = subprocess.Popen(  # noqa: S603 - strict absolute argv, shell disabled
+        process_argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        **_measure_spawn_kwargs(),
+    )
+    assert process.stdout is not None and process.stderr is not None
+    outputs = (bytearray(), bytearray())
+    overflow = threading.Event()
+    reader_errors: list[BaseException] = []
+    error_lock = threading.Lock()
+
+    def drain(pipe, target: bytearray) -> None:  # noqa: ANN001 - binary pipe protocol
+        read = getattr(pipe, "read1", pipe.read)
+        try:
+            while True:
+                block = read(65536)
+                if not block:
+                    return
+                remaining = _MAX_MEASURE_OUTPUT_BYTES + 1 - len(target)
+                if remaining > 0:
+                    target.extend(block[:remaining])
+                if len(block) > remaining or len(target) > _MAX_MEASURE_OUTPUT_BYTES:
+                    overflow.set()
+                    return
+        except BaseException as exc:  # preserve the failure for the controller thread
+            with error_lock:
+                reader_errors.append(exc)
+
+    readers = [
+        threading.Thread(
+            target=drain, args=(process.stdout, outputs[0]),
+            name="remrun-measure-stdout", daemon=True,
+        ),
+        threading.Thread(
+            target=drain, args=(process.stderr, outputs[1]),
+            name="remrun-measure-stderr", daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout_s
+    timed_out = False
+    direct_failure = False
+    while True:
+        return_code = process.poll()
+        if overflow.is_set() or reader_errors:
+            break
+        if return_code is not None:
+            if return_code != 0:
+                direct_failure = True
+                break
+            if not any(reader.is_alive() for reader in readers):
+                break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            break
+        time.sleep(0.005)
+
+    if overflow.is_set() or timed_out or direct_failure or reader_errors:
+        _kill_measure_process(process)
+        drain_deadline = time.monotonic() + min(0.2, max(0.05, timeout_s * 0.25))
+        try:
+            process.wait(timeout=max(0.0, drain_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+        for reader in readers:
+            reader.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+    else:
+        for reader in readers:
+            reader.join()
+
+    # Closing an in-use buffered pipe can block on its read lock. Close only readers
+    # that reached EOF; daemon readers from an escaped descendant cannot postpone return.
+    for reader, pipe in zip(readers, (process.stdout, process.stderr), strict=True):
+        if reader.is_alive():
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+    if overflow.is_set():
+        raise PreparationError("external work measure exceeded its output limit")
+    if timed_out:
+        raise PreparationError("external work measure timed out")
+    if reader_errors:
+        raise PreparationError(
+            f"external work measure output could not be read: {reader_errors[0]}"
+        ) from reader_errors[0]
+    if process.returncode is None:
+        _kill_measure_process(process)
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired as exc:
+            raise PreparationError("external work measure could not be stopped") from exc
+    return int(process.returncode), bytes(outputs[0]), bytes(outputs[1])
+
+
 def _revalidate_payload(payload: Mapping[str, Any]) -> None:
     for item in payload["items"]:
         current = _identity(
@@ -338,9 +491,6 @@ def _external_scalar_cost(contract: Mapping[str, Any], payload: Mapping[str, Any
     request = {"schema": 1, "request_id": request_id,
                **{key: value for key, value in request_body.items() if key != "schema"}}
     request_path: Path | None = None
-    stdout_path: Path | None = None
-    stderr_path: Path | None = None
-    process: subprocess.Popen | None = None
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", suffix=".json", delete=False,
@@ -351,38 +501,9 @@ def _external_scalar_cost(contract: Mapping[str, Any], payload: Mapping[str, Any
         _revalidate_payload(payload)
         argv = [str(request_path) if token == "{request}" else token
                 for token in command["argv"]]
-        with tempfile.NamedTemporaryFile("w+b", delete=False) as stdout_stream, \
-                tempfile.NamedTemporaryFile("w+b", delete=False) as stderr_stream:
-            stdout_path = Path(stdout_stream.name)
-            stderr_path = Path(stderr_stream.name)
-            process = subprocess.Popen(  # noqa: S603 - strict absolute argv, shell disabled
-                argv, stdin=subprocess.DEVNULL, stdout=stdout_stream, stderr=stderr_stream,
-                shell=False,
-            )
-            deadline = time.monotonic() + float(command["timeout_s"])
-            failure: str | None = None
-            while process.poll() is None:
-                if time.monotonic() >= deadline:
-                    failure = "external work measure timed out"
-                    break
-                if (os.fstat(stdout_stream.fileno()).st_size > _MAX_MEASURE_OUTPUT_BYTES
-                        or os.fstat(stderr_stream.fileno()).st_size > _MAX_MEASURE_OUTPUT_BYTES):
-                    failure = "external work measure exceeded its output limit"
-                    break
-                time.sleep(0.01)
-            if failure is not None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=1.0)
-                raise PreparationError(failure)
-            return_code = process.wait()
-        stdout = stdout_path.read_bytes()
-        stderr = stderr_path.read_bytes()
-        if len(stdout) > _MAX_MEASURE_OUTPUT_BYTES or len(stderr) > _MAX_MEASURE_OUTPUT_BYTES:
-            raise PreparationError("external work measure exceeded its output limit")
+        return_code, stdout, stderr = _bounded_measure_process(
+            argv, float(command["timeout_s"]),
+        )
         if return_code != 0:
             detail = stderr.decode("utf-8", errors="replace")[-500:].strip()
             raise PreparationError(
@@ -435,12 +556,8 @@ def _external_scalar_cost(contract: Mapping[str, Any], payload: Mapping[str, Any
     except OSError as exc:
         raise PreparationError(f"external work measure could not run: {exc}") from exc
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
-        for path in (request_path, stdout_path, stderr_path):
-            if path is not None:
-                _unlink_measure_temp(path)
+        if request_path is not None:
+            _unlink_measure_temp(request_path)
 
 
 def _cost(definition: Mapping[str, Any], payload: Mapping[str, Any],

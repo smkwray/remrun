@@ -6,6 +6,7 @@ cache are regenerable and never synced.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -13,7 +14,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .models import FleetProfile
+from .models import FleetProfile, FleetTask
 from .task_contract import sha256_id
 
 FLEET_PROFILE_FILE = "fleet_profiles.json"
@@ -47,6 +48,98 @@ def prepared_profile_family_id(task) -> str:  # noqa: ANN001
         "measure_id": cost.get("measure_id") or "legacy",
         "bucket_id": cost.get("bucket_id"),
     })
+
+
+def profile_observation(tasks: list[FleetTask], device: str, result: dict[str, Any],
+                        result_record: str | None) -> dict[str, Any]:
+    """Build one raw generic observation; eligibility is explicit, never inferred later."""
+    head = tasks[0]
+    configured = bool(tasks) and all(
+        task.prepared and task.prepared["kind"] == "task" for task in tasks
+    )
+    costs = [task.prepared["cost"] for task in tasks if task.prepared]
+    rows = list(result.get("item_results") or [])
+    performed = bool(rows) and all(
+        row.get("outcome") == "succeeded" and row.get("work_performed") is True
+        for row in rows
+    )
+    work_rows = [row.get("work_units") for row in rows]
+    measured = bool(work_rows) and all(isinstance(value, dict) for value in work_rows)
+    observed_units = (sum(float(value["value"]) for value in work_rows)
+                      if measured else None)
+    declared_exact = configured and all(cost.get("status") == "exact" for cost in costs)
+    exact_costs = declared_exact and all(cost.get("measure_id") for cost in costs)
+    prepared_units = (sum(float(cost["value"]) for cost in costs)
+                      if exact_costs and all(cost.get("value") is not None for cost in costs)
+                      else None)
+    elapsed = result.get("elapsed_s")
+    accepted = bool(
+        configured
+        and result.get("ok")
+        and exact_costs
+        and prepared_units is not None
+        and performed
+        and measured
+        and isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and float(elapsed) > 0
+    )
+    if accepted:
+        reject_reason = None
+    elif not configured:
+        reject_reason = "intrinsic_command"
+    elif not declared_exact:
+        reject_reason = "unestimated"
+    elif not exact_costs:
+        reject_reason = "unverified_work_measure"
+    elif not result.get("ok"):
+        reject_reason = "unsuccessful"
+    elif any(row.get("failure_code") == "work_measure_mismatch" for row in rows):
+        reject_reason = "work_measure_mismatch"
+    elif not performed:
+        reject_reason = "partial_or_no_work"
+    elif not measured:
+        reject_reason = "work_measure_missing"
+    else:
+        reject_reason = "elapsed_invalid"
+    telemetry = result.get("telemetry") if isinstance(result.get("telemetry"), dict) else {}
+    item_elapsed = [float(row["elapsed_s"]) for row in rows
+                    if isinstance(row.get("elapsed_s"), (int, float))
+                    and not isinstance(row.get("elapsed_s"), bool)]
+    adapter_id = None
+    profile_key = None
+    family_id = None
+    if configured:
+        adapter = (head.resolved_spec.get("adapters") or {}).get(device) or {}
+        adapter_id = adapter.get("adapter_id")
+        profile_keys = {prepared_profile_key(task, device) for task in tasks}
+        family_ids = {prepared_profile_family_id(task) for task in tasks}
+        if len(profile_keys) == len(family_ids) == 1:
+            profile_key = profile_keys.pop()
+            family_id = family_ids.pop()
+        else:
+            accepted = False
+            reject_reason = "mixed_profile_identity"
+    digest_source = result_record or json.dumps(
+        result, sort_keys=True, default=str, separators=(",", ":"),
+    )
+    result_digest = "sha256:" + hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+    return {
+        "profile_key": profile_key,
+        "family_id": family_id,
+        "device": device,
+        "adapter_id": adapter_id,
+        "prepared_units": float(prepared_units) if prepared_units is not None else None,
+        "observed_units": observed_units,
+        "controller_elapsed_s": float(elapsed) if isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool) else None,
+        "worker_elapsed_s": sum(item_elapsed) if item_elapsed else None,
+        "peak_rss_mb": telemetry.get("peak_rss_mb"),
+        "peak_vram_mb": telemetry.get("peak_vram_mb"),
+        "accepted_duration": accepted,
+        "reject_reason": reject_reason,
+        "result_digest": result_digest,
+    }
 
 
 def prepared_profile(profiles: dict, task, device: str) -> FleetProfile | None:  # noqa: ANN001

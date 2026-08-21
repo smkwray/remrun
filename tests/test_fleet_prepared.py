@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from remrun.fleet import dispatcher, executor
+from remrun.fleet import dispatcher, executor, prepared as prepared_mod
 from remrun.fleet.prepared import (
     PreparationError,
     as_fleet_task,
@@ -177,6 +178,79 @@ def test_external_scalar_timeout_and_output_limit_fail_before_enqueue(tmp_path: 
         assert queue.counts().get("queued", 0) == 0
     finally:
         queue.close()
+
+
+def test_external_scalar_completed_output_is_read_through_a_hard_bound(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    source = tmp_path / "item.zot"
+    source.write_bytes(b"x")
+    script = tmp_path / "measure.py"
+    _write_measure(
+        script,
+        "print(json.dumps({'schema':1,'request_id':request['request_id'],"
+        "'items':[{'index':0,'value':1}]}))\n",
+    )
+    spec = _spec(tmp_path, _external_task(script))
+
+    def reject_unbounded_read(_path: Path) -> bytes:
+        raise AssertionError("Path.read_bytes is unbounded")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_unbounded_read)
+    prepared = prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    assert prepared["cost"]["value"] == 1.0
+
+
+def test_external_scalar_waits_for_inherited_output_and_enforces_the_deadline(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "item.zot"
+    source.write_bytes(b"x")
+    script = tmp_path / "measure.py"
+    _write_measure(
+        script,
+        "import subprocess\n"
+        "subprocess.Popen([sys.executable,'-c',"
+        "'import sys,time; time.sleep(3); sys.stdout.write(\\\"x\\\"*1100000)'])\n"
+        "print(json.dumps({'schema':1,'request_id':request['request_id'],"
+        "'items':[{'index':0,'value':1}]}))\n",
+    )
+    spec = _spec(tmp_path, _external_task(script, timeout_s=2.0))
+    with pytest.raises(PreparationError, match="timed out|output limit"):
+        prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+
+
+def test_external_scalar_timeout_terminates_inherited_child(tmp_path: Path) -> None:
+    source = tmp_path / "item.zot"
+    source.write_bytes(b"x")
+    marker = tmp_path / "escaped-child.txt"
+    child = (
+        "import pathlib,time; time.sleep(0.8); "
+        f"pathlib.Path({str(marker)!r}).write_text('escaped', encoding='utf-8')"
+    )
+    script = tmp_path / "measure.py"
+    _write_measure(
+        script,
+        "import subprocess\n"
+        f"subprocess.Popen([sys.executable,'-c',{child!r}])\n"
+        "print(json.dumps({'schema':1,'request_id':request['request_id'],"
+        "'items':[{'index':0,'value':1}]}))\n",
+    )
+    spec = _spec(tmp_path, _external_task(script, timeout_s=0.2))
+    with pytest.raises(PreparationError, match="timed out"):
+        prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    time.sleep(0.9)
+    assert not marker.exists(), "the measurement child survived its bounded preparation window"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows wrapper selection")
+def test_windows_external_scalar_uses_suspended_job_wrapper() -> None:
+    command = [r"C:\Tools\measure.exe", "--input", "request.json"]
+    wrapped = prepared_mod._measure_process_argv(command)
+    assert wrapped[:3] == [sys.executable, str(
+        Path(prepared_mod.__file__).resolve().parents[1] / "_win_telemetry.py"
+    ), "--bounded-helper"]
+    assert wrapped[3:] == ["--", *command]
 
 
 def test_external_scalar_rejects_nonfinite_aggregate(tmp_path: Path) -> None:

@@ -440,6 +440,19 @@ def _enable_observed_breakaway(h_job) -> None:
         raise _last_error("SetInformationJobObject(ObservedBreakaway)")
 
 
+def _enable_kill_on_close(h_job) -> None:
+    """Make closing the one private job handle terminate every ordinary descendant."""
+    info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not _kernel32().SetInformationJobObject(
+        h_job,
+        JobObjectExtendedLimitInformation,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        raise _last_error("SetInformationJobObject(KillOnClose)")
+
+
 def _wait_job_empty(h_job, timeout_s: float = JOB_DRAIN_GRACE_S) -> tuple[bool, int]:
     # A job object is not signaled merely because all processes exited. Poll the
     # kernel-maintained ActiveProcesses accounting counter instead. This wait is
@@ -856,6 +869,50 @@ def _plain_run(argv: list[str]) -> int:
         except Exception:
             pass
         return 127
+
+
+def _bounded_helper_run(argv: list[str]) -> int:
+    """Run an internal helper in a fail-closed Job Object until its whole tree exits."""
+    job = None
+    pi = PROCESS_INFORMATION()
+    created = False
+    resumed = False
+    try:
+        job = _kernel32().CreateJobObjectW(None, None)
+        if not _valid_handle(job):
+            raise _last_error("CreateJobObjectW")
+        _enable_kill_on_close(job)
+        pi = _create_suspended(argv)
+        created = True
+        if not _kernel32().AssignProcessToJobObject(job, pi.hProcess):
+            raise _CommandNotStarted("AssignProcessToJobObject failed")
+        _resume(pi)
+        resumed = True
+        direct_rc = _wait_exit_code(pi.hProcess)
+        _close_handle(pi.hProcess)
+        pi.hProcess = None
+        while int(_query_basic(job).ActiveProcesses) > 0:
+            time.sleep(0.01)
+        return direct_rc
+    except BaseException as exc:
+        if created and not resumed:
+            try:
+                _kernel32().TerminateProcess(pi.hProcess, GUARD_HELPER_EXIT)
+            except Exception:
+                pass
+        try:
+            sys.stderr.write(
+                f"remrun bounded helper failed: {type(exc).__name__}: {exc}\n"
+            )
+        except Exception:
+            pass
+        return GUARD_HELPER_EXIT
+    finally:
+        _close_handle(pi.hThread)
+        _close_handle(pi.hProcess)
+        # This is the final containment boundary when the outer deadline kills
+        # this wrapper while an inherited-output descendant still exists.
+        _close_handle(job)
 
 
 def _job_run(argv: list[str], *, allow_observed_breakaway: bool = False) -> int:
@@ -1675,6 +1732,7 @@ def main() -> int:
     detailed = "--detailed" in options
     telemetry = "--telemetry" in options
     allow_observed_breakaway = "--allow-observed-breakaway" in options
+    bounded_helper = "--bounded-helper" in options
     argv_json_file = None
 
     def option_value(name: str) -> str | None:
@@ -1696,6 +1754,7 @@ def main() -> int:
         "--detailed",
         "--telemetry",
         "--allow-observed-breakaway",
+        "--bounded-helper",
         "--argv-json-file",
         *guard_names,
     }
@@ -1734,6 +1793,12 @@ def main() -> int:
     if not argv:
         sys.stderr.write("remrun telemetry wrapper: invalid options or empty command\n")
         return 2
+
+    if bounded_helper:
+        if options != ["--bounded-helper"] or os.name != "nt":
+            sys.stderr.write("remrun telemetry wrapper: invalid bounded-helper invocation\n")
+            return 2
+        return _bounded_helper_run(argv)
 
     if guard_requested:
         if allow_observed_breakaway:
