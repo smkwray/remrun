@@ -172,6 +172,37 @@ def test_shared_view_executes_and_wrong_candidate_falls_back_to_stream(
     assert calls == {"shared": 2, "stream": 1}
 
 
+def test_corrupt_registry_fails_before_shared_job_launch(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    root = tmp_path / "shared"
+    root.mkdir()
+    source = root / "input.bin"
+    source.write_bytes(b"frozen source")
+    enroll_local_root(state, root)
+    worker_marker = tmp_path / "worker-launched"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        f"import pathlib; pathlib.Path({str(worker_marker)!r}).write_text('yes')",
+        encoding="utf-8",
+    )
+    spec = _spec(tmp_path, worker)
+    record = prepare_task_job(
+        spec, repo_root=tmp_path, inputs=[str(source)],
+        storage_registry=load_registry(state),
+    )
+    (state / "fleet" / "storage-roots-v1.json").write_text("{", encoding="utf-8")
+
+    result = executor.run_batch(
+        "LOCAL_SIM", [as_fleet_task(record, spec)], _config(tmp_path), state_root=state,
+        prelaunch_gate=lambda: True,
+    )
+
+    assert result["ok"] is False
+    assert result["phase"] == "storage_registry"
+    assert "registry is unreadable" in result["error"]
+    assert not worker_marker.exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink court; Windows helper uses junction check")
 def test_target_shared_helper_rejects_escaping_symlink(tmp_path: Path) -> None:
     root = tmp_path / "root"

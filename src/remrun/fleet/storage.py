@@ -22,10 +22,29 @@ def registry_path(state_root: Path) -> Path:
 
 
 def load_registry(state_root: Path) -> dict[str, Any]:
-    raw = read_json(registry_path(state_root)) or {"schema": 1, "roots": {}}
+    try:
+        raw = read_json(registry_path(state_root)) or {"schema": 1, "roots": {}}
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StorageError(f"storage binding registry is unreadable: {exc}") from exc
     if not isinstance(raw, dict) or set(raw) != {"schema", "roots"} \
             or raw["schema"] != 1 or not isinstance(raw["roots"], dict):
         raise StorageError("storage binding registry is malformed")
+    for storage_id, entry in raw["roots"].items():
+        try:
+            valid_id = isinstance(storage_id, str) and len(storage_id) == 32 \
+                and int(storage_id, 16) >= 0
+        except ValueError:
+            valid_id = False
+        if not valid_id or not isinstance(entry, dict) \
+                or set(entry) != {"local_root", "devices"} \
+                or (entry["local_root"] is not None
+                    and (not isinstance(entry["local_root"], str)
+                         or not Path(entry["local_root"]).is_absolute())) \
+                or not isinstance(entry["devices"], dict) \
+                or any(not isinstance(device, str) or not device
+                       or not isinstance(root, str) or not root
+                       for device, root in entry["devices"].items()):
+            raise StorageError("storage binding registry contains a malformed root")
     return raw
 
 

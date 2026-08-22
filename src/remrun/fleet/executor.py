@@ -570,6 +570,20 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
     if output_error:
         return {"ok": False, "device": device_name, "phase": "output_root",
                 "error": output_error}
+    uses_storage_ref = any(
+        item.get("storage_ref") is not None
+        for task in tasks for item in task.prepared["payload"]["items"]
+    )
+    if uses_storage_ref:
+        try:
+            storage_registry = storage.load_registry(state_root)
+        except storage.StorageError as exc:
+            return {
+                "ok": False, "device": device_name, "phase": "storage_registry",
+                "error": f"storage registry invalid: {exc}",
+            }
+    else:
+        storage_registry = {"schema": 1, "roots": {}}
     transport = None
     stage = None
     try:
@@ -583,10 +597,6 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
         return {"ok": False, "device": device_name, "error": f"stage failed: {exc}"}
 
     batch_id = observation_id or f"batch-{uuid.uuid4().hex[:12]}"
-    try:
-        storage_registry = storage.load_registry(state_root)
-    except storage.StorageError:
-        storage_registry = {"schema": 1, "roots": {}}
     used: set[str] = set()
     manifest_items: list[dict[str, Any]] = []
     expected: list[dict[str, Any]] = []
