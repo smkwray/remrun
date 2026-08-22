@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -57,7 +59,7 @@ def _spec(tmp_path: Path, *, allow_root_override: bool = False) -> dict:
         "adapters": {
             name: {
                 "engine": "generic",
-                "argv": ["python", str(worker)],
+                "argv": [sys.executable, str(worker)],
                 "output_root": str(tmp_path / name / "out"),
                 "pool": False,
                 "memory_kind": "cpu",
@@ -77,7 +79,7 @@ def _device(name: str, tmp_path: Path):
 
     return Device.from_mapping(name, {
         "kind": "local-sim",
-        "os": "posix",
+        "os": "windows" if os.name == "nt" else "posix",
         "address_candidates": ["localhost"],
         "project_root": str(tmp_path / name / "project"),
         "cache_root": str(tmp_path / name / "cache"),
