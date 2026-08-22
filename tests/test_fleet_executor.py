@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from remrun import transport as transport_mod
 from remrun.config import RemrunConfig
 from remrun.fleet import executor, profiles
 from remrun.fleet.prepared import (
@@ -18,6 +19,7 @@ from remrun.fleet.prepared import (
     prepare_raw_command,
     prepare_task_job,
 )
+from remrun.fleet.queue import FleetQueue
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.models import Device
 from remrun.transport import TransportError, make_transport
@@ -144,7 +146,7 @@ def test_prepared_source_change_stops_before_worker_launch(tmp_path) -> None:
     assert not marker.exists()
 
 
-def test_configured_task_executes_frozen_manifest_and_result_v2(tmp_path) -> None:
+def test_state_during_output_return_and_delivery_failure_status(tmp_path, monkeypatch) -> None:
     output_root = tmp_path / "prepared-output"
     output_root.mkdir()
     worker = tmp_path / "worker.py"
@@ -180,10 +182,47 @@ def test_configured_task_executes_frozen_manifest_and_result_v2(tmp_path) -> Non
         spec, repo_root=tmp_path, inputs=[str(source)], return_root=str(return_root),
     )
     task = as_fleet_task(prepared, spec)
+    queue = FleetQueue(tmp_path / "state" / "fleet" / "fleet.db")
+    job_id = queue.enqueue_prepared(
+        prepared, spec=spec, job_id="j1", current_spec_id=lambda: spec["spec_id"],
+    )
+    owner = queue.claim_many(
+        [job_id], "LOCAL_SIM", batch_id="batch1",
+        lease_until="2099-01-01T00:00:00Z", pool=None,
+        current_spec_ids=lambda: {job_id: spec["spec_id"]},
+    )
+    assert owner is not None
+    assert queue.set_batch_state(
+        "batch1", "staging", expected_state="leased", owner_token=owner,
+    )
+    assert queue.set_batch_state(
+        "batch1", "running", expected_state="staging", owner_token=owner,
+    )
+
+    phases: list[str] = []
+    check_queue = [True]
+    original_fetch = transport_mod.LocalSimTransport.fetch_output
+
+    def observed_fetch(self, remote_path, local_path):  # noqa: ANN001
+        assert phases == ["fetching"]
+        if check_queue[0]:
+            assert queue.get_batch("batch1")["state"] == "fetching"
+        return original_fetch(self, remote_path, local_path)
+
+    monkeypatch.setattr(transport_mod.LocalSimTransport, "fetch_output", observed_fetch)
+
+    def queue_output_gate() -> bool:
+        if phases:
+            return True
+        phases.append("fetching")
+        return queue.set_batch_state(
+            "batch1", "fetching", expected_state="running", owner_token=owner,
+        )
 
     result = executor.run_batch(
         "LOCAL_SIM", [task], _config(tmp_path), state_root=tmp_path / "state",
         job_ids=["j1"], observation_id="batch1", prelaunch_gate=lambda: True,
+        before_output_return=queue_output_gate,
     )
 
     assert result["ok"] is True and result["completion_evidence"] == "complete"
@@ -192,11 +231,71 @@ def test_configured_task_executes_frozen_manifest_and_result_v2(tmp_path) -> Non
     assert (output_root / output).read_text() == "done"
     assert (return_root / output).read_text() == "done"
     assert result["item_results"][0]["delivery"]["status"] == "complete"
+    assert phases == ["fetching"]
+    succeeded, failed = executor.item_result_maps(result["item_results"])
+    assert queue.complete_batch_items(
+        "batch1", succeeded, failed, expected_state="fetching", owner_token=owner,
+        max_attempts=1, dispositions=executor.item_dispositions(result["item_results"]),
+    )
+    assert queue.get(job_id)["state"] == "done"
+    queue.close()
     # Raw execution evidence is admitted only by the queue's atomic terminal
     # transition, never by the executor on its own.
     assert profiles.prepared_profile_key(task, "LOCAL_SIM") not in profiles.load_profiles(
         tmp_path / "state"
     )
+
+    # A delivery failure changes the overall result and the item disposition; it
+    # cannot be reported as a successful completed dispatch.
+    (return_root / output).write_text("controller edit", encoding="utf-8")
+    phases.clear()
+    check_queue[0] = False
+
+    def direct_output_gate() -> bool:
+        if not phases:
+            phases.append("fetching")
+        return True
+
+    failed = executor.run_batch(
+        "LOCAL_SIM", [task], _config(tmp_path), state_root=tmp_path / "state",
+        job_ids=["j1"], observation_id="batch2", prelaunch_gate=lambda: True,
+        before_output_return=direct_output_gate,
+    )
+    assert failed["ok"] is False
+    assert failed["item_results"][0]["outcome"] == "review"
+    assert failed["item_results"][0]["failure_code"] == "output_return_failed"
+    assert phases == ["fetching"]
+
+    def forbidden_fetch(*_args, **_kwargs):
+        raise AssertionError("stale owner must not begin output transfer")
+
+    monkeypatch.setattr(transport_mod.LocalSimTransport, "fetch_output", forbidden_fetch)
+    lost = executor.run_batch(
+        "LOCAL_SIM", [task], _config(tmp_path), state_root=tmp_path / "state",
+        job_ids=["j1"], observation_id="batch3", prelaunch_gate=lambda: True,
+        before_output_return=lambda: False,
+    )
+    assert lost["ok"] is False and lost["ownership_lost"] is True
+    assert (return_root / output).read_text(encoding="utf-8") == "controller edit"
+
+
+def test_concurrent_destination_is_preserved_during_local_output_fetch(
+    tmp_path, monkeypatch,
+) -> None:
+    remote = tmp_path / "remote.bin"
+    remote.write_bytes(b"remote result")
+    destination = tmp_path / "returned" / "result.bin"
+    transport = make_transport(_config(tmp_path).devices["LOCAL_SIM"])
+    original_install = transport_mod._install_output_no_replace
+
+    def race(tmp: Path, dest: Path) -> None:
+        dest.write_bytes(b"controller edit")
+        original_install(tmp, dest)
+
+    monkeypatch.setattr(transport_mod, "_install_output_no_replace", race)
+    with pytest.raises(TransportError, match="appeared with different bytes"):
+        transport.fetch_output(str(remote), destination)
+    assert destination.read_bytes() == b"controller edit"
 
 
 def test_exit_code_worker_is_not_asked_for_structured_metrics(tmp_path) -> None:

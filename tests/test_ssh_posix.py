@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from remrun import transport as transport_mod
 from remrun.memory_guard import MemoryAdmissionResult, MemoryReservation
 from remrun.models import Device
 from remrun.transport import (
@@ -173,6 +174,32 @@ def test_fetch_output_streams_to_atomic_local_file(monkeypatch, tmp_path):
     assert destination.read_bytes() == payload and seen["address"] == "macbox"
     assert seen["script"] == "cat /remote/output.bin"
     assert receipt["route"] == "stream" and receipt["sha256"] == "sha256:" + digest
+
+
+def test_concurrent_destination_is_preserved_during_posix_output_fetch(
+    monkeypatch, tmp_path,
+) -> None:
+    t = SSHPosixTransport(device())
+    t._address = "macbox"
+    payload = b"remote result"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(t, "hash_file", lambda _path: digest)
+    def remote_to_file(_address, _script, destination):  # noqa: ANN001
+        destination.write_bytes(payload)
+        return cp(0)
+
+    monkeypatch.setattr(t, "_remote_to_local_file", remote_to_file)
+    destination = tmp_path / "returned" / "output.bin"
+    original_install = transport_mod._install_output_no_replace
+
+    def race(tmp: Path, dest: Path) -> None:
+        dest.write_bytes(b"controller edit")
+        original_install(tmp, dest)
+
+    monkeypatch.setattr(transport_mod, "_install_output_no_replace", race)
+    with pytest.raises(TransportError, match="appeared with different bytes"):
+        t.fetch_output("/remote/output.bin", destination)
+    assert destination.read_bytes() == b"controller edit"
 
 
 def test_read_small_file_caps_remotely_and_returns_binary(monkeypatch):

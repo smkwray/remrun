@@ -414,6 +414,27 @@ def test_queue_stores_spec_once_and_dedupes_only_prepared_tasks(tmp_path: Path) 
         queue.close()
 
 
+def test_legacy_spec_identity_remains_claimable(tmp_path: Path) -> None:
+    source = tmp_path / "item.zot"
+    source.write_text("x", encoding="utf-8")
+    spec = _spec(tmp_path)
+    record = prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        job_id = queue.enqueue_prepared(
+            record, spec=spec, current_spec_id=lambda: spec["spec_id"],
+        )
+        owner = queue.claim_many(
+            [job_id], "BOX", batch_id="legacy-spec",
+            lease_until="2099-01-01T00:00:00Z", pool=None,
+            current_spec_ids=lambda: {job_id: spec["spec_id"]},
+        )
+        assert owner is not None
+        assert queue.get(job_id)["state"] == "leased"
+    finally:
+        queue.close()
+
+
 def test_queue_rejects_idempotency_collision_with_different_prepared_work(tmp_path: Path) -> None:
     first = prepare_raw_command(["echo", "one"], device="BOX")
     second = prepare_raw_command(["echo", "two"], device="BOX")

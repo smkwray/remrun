@@ -1719,10 +1719,15 @@ class LocalSimTransport(BaseTransport):
         marker = json.loads((root / ".remrun-storage-root-v1.json").read_text(encoding="utf-8"))
         if marker != {"schema": 1, "storage_id": storage_id}:
             raise TransportError("shared storage marker identity mismatch")
-        if not source.is_file() or source.is_symlink() or source.stat().st_size != expected_bytes \
-                or sha256_file(source) != expected_sha256:
+        if not source.is_file() or source.is_symlink():
             raise TransportError("shared candidate disagrees with frozen input identity")
-        receipt = self.fetch_output(str(source), Path(remote_path))
+        # Qualify and copy through one stable open handle. The streamed receipt is
+        # checked against the prepared identity before the private input is installed.
+        with source.open("rb") as incoming:
+            receipt = self.materialize_input(
+                incoming, remote_path, expected_bytes=expected_bytes,
+                expected_sha256=expected_sha256,
+            )
         return {**receipt, "schema": "verified-input-v1", "route": "shared-view"}
 
     def pull_file(self, remote_path: str, local_path: Path) -> None:
@@ -1736,25 +1741,11 @@ class LocalSimTransport(BaseTransport):
     def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
         source = Path(remote_path)
         remote_digest = sha256_file(source)
-        if local_path.exists() or local_path.is_symlink():
-            if local_path.is_file() and sha256_file(local_path) == remote_digest:
-                return {
-                    "schema": "verified-output-v1", "route": "reused",
-                    "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-                }
-            raise TransportError("output return destination already exists with different bytes")
 
         def fill(tmp: Path) -> None:
             with source.open("rb") as incoming, tmp.open("wb") as target:
                 shutil.copyfileobj(incoming, target, length=1024 * 1024)
-            if sha256_file(tmp) != remote_digest:
-                raise TransportError("fetched output digest disagrees with target")
-
-        _atomic_write_local(local_path, fill)
-        return {
-            "schema": "verified-output-v1", "route": "stream",
-            "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-        }
+        return _fetch_output_local(local_path, remote_digest, fill)
 
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         limit = _validate_small_file_limit(max_bytes)
@@ -2359,6 +2350,62 @@ def _atomic_write_local(dest: Path, fill, *, mode: int | None = None) -> None:
         except OSError:
             pass
         raise
+
+
+def _install_output_no_replace(tmp: Path, dest: Path) -> None:
+    """Atomically publish ``tmp`` only when ``dest`` is still absent."""
+    if os.name == "nt":
+        # Windows rename is atomic and refuses an existing destination.
+        _retry_windows_file_lock(lambda: os.rename(tmp, dest))
+    else:
+        # A same-directory hard link provides create-if-absent semantics on POSIX.
+        os.link(tmp, dest)
+        tmp.unlink()
+
+
+def _fetch_output_local(
+    dest: Path, remote_digest: str, fill: Callable[[Path], None],
+) -> dict[str, Any]:
+    """Fetch to an adjacent temp, verify it, then install without replacement."""
+    dest = Path(dest)
+    if dest.exists() or dest.is_symlink():
+        if dest.is_file() and not dest.is_symlink() and sha256_file(dest) == remote_digest:
+            return {
+                "schema": "verified-output-v1", "route": "reused",
+                "bytes": dest.stat().st_size, "sha256": "sha256:" + remote_digest,
+            }
+        raise TransportError("output return destination already exists with different bytes")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.parent / f".remrun-fetch-{dest.name}-{uuid.uuid4().hex}.tmp"
+    try:
+        fill(tmp)
+        if sha256_file(tmp) != remote_digest:
+            raise TransportError("fetched output digest disagrees with target")
+        with tmp.open("r+b") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            _install_output_no_replace(tmp, dest)
+        except FileExistsError:
+            if (dest.is_file() and not dest.is_symlink()
+                    and sha256_file(dest) == remote_digest):
+                return {
+                    "schema": "verified-output-v1", "route": "reused",
+                    "bytes": dest.stat().st_size, "sha256": "sha256:" + remote_digest,
+                }
+            raise TransportError(
+                "output return destination appeared with different bytes"
+            ) from None
+        _fsync_dir(dest.parent)
+        return {
+            "schema": "verified-output-v1", "route": "stream",
+            "bytes": dest.stat().st_size, "sha256": "sha256:" + remote_digest,
+        }
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _ps_squote(value: str) -> str:
@@ -3465,13 +3512,6 @@ class SSHPosixTransport(_SSHCommon):
     def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
         address = self._address_or_resolve()
         remote_digest = self.hash_file(remote_path)
-        if local_path.exists() or local_path.is_symlink():
-            if local_path.is_file() and sha256_file(local_path) == remote_digest:
-                return {
-                    "schema": "verified-output-v1", "route": "reused",
-                    "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-                }
-            raise TransportError("output return destination already exists with different bytes")
 
         def fill(tmp: Path) -> None:
             proc = self._remote_to_local_file(address, f"cat {shlex.quote(remote_path)}", tmp)
@@ -3480,14 +3520,7 @@ class SSHPosixTransport(_SSHCommon):
                 raise TransportError(
                     f"fetch {remote_path} failed: {detail or f'exit {proc.returncode}'}"
                 )
-            if sha256_file(tmp) != remote_digest:
-                raise TransportError("fetched output digest disagrees with target")
-
-        _atomic_write_local(local_path, fill)
-        return {
-            "schema": "verified-output-v1", "route": "stream",
-            "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-        }
+        return _fetch_output_local(local_path, remote_digest, fill)
 
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         limit = _validate_small_file_limit(max_bytes)
@@ -4426,13 +4459,6 @@ class SSHPowerShellTransport(_SSHCommon):
     def fetch_output(self, remote_path: str, local_path: Path) -> dict[str, Any]:
         address = self._address_or_resolve()
         remote_digest = self.hash_file(remote_path)
-        if local_path.exists() or local_path.is_symlink():
-            if local_path.is_file() and sha256_file(local_path) == remote_digest:
-                return {
-                    "schema": "verified-output-v1", "route": "reused",
-                    "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-                }
-            raise TransportError("output return destination already exists with different bytes")
 
         argv = [
             self.device.remote_python or "python", "-S", "-c",
@@ -4449,14 +4475,7 @@ class SSHPowerShellTransport(_SSHCommon):
                 raise TransportError(
                     f"fetch {remote_path} failed: {detail or f'exit {proc.returncode}'}"
                 )
-            if sha256_file(tmp) != remote_digest:
-                raise TransportError("fetched output digest disagrees with target")
-
-        _atomic_write_local(local_path, fill)
-        return {
-            "schema": "verified-output-v1", "route": "stream",
-            "bytes": local_path.stat().st_size, "sha256": "sha256:" + remote_digest,
-        }
+        return _fetch_output_local(local_path, remote_digest, fill)
 
     def read_small_file(self, remote_path: str, max_bytes: int) -> bytes:
         limit = _validate_small_file_limit(max_bytes)

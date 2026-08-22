@@ -6,7 +6,7 @@ import secrets
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..state import read_json, write_json
+from ..state import write_json
 from ..transport import BaseTransport, TransportError
 
 MARKER_NAME = ".remrun-storage-root-v1.json"
@@ -22,10 +22,14 @@ def registry_path(state_root: Path) -> Path:
 
 
 def load_registry(state_root: Path) -> dict[str, Any]:
-    try:
-        raw = read_json(registry_path(state_root)) or {"schema": 1, "roots": {}}
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise StorageError(f"storage binding registry is unreadable: {exc}") from exc
+    path = registry_path(state_root)
+    if not path.exists():
+        raw = {"schema": 1, "roots": {}}
+    else:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise StorageError(f"storage binding registry is unreadable: {exc}") from exc
     if not isinstance(raw, dict) or set(raw) != {"schema", "roots"} \
             or raw["schema"] != 1 or not isinstance(raw["roots"], dict):
         raise StorageError("storage binding registry is malformed")

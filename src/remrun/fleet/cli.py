@@ -23,7 +23,7 @@ from .prepared import (
     RAW_COMMAND_SPEC, RAW_COMMAND_SPEC_ID, as_fleet_task, parse_option_assignments,
     prepare_raw_command, prepare_task_jobs,
 )
-from .storage import bind_device_root, enroll_local_root, load_registry
+from .storage import StorageError, bind_device_root, enroll_local_root, load_registry
 from .task_contract import resolve_tasks
 from ..transport import make_transport, _posix_cancel_script, _powershell_cancel_script
 
@@ -72,7 +72,7 @@ def _prepare_configured(args, config):  # noqa: ANN001
         engine=getattr(args, "engine", None),
         output_root=getattr(args, "output_root", None),
         memory_limit_mib=getattr(args, "memory_limit_mib", None),
-        storage_registry=load_registry(default_state_root()),
+        storage_registry=_optional_storage_registry(default_state_root()),
         return_root=getattr(args, "return_root", None),
     )
     # Preparation may be slow. Re-resolve immediately before the caller opens
@@ -81,6 +81,18 @@ def _prepare_configured(args, config):  # noqa: ANN001
     if current is None or current["spec_id"] != spec["spec_id"]:
         raise ValueError("task definition changed during preparation; no job was enqueued")
     return spec, records, [as_fleet_task(record, spec) for record in records]
+
+
+def _optional_storage_registry(state_root: Path) -> dict:
+    """Use shared routing only when its controller-local registry is readable."""
+    try:
+        return load_registry(state_root)
+    except StorageError as exc:
+        print(
+            f"remrun: fleet storage registry unavailable; using stream route: {exc}",
+            file=sys.stderr,
+        )
+        return {"schema": 1, "roots": {}}
 
 
 def _read_clipboard() -> str:

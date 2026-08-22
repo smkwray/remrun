@@ -278,6 +278,22 @@ def _payload(definition: Mapping[str, Any], *, text: str | None,
     raise PreparationError("this task requires a payload")
 
 
+def _target_semantic_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project route metadata out of the target worker's durable work identity."""
+    return {
+        "mode": payload["mode"],
+        "text": payload["text"],
+        "items": [
+            {
+                "index": item["index"],
+                "source_path": item["source_path"],
+                "identity": item["identity"],
+            }
+            for item in payload["items"]
+        ],
+    }
+
+
 def _authority_digest(path_value: str) -> dict[str, str]:
     path = Path(path_value)
     try:
@@ -648,7 +664,7 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
     if return_root == "":
         raise PreparationError("return-root must not be empty")
     if return_root is not None:
-        if not definition["output"]["allow_return"]:
+        if not definition["output"].get("allow_return", False):
             raise PreparationError("this task forbids output return")
         return_root = str(Path(return_root).expanduser().resolve(strict=False))
         storage_registry = storage_registry or {"schema": 1, "roots": {}}
@@ -681,12 +697,10 @@ def prepare_task_job(spec: Mapping[str, Any], *, repo_root: Path, text: str | No
         [*configured, *caller], "prepared requirements"))
     cost = _cost(definition, payload, normalized_options, spec["spec_id"])
     semantic = {
-        "spec_id": spec["spec_id"], "payload": payload,
+        "spec_id": spec["spec_id"], "payload": _target_semantic_payload(payload),
         "options": normalized_options, "requirements": requirements,
         "output_root": output_root,
     }
-    if storage_registry is not None:
-        semantic["return_root"] = return_root
     work_id = sha256_id(semantic)
     reservations: list[dict[str, Any]] = []
     reservation = definition["output"]["reservation"]
@@ -950,11 +964,10 @@ def validate_prepared_job(record: Mapping[str, Any]) -> None:
         if not isinstance(task, Mapping) or set(task) != {"name", "options"} \
                 or not isinstance(task["name"], str) or not isinstance(task["options"], dict):
             raise PreparationError("prepared configured task fields are invalid")
-        semantic = {"spec_id": record["spec_id"], "payload": payload,
+        semantic = {"spec_id": record["spec_id"],
+                    "payload": _target_semantic_payload(payload),
                     "options": task["options"], "requirements": routing["requirements"],
                     "output_root": output["root_override"]}
-        if schema in {5, 6}:
-            semantic["return_root"] = output["return_root"]
     if record["work_id"] != sha256_id(semantic):
         raise PreparationError("work_id does not match prepared semantic work")
     canonical_json(record)
@@ -998,7 +1011,7 @@ def validate_prepared_against_spec(record: Mapping[str, Any], spec: Mapping[str,
     if root is not None and (not root or not definition["output"]["allow_root_override"]):
         raise PreparationError("prepared output-root override violates the frozen contract")
     return_root = record["output"].get("return_root")
-    if return_root is not None and not definition["output"]["allow_return"]:
+    if return_root is not None and not definition["output"].get("allow_return", False):
         raise PreparationError("prepared output return violates the frozen contract")
     policy = definition["output"]["reservation"]
     reservations = record["output"]["reservations"]

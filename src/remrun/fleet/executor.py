@@ -400,6 +400,16 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
             batch_state = "running"
             return True
 
+        def output_return_gate() -> bool:
+            nonlocal batch_state
+            if heartbeat is None or heartbeat.ownership_lost.is_set():
+                return False
+            if batch_state != "fetching":
+                if not heartbeat.transition(queue, "fetching"):
+                    return False
+                batch_state = "fetching"
+            return True
+
         try:
             with BatchHeartbeat(
                 db_path, batch_id, owner_token, batch_state, lease_seconds,
@@ -412,6 +422,7 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                     device_name, tasks, config, state_root=state_root,
                     cleanup=cleanup, job_ids=job_ids, observation_id=batch_id,
                     prelaunch_gate=launch_gate,
+                    before_output_return=output_return_gate,
                 )
             attempt_record = durable_attempt_record(task, result)
         except BaseException as exc:  # noqa: BLE001
@@ -468,7 +479,7 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 result_record=attempt_record, observation=observation,
             )
         else:
-            if result.get("ok"):
+            if result.get("ok") and batch_state != "fetching":
                 if not queue.set_batch_state(
                     batch_id, "fetching", expected_state=batch_state, owner_token=owner_token,
                 ):
@@ -514,7 +525,8 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
               state_root: Path | None = None, cleanup: bool = True,
               job_ids: list[str] | None = None,
               observation_id: str | None = None,
-              prelaunch_gate: Callable[[], bool] | None = None) -> dict[str, Any]:
+              prelaunch_gate: Callable[[], bool] | None = None,
+              before_output_return: Callable[[], bool] | None = None) -> dict[str, Any]:
     """Run one already-placed compatible prepared batch."""
     if device_name not in config.devices:
         return {"ok": False, "error": f"unknown device {device_name!r}"}
@@ -538,11 +550,18 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
                     current = None
                 return current == head.prepared["spec_id"]
             prelaunch_gate = default_gate
-    result = _run_prepared_batch(
-        device_name, tasks, config, state_root=state_root or default_state_root(),
-        cleanup=cleanup, job_ids=job_ids, observation_id=observation_id,
-        prelaunch_gate=prelaunch_gate,
-    )
+    try:
+        result = _run_prepared_batch(
+            device_name, tasks, config, state_root=state_root or default_state_root(),
+            cleanup=cleanup, job_ids=job_ids, observation_id=observation_id,
+            prelaunch_gate=prelaunch_gate, before_output_return=before_output_return,
+        )
+    except _OutputReturnOwnershipLost:
+        return {
+            "ok": False, "device": device_name, "ownership_lost": True,
+            "completion_state": "unknown", "command_started": True,
+            "error": "lost batch ownership during output return",
+        }
     admission = result.pop("_memory_admission", None)
     if prepared_memory_limit_mib(head.prepared) is not None:
         result["memory_limit"] = _memory_limit_receipt(
@@ -555,7 +574,8 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
 def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
                         state_root: Path, cleanup: bool, job_ids: list[str] | None,
                         observation_id: str | None,
-                        prelaunch_gate: Callable[[], bool] | None) -> dict[str, Any]:
+                        prelaunch_gate: Callable[[], bool] | None,
+                        before_output_return: Callable[[], bool] | None) -> dict[str, Any]:
     device = config.devices[device_name]
     head = tasks[0]
     record = head.prepared
@@ -830,13 +850,22 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             )
             rows = [{**row, "ok": row["outcome"] == "succeeded",
                      "error": row["message"]} for row in rows]
-            rows = _return_outputs(tasks, rows, output_root, transport, job_ids)
+            rows, output_return_started = _return_outputs(
+                tasks, rows, output_root, transport, job_ids,
+                before_output_return=before_output_return,
+            )
+            if (output_return_started and before_output_return is not None
+                    and not before_output_return()):
+                raise _OutputReturnOwnershipLost
         except ResultProtocolError as exc:
             evidence_error = str(exc)
     if cleanup:
         _safe_delete(transport, stage)
+    delivery_complete = not any(
+        row.get("failure_code") == "output_return_failed" for row in rows
+    )
     response = {
-        "ok": result.exit_code == 0 and evidence_error is None,
+        "ok": result.exit_code == 0 and evidence_error is None and delivery_complete,
         "device": device_name, "engine": adapter["engine"] if adapter else "raw-command",
         "exit_code": result.exit_code, "elapsed_s": elapsed, "staged": staged,
         "jobs": len(tasks), "output_root": output_root, "telemetry": result.telemetry,
@@ -882,16 +911,22 @@ def item_result_maps(item_results: list[dict[str, Any]]) -> tuple[dict[str, str 
     return succeeded, failed
 
 
+class _OutputReturnOwnershipLost(RuntimeError):
+    pass
+
+
 def _return_outputs(
     tasks: list[FleetTask], rows: list[dict[str, Any]], output_root: str,
-    transport: Any, job_ids: list[str] | None,
-) -> list[dict[str, Any]]:
+    transport: Any, job_ids: list[str] | None, *,
+    before_output_return: Callable[[], bool] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     """Opt-in verified delivery; a failure preserves remote publication for review."""
     task_by_job = {
         (job_ids[index] if job_ids and index < len(job_ids) else f"adhoc-{index}"): task
         for index, task in enumerate(tasks)
     }
     delivered: list[dict[str, Any]] = []
+    output_return_started = False
     for original in rows:
         row = dict(original)
         task = task_by_job.get(str(row.get("job_id")))
@@ -906,6 +941,9 @@ def _return_outputs(
         receipts = []
         try:
             for rel in rel_paths:
+                if before_output_return is not None and not before_output_return():
+                    raise _OutputReturnOwnershipLost
+                output_return_started = True
                 components = rel.split("/")
                 remote_path = transport.native_join(output_root, *components)
                 local_path = _confined_return_path(Path(return_root), components)
@@ -926,7 +964,7 @@ def _return_outputs(
                 "root": return_root, "receipts": receipts,
             }
         delivered.append(row)
-    return delivered
+    return delivered, output_return_started
 
 
 def _confined_return_path(root: Path, components: list[str]) -> Path:

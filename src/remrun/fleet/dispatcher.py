@@ -547,6 +547,15 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 "dispatch_run", batch=batch_id, device=device, jobs=len(btasks), engine=engine,
             )
             return True
+        def output_return_gate() -> bool:
+            nonlocal batch_state
+            if heartbeat.ownership_lost.is_set():
+                return False
+            if batch_state != "fetching":
+                if not heartbeat.transition(q, "fetching"):
+                    return False
+                batch_state = "fetching"
+            return True
         try:
             with BatchHeartbeat(
                 db_path, batch_id, owner_token, batch_state, lease_seconds,
@@ -556,6 +565,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 res = executor.run_batch(
                     device, btasks, config, state_root=state_root, job_ids=job_ids,
                     observation_id=batch_id, prelaunch_gate=frozen_launch_gate,
+                    before_output_return=output_return_gate,
                 )
             latest_result = res
             attempt_record = executor.durable_attempt_record(head, res)
@@ -570,13 +580,14 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 out["failed"] = 1
                 return out
             if res.get("ok"):
-                if not q.set_batch_state(
-                    batch_id, "fetching", expected_state=batch_state,
-                    owner_token=owner_token,
-                ):
-                    out["ran"] = 1
-                    return ownership_lost("fetch")
-                batch_state = "fetching"
+                if batch_state != "fetching":
+                    if not q.set_batch_state(
+                        batch_id, "fetching", expected_state=batch_state,
+                        owner_token=owner_token,
+                    ):
+                        out["ran"] = 1
+                        return ownership_lost("fetch")
+                    batch_state = "fetching"
                 with BatchHeartbeat(
                     db_path, batch_id, owner_token, batch_state, lease_seconds,
                 ) as heartbeat:

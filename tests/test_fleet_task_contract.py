@@ -84,6 +84,31 @@ def test_novel_task_definition_is_config_only_and_content_addressed(tmp_path: Pa
     assert first["adapters"]["BOX"]["adapter_id"].startswith("sha256:")
 
 
+def test_omitted_allow_return_preserves_legacy_spec_identity(tmp_path: Path) -> None:
+    spec = resolve_task_spec("zotomatic", _task(), devices={"BOX"}, repo_root=tmp_path)
+
+    assert "allow_return" not in spec["definition"]["output"]
+    assert spec["spec_id"] == (
+        "sha256:05dc9a172804f46df45c969c461bdccf39f616c2594b5ba660e95d7ea05dbce3"
+    )
+
+
+def test_allow_return_requires_item_result_with_output_paths() -> None:
+    raw = _task()
+    raw["execution"] = {"batching": "never", "replay": "at-most-once-v1"}
+    raw["output"] = {
+        "reservation": "none", "allow_root_override": False,
+        "allow_return": True, "verification": "none",
+    }
+    raw["completion"] = {
+        "protocol": "exit-code-v1", "evidence": "never", "companion": "forbidden",
+        "allowed_publication": ["none"], "unstructured_memory": "ignore",
+    }
+
+    with pytest.raises(TaskContractError, match="output return requires item-result-v2"):
+        validate_task_definition("zotomatic", raw, {"BOX"})
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

@@ -10,11 +10,11 @@ from pathlib import Path
 import pytest
 
 from remrun.config import RemrunConfig
-from remrun.fleet import executor
+from remrun.fleet import cli, executor
 from remrun.fleet.cli import build_parser
 from remrun.fleet.prepared import as_fleet_task, prepare_task_job, validate_prepared_job
 from remrun.fleet.storage import (
-    MARKER_NAME, bind_device_root, enroll_local_root, load_registry,
+    MARKER_NAME, StorageError, bind_device_root, enroll_local_root, load_registry,
     storage_ref_for_path,
 )
 from remrun.fleet.task_contract import resolve_task_spec
@@ -55,6 +55,32 @@ def _spec(tmp_path: Path, worker: Path) -> dict:
             "memory_kind": "cpu", "capability_paths": [], "provides": [],
         }},
     }, devices={"LOCAL_SIM"}, repo_root=tmp_path)
+
+
+def _return_spec(tmp_path: Path, worker: Path) -> dict:
+    raw = {
+        "input": {"mode": "files", "extensions": [".bin"], "split": "per-item",
+                  "file_identity": "sha256"},
+        "prepare": {"mode": "none"},
+        "routing": {"requirements": [], "requirements_by_option": {}},
+        "execution": {"batching": "never", "replay": "at-most-once-v1"},
+        "cost": {"measure": "item-count", "unit": "items", "divisor": 1,
+                 "bucket_options": []},
+        "output": {"reservation": "content-work-stem-v1", "allow_root_override": False,
+                   "allow_return": True, "verification": "none"},
+        "completion": {"protocol": "item-result-v2", "evidence": "always",
+                       "companion": "forbidden", "allowed_publication": ["produced"],
+                       "unstructured_memory": "ignore"},
+        "options": {},
+        "adapters": {"LOCAL_SIM": {
+            "engine": "generic", "argv": ["python", str(worker)], "pool": False,
+            "memory_kind": "cpu", "capability_paths": [], "provides": [],
+            "output_root": str(tmp_path / "output"),
+        }},
+    }
+    return resolve_task_spec(
+        "novel-return", raw, devices={"LOCAL_SIM"}, repo_root=tmp_path,
+    )
 
 
 def test_enroll_bind_and_prepare_storage_ref(tmp_path: Path) -> None:
@@ -104,6 +130,69 @@ def test_empty_registry_preserves_legacy_prepared_identity(tmp_path: Path) -> No
 
     assert empty == legacy
     assert empty["schema"] == 3
+
+
+def test_shared_route_identity_does_not_change_target_work(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    root = tmp_path / "shared"
+    root.mkdir()
+    source = root / "input.bin"
+    source.write_bytes(b"same bytes")
+    worker = tmp_path / "worker.py"
+    worker.write_text("raise SystemExit(0)", encoding="utf-8")
+    spec = _spec(tmp_path, worker)
+
+    streamed = prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    enroll_local_root(state, root)
+    shared = prepare_task_job(
+        spec, repo_root=tmp_path, inputs=[str(source)],
+        storage_registry=load_registry(state),
+    )
+
+    assert shared["work_id"] == streamed["work_id"]
+    assert shared["prepared_id"] != streamed["prepared_id"]
+
+
+def test_return_root_identity_does_not_change_target_work_or_reservation(tmp_path: Path) -> None:
+    source = tmp_path / "input.bin"
+    source.write_bytes(b"same bytes")
+    worker = tmp_path / "worker.py"
+    worker.write_text("raise SystemExit(0)", encoding="utf-8")
+    spec = _return_spec(tmp_path, worker)
+
+    first = prepare_task_job(
+        spec, repo_root=tmp_path, inputs=[str(source)], return_root=str(tmp_path / "a"),
+    )
+    second = prepare_task_job(
+        spec, repo_root=tmp_path, inputs=[str(source)], return_root=str(tmp_path / "b"),
+    )
+
+    assert first["work_id"] == second["work_id"]
+    assert first["output"]["reservations"] == second["output"]["reservations"]
+    assert first["prepared_id"] != second["prepared_id"]
+
+
+@pytest.mark.parametrize("payload", [{}, [], False, 0, "", None])
+def test_falsey_corrupt_registry_is_not_treated_as_absent(
+    tmp_path: Path, payload: object,
+) -> None:
+    path = tmp_path / "state" / "fleet" / "storage-roots-v1.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(StorageError, match="registry is malformed"):
+        load_registry(tmp_path / "state")
+
+
+def test_unrelated_preparation_ignores_corrupt_optional_registry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "state" / "fleet" / "storage-roots-v1.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{", encoding="utf-8")
+
+    assert cli._optional_storage_registry(tmp_path / "state") == {"schema": 1, "roots": {}}
+    assert "storage registry unavailable; using stream route" in capsys.readouterr().err
 
 
 def test_storage_cli_is_explicit_and_output_return_is_opt_in() -> None:
@@ -161,7 +250,7 @@ def test_shared_view_executes_and_wrong_candidate_falls_back_to_stream(
         prelaunch_gate=lambda: True,
     )
     assert shared_result["ok"] is True, shared_result
-    assert calls == {"shared": 1, "stream": 0}
+    assert calls == {"shared": 1, "stream": 1}
 
     (target_root / "input.bin").write_bytes(b"wrong source!")
     fallback_result = executor.run_batch(
@@ -169,7 +258,41 @@ def test_shared_view_executes_and_wrong_candidate_falls_back_to_stream(
         prelaunch_gate=lambda: True,
     )
     assert fallback_result["ok"] is True, fallback_result
-    assert calls == {"shared": 2, "stream": 1}
+    assert calls == {"shared": 2, "stream": 3}
+
+
+def test_shared_source_changes_during_materialize_use_one_frozen_handle(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    storage_id = "1" * 32
+    (root / MARKER_NAME).write_text(
+        json.dumps({"schema": 1, "storage_id": storage_id}), encoding="utf-8",
+    )
+    original = b"frozen source"
+    source = root / "input.bin"
+    source.write_bytes(original)
+    destination = tmp_path / "private" / "input.bin"
+    transport = make_transport(_config(tmp_path).devices["LOCAL_SIM"])
+    old_fetch = transport.fetch_output
+
+    def mutate_between_check_and_copy(remote_path: str, local_path: Path):
+        source.write_bytes(b"changed after qualification")
+        return old_fetch(remote_path, local_path)
+
+    # The rejected implementation called fetch_output after separately hashing the
+    # source, allowing this mutation to change the copied bytes. The stable-handle
+    # implementation never uses that second-open path.
+    monkeypatch.setattr(transport, "fetch_output", mutate_between_check_and_copy)
+    receipt = transport.materialize_shared_input(
+        str(root), str(source), str(destination), storage_id=storage_id,
+        expected_bytes=len(original), expected_sha256=hashlib.sha256(original).hexdigest(),
+    )
+
+    assert destination.read_bytes() == original
+    assert receipt["route"] == "shared-view"
+    assert receipt["sha256"] == "sha256:" + hashlib.sha256(original).hexdigest()
 
 
 def test_corrupt_registry_fails_before_shared_job_launch(tmp_path: Path) -> None:

@@ -377,9 +377,11 @@ def _validate_output(raw: Any, input_spec: Mapping[str, Any]) -> dict[str, Any]:
     out = {"reservation": reservation,
            "allow_root_override": _bool(table["allow_root_override"],
                                         "output.allow_root_override"),
-           "allow_return": _bool(table.get("allow_return", False),
-                                 "output.allow_return"),
            "verification": verification}
+    # Omitted default-false fields stay omitted so an unchanged legacy task keeps
+    # its exact content-addressed spec identity across this optional feature addition.
+    if "allow_return" in table:
+        out["allow_return"] = _bool(table["allow_return"], "output.allow_return")
     if reservation != "none" and input_spec["mode"] not in {"files", "text-or-files"}:
         raise TaskContractError("output reservation requires file-capable input")
     if reservation == "content-work-stem-v1" and input_spec.get("file_identity") != "sha256":
@@ -426,6 +428,13 @@ def _validate_completion(raw: Any, batching: str, output: Mapping[str, Any]) -> 
         raise TaskContractError("output publication requires a reservation")
     if reservation != "none" and protocol != "item-result-v2":
         raise TaskContractError("output reservation requires item-result-v2")
+    if output.get("allow_return", False) and (
+        protocol != "item-result-v2" or reservation == "none"
+        or not set(publication) & {"produced", "reused"}
+    ):
+        raise TaskContractError(
+            "output return requires item-result-v2 with reserved produced or reused paths"
+        )
     if companion == "required" and (reservation == "none" or
                                      not set(publication) & {"produced", "reused"}):
         raise TaskContractError("required companion needs output-bearing publication")
