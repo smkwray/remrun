@@ -909,6 +909,7 @@ def _reclaim_marginal_devices(config: RemrunConfig, groups: list[dict[str, Any]]
 def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                debounce_s: float = 0.0, lease_seconds: int = 300,
                reporter: Reporter | None = None, max_parallel: int | None = None,
+               job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
                sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     """Run ONE dispatcher tick: place + claim every runnable group (lease/cooldown-aware), then
     execute the claimed batches CONCURRENTLY (one per device — Phase 3a). Returns a summary dict
@@ -921,15 +922,15 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                                "failed": 0, "review": 0, "skipped": {}, "cooled": []}
     try:
         now0 = utc_now_iso()
-        summary["recovered"] = q.recover_stale(now0)
+        summary["recovered"] = q.recover_stale(now0, job_ids=job_ids)
         q.prune_cooldowns(now0)
 
-        queued = q.list("queued")
+        queued = q.list("queued", job_ids=job_ids)
         if not queued:
             return summary
         if debounce_s > 0:                 # let a burst fill, then re-read so late arrivals join
             sleep(debounce_s)
-            queued = q.list("queued")
+            queued = q.list("queued", job_ids=job_ids)
             if not queued:
                 return summary
 
@@ -1179,7 +1180,8 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                 summary["failed"] += o["failed"]
                 summary["review"] += o.get("review", 0)
 
-        q.prune_final()
+        if job_ids is None:
+            q.prune_final()
         return summary
     finally:
         q.close()
@@ -1188,6 +1190,7 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
 def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float = 2.0,
         debounce_s: float = 5.0, lease_seconds: int = 300, max_ticks: int | None = None,
         until_empty: bool = False, reporter: Reporter | None = None,
+        job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
         idle_grace_s: float | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic) -> DrainResultV1:
@@ -1213,8 +1216,8 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         queue = FleetQueue(sr / "fleet" / "fleet.db")
         try:
             return (
-                int(queue.counts().get("queued", 0)),
-                sum(queue.active_by_device().values()),
+                int(queue.counts(job_ids=job_ids).get("queued", 0)),
+                sum(queue.active_by_device(job_ids=job_ids).values()),
             )
         finally:
             queue.close()
@@ -1231,7 +1234,8 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
                        drain=until_empty, idle_grace_s=grace_s)
         while max_ticks is None or ticks < max_ticks:
             summary = drain_once(config, state_root=sr, debounce_s=debounce_s,
-                                 lease_seconds=lease_seconds, reporter=reporter, sleep=sleep)
+                                 lease_seconds=lease_seconds, reporter=reporter,
+                                 job_ids=job_ids, sleep=sleep)
             ticks += 1
             for key in totals:
                 totals[key] += int(summary.get(key, 0) or 0)

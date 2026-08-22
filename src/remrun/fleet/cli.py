@@ -21,7 +21,7 @@ from .models import FleetTask
 from .queue import FleetQueue
 from .prepared import (
     RAW_COMMAND_SPEC, RAW_COMMAND_SPEC_ID, as_fleet_task, parse_option_assignments,
-    prepare_raw_command, prepare_task_jobs,
+    pin_prepared_job, prepare_raw_command, prepare_task_jobs,
 )
 from .storage import StorageError, bind_device_root, enroll_local_root, load_registry
 from .task_contract import resolve_tasks
@@ -262,6 +262,33 @@ def cmd_plan(args, reporter: Reporter) -> int:
     features = [adapters.extract_features(task) for task in tasks]
     result = placement.plan_jobs(tasks, features, snaps, load_costs(config, state_root),
                                  fcfg, safety_fraction(config), device_backlog=backlog)
+    saved_plan = None
+    if getattr(args, "save", False):
+        assignments: list[str | None] = [None] * len(records)
+        for batch in result.batches:
+            for index in batch.job_indices:
+                if index < 0 or index >= len(assignments) or assignments[index] is not None:
+                    raise ValueError("planner returned duplicate or out-of-range job assignment")
+                assignments[index] = batch.device
+        if any(device is None for device in assignments):
+            raise ValueError("cannot save a plan unless every prepared job has a selected device")
+        pinned = [
+            pin_prepared_job(record, str(device), spec)
+            for record, device in zip(records, assignments)
+        ]
+        q = FleetQueue(state_root / "fleet" / "fleet.db")
+        try:
+            saved_plan = q.save_submission_plan(
+                spec=spec,
+                prepared_records=pinned,
+                current_spec_id=lambda: (
+                    (resolve_tasks(load_config(config.repo_root)).get(spec["task_name"]) or {})
+                    .get("spec_id")
+                ),
+            )
+        finally:
+            q.close()
+        records = pinned
     payload = {
         "task": spec["task_name"], "spec_id": spec["spec_id"],
         "prepared_ids": [record["prepared_id"] for record in records],
@@ -275,6 +302,11 @@ def cmd_plan(args, reporter: Reporter) -> int:
         "makespan_s": result.makespan_s,
         "skipped": result.skipped, "note": result.note,
     }
+    if saved_plan is not None:
+        payload.update({
+            "plan_id": saved_plan["plan_id"],
+            "plan_digest": saved_plan["plan_digest"],
+        })
     if records and "limits" in records[0]:
         payload["limits"] = records[0]["limits"]
     if args.json:
@@ -325,6 +357,69 @@ def _route_line(task_name: str, route: dict, will_run: bool, queued_total: int) 
 def cmd_submit(args, reporter: Reporter) -> int:
     if getattr(args, "preview_route", False) and not getattr(args, "json", False):
         raise ValueError("--preview-route requires --json")
+    plan_id = getattr(args, "plan_id", None)
+    if plan_id:
+        incompatible = {
+            "task_name": getattr(args, "task_name", None),
+            "require": getattr(args, "require", None) or [],
+            "text": getattr(args, "text", None),
+            "input": getattr(args, "input", None) or [],
+            "clipboard": getattr(args, "clipboard", False),
+            "device": getattr(args, "device", None),
+            "engine": getattr(args, "engine", None),
+            "opt": getattr(args, "opt", None) or [],
+            "output_root": getattr(args, "output_root", None),
+            "return_root": getattr(args, "return_root", None),
+            "memory_limit_mib": getattr(args, "memory_limit_mib", None),
+            "route_line": getattr(args, "route_line", False),
+            "preview_route": getattr(args, "preview_route", False),
+            "allow_fallback": getattr(args, "allow_fallback", False),
+        }
+        used = sorted(name for name, value in incompatible.items() if value)
+        if used:
+            raise ValueError(
+                "--plan consumes its frozen task and placement; incompatible arguments: "
+                + ", ".join(used)
+            )
+        state_root = default_state_root()
+        q = FleetQueue(state_root / "fleet" / "fleet.db")
+        try:
+            existing = q.get_submission(plan_id=plan_id)
+            plan = q.get_submission_plan(plan_id)
+            if existing is None and plan is None:
+                raise ValueError(f"unknown saved plan {plan_id!r}")
+            if existing is not None:
+                receipt = existing
+                task_name = plan["spec"]["task_name"] if plan is not None else "saved-plan"
+            else:
+                config = load_config()
+                task_name = plan["spec"]["task_name"]
+
+                def current_spec_id() -> str | None:
+                    current = resolve_tasks(load_config(config.repo_root)).get(task_name)
+                    return current.get("spec_id") if current else None
+
+                receipt = q.enqueue_saved_plan(
+                    plan_id, priority=getattr(args, "priority", 0),
+                    request_id=getattr(args, "request_id", None),
+                    current_spec_id=current_spec_id,
+                )
+            queued_total = q.counts().get("queued", 0)
+        finally:
+            q.close()
+        payload = {**receipt, "task": task_name, "queued_total": queued_total,
+                   "route_preview": False}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        else:
+            reporter.event(
+                "submission_accepted", submission_id=receipt["submission_id"],
+                plan_id=plan_id, jobs=len(receipt["job_ids"]),
+                replayed=receipt["replayed"],
+            )
+        return EXIT_OK
+    if not getattr(args, "task_name", None):
+        raise ValueError("submit requires a configured task name or --plan PLAN_ID")
     config = load_config()
     spec, records, tasks = _prepare_configured(args, config)
     state_root = default_state_root()
@@ -346,10 +441,12 @@ def cmd_submit(args, reporter: Reporter) -> int:
         def current_spec_id() -> str | None:
             current = resolve_tasks(load_config(config.repo_root)).get(args.task_name)
             return current.get("spec_id") if current else None
-        jids = q.enqueue_prepared_many(
+        receipt = q.enqueue_submission(
             records, spec=spec, priority=getattr(args, "priority", 0),
+            request_id=getattr(args, "request_id", None),
             current_spec_id=current_spec_id,
         )
+        jids = receipt["job_ids"]
         queued_total = q.counts().get("queued", 0) if (args.json or need_route) else 0
         if need_route and len(tasks) == 1:
             will_run = (bool(route.get("device")) and not route.get("device_busy")
@@ -361,7 +458,7 @@ def cmd_submit(args, reporter: Reporter) -> int:
               if len(tasks) == 1 else
               _route_line_multi(spec["task_name"], preview_multi or {}, queued_total))
     elif args.json:
-        payload = {"job_ids": jids, "task": spec["task_name"],
+        payload = {**receipt, "task": spec["task_name"],
                    "spec_id": spec["spec_id"], "queued_total": queued_total,
                    "route_preview": need_route}
         if records and "limits" in records[0]:
@@ -373,6 +470,7 @@ def cmd_submit(args, reporter: Reporter) -> int:
         for jid, record in zip(jids, records):
             event = {
                 "job_id": jid, "task": spec["task_name"],
+                "submission_id": receipt["submission_id"],
                 "prepared_id": record["prepared_id"],
                 "device": record["routing"]["force_device"] or "auto",
             }
@@ -398,10 +496,14 @@ def cmd_command(args, reporter: Reporter) -> int:
     if args.command_action == "submit":
         queue = FleetQueue(state_root / "fleet" / "fleet.db")
         try:
-            job_id = queue.enqueue_prepared(record, spec=None, priority=args.priority)
+            receipt = queue.enqueue_submission(
+                [record], spec=None, priority=args.priority,
+                request_id=getattr(args, "request_id", None),
+            )
         finally:
             queue.close()
-        payload = {"job_id": job_id, "prepared_id": record["prepared_id"],
+        job_id = receipt["job_ids"][0]
+        payload = {**receipt, "job_id": job_id, "prepared_id": record["prepared_id"],
                    "device": args.device, "state": "queued"}
         if "limits" in record:
             payload["limits"] = record["limits"]
@@ -467,6 +569,48 @@ def cmd_command(args, reporter: Reporter) -> int:
 def cmd_status(args, reporter: Reporter) -> int:
     q = FleetQueue(default_state_root() / "fleet" / "fleet.db")
     try:
+        submission_id = getattr(args, "submission_id", None)
+        request_id = getattr(args, "request_id", None)
+        exact_job_ids = list(getattr(args, "job_id", None) or [])
+        if submission_id is not None or request_id is not None:
+            receipt = q.get_submission(
+                submission_id=submission_id, request_id=request_id,
+            )
+            if receipt is None:
+                raise ValueError("submission identity was not found")
+            jobs = q.jobs_for_submission(receipt["submission_id"])
+            payload = {"schema": 1, "submission": receipt, "jobs": jobs}
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                reporter.event(
+                    "submission", submission_id=receipt["submission_id"],
+                    request_id=receipt["request_id"], jobs=len(jobs),
+                )
+                for job in jobs:
+                    reporter.event(
+                        "job", job_id=job["job_id"],
+                        task=job.get("task_name") or "-",
+                        state=job.get("state") or "pruned",
+                        device=job.get("assigned_device") or "-",
+                    )
+            return EXIT_OK
+        if exact_job_ids:
+            jobs = []
+            for job_id in exact_job_ids:
+                row = q.get(job_id)
+                if row is None:
+                    raise ValueError(f"job {job_id!r} was not found")
+                jobs.append(row)
+            if args.json:
+                print(json.dumps({"schema": 1, "jobs": jobs}, indent=2, sort_keys=True))
+            else:
+                for job in jobs:
+                    reporter.event(
+                        "job", job_id=job["job_id"], task=job["task_name"],
+                        state=job["state"], device=job.get("assigned_device") or "-",
+                    )
+            return EXIT_OK
         counts = q.counts()
         recent = q.list()[-getattr(args, "limit", 20):]
         active = q.active_by_device()
@@ -510,8 +654,38 @@ def cmd_run(args, reporter: Reporter) -> int:
 def cmd_dispatch(args, reporter: Reporter) -> int:
     from . import dispatcher
     config = load_config()
+    scope_job_ids = list(getattr(args, "job_id", None) or [])
+    submission_id = getattr(args, "submission_id", None)
+    request_id = getattr(args, "request_id", None)
+    if submission_id is not None or request_id is not None:
+        queue = FleetQueue(default_state_root() / "fleet" / "fleet.db")
+        try:
+            receipt = queue.get_submission(
+                submission_id=submission_id, request_id=request_id,
+            )
+            if receipt is None:
+                raise ValueError("scoped dispatch submission identity was not found")
+            submission_id = receipt["submission_id"]
+            scope_job_ids = receipt["job_ids"]
+        finally:
+            queue.close()
+    if scope_job_ids:
+        queue = FleetQueue(default_state_root() / "fleet" / "fleet.db")
+        try:
+            missing = [job_id for job_id in scope_job_ids if queue.get(job_id) is None]
+        finally:
+            queue.close()
+        if missing:
+            raise ValueError("scoped dispatch job was not found: " + ", ".join(missing))
+        reporter.event(
+            "dispatch_scope", submission_id=submission_id,
+            request_id=request_id, job_ids=scope_job_ids,
+        )
+    scope = scope_job_ids or None
     if args.once:
-        summary = dispatcher.drain_once(config, debounce_s=args.debounce, reporter=reporter)
+        summary = dispatcher.drain_once(
+            config, debounce_s=args.debounce, reporter=reporter, job_ids=scope,
+        )
         if args.json:
             print(json.dumps(summary, indent=2, sort_keys=True))
         else:
@@ -519,7 +693,8 @@ def cmd_dispatch(args, reporter: Reporter) -> int:
         return EXIT_OK
     result = dispatcher.run(
         config, poll_s=args.poll, debounce_s=args.debounce,
-        until_empty=getattr(args, "drain", False), reporter=reporter,
+        until_empty=bool(getattr(args, "drain", False) or scope is not None), reporter=reporter,
+        job_ids=scope,
     )
     if args.json:
         print(json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")))
@@ -892,8 +1067,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="remrun fleet")
     sub = p.add_subparsers(dest="fleet_command", required=True)
 
-    def add_common(sp):
-        sp.add_argument("task_name", help="configured task name")
+    def add_common(sp, *, task_optional: bool = False):
+        sp.add_argument(
+            "task_name", nargs="?" if task_optional else None,
+            help="configured task name",
+        )
         sp.add_argument("--require", action="append", default=[], metavar="TOKEN",
                         help="opaque capability token an eligible adapter must "
                              "list in its `provides` (repeatable)")
@@ -921,9 +1099,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     pp = sub.add_parser("plan", help="show placement decision; runs nothing")
     add_common(pp)
+    pp.add_argument(
+        "--save", action="store_true",
+        help="persist this exact fully placed plan and return a token for submit --plan",
+    )
     ps = sub.add_parser("submit", help="enqueue a job")
-    add_common(ps)
+    add_common(ps, task_optional=True)
     ps.add_argument("--priority", type=int, default=0)
+    ps.add_argument("--request-id", help="caller-owned stable submission retry/correlation token")
+    ps.add_argument(
+        "--plan", dest="plan_id",
+        help="consume an exact saved plan instead of preparing task arguments again",
+    )
     ps.add_argument(
         "--preview-route", action="store_true",
         help="requires --json; probe live placement before enqueue and include the non-binding preview",
@@ -953,6 +1140,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if action == "submit":
             command_parser.add_argument("--priority", type=int, default=0)
+            command_parser.add_argument(
+                "--request-id", help="caller-owned stable submission retry/correlation token",
+            )
         if action == "run":
             command_parser.add_argument("--no-lease", action="store_true",
                                         help="skip the resource lease (dev/test only)")
@@ -960,6 +1150,13 @@ def build_parser() -> argparse.ArgumentParser:
                                     help="exact argv after --")
     pst = sub.add_parser("status", help="show the fleet queue")
     pst.add_argument("--limit", type=int, default=20)
+    status_scope = pst.add_mutually_exclusive_group()
+    status_scope.add_argument("--job", dest="job_id", action="append",
+                              help="look up this exact job ID (repeatable)")
+    status_scope.add_argument("--submission", dest="submission_id",
+                              help="look up one exact submission and all its jobs")
+    status_scope.add_argument("--request-id",
+                              help="look up the submission accepted for this caller request")
     pst.add_argument("--json", action="store_true")
     pd = sub.add_parser("dispatch", help="drain the queue: place + run batched jobs "
                                          "(loops until Ctrl-C; --once for one tick; --drain "
@@ -971,6 +1168,13 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--poll", type=float, default=2.0, help="idle poll interval (s)")
     pd.add_argument("--debounce", type=float, default=5.0,
                     help="seconds to coalesce a burst before launching one worker")
+    dispatch_scope = pd.add_mutually_exclusive_group()
+    dispatch_scope.add_argument("--job", dest="job_id", action="append",
+                                help="dispatch only this exact queued job (repeatable)")
+    dispatch_scope.add_argument("--submission", dest="submission_id",
+                                help="dispatch only the immutable jobs in this submission")
+    dispatch_scope.add_argument("--request-id",
+                                help="dispatch only the submission accepted for this caller request")
     pd.add_argument("--json", action="store_true")
     pc = sub.add_parser("clear", help="unstick the fleet: drop all queued + in-flight jobs, "
                                       "release leases, clear cooldowns")
@@ -1036,9 +1240,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
-    reporter = Reporter(json_events=bool(
+    lifecycle_json = bool(
         args.fleet_command == "dispatch" and getattr(args, "json", False)
-    ))
+    )
+    reporter = Reporter(
+        json_events=lifecycle_json,
+        event_schema="remrun.fleet.lifecycle" if lifecycle_json else None,
+        event_version=1 if lifecycle_json else None,
+    )
     try:
         if args.fleet_command == "plan":
             return cmd_plan(args, reporter)

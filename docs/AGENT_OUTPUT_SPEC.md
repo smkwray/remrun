@@ -81,16 +81,30 @@ top-level estimate. A batch with no honest estimate has `estimated_finish_s=null
 requires top-level `makespan_s=null`. Never display null as zero. The owner-facing wording is
 `Uncalibrated placement; no duration estimate.` for an uncalibrated cold start.
 
+With `--save`, a completely placeable plan also returns `plan_id` and `plan_digest`; its
+`prepared_ids` are the exact device-pinned records later consumed by
+`remrun fleet submit --plan PLAN_ID`. The token is controller-local. Replaying an already
+accepted token returns the same `submission_id` and ordered `job_ids`. It never prepares a
+directory again or silently changes the selected devices.
+
 `remrun fleet submit TASK --json` reports the durable queue result and does not probe devices.
 Its `route_preview` field is `false`. Add `--preview-route` only together with `--json` and only
 when a non-binding live placement hint is worth the extra device probes; then `route_preview` is
 `true` and the route fields are included. The dispatcher still makes the authoritative placement
 when it claims queued work.
 
+Every durable submit now returns `submission_id`, ordered `job_ids`, ordered
+`prepared_ids`, and the optional caller `request_id` or saved `plan_id`. Use
+`fleet status --submission`, `--request-id`, or repeatable `--job` for exact lookup; do not
+scan the recent tail. `fleet dispatch --submission` or `--request-id` drains only those
+immutable members and then exits. Unrelated queued rows remain untouched.
+
 `remrun fleet dispatch --drain --json` writes reporter events to stderr and exactly one compact
 `DrainResultV1` document to stdout. Its status is `drained`, `stuck_unplaceable`, `cancelled`, or
 `infrastructure_error`; exit codes are respectively 0/1 (depending on failed or review attempts),
-2, 130, and 4. Parse the final JSON before converting a nonzero process status into an error.
+2, 130, and 4. Every stderr event carries
+`{"schema":"remrun.fleet.lifecycle","version":1,"event":"..."}`. Parse the final JSON
+before converting a nonzero process status into an error.
 
 When a fleet submission includes `--memory-limit-mib N`, plan and submit JSON include the
 frozen `limits` object. Synchronous execution includes a token-free `memory_limit` receipt.

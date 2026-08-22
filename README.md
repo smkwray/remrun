@@ -140,8 +140,11 @@ remrun fleet resources                         # CPU, load/queue, RAM, GPU/VRAM,
 remrun fleet jobs [--device NAME]              # active jobs across all controllers
 remrun fleet mesh [--no-hops]                  # measured SSH reachability matrix
 remrun fleet plan zotomatic --input items/      # arbitrary configured name; preview only
+remrun fleet plan zotomatic --input items/ --save --json  # save exact prepared placement
 remrun fleet run zotomatic --input items/       # synchronous placement + execution
 remrun fleet submit zotomatic --input items/    # durable queue submission
+remrun fleet submit zotomatic --input items/ --request-id ui-action-17
+remrun fleet submit --plan PLAN_ID --json        # consume/replay one exact saved plan
 remrun fleet submit zotomatic --input items/ --json  # queue IDs only; no live device probes
 remrun fleet submit zotomatic --input items/ --json --preview-route  # add non-binding live route
 remrun fleet submit zotomatic --device macbox --memory-limit-mib 8192 --input item.zot
@@ -150,7 +153,9 @@ remrun fleet storage enroll /path/to/shared/root
 remrun fleet storage bind --device winbox 'Z:\shared-root'
 remrun fleet command run --device macbox --memory-limit-mib 8192 -- tool --flag
 remrun fleet dispatch --drain                   # batch compatible jobs, then exit
+remrun fleet dispatch --submission ID           # drain only this immutable submission
 remrun fleet status                             # queue state and recent jobs
+remrun fleet status --request-id ui-action-17 --json  # exact accepted submission
 remrun fleet clear                              # release queue leases/cooldowns
 remrun fleet cancel                             # clear queue and stop configured workers
 ```
@@ -163,6 +168,17 @@ and both its device key and every configured address alias corroborate the local
 unresolved, or contradictory identity falls back to the normal transport path; `local-sim` is never
 replaced by controller evidence.
 
+Ordinary `fleet plan` remains a non-binding preview. `fleet plan --save` succeeds only
+when every prepared item is placed exactly once; it freezes those selected devices into
+the normal prepared-job identities and returns a controller-local `plan_id`. Submitting
+that token enqueues those exact prepared records atomically. Repeating the token after a
+lost response returns the original submission and job IDs. A caller may supply
+`--request-id` without a saved plan for exact correlation and lookup. Reusing a request
+identity for different prepared work fails closed. Multi-device saved plans use each
+adapter's configured output root; a single controller-supplied `--output-root` is rejected
+for such a split. `fleet dispatch --submission` and `--request-id` are self-terminating
+scoped drains and never claim unrelated queued work.
+
 The controller-side fleet queue requires WAL mode on SQLite 3.51.3 or later, or
 the 3.50.7 / 3.44.6 backports. `remrun doctor` reports the controller's SQLite
 version and queue journal mode. An older runtime may still act as a worker; only
@@ -172,6 +188,8 @@ An otherwise qualified task with no duration profile is placed on exactly one
 deterministically selected device and reports `Uncalibrated placement; no duration estimate.`
 Unknown time is JSON `null`, never zero. `fleet dispatch --drain --json` always emits one final
 `DrainResultV1` document; unplaceable queued work exits 2 rather than silently succeeding.
+Each dispatch lifecycle event on stderr carries
+`"schema":"remrun.fleet.lifecycle","version":1`.
 
 `fleet resources`, `fleet jobs`, and `fleet mesh` are read-only. Resource probes read
 bounded operating-system metadata rather than scanning files. Interactive resource

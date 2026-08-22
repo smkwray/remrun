@@ -91,6 +91,33 @@ CREATE TABLE IF NOT EXISTS prepared_output_reservations (
     work_id        TEXT NOT NULL,
     created_at     TEXT NOT NULL
 );
+-- One caller action may create several queue rows.  The submission is the
+-- stable controller-local identity; request_id is an optional caller-owned
+-- retry key and plan_id identifies an exact saved placement.
+CREATE TABLE IF NOT EXISTS submissions (
+    submission_id TEXT PRIMARY KEY,
+    request_id    TEXT UNIQUE,
+    plan_id       TEXT UNIQUE,
+    fingerprint   TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS submission_jobs (
+    submission_id   TEXT NOT NULL,
+    item_index      INTEGER NOT NULL,
+    job_id          TEXT NOT NULL,
+    prepared_id     TEXT NOT NULL,
+    PRIMARY KEY (submission_id, item_index)
+);
+CREATE INDEX IF NOT EXISTS ix_submission_jobs_job ON submission_jobs(job_id);
+-- Saved plans are controller-local immutable prepared records with their
+-- selected devices already frozen into normal PreparedJob identities.
+CREATE TABLE IF NOT EXISTS submission_plans (
+    plan_id                 TEXT PRIMARY KEY,
+    plan_digest             TEXT NOT NULL,
+    plan_json               TEXT NOT NULL,
+    created_at              TEXT NOT NULL,
+    consumed_submission_id  TEXT
+);
 -- Raw execution observations are authoritative and are committed atomically
 -- with the queue's terminal transition. Derived profile caches are rebuildable.
 CREATE TABLE IF NOT EXISTS fleet_profile_observations (
@@ -419,11 +446,31 @@ class FleetQueue:
         now: str | None = None, job_ids: list[str | None] | None = None,
         current_spec_id: Callable[[], str | None] | None = None,
     ) -> list[str]:
-        """Atomically store one prepared submission, including every split row.
+        """Compatibility wrapper returning only the jobs in a new submission."""
+        return self.enqueue_submission(
+            prepared_records, spec=spec, priority=priority,
+            idempotency_keys=idempotency_keys, now=now, job_ids=job_ids,
+            current_spec_id=current_spec_id,
+        )["job_ids"]
+
+    def enqueue_submission(
+        self, prepared_records: list[dict[str, Any]], *, spec: dict[str, Any] | None,
+        priority: int = 0, idempotency_keys: list[str | None] | None = None,
+        now: str | None = None, job_ids: list[str | None] | None = None,
+        current_spec_id: Callable[[], str | None] | None = None,
+        request_id: str | None = None, plan_id: str | None = None,
+        submission_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically store and identify one prepared submission.
 
         A callable equality gate is evaluated *inside* ``BEGIN IMMEDIATE`` after
         route preview and preparation. A changed or unreadable definition raises
         before any spec, job, or reservation row exists.
+
+        ``request_id`` is a caller-owned retry/correlation token. Reusing it for
+        the same exact prepared submission returns the first receipt; reusing it
+        for different work fails closed. ``plan_id`` has the same one-shot replay
+        semantics for an immutable saved placement.
         """
         from .prepared import (
             RAW_COMMAND_SPEC, RAW_COMMAND_SPEC_ID, validate_prepared_against_spec,
@@ -433,6 +480,14 @@ class FleetQueue:
 
         if not prepared_records:
             raise ValueError("prepared enqueue requires at least one record")
+        if request_id is not None and (
+                not isinstance(request_id, str) or not request_id
+                or request_id.strip() != request_id or "\x00" in request_id
+                or len(request_id) > 200):
+            raise ValueError("request_id must be 1-200 non-whitespace-surrounded characters")
+        if plan_id is not None and (
+                not isinstance(plan_id, str) or not plan_id or len(plan_id) > 200):
+            raise ValueError("plan_id must be a non-empty token")
         for prepared in prepared_records:
             validate_prepared_job(prepared)
         kinds = {prepared["kind"] for prepared in prepared_records}
@@ -464,8 +519,36 @@ class FleetQueue:
             raise ValueError("prepared enqueue metadata length mismatch")
         now = now or utc_now_iso()
         allocated = [job_id or uuid.uuid4().hex[:12] for job_id in job_ids]
+        submission_id = submission_id or uuid.uuid4().hex[:16]
+        resolved_keys = [
+            ((prepared["prepared_id"] if requested_key is None else requested_key)
+             if kind == "task" else ("" if requested_key is None else requested_key))
+            for prepared, requested_key in zip(prepared_records, idempotency_keys)
+        ]
+        fingerprint = sha256_id({
+            "schema": 1,
+            "spec_id": spec_id,
+            "prepared_ids": [record["prepared_id"] for record in prepared_records],
+            "priority": priority,
+            "idempotency_keys": resolved_keys,
+        })
         result: list[str] = []
         with self._immediate():
+            existing = None
+            if plan_id is not None:
+                existing = self.db.execute(
+                    "SELECT * FROM submissions WHERE plan_id=?", (plan_id,),
+                ).fetchone()
+            if existing is None and request_id is not None:
+                existing = self.db.execute(
+                    "SELECT * FROM submissions WHERE request_id=?", (request_id,),
+                ).fetchone()
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    raise ValueError(
+                        "request or plan identity already names a different prepared submission"
+                    )
+                return self._submission_receipt(existing, replayed=True)
             if kind == "task":
                 live_id = current_spec_id()
                 if live_id != spec_id:
@@ -480,11 +563,8 @@ class FleetQueue:
                 self.db.execute(
                     "INSERT INTO prepared_specs(spec_id,schema,canonical_json,created_at) "
                     "VALUES(?,?,?,?)", (spec_id, 1, spec_blob, now))
-            for prepared, requested_key, jid in zip(
-                    prepared_records, idempotency_keys, allocated):
+            for prepared, key, jid in zip(prepared_records, resolved_keys, allocated):
                 prepared_id = prepared["prepared_id"]
-                key = ((prepared_id if requested_key is None else requested_key)
-                       if kind == "task" else ("" if requested_key is None else requested_key))
                 for reservation in prepared["output"]["reservations"]:
                     stem = reservation["stem"]
                     owner = self.db.execute(
@@ -531,7 +611,182 @@ class FleetQueue:
                         raise
                     jid = row["job_id"]
                 result.append(jid)
-        return result
+            self.db.execute(
+                "INSERT INTO submissions(submission_id,request_id,plan_id,fingerprint,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (submission_id, request_id, plan_id, fingerprint, now),
+            )
+            for index, (jid, prepared) in enumerate(zip(result, prepared_records)):
+                self.db.execute(
+                    "INSERT INTO submission_jobs(submission_id,item_index,job_id,prepared_id) "
+                    "VALUES(?,?,?,?)",
+                    (submission_id, index, jid, prepared["prepared_id"]),
+                )
+            if plan_id is not None:
+                cur = self.db.execute(
+                    "UPDATE submission_plans SET consumed_submission_id=? "
+                    "WHERE plan_id=? AND consumed_submission_id IS NULL",
+                    (submission_id, plan_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("saved plan is missing or already consumed inconsistently")
+            row = self.db.execute(
+                "SELECT * FROM submissions WHERE submission_id=?", (submission_id,),
+            ).fetchone()
+            return self._submission_receipt(row, replayed=False)
+
+    def _submission_receipt(self, row: sqlite3.Row, *, replayed: bool) -> dict[str, Any]:
+        jobs = self.db.execute(
+            "SELECT item_index,job_id,prepared_id FROM submission_jobs "
+            "WHERE submission_id=? ORDER BY item_index",
+            (row["submission_id"],),
+        ).fetchall()
+        return {
+            "schema": 1,
+            "submission_id": row["submission_id"],
+            "request_id": row["request_id"],
+            "plan_id": row["plan_id"],
+            "job_ids": [job["job_id"] for job in jobs],
+            "prepared_ids": [job["prepared_id"] for job in jobs],
+            "created_at": row["created_at"],
+            "replayed": bool(replayed),
+        }
+
+    def get_submission(self, *, submission_id: str | None = None,
+                       request_id: str | None = None,
+                       plan_id: str | None = None) -> dict[str, Any] | None:
+        selectors = [("submission_id", submission_id), ("request_id", request_id),
+                     ("plan_id", plan_id)]
+        selected = [(field, value) for field, value in selectors if value is not None]
+        if len(selected) != 1:
+            raise ValueError("submission lookup requires exactly one identity")
+        field, value = selected[0]
+        row = self.db.execute(
+            f"SELECT * FROM submissions WHERE {field}=?", (value,),
+        ).fetchone()
+        return self._submission_receipt(row, replayed=True) if row is not None else None
+
+    def jobs_for_submission(self, submission_id: str) -> list[dict[str, Any]]:
+        """Exact durable submission membership in caller item order.
+
+        A left join keeps the accepted job IDs visible even if an explicit
+        maintenance command later prunes their detailed queue rows.
+        """
+        rows = self.db.execute(
+            "SELECT sj.item_index,sj.job_id AS submitted_job_id,"
+            "sj.prepared_id AS submitted_prepared_id,j.* "
+            "FROM submission_jobs sj LEFT JOIN jobs j ON j.job_id=sj.job_id "
+            "WHERE sj.submission_id=? ORDER BY sj.item_index",
+            (submission_id,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["job_id"] = item.pop("submitted_job_id")
+            if item.get("prepared_id") is None:
+                item["prepared_id"] = item["submitted_prepared_id"]
+            out.append(item)
+        return out
+
+    def save_submission_plan(self, *, spec: dict[str, Any],
+                             prepared_records: list[dict[str, Any]],
+                             current_spec_id: Callable[[], str | None],
+                             now: str | None = None) -> dict[str, Any]:
+        """Persist one immutable, fully placed configured submission plan."""
+        from .prepared import validate_prepared_against_spec, validate_prepared_job
+        from .task_contract import canonical_json, sha256_id
+
+        if not prepared_records:
+            raise ValueError("saved plan requires at least one prepared record")
+        for record in prepared_records:
+            validate_prepared_job(record)
+            if record["kind"] != "task" or not record["routing"]["force_device"]:
+                raise ValueError("saved plan requires every prepared job to have a pinned device")
+            if record["routing"]["allow_fallback"]:
+                raise ValueError("saved plan may not permit placement fallback")
+            validate_prepared_against_spec(record, spec)
+        planned_devices = {record["routing"]["force_device"] for record in prepared_records}
+        if len(planned_devices) > 1 and any(
+                record["output"]["root_override"] is not None
+                for record in prepared_records):
+            raise ValueError(
+                "a multi-device saved plan cannot carry one controller-supplied output-root; "
+                "use each adapter's configured root and verified return-root instead"
+            )
+        plan = {"schema": 1, "spec": spec, "prepared": prepared_records}
+        blob = canonical_json(plan)
+        digest = sha256_id(plan)
+        plan_id = uuid.uuid4().hex[:20]
+        now = now or utc_now_iso()
+        with self._immediate():
+            if not callable(current_spec_id) or current_spec_id() != spec.get("spec_id"):
+                raise ValueError(
+                    "task definition changed before atomic plan save; no plan was saved"
+                )
+            self.db.execute(
+                "INSERT INTO submission_plans(plan_id,plan_digest,plan_json,created_at) "
+                "VALUES(?,?,?,?)", (plan_id, digest, blob, now),
+            )
+        return {
+            "schema": 1,
+            "plan_id": plan_id,
+            "plan_digest": digest,
+            "prepared_ids": [record["prepared_id"] for record in prepared_records],
+            "devices": [record["routing"]["force_device"] for record in prepared_records],
+            "created_at": now,
+        }
+
+    def get_submission_plan(self, plan_id: str) -> dict[str, Any] | None:
+        from .prepared import validate_prepared_against_spec, validate_prepared_job
+        from .task_contract import sha256_id
+
+        row = self.db.execute(
+            "SELECT * FROM submission_plans WHERE plan_id=?", (plan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            plan = json.loads(row["plan_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise QueueMigrationError(f"saved plan {plan_id} has malformed bytes") from exc
+        if not isinstance(plan, dict) or set(plan) != {"schema", "spec", "prepared"} \
+                or plan["schema"] != 1 or not isinstance(plan["spec"], dict) \
+                or not isinstance(plan["prepared"], list) or not plan["prepared"]:
+            raise QueueMigrationError(f"saved plan {plan_id} has an unsupported shape")
+        if sha256_id(plan) != row["plan_digest"]:
+            raise QueueMigrationError(f"saved plan {plan_id} fails its content identity")
+        try:
+            for record in plan["prepared"]:
+                validate_prepared_job(record)
+                if record["kind"] != "task" or not record["routing"]["force_device"] \
+                        or record["routing"]["allow_fallback"]:
+                    raise ValueError("prepared record is not pinned")
+                validate_prepared_against_spec(record, plan["spec"])
+        except ValueError as exc:
+            raise QueueMigrationError(f"saved plan {plan_id} is invalid: {exc}") from exc
+        return {
+            "plan_id": plan_id,
+            "plan_digest": row["plan_digest"],
+            "created_at": row["created_at"],
+            "consumed_submission_id": row["consumed_submission_id"],
+            **plan,
+        }
+
+    def enqueue_saved_plan(self, plan_id: str, *, priority: int = 0,
+                           request_id: str | None = None,
+                           current_spec_id: Callable[[], str | None]) -> dict[str, Any]:
+        """Consume an exact saved plan, replaying its first receipt after response loss."""
+        existing = self.get_submission(plan_id=plan_id)
+        if existing is not None:
+            return existing
+        plan = self.get_submission_plan(plan_id)
+        if plan is None:
+            raise ValueError(f"unknown saved plan {plan_id!r}")
+        return self.enqueue_submission(
+            plan["prepared"], spec=plan["spec"], priority=priority,
+            request_id=request_id, plan_id=plan_id,
+            current_spec_id=current_spec_id,
+        )
 
     def prepared_record(self, job_id: str) -> dict[str, Any] | None:
         """Return a verified prepared record, or fail closed on corrupt bytes."""
@@ -585,24 +840,58 @@ class FleetQueue:
         row = self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
-    def list(self, state: str | None = None) -> list[dict[str, Any]]:
+    def list(self, state: str | None = None,
+             job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+             ) -> list[dict[str, Any]]:
+        if job_ids is not None and not job_ids:
+            return []
+        clauses: list[str] = []
+        values: list[Any] = []
         if state:
-            rows = self.db.execute("SELECT * FROM jobs WHERE state=? ORDER BY priority DESC, created_at",
-                                   (state,)).fetchall()
-        else:
-            rows = self.db.execute("SELECT * FROM jobs ORDER BY priority DESC, created_at").fetchall()
+            clauses.append("state=?")
+            values.append(state)
+        if job_ids is not None:
+            ordered_ids = sorted(set(job_ids))
+            clauses.append(f"job_id IN ({','.join('?' * len(ordered_ids))})")
+            values.extend(ordered_ids)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.db.execute(
+            "SELECT * FROM jobs" + where + " ORDER BY priority DESC, created_at",
+            tuple(values),
+        ).fetchall()
         return [dict(r) for r in rows]
 
-    def counts(self) -> dict[str, int]:
-        rows = self.db.execute("SELECT state, COUNT(*) c FROM jobs GROUP BY state").fetchall()
+    def counts(self, job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+               ) -> dict[str, int]:
+        if job_ids is not None and not job_ids:
+            return {}
+        values: tuple[str, ...] = ()
+        where = ""
+        if job_ids is not None:
+            ordered_ids = tuple(sorted(set(job_ids)))
+            where = f" WHERE job_id IN ({','.join('?' * len(ordered_ids))})"
+            values = ordered_ids
+        rows = self.db.execute(
+            "SELECT state, COUNT(*) c FROM jobs" + where + " GROUP BY state", values,
+        ).fetchall()
         return {r["state"]: r["c"] for r in rows}
 
-    def active_by_device(self) -> dict[str, int]:
+    def active_by_device(
+        self, job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> dict[str, int]:
         """In-flight (leased/staging/running/fetching) job count per device."""
+        if job_ids is not None and not job_ids:
+            return {}
+        values: tuple[str, ...] = ()
+        scope = ""
+        if job_ids is not None:
+            ordered_ids = tuple(sorted(set(job_ids)))
+            scope = f" AND job_id IN ({','.join('?' * len(ordered_ids))})"
+            values = ordered_ids
         rows = self.db.execute(
             "SELECT assigned_device d, COUNT(*) c FROM jobs "
             "WHERE state IN ('leased','staging','running','fetching') AND assigned_device IS NOT NULL "
-            "GROUP BY assigned_device").fetchall()
+            + scope + " GROUP BY assigned_device", values).fetchall()
         return {r["d"]: r["c"] for r in rows}
 
     def active_backlog(self, now: str | None = None) -> dict[str, float | None]:
@@ -1290,18 +1579,35 @@ class FleetQueue:
                               (batch_id,)).fetchone()
         return int(row["m"]) if row and row["m"] is not None else 1
 
-    def recover_stale(self, now: str | None = None) -> int:
+    def recover_stale(
+        self, now: str | None = None,
+        job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> int:
         """Fail any batch whose lease expired (controller/worker died mid-flight) — which
         requeues its jobs and frees the device — plus orphan leases and singly-claimed
         stale jobs. Returns the number of stale batches recovered."""
         now = now or utc_now_iso()
+        if job_ids is not None and not job_ids:
+            return 0
+        values: list[str] = [now]
+        scope = ""
+        if job_ids is not None:
+            ordered_ids = sorted(set(job_ids))
+            scope = (
+                " AND batch_id IN (SELECT DISTINCT batch_id FROM jobs WHERE job_id IN ("
+                + ",".join("?" * len(ordered_ids)) + ") AND batch_id IS NOT NULL)"
+            )
+            values.extend(ordered_ids)
         stale = self.db.execute(
-            "SELECT batch_id FROM batches WHERE state NOT IN ('done','failed') AND lease_until<?",
-            (now,)).fetchall()
+            "SELECT batch_id FROM batches WHERE state NOT IN ('done','failed') "
+            "AND lease_until<?" + scope,
+            tuple(values),
+        ).fetchall()
         recovered = 0
         for r in stale:
             recovered += int(self._expire_batch(r["batch_id"], now=now))
-        self.db.execute("DELETE FROM resource_leases WHERE lease_until<?", (now,))
+        if job_ids is None:
+            self.db.execute("DELETE FROM resource_leases WHERE lease_until<?", (now,))
         return recovered
 
     # --- cooldowns (Phase 3d failure backoff) -----------------------------

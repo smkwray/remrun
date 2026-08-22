@@ -1,6 +1,7 @@
 """Prepare immutable fleet work before it enters the durable queue."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -749,6 +750,29 @@ def prepare_task_jobs(spec: Mapping[str, Any], **kwargs: Any) -> list[dict[str, 
         item_kwargs["inputs"] = [str(item)]
         jobs.append(prepare_task_job(spec, **item_kwargs))
     return jobs
+
+
+def pin_prepared_job(record: Mapping[str, Any], device: str,
+                     spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind one configured prepared job to the exact device selected by a saved plan.
+
+    Device assignment is already part of PreparedJobV1's content identity.  A
+    saved plan therefore needs no parallel routing vocabulary: it freezes the
+    normal prepared record with ``force_device`` filled in and fallback disabled.
+    """
+    if not isinstance(device, str) or not device:
+        raise PreparationError("saved plan requires a non-empty pinned device")
+    pinned = copy.deepcopy(dict(record))
+    validate_prepared_job(pinned)
+    if pinned["kind"] != "task":
+        raise PreparationError("saved configured plans require task prepared records")
+    pinned["routing"]["force_device"] = device
+    pinned["routing"]["allow_fallback"] = False
+    pinned["prepared_id"] = sha256_id({
+        key: value for key, value in pinned.items() if key != "prepared_id"
+    })
+    validate_prepared_against_spec(pinned, spec)
+    return pinned
 
 
 def prepare_raw_command(argv: list[str], *, device: str, inputs: list[str] | None = None,
