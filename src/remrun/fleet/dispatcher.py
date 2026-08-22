@@ -675,7 +675,23 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
         if item_results and job_ids:
             succeeded, failed = executor.item_result_maps(item_results)
             if succeeded and not res.get("ok"):
-                verify = _verify_batch_output(config, device, head, reporter, pre_output)
+                if batch_state != "fetching":
+                    if not q.set_batch_state(
+                        batch_id, "fetching", expected_state=batch_state,
+                        owner_token=owner_token,
+                    ):
+                        return ownership_lost("fetch")
+                    batch_state = "fetching"
+                with BatchHeartbeat(
+                    db_path, batch_id, owner_token, batch_state, lease_seconds,
+                ) as heartbeat:
+                    if heartbeat.ownership_lost.is_set():
+                        return ownership_lost("pre_verify")
+                    verify = _verify_batch_output(
+                        config, device, head, reporter, pre_output,
+                    )
+                if heartbeat.ownership_lost.is_set():
+                    return ownership_lost("verify")
             item_results = _apply_item_output_verdict(item_results, verify)
             succeeded, failed = executor.item_result_maps(item_results)
             _health_audit(config, q, device, engine, reporter)

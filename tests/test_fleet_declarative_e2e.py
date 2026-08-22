@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from remrun.config import RemrunConfig
-from remrun.fleet import adapters, cli, dispatcher, placement, probes
+from remrun.fleet import adapters, cli, dispatcher, executor, placement, probes, queue as queue_mod
 from remrun.fleet.models import DeviceSnapshot
 from remrun.fleet.prepared import as_fleet_task, prepare_task_job
 from remrun.fleet.queue import FleetQueue
@@ -45,7 +45,9 @@ def _definition(worker: Path, output_root: Path) -> dict:
     }
 
 
-def _config(tmp_path: Path, task: dict) -> RemrunConfig:
+def _config(
+    tmp_path: Path, task: dict, *, sync_roots: dict | None = None,
+) -> RemrunConfig:
     device = Device.from_mapping("LOCAL_SIM", {
         "kind": "local-sim", "os": "windows" if os.name == "nt" else "posix",
         "address_candidates": ["localhost"],
@@ -56,7 +58,7 @@ def _config(tmp_path: Path, task: dict) -> RemrunConfig:
     return RemrunConfig(
         repo_root=tmp_path, defaults={"fleet": {"pools": {}}},
         devices={"LOCAL_SIM": device}, project_roots={}, offload={},
-        fleet_tasks={"zotomatic": task},
+        fleet_tasks={"zotomatic": task}, sync_roots=sync_roots or {},
     )
 
 
@@ -363,3 +365,119 @@ def test_preview_route_requires_json_before_prepare_or_enqueue(monkeypatch) -> N
         assert str(exc) == "--preview-route requires --json"
     else:
         raise AssertionError("preview without JSON must be rejected")
+
+
+def test_partial_result_does_not_verify_after_ownership_loss(
+    tmp_path, monkeypatch,
+) -> None:
+    """A mixed result must reacquire a live owner heartbeat before mapped verification."""
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    output_root = tmp_path / "outputs"
+    output_root.mkdir()
+    worker = tmp_path / "worker.py"
+    worker.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    definition = _definition(worker, output_root)
+    definition["output"].update({
+        "verification": "mapped-tree-change-v1",
+        "missing_mapping": "final",
+        "no_change": "final",
+    })
+    config = _config(
+        tmp_path, definition,
+        sync_roots={"outputs": {"default": str(output_root)}},
+    )
+    spec = resolve_task_spec(
+        "zotomatic", definition, devices=config.devices, repo_root=tmp_path,
+    )
+    records = []
+    for index, payload in enumerate((b"one", b"two")):
+        source = tmp_path / f"input-{index}.zot"
+        source.write_bytes(payload)
+        records.append(prepare_task_job(
+            spec, repo_root=tmp_path, inputs=[str(source)],
+        ))
+    tasks = [as_fleet_task(record, spec) for record in records]
+
+    state_root = tmp_path / "state"
+    db_path = state_root / "fleet" / "fleet.db"
+    queue = FleetQueue(db_path)
+    try:
+        job_ids = [
+            queue.enqueue_prepared(
+                record, spec=spec, job_id=f"job-{index}",
+                current_spec_id=lambda: spec["spec_id"],
+            )
+            for index, record in enumerate(records)
+        ]
+        batch_id = "partial-owner-loss"
+        owner_token = queue.claim_many(
+            job_ids, "LOCAL_SIM", batch_id=batch_id,
+            lease_until=dispatcher._lease_until(dispatcher.utc_now_iso(), 60),
+            pool=None, task_name="zotomatic", engine="zot-engine", bucket="",
+            current_spec_ids=lambda: {
+                job_id: spec["spec_id"] for job_id in job_ids
+            },
+        )
+        assert owner_token is not None
+    finally:
+        queue.close()
+
+    monkeypatch.setattr(dispatcher, "load_config", lambda _root=None: config)
+    remote_snapshot_calls = 0
+
+    def remote_snapshot(*_args):
+        nonlocal remote_snapshot_calls
+        remote_snapshot_calls += 1
+        return {}
+
+    monkeypatch.setattr(dispatcher, "_remote_output_mtimes", remote_snapshot)
+
+    def partial_result(_device, _tasks, _config, **kwargs):
+        assert kwargs["prelaunch_gate"]() is True
+        assert kwargs["before_output_return"]() is True
+        return {
+            "ok": False, "exit_code": 1, "elapsed_s": 0.01,
+            "item_results": [
+                {
+                    "job_id": job_ids[0],
+                    "prepared_id": records[0]["prepared_id"],
+                    "outcome": "succeeded", "disposition": "none",
+                    "publication": "produced", "outputs": ["one.zout"],
+                },
+                {
+                    "job_id": job_ids[1],
+                    "prepared_id": records[1]["prepared_id"],
+                    "outcome": "review", "disposition": "none",
+                    "publication": "produced", "outputs": ["two.zout"],
+                    "message": "output return failed",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(executor, "run_batch", partial_result)
+    original_maps = executor.item_result_maps
+    recovered = False
+
+    def recover_before_verify(rows):
+        nonlocal recovered
+        if not recovered:
+            contender = FleetQueue(db_path)
+            try:
+                assert contender.recover_stale("9999-01-01T00:00:00Z") == 1
+            finally:
+                contender.close()
+            recovered = True
+        return original_maps(rows)
+
+    monkeypatch.setattr(executor, "item_result_maps", recover_before_verify)
+    result = dispatcher._run_claimed_batch(
+        config, state_root, {
+            "batch_id": batch_id, "device": "LOCAL_SIM",
+            "owner_token": owner_token, "btasks": tasks,
+            "engine": "zot-engine", "job_ids": job_ids,
+        }, 60, Reporter(json_events=False),
+    )
+
+    assert recovered is True
+    assert remote_snapshot_calls == 1  # pre-run baseline only; no post-loss verify
+    assert result["ran"] == 1 and result["ownership_lost"] == 1
