@@ -645,6 +645,75 @@ def test_nonexact_unique_request_index_fails_at_queue_open(
         FleetQueue(db_path)
 
 
+def test_concurrent_same_identity_saved_plan_replay_survives_stale_plan_read(
+    tmp_path: Path,
+) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    db_path = tmp_path / "fleet.db"
+    queue = FleetQueue(db_path)
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec,
+            prepared_records=[pin_prepared_job(records[0], "A", spec)],
+            current_spec_id=lambda: spec["spec_id"],
+        )
+    finally:
+        queue.close()
+
+    plan_read = threading.Event()
+    release_replay = threading.Event()
+    outcome: dict[str, object] = {}
+
+    class PausedPlanReadQueue(FleetQueue):
+        def get_submission_plan(self, saved_plan_id: str) -> dict | None:
+            saved_plan = super().get_submission_plan(saved_plan_id)
+            plan_read.set()
+            if not release_replay.wait(timeout=20):
+                raise TimeoutError("same-identity replay was not released")
+            return saved_plan
+
+    def replay() -> None:
+        local = PausedPlanReadQueue(db_path)
+        try:
+            outcome["receipt"] = local.enqueue_saved_plan(
+                plan["plan_id"], request_id="same-request",
+                current_spec_id=lambda: spec["spec_id"],
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            local.close()
+
+    worker = threading.Thread(target=replay)
+    worker.start()
+    assert plan_read.wait(timeout=20)
+    winner_queue = FleetQueue(db_path)
+    try:
+        winner = winner_queue.enqueue_saved_plan(
+            plan["plan_id"], request_id="same-request",
+            current_spec_id=lambda: spec["spec_id"],
+        )
+    finally:
+        winner_queue.close()
+        release_replay.set()
+    worker.join(timeout=20)
+
+    assert not worker.is_alive()
+    assert "error" not in outcome
+    replayed = outcome["receipt"]
+    assert isinstance(replayed, dict)
+    assert replayed["submission_id"] == winner["submission_id"]
+    assert replayed["request_id"] == "same-request"
+    queue = FleetQueue(db_path)
+    try:
+        assert queue.db.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 1
+        saved_plan = queue.get_submission_plan(plan["plan_id"])
+        assert saved_plan is not None
+        assert saved_plan["consumed_submission_id"] == winner["submission_id"]
+    finally:
+        queue.close()
+
+
 def test_concurrent_saved_plan_consumers_cannot_change_request_identity(tmp_path: Path) -> None:
     spec, records = _prepared_pair(tmp_path)
     db_path = tmp_path / "fleet.db"

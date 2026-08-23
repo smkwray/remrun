@@ -901,10 +901,12 @@ class FleetQueue:
     def enqueue_saved_plan(self, plan_id: str, *, request_id: str | None = None,
                            current_spec_id: Callable[[], str | None]) -> dict[str, Any]:
         """Consume an exact saved plan, replaying its first receipt after response loss."""
+        # Submission insertion and plan consumption commit atomically. Read the immutable
+        # receipt first so a concurrent commit cannot pair a stale plan with a fresh receipt.
+        existing = self.get_submission(plan_id=plan_id)
         plan = self.get_submission_plan(plan_id)
         if plan is None:
             raise ValueError(f"unknown saved plan {plan_id!r}")
-        existing = self.get_submission(plan_id=plan_id)
         if existing is not None:
             if plan["consumed_submission_id"] != existing["submission_id"]:
                 raise QueueMigrationError(
