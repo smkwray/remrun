@@ -221,6 +221,7 @@ class FleetQueue:
             self._migrate()
             self._migrate_nullable_batch_estimates()
             self._migrate_prepared_output_reservations()
+            self._verify_submission_control_schema()
         except BaseException:
             self.db.close()
             raise
@@ -402,6 +403,48 @@ class FleetQueue:
                             "INSERT INTO prepared_output_reservations(stem,work_id,created_at) "
                             "VALUES(?,?,?)", (stem, prepared["work_id"], utc_now_iso()),
                         )
+
+    def _verify_submission_control_schema(self) -> None:
+        """Fail closed if a pre-existing table cannot enforce submission identity."""
+        expected = {
+            "submissions": {
+                "submission_id", "request_id", "plan_id", "fingerprint", "created_at",
+            },
+            "submission_jobs": {
+                "submission_id", "item_index", "job_id", "prepared_id",
+            },
+            "submission_plans": {
+                "plan_id", "plan_digest", "plan_json", "created_at",
+                "consumed_submission_id",
+            },
+        }
+        for table, columns in expected.items():
+            actual = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            if actual != columns:
+                raise QueueMigrationError(
+                    f"{table} schema cannot enforce durable submission identity; "
+                    f"expected {sorted(columns)}, found {sorted(actual)}"
+                )
+
+        required_unique = {
+            "submissions": {("submission_id",), ("request_id",), ("plan_id",)},
+            "submission_jobs": {("submission_id", "item_index")},
+            "submission_plans": {("plan_id",)},
+        }
+        for table, required in required_unique.items():
+            unique_columns = set()
+            for index in self.db.execute(f"PRAGMA index_list({table})"):
+                if not int(index["unique"]):
+                    continue
+                name = str(index["name"]).replace('"', '""')
+                unique_columns.add(tuple(
+                    row["name"]
+                    for row in self.db.execute(f'PRAGMA index_info("{name}")')
+                ))
+            if not required <= unique_columns:
+                raise QueueMigrationError(
+                    f"{table} schema lacks a database uniqueness fence for identity"
+                )
 
     @contextlib.contextmanager
     def _immediate(self):
@@ -641,6 +684,10 @@ class FleetQueue:
             "WHERE submission_id=? ORDER BY item_index",
             (row["submission_id"],),
         ).fetchall()
+        if not jobs or [job["item_index"] for job in jobs] != list(range(len(jobs))):
+            raise QueueMigrationError(
+                f"submission {row['submission_id']} has incomplete durable membership"
+            )
         return {
             "schema": 1,
             "submission_id": row["submission_id"],
@@ -683,6 +730,11 @@ class FleetQueue:
         for row in rows:
             item = dict(row)
             item["job_id"] = item.pop("submitted_job_id")
+            if item.get("prepared_id") is not None \
+                    and item["prepared_id"] != item["submitted_prepared_id"]:
+                raise QueueMigrationError(
+                    f"submission {submission_id} membership identity disagrees with its job row"
+                )
             if item.get("prepared_id") is None:
                 item["prepared_id"] = item["submitted_prepared_id"]
             out.append(item)
@@ -691,6 +743,7 @@ class FleetQueue:
     def save_submission_plan(self, *, spec: dict[str, Any],
                              prepared_records: list[dict[str, Any]],
                              current_spec_id: Callable[[], str | None],
+                             priority: int = 0,
                              now: str | None = None) -> dict[str, Any]:
         """Persist one immutable, fully placed configured submission plan."""
         from .prepared import validate_prepared_against_spec, validate_prepared_job
@@ -713,7 +766,14 @@ class FleetQueue:
                 "a multi-device saved plan cannot carry one controller-supplied output-root; "
                 "use each adapter's configured root and verified return-root instead"
             )
-        plan = {"schema": 1, "spec": spec, "prepared": prepared_records}
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError("saved plan priority must be an integer")
+        plan = {
+            "schema": 1,
+            "spec": spec,
+            "prepared": prepared_records,
+            "priority": priority,
+        }
         blob = canonical_json(plan)
         digest = sha256_id(plan)
         plan_id = uuid.uuid4().hex[:20]
@@ -733,6 +793,7 @@ class FleetQueue:
             "plan_digest": digest,
             "prepared_ids": [record["prepared_id"] for record in prepared_records],
             "devices": [record["routing"]["force_device"] for record in prepared_records],
+            "priority": priority,
             "created_at": now,
         }
 
@@ -749,9 +810,11 @@ class FleetQueue:
             plan = json.loads(row["plan_json"])
         except (TypeError, json.JSONDecodeError) as exc:
             raise QueueMigrationError(f"saved plan {plan_id} has malformed bytes") from exc
-        if not isinstance(plan, dict) or set(plan) != {"schema", "spec", "prepared"} \
+        if not isinstance(plan, dict) \
+                or set(plan) != {"schema", "spec", "prepared", "priority"} \
                 or plan["schema"] != 1 or not isinstance(plan["spec"], dict) \
-                or not isinstance(plan["prepared"], list) or not plan["prepared"]:
+                or not isinstance(plan["prepared"], list) or not plan["prepared"] \
+                or isinstance(plan["priority"], bool) or not isinstance(plan["priority"], int):
             raise QueueMigrationError(f"saved plan {plan_id} has an unsupported shape")
         if sha256_id(plan) != row["plan_digest"]:
             raise QueueMigrationError(f"saved plan {plan_id} fails its content identity")
@@ -772,8 +835,7 @@ class FleetQueue:
             **plan,
         }
 
-    def enqueue_saved_plan(self, plan_id: str, *, priority: int = 0,
-                           request_id: str | None = None,
+    def enqueue_saved_plan(self, plan_id: str, *, request_id: str | None = None,
                            current_spec_id: Callable[[], str | None]) -> dict[str, Any]:
         """Consume an exact saved plan, replaying its first receipt after response loss."""
         existing = self.get_submission(plan_id=plan_id)
@@ -783,7 +845,7 @@ class FleetQueue:
         if plan is None:
             raise ValueError(f"unknown saved plan {plan_id!r}")
         return self.enqueue_submission(
-            plan["prepared"], spec=plan["spec"], priority=priority,
+            plan["prepared"], spec=plan["spec"], priority=plan["priority"],
             request_id=request_id, plan_id=plan_id,
             current_spec_id=current_spec_id,
         )

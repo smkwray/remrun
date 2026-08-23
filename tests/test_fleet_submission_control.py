@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sqlite3
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +16,7 @@ from remrun.config import RemrunConfig
 from remrun.fleet import cli, dispatcher
 from remrun.fleet.models import DeviceSnapshot, DrainResultV1, PlacedBatch, PlacementResult
 from remrun.fleet.prepared import as_fleet_task, pin_prepared_job, prepare_task_job
-from remrun.fleet.queue import FleetQueue
+from remrun.fleet.queue import FleetQueue, QueueMigrationError
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.output import Reporter
 
@@ -201,6 +202,28 @@ def test_saved_plan_consumes_exact_pinned_records_once(tmp_path: Path) -> None:
         queue.close()
 
 
+def test_saved_plan_freezes_priority_for_response_loss_replay(tmp_path: Path) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec,
+            prepared_records=[pin_prepared_job(records[0], "A", spec)],
+            priority=7,
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        first = queue.enqueue_saved_plan(
+            plan["plan_id"], current_spec_id=lambda: spec["spec_id"],
+        )
+        replay = queue.enqueue_saved_plan(
+            plan["plan_id"], current_spec_id=lambda: None,
+        )
+        assert first["job_ids"] == replay["job_ids"]
+        assert queue.get(first["job_ids"][0])["priority"] == 7
+    finally:
+        queue.close()
+
+
 def test_submission_scope_selects_only_its_jobs(tmp_path: Path) -> None:
     spec, records = _prepared_pair(tmp_path)
     queue = FleetQueue(tmp_path / "fleet.db")
@@ -220,6 +243,37 @@ def test_submission_scope_selects_only_its_jobs(tmp_path: Path) -> None:
         assert queue.counts(job_ids=one["job_ids"]) == {"queued": 1}
     finally:
         queue.close()
+
+
+def test_submission_membership_corruption_fails_closed(tmp_path: Path) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        receipt = queue.enqueue_submission(
+            [records[0]], spec=spec,
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        queue.db.execute(
+            "UPDATE submission_jobs SET prepared_id='sha256:' || printf('%064d', 0) "
+            "WHERE submission_id=?",
+            (receipt["submission_id"],),
+        )
+        with pytest.raises(QueueMigrationError, match="membership identity"):
+            queue.jobs_for_submission(receipt["submission_id"])
+    finally:
+        queue.close()
+
+
+def test_malformed_submission_schema_fails_at_queue_open(tmp_path: Path) -> None:
+    db_path = tmp_path / "fleet.db"
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute("CREATE TABLE submissions (wrong TEXT)")
+        db.commit()
+    finally:
+        db.close()
+    with pytest.raises(QueueMigrationError, match="submissions schema"):
+        FleetQueue(db_path)
 
 
 def test_plan_rejects_unpinned_or_tampered_prepared_records(tmp_path: Path) -> None:
@@ -433,3 +487,17 @@ def test_dispatch_json_events_are_versioned_on_the_live_cli_path(
         "batch": "b1",
     }
     assert json.loads(captured.out)["status"] == "drained"
+
+
+def test_lifecycle_schema_and_version_cannot_be_overridden(capsys) -> None:
+    reporter = Reporter(
+        json_events=True,
+        event_schema="remrun.fleet.lifecycle",
+        event_version=1,
+    )
+    reporter.event("dispatch_probe", schema="wrong", version=999)
+    assert json.loads(capsys.readouterr().err) == {
+        "schema": "remrun.fleet.lifecycle",
+        "version": 1,
+        "event": "dispatch_probe",
+    }

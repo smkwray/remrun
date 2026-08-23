@@ -85,7 +85,8 @@ With `--save`, a completely placeable plan also returns `plan_id` and `plan_dige
 `prepared_ids` are the exact device-pinned records later consumed by
 `remrun fleet submit --plan PLAN_ID`. The token is controller-local. Replaying an already
 accepted token returns the same `submission_id` and ordered `job_ids`. It never prepares a
-directory again or silently changes the selected devices.
+directory again or silently changes the selected devices. A saved plan's priority is frozen;
+`submit --plan` rejects a new nonzero priority rather than changing the recorded submission.
 
 `remrun fleet submit TASK --json` reports the durable queue result and does not probe devices.
 Its `route_preview` field is `false`. Add `--preview-route` only together with `--json` and only

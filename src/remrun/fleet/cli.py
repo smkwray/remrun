@@ -281,6 +281,7 @@ def cmd_plan(args, reporter: Reporter) -> int:
             saved_plan = q.save_submission_plan(
                 spec=spec,
                 prepared_records=pinned,
+                priority=getattr(args, "priority", 0),
                 current_spec_id=lambda: (
                     (resolve_tasks(load_config(config.repo_root)).get(spec["task_name"]) or {})
                     .get("spec_id")
@@ -306,6 +307,7 @@ def cmd_plan(args, reporter: Reporter) -> int:
         payload.update({
             "plan_id": saved_plan["plan_id"],
             "plan_digest": saved_plan["plan_digest"],
+            "priority": saved_plan["priority"],
         })
     if records and "limits" in records[0]:
         payload["limits"] = records[0]["limits"]
@@ -374,6 +376,7 @@ def cmd_submit(args, reporter: Reporter) -> int:
             "route_line": getattr(args, "route_line", False),
             "preview_route": getattr(args, "preview_route", False),
             "allow_fallback": getattr(args, "allow_fallback", False),
+            "priority": bool(getattr(args, "priority", 0)),
         }
         used = sorted(name for name, value in incompatible.items() if value)
         if used:
@@ -400,7 +403,7 @@ def cmd_submit(args, reporter: Reporter) -> int:
                     return current.get("spec_id") if current else None
 
                 receipt = q.enqueue_saved_plan(
-                    plan_id, priority=getattr(args, "priority", 0),
+                    plan_id,
                     request_id=getattr(args, "request_id", None),
                     current_spec_id=current_spec_id,
                 )
@@ -1099,6 +1102,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     pp = sub.add_parser("plan", help="show placement decision; runs nothing")
     add_common(pp)
+    pp.add_argument("--priority", type=int, default=0,
+                    help="freeze this queue priority into a saved plan")
     pp.add_argument(
         "--save", action="store_true",
         help="persist this exact fully placed plan and return a token for submit --plan",

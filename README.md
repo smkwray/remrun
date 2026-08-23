@@ -160,6 +160,9 @@ remrun fleet clear                              # release queue leases/cooldowns
 remrun fleet cancel                             # clear queue and stop configured workers
 ```
 
+When `--priority` is present on `fleet plan --save`, it is frozen into the saved
+plan and is not supplied again to `fleet submit --plan`.
+
 `--preview-route` is valid only with `--json`. Fixed placement snapshots use a
 guardless probe transport because they run only remrun-owned resource/capability scripts; they
 do not stage the arbitrary-command memory-guard helper. A device is measured locally only when

@@ -30,12 +30,12 @@ class Reporter:
         if self.quiet:
             return
         if self.json_events:
-            payload = {"event": event, **fields}
+            payload = {**fields, "event": event}
             if self.event_schema is not None:
                 payload = {
+                    **payload,
                     "schema": self.event_schema,
                     "version": self.event_version,
-                    **payload,
                 }
             print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
         else:
