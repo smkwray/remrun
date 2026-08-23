@@ -93,7 +93,7 @@ def test_setuptools_declares_schema_package_data() -> None:
     assert project["tool"]["setuptools"]["package-data"]["remrun"] == ["schemas/*.json"]
 
 
-def test_target_resource_schemas_are_packaged_but_not_advertised() -> None:
+def test_target_resource_schemas_are_packaged_and_advertised_after_activation() -> None:
     policy = _packaged_schema("target-resource-policy.v1.schema.json")
     receipt = _packaged_schema("target-resource-receipt.v1.schema.json")
     capabilities = build_capabilities_document()
@@ -101,12 +101,13 @@ def test_target_resource_schemas_are_packaged_but_not_advertised() -> None:
     assert policy["properties"]["schema"]["const"] == "remrun.target-resource-policy"
     assert policy["properties"]["resources"]["items"]["properties"]["capacity"]["const"] == 1
     assert receipt["properties"]["schema"]["const"] == "remrun.target-resource-receipt"
-    assert capabilities["features"]["target_fenced_admission"] == "unavailable"
-    assert all(
-        item["schema"] not in {"remrun.target-resource-policy", "remrun.target-resource-receipt"}
+    assert capabilities["features"]["target_fenced_admission"] == "stable"
+    declared = {
+        item["schema"]
         for group in capabilities["documents"].values()
         for item in group
-    )
+    }
+    assert {"remrun.target-resource-policy", "remrun.target-resource-receipt"} <= declared
 
 
 def test_setuptools_reads_the_package_version_from_one_source() -> None:

@@ -60,6 +60,10 @@ def _run_dir(root: Path, run_id: str) -> Path:
     return _runs_root(root) / _safe_component(run_id, "run_id")
 
 
+def _claim_auth_path(root: Path, run_id: str) -> Path:
+    return _run_dir(root, run_id) / "claim-auth.json"
+
+
 def _fsync_dir(path: Path) -> None:
     try:
         fd = os.open(str(path), os.O_RDONLY)
@@ -85,7 +89,23 @@ def _atomic_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
             os.fsync(handle.fileno())
     finally:
         os.close(fd)
-    os.replace(tmp, path)
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            # Windows can briefly deny replacement while another process has just
+            # closed the destination after reading it. The temp bytes are already
+            # durable; retry the same exact replacement rather than rebuilding or
+            # accepting a torn/non-authoritative status document.
+            if time.monotonic() >= deadline:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.02)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
     try:
         os.chmod(path, mode)
     except OSError:
@@ -240,7 +260,62 @@ def _validate_spec(spec: dict[str, Any], root: Path) -> dict[str, Any]:
     token_sha = spec.get("token_sha256")
     if not isinstance(token_sha, str) or len(token_sha) != 64:
         raise DurableError("token_sha256 is invalid")
+    acceptance = spec.get("acceptance")
+    if acceptance is not None:
+        _validate_acceptance(acceptance, spec, root)
     return spec
+
+
+def _validate_acceptance(
+    acceptance: object, spec: dict[str, Any], root: Path
+) -> dict[str, Any]:
+    fields = {
+        "schema", "runner_path", "state_root", "operation_id", "request_sha256",
+        "reservation", "start_gate_path", "started_path",
+    }
+    if not isinstance(acceptance, dict) or set(acceptance) != fields:
+        raise DurableError("target acceptance has unknown or missing fields")
+    if acceptance.get("schema") != 1:
+        raise DurableError("target acceptance schema is unsupported")
+    if acceptance.get("operation_id") != spec.get("run_id"):
+        raise DurableError("target acceptance operation identity mismatch")
+    digest = acceptance.get("request_sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise DurableError("target acceptance request digest is invalid")
+    try:
+        int(digest, 16)
+    except ValueError as exc:
+        raise DurableError("target acceptance request digest is invalid") from exc
+    runner_path = acceptance.get("runner_path")
+    state_root = acceptance.get("state_root")
+    if not isinstance(runner_path, str) or not os.path.isabs(runner_path):
+        raise DurableError("target acceptance runner path is invalid")
+    if not isinstance(state_root, str) or not os.path.isabs(state_root):
+        raise DurableError("target acceptance state root is invalid")
+    reservation = acceptance.get("reservation")
+    if not isinstance(reservation, dict) or set(reservation) != {
+        "allocation_id", "fence", "policy_generation", "policy_digest"
+    }:
+        raise DurableError("target acceptance reservation is malformed")
+    if not isinstance(reservation.get("allocation_id"), str) \
+            or not reservation["allocation_id"]:
+        raise DurableError("target acceptance allocation identity is invalid")
+    for field in ("fence", "policy_generation"):
+        value = reservation.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DurableError(f"target acceptance reservation {field} is invalid")
+    policy_digest = reservation.get("policy_digest")
+    if not isinstance(policy_digest, str) or len(policy_digest) != 64:
+        raise DurableError("target acceptance policy digest is invalid")
+    rdir = _run_dir(root, str(spec["run_id"]))
+    expected = {
+        "start_gate_path": str(rdir / "start-gate.json"),
+        "started_path": str(rdir / "started.json"),
+    }
+    for field, path in expected.items():
+        if acceptance.get(field) != path:
+            raise DurableError(f"target acceptance {field} does not match run identity")
+    return acceptance
 
 
 def _load_authenticated(root: Path, run_id: str, token: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
@@ -270,6 +345,10 @@ def _validate_status(status: dict[str, Any], spec: dict[str, Any]) -> None:
         raise DurableError("status state is invalid")
     if not isinstance(status.get("acknowledged"), bool):
         raise DurableError("status acknowledgement is invalid")
+    if spec.get("acceptance") is not None:
+        if status.get("operation_id") != spec["acceptance"]["operation_id"] \
+                or status.get("request_sha256") != spec["acceptance"]["request_sha256"]:
+            raise DurableError("status target acceptance identity mismatch")
 
 
 class _BoundedWriter:
@@ -349,7 +428,7 @@ def _pump(pipe, writer: _BoundedWriter) -> None:  # noqa: ANN001
 
 
 def _base_status(spec: dict[str, Any], state: str) -> dict[str, Any]:
-    return {
+    status = {
         "schema": SCHEMA,
         "run_id": spec["run_id"],
         "project_id": spec["project_id"],
@@ -364,6 +443,14 @@ def _base_status(spec: dict[str, Any], state: str) -> dict[str, Any]:
         "updated_at": time.time(),
         "boot_marker": _boot_marker(),
     }
+    if spec.get("acceptance") is not None:
+        status.update(
+            operation_id=spec["acceptance"]["operation_id"],
+            request_sha256=spec["acceptance"]["request_sha256"],
+            target_acceptance=None,
+            target_cleanup=None,
+        )
+    return status
 
 
 def _ready_valid(path: Path, spec: dict[str, Any]) -> bool:
@@ -376,6 +463,81 @@ def _ready_valid(path: Path, spec: dict[str, Any]) -> bool:
         and ready.get("job_id") == spec["run_id"]
         and ready.get("command_sha256") == spec["command_sha256"]
     )
+
+
+def _read_control(path: Path, spec: dict[str, Any], *, require_owner: bool = False) -> dict[str, Any]:
+    value = _read_json(path, 64 * 1024)
+    if value.get("schema") != 1 or value.get("job_id") != spec["run_id"] \
+            or value.get("command_sha256") != spec["command_sha256"]:
+        raise DurableError(f"{path.name} identity mismatch")
+    if require_owner:
+        owner = value.get("owner")
+        if not isinstance(owner, dict) or set(owner) != {
+            "kind", "key", "pid", "start_id", "root_pid", "root_start_id"
+        }:
+            raise DurableError("observer readiness omitted exact process ownership")
+    return value
+
+
+def _resource_transition(
+    acceptance: dict[str, Any], token: str, operation: str, values: dict[str, Any]
+) -> dict[str, Any]:
+    reservation = {**acceptance["reservation"], "token": token}
+    request = {
+        "operation": operation,
+        "reservation": reservation,
+        "values": values,
+    }
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(acceptance["runner_path"]),
+            "resource-operation",
+            str(acceptance["state_root"]),
+        ],
+        input=json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise DurableError(f"target resource {operation} failed: {detail or proc.returncode}")
+    try:
+        response = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise DurableError(f"target resource {operation} returned malformed JSON") from exc
+    receipt = response.get("receipt") if isinstance(response, dict) else None
+    if not isinstance(receipt, dict) \
+            or receipt.get("operation_id") != acceptance["operation_id"] \
+            or receipt.get("request_sha256") != acceptance["request_sha256"]:
+        raise DurableError(f"target resource {operation} receipt identity mismatch")
+    return receipt
+
+
+def _write_start_gate(path: Path, spec: dict[str, Any]) -> None:
+    _atomic_json(
+        path,
+        {
+            "schema": 1,
+            "job_id": spec["run_id"],
+            "command_sha256": spec["command_sha256"],
+        },
+    )
+
+
+def _resource_start_certainty(receipt: object) -> bool | None | object:
+    if not isinstance(receipt, dict):
+        return NotImplemented
+    state = receipt.get("command_start_state")
+    if state == "YES":
+        return True
+    if state == "NO":
+        return False
+    if state == "MAYBE":
+        return None
+    return NotImplemented
 
 
 def _supervise(root: Path, run_id: str) -> int:
@@ -409,16 +571,18 @@ def _supervise(root: Path, run_id: str) -> int:
             _atomic_json(rdir / "status.json", status)
 
             ready_path = Path(str(spec["ready_path"]))
+            acceptance = spec.get("acceptance")
             acknowledged = False
-            while proc.poll() is None:
-                if ready_path.exists():
+            command_started = False
+            claim_token = None
+            while proc.poll() is None and not ready_path.exists():
+                time.sleep(POLL_SECONDS)
+            if ready_path.exists():
+                if acceptance is None:
                     if not _ready_valid(ready_path, spec):
-                        try:
-                            proc.terminate()
-                        except OSError:
-                            pass
                         raise DurableError("observer readiness record is corrupt or mismatched")
                     acknowledged = True
+                    command_started = True
                     status.update(
                         state="running",
                         acknowledged=True,
@@ -427,20 +591,87 @@ def _supervise(root: Path, run_id: str) -> int:
                         updated_at=time.time(),
                     )
                     _atomic_json(rdir / "status.json", status)
-                    break
-                time.sleep(POLL_SECONDS)
+                else:
+                    ready = _read_control(ready_path, spec, require_owner=True)
+                    claim_auth_path = _claim_auth_path(root, run_id)
+                    claim_auth = _read_json(claim_auth_path, 4096)
+                    claim_token = claim_auth.get("claim_token")
+                    if claim_auth.get("schema") != SCHEMA \
+                            or claim_auth.get("run_id") != run_id \
+                            or not isinstance(claim_token, str):
+                        raise DurableError("target acceptance claim authentication is invalid")
+                    receipt = _resource_transition(
+                        acceptance, claim_token, "claim", {"owner": ready["owner"]}
+                    )
+                    claim_auth_path.unlink()
+                    _fsync_dir(claim_auth_path.parent)
+                    acknowledged = True
+                    status.update(
+                        acknowledged=True,
+                        command_started=False,
+                        acknowledged_at=time.time(),
+                        target_acceptance=receipt,
+                        updated_at=time.time(),
+                    )
+                    _atomic_json(rdir / "status.json", status)
+
+                    _resource_transition(
+                        acceptance,
+                        claim_token,
+                        "start",
+                        {"state": "MAYBE", "explicit_no_start": False},
+                    )
+                    # Once the gate may be observed, absence of the started receipt
+                    # cannot prove absence of execution: a very short child can exit
+                    # before its exact process identity is sampled. Preserve MAYBE
+                    # until the positive identity receipt advances it to YES.
+                    command_started = None
+                    status.update(command_started=None, updated_at=time.time())
+                    _atomic_json(rdir / "status.json", status)
+                    _write_start_gate(Path(str(acceptance["start_gate_path"])), spec)
+                    started_path = Path(str(acceptance["started_path"]))
+                    while proc.poll() is None and not started_path.exists():
+                        time.sleep(POLL_SECONDS)
+                    if started_path.exists():
+                        started = _read_control(started_path, spec)
+                        user_pid = started.get("user_pid")
+                        user_identity = started.get("user_identity")
+                        if isinstance(user_pid, bool) or not isinstance(user_pid, int) \
+                                or user_pid < 1 or not isinstance(user_identity, str) \
+                                or not user_identity:
+                            raise DurableError("observer started receipt is malformed")
+                        _resource_transition(
+                            acceptance,
+                            claim_token,
+                            "exec_confirm",
+                            {"user_pid": user_pid, "user_start_id": user_identity},
+                        )
+                        command_started = True
+                        status.update(
+                            state="running",
+                            command_started=True,
+                            started_at=time.time(),
+                            updated_at=time.time(),
+                        )
+                        _atomic_json(rdir / "status.json", status)
 
             code = proc.wait()
             out_thread.join()
             err_thread.join()
             stdout_writer.close()
             stderr_writer.close()
-            if not acknowledged and ready_path.exists():
+            if not acknowledged and ready_path.exists() and acceptance is None:
                 acknowledged = _ready_valid(ready_path, spec)
+                command_started = acknowledged
+            cleanup_receipt = None
+            if acceptance is not None and acknowledged and claim_token is not None:
+                cleanup_receipt = _resource_transition(
+                    acceptance, claim_token, "finish", {}
+                )
             status.update(
                 state="complete",
                 acknowledged=acknowledged,
-                command_started=acknowledged,
+                command_started=command_started,
                 wrapper_exit_code=(128 - code) if code < 0 else code,
                 ended_at=time.time(),
                 updated_at=time.time(),
@@ -451,6 +682,8 @@ def _supervise(root: Path, run_id: str) -> int:
                 stdout_truncated=stdout_writer.truncated,
                 stderr_truncated=stderr_writer.truncated,
             )
+            if acceptance is not None:
+                status["target_cleanup"] = cleanup_receipt
             _atomic_json(rdir / "status.json", status)
             return 0
         finally:
@@ -468,6 +701,19 @@ def _supervise(root: Path, run_id: str) -> int:
                 status = locals().get("status")
                 if not isinstance(status, dict):
                     status = _base_status(spec, "failed")
+                acceptance = spec.get("acceptance")
+                claim_token = locals().get("claim_token")
+                if acceptance is not None and isinstance(claim_token, str) \
+                        and status.get("target_acceptance") is not None:
+                    try:
+                        status["target_cleanup"] = _resource_transition(
+                            acceptance,
+                            claim_token,
+                            "quarantine",
+                            {"reason": "durable_supervisor_failure"},
+                        )
+                    except Exception:
+                        pass
                 status.update(
                     state="failed",
                     error=f"{type(exc).__name__}: {exc}"[:1000],
@@ -540,6 +786,11 @@ def _launch(root: Path, raw_spec: bytes) -> dict[str, Any]:
             rdir / "auth.json",
             {"schema": SCHEMA, "run_id": run_id, "token_sha256": token_sha},
         )
+        if spec.get("acceptance") is not None:
+            _atomic_json(
+                _claim_auth_path(root, run_id),
+                {"schema": SCHEMA, "run_id": run_id, "claim_token": token},
+            )
         for name in ("stdout.log", "stderr.log"):
             _atomic_bytes(rdir / name, b"")
         status = _base_status(spec, "launching")
@@ -579,12 +830,48 @@ def _launch(root: Path, raw_spec: bytes) -> dict[str, Any]:
 
 def _status(root: Path, run_id: str, token: str, include_logs: bool) -> dict[str, Any]:
     rdir, spec, status = _load_authenticated(root, run_id, token)
+    acceptance = spec.get("acceptance")
     if status.get("state") in {"launching", "pending", "running"}:
         if status.get("boot_marker") != _boot_marker() or not _pid_alive(status.get("supervisor_pid")):
             status = dict(status)
             status["state"] = "failed"
             status["error"] = "durable supervisor is absent or target rebooted; restart is forbidden"
             status["ambiguous"] = True
+            if isinstance(acceptance, dict):
+                try:
+                    cleanup = _resource_transition(acceptance, token, "finish", {})
+                except DurableError:
+                    try:
+                        cleanup = _resource_transition(acceptance, token, "status", {})
+                    except DurableError as exc:
+                        cleanup = {
+                            "schema": 1,
+                            "state": "UNKNOWN",
+                            "terminal_reason": f"resource_status_failed:{type(exc).__name__}",
+                        }
+                status["target_cleanup"] = cleanup
+                status["updated_at"] = time.time()
+                _atomic_json(rdir / "status.json", status)
+    cleanup = status.get("target_cleanup")
+    if isinstance(acceptance, dict) and isinstance(cleanup, dict) \
+            and cleanup.get("state") in {"CLAIMED", "QUARANTINED"}:
+        try:
+            reconciled = _resource_transition(acceptance, token, "status", {})
+        except DurableError:
+            pass
+        else:
+            if reconciled != cleanup:
+                status = dict(status)
+                status["target_cleanup"] = reconciled
+                status["updated_at"] = time.time()
+                _atomic_json(rdir / "status.json", status)
+    cleanup = status.get("target_cleanup")
+    certainty = _resource_start_certainty(cleanup)
+    if certainty is not NotImplemented and status.get("command_started") is not certainty:
+        status = dict(status)
+        status["command_started"] = certainty
+        status["updated_at"] = time.time()
+        _atomic_json(rdir / "status.json", status)
     if include_logs:
         if status.get("state") != "complete":
             raise DurableError("logs are available only for a complete durable run")
@@ -602,9 +889,18 @@ def _status(root: Path, run_id: str, token: str, include_logs: bool) -> dict[str
 
 
 def _cleanup(root: Path, run_id: str, token: str) -> dict[str, Any]:
-    rdir, _spec, status = _load_authenticated(root, run_id, token)
+    rdir, spec, status = _load_authenticated(root, run_id, token)
     if status.get("state") not in {"complete", "failed"}:
         raise DurableError("cannot clean an unresolved durable run")
+    if spec.get("acceptance") is not None:
+        target_cleanup = status.get("target_cleanup")
+        if not isinstance(target_cleanup, dict) \
+                or target_cleanup.get("state") not in {
+                    "RELEASED", "CANCELLED", "EXPIRED", "REBOOTED",
+                }:
+            raise DurableError(
+                "cannot clean durable target evidence before target cleanup is terminal"
+            )
     shutil.rmtree(rdir)
     _fsync_dir(rdir.parent)
     return {"schema": SCHEMA, "run_id": run_id, "cleaned": True}

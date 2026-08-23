@@ -1,19 +1,32 @@
 """Execute frozen fleet work without configured-workflow vocabulary."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
-from ..config import RemrunConfig, load_config
-from ..job_observation import JobObservation, active_job_observation_enabled
+from ..config import RemrunConfig, load_config, load_retention
+from ..job_observation import JobObservation, active_job_observation_enabled, controller_label
 from ..state import default_state_root, iso_plus_seconds, utc_now_iso
-from ..transport import GuardFinalizationError, TransportError, make_transport
+from ..target_resources import (
+    EMPTY_POLICY_DIGEST,
+    TargetReservation,
+    TargetResourceClient,
+    TargetResourceError,
+    canonical_json,
+)
+from ..transport import (
+    GuardFinalizationError,
+    TransportError,
+    finalize_durable_result,
+    make_transport,
+)
 from . import adapters, placement, probes, profiles, storage
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
@@ -28,6 +41,67 @@ BATCH_MANIFEST_NAME = "remrun_batch.json"
 BATCH_METRICS_NAME = "batch_metrics.json"
 DONE_JSON_NAME = "done.json"
 MAX_RESULT_EVIDENCE_BYTES = 4 * 1024 * 1024
+TARGET_OPERATION_POLL_SECONDS = 1.0
+
+
+def _target_acceptance_supported(device: Any) -> bool:
+    return device.kind in {"ssh-posix", "ssh-powershell"}
+
+
+def _target_state_root(transport: Any, device: Any) -> str:
+    """Resolve the configured target state root before constructing operation paths."""
+    probe = transport.probe()
+    if not probe.reachable:
+        raise TransportError(f"{device.name} unreachable: {probe.detail}")
+    root = transport.expand_remote(device.state_root)
+    path = PureWindowsPath(root) if device.os == "windows" else PurePosixPath(root)
+    if root.startswith("~") or not path.is_absolute():
+        raise TransportError("target state root did not resolve to an absolute path")
+    return root
+
+
+def _target_operation_identity(batch_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", batch_id)[:120]
+    return f"fleet-{safe or hashlib.sha256(batch_id.encode()).hexdigest()[:24]}"
+
+
+def _target_operation_digest(
+    *,
+    operation_id: str,
+    device_name: str,
+    stage: str,
+    command: list[str],
+    env: dict[str, str],
+    prepared_ids: list[str],
+    job_ids: list[str],
+    resource_keys: list[str],
+) -> str:
+    return hashlib.sha256(canonical_json({
+        "schema": 1,
+        "operation_id": operation_id,
+        "device": device_name,
+        "stage": stage,
+        "command": command,
+        "env": env,
+        "prepared_ids": prepared_ids,
+        "job_ids": job_ids,
+        "resource_keys": resource_keys,
+    })).hexdigest()
+
+
+def _wait_target_operation(
+    transport: Any, operation_id: str, token: str
+) -> dict[str, object]:
+    while True:
+        status = transport.durable_status(operation_id, token)
+        state = status.get("state")
+        if state == "complete":
+            return transport.durable_status(operation_id, token, include_logs=True)
+        if state == "failed":
+            return status
+        if state not in {"launching", "pending", "running"}:
+            raise TransportError(f"target operation returned invalid state {state!r}")
+        time.sleep(TARGET_OPERATION_POLL_SECONDS)
 
 
 def _guard_outcome_fields(memory_guard: dict[str, Any]) -> dict[str, Any]:
@@ -158,16 +232,21 @@ def _memory_limit_receipt(record: dict[str, Any], *, admission: Any = None,
 def durable_attempt_record(task: FleetTask, result: dict[str, Any],
                            worker_record: str | None = None) -> str | None:
     """Return one token-free completed-attempt record for durable queue status."""
-    if prepared_memory_limit_mib(task.prepared) is None:
+    target_operation = result.get("target_operation")
+    has_target_operation = isinstance(target_operation, dict)
+    if prepared_memory_limit_mib(task.prepared) is None and not has_target_operation:
         return worker_record
-    receipt = result.get("memory_limit")
-    if not isinstance(receipt, dict):
-        receipt = _memory_limit_receipt(task.prepared, guard=result.get("memory_guard"))
     record: dict[str, Any] = {
         "schema": 1,
         "kind": "fleet-attempt-receipt",
-        "memory_limit": receipt,
     }
+    if prepared_memory_limit_mib(task.prepared) is not None:
+        receipt = result.get("memory_limit")
+        if not isinstance(receipt, dict):
+            receipt = _memory_limit_receipt(task.prepared, guard=result.get("memory_guard"))
+        record["memory_limit"] = receipt
+    if has_target_operation:
+        record["target_operation"] = target_operation
     if worker_record is not None:
         try:
             record["worker_result"] = json.loads(worker_record)
@@ -410,6 +489,35 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 batch_state = "fetching"
             return True
 
+        def record_target_reservation(receipt: dict[str, Any], resume_token: str) -> bool:
+            if heartbeat is None or heartbeat.ownership_lost.is_set():
+                return False
+            recorded = queue.record_target_reservation(
+                batch_id,
+                operation_id=str(receipt.get("operation_id") or ""),
+                request_sha256=str(receipt.get("request_sha256") or ""),
+                resume_token=resume_token,
+                expected_state=batch_state,
+                owner_token=owner_token,
+            )
+            if not recorded:
+                heartbeat.ownership_lost.set()
+            return recorded
+
+        def record_target_acceptance(receipt: dict[str, Any]) -> bool:
+            if heartbeat is None or heartbeat.ownership_lost.is_set():
+                return False
+            recorded = queue.record_target_acceptance(
+                batch_id,
+                operation_id=str(receipt.get("operation_id") or ""),
+                request_sha256=str(receipt.get("request_sha256") or ""),
+                expected_state=batch_state,
+                owner_token=owner_token,
+            )
+            if not recorded:
+                heartbeat.ownership_lost.set()
+            return recorded
+
         try:
             with BatchHeartbeat(
                 db_path, batch_id, owner_token, batch_state, lease_seconds,
@@ -423,6 +531,8 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                     cleanup=cleanup, job_ids=job_ids, observation_id=batch_id,
                     prelaunch_gate=launch_gate,
                     before_output_return=output_return_gate,
+                    on_target_reservation=record_target_reservation,
+                    on_target_acceptance=record_target_acceptance,
                 )
             attempt_record = durable_attempt_record(task, result)
         except BaseException as exc:  # noqa: BLE001
@@ -526,7 +636,10 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
               job_ids: list[str] | None = None,
               observation_id: str | None = None,
               prelaunch_gate: Callable[[], bool] | None = None,
-              before_output_return: Callable[[], bool] | None = None) -> dict[str, Any]:
+              before_output_return: Callable[[], bool] | None = None,
+              on_target_reservation: Callable[[dict[str, Any], str], bool] | None = None,
+              on_target_acceptance: Callable[[dict[str, Any]], bool] | None = None,
+              ) -> dict[str, Any]:
     """Run one already-placed compatible prepared batch."""
     if device_name not in config.devices:
         return {"ok": False, "error": f"unknown device {device_name!r}"}
@@ -555,6 +668,8 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
             device_name, tasks, config, state_root=state_root or default_state_root(),
             cleanup=cleanup, job_ids=job_ids, observation_id=observation_id,
             prelaunch_gate=prelaunch_gate, before_output_return=before_output_return,
+            on_target_reservation=on_target_reservation,
+            on_target_acceptance=on_target_acceptance,
         )
     except _OutputReturnOwnershipLost:
         return {
@@ -575,7 +690,10 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                         state_root: Path, cleanup: bool, job_ids: list[str] | None,
                         observation_id: str | None,
                         prelaunch_gate: Callable[[], bool] | None,
-                        before_output_return: Callable[[], bool] | None) -> dict[str, Any]:
+                        before_output_return: Callable[[], bool] | None,
+                        on_target_reservation: Callable[[dict[str, Any], str], bool] | None,
+                        on_target_acceptance: Callable[[dict[str, Any]], bool] | None,
+                        ) -> dict[str, Any]:
     device = config.devices[device_name]
     head = tasks[0]
     record = head.prepared
@@ -604,19 +722,30 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             }
     else:
         storage_registry = {"schema": 1, "roots": {}}
+    batch_id = observation_id or f"batch-{uuid.uuid4().hex[:12]}"
     transport = None
     stage = None
     try:
         transport = make_transport(device)
-        stage = transport.remote_temp_dir("fleet")
+        if _target_acceptance_supported(device):
+            operation_root = transport.native_join(
+                _target_state_root(transport, device),
+                "fleet-operations",
+                _target_operation_identity(batch_id),
+            )
+            # The operation root is itself the private stage. Removing a
+            # released operation therefore cannot leave an empty directory per
+            # historical run; quarantined operations retain the whole root.
+            stage = operation_root
+            transport.ensure_remote_dir(stage)
+        else:
+            stage = transport.remote_temp_dir("fleet")
         stage_in = transport.native_join(stage, "in")
         transport.ensure_remote_dir(stage_in)
     except TransportError as exc:
         if cleanup and transport is not None and stage is not None:
             _safe_delete(transport, stage)
         return {"ok": False, "device": device_name, "error": f"stage failed: {exc}"}
-
-    batch_id = observation_id or f"batch-{uuid.uuid4().hex[:12]}"
     used: set[str] = set()
     manifest_items: list[dict[str, Any]] = []
     expected: list[dict[str, Any]] = []
@@ -796,28 +925,229 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             response["memory_reservation_release"] = release_receipt
         return response
     started = time.monotonic()
+    operation_id = _target_operation_identity(batch_id)
+    target_operation: dict[str, Any] | None = None
+    durable_context: tuple[str, str] | None = None
+    target_resource_client: TargetResourceClient | None = None
+    target_reservation: TargetReservation | None = None
+    reservation_receipt: dict[str, Any] | None = None
+
+    def operation_observation(job_id: str) -> JobObservation:
+        return JobObservation.for_command(
+            job_id=job_id,
+            project="@fleet", target=device_name, phase="fleet-worker",
+            command=command,
+            declared_label=("raw-command" if is_command else
+                            f"{record['task']['name']}:{adapter['engine']}"),
+            member_count=len(tasks),
+        )
+
     try:
-        observed_exec = getattr(transport, "exec_observed", None)
-        if not active_job_observation_enabled() or observed_exec is None:
-            result = transport.exec(
-                command, cwd=stage, telemetry=True, env=env,
-                memory_reservation=reservation,
-            )
-        else:
-            observation = JobObservation.for_command(
-                job_id=(observation_id or
-                        (job_ids[0] if job_ids and len(job_ids) == 1
-                         else f"fleet-{uuid.uuid4().hex[:12]}")),
-                project="@fleet", target=device_name, phase="fleet-worker",
+        if _target_acceptance_supported(device):
+            observation = operation_observation(operation_id)
+            pool = adapters.pool_for(head, device_name)
+            resource_keys = [f"pool/{pool}"] if pool else []
+            client = TargetResourceClient.connect(config, device_name, install=True)
+            target_resource_client = client
+            if resource_keys:
+                policy = client.policy_get()
+                current = policy.get("policy")
+                if policy.get("status") != "installed" or not isinstance(current, dict):
+                    raise TargetResourceError(
+                        f"target resource policy is not installed on {device_name}"
+                    )
+                generation = current.get("generation")
+                policy_sha = current.get("digest")
+                if isinstance(generation, bool) or not isinstance(generation, int) \
+                        or not isinstance(policy_sha, str):
+                    raise TargetResourceError("target resource policy identity is malformed")
+            else:
+                generation = 0
+                policy_sha = EMPTY_POLICY_DIGEST
+            stable_job_ids = list(job_ids or [
+                f"adhoc-{index}" for index in range(len(tasks))
+            ])
+            request_sha = _target_operation_digest(
+                operation_id=operation_id,
+                device_name=device_name,
+                stage=stage,
                 command=command,
-                declared_label=("raw-command" if is_command else
-                                f"{record['task']['name']}:{adapter['engine']}"),
-                member_count=len(tasks),
+                env=env,
+                prepared_ids=[task.prepared["prepared_id"] for task in tasks],
+                job_ids=stable_job_ids,
+                resource_keys=resource_keys,
             )
-            result = observed_exec(
-                command, cwd=stage, telemetry=True, env=env,
-                observation=observation, memory_reservation=reservation,
+            accepted = client.reserve(
+                allocation_id=operation_id,
+                operation_id=operation_id,
+                request_sha256=request_sha,
+                resource_keys=resource_keys,
+                expected_policy_generation=generation,
+                expected_policy_digest=policy_sha,
+                rpc_id=f"fleet-reserve-{operation_id}",
             )
+            if not isinstance(accepted, TargetReservation):
+                status = str(accepted.get("status") or "refused")
+                busy = accepted.get("busy_keys")
+                detail = f": {', '.join(busy)}" if isinstance(busy, list) and busy else ""
+                raise TargetResourceError(f"target resource reservation {status}{detail}")
+            target_reservation = accepted
+            reservation_receipt = {
+                "schema": 1,
+                "operation_id": operation_id,
+                "request_sha256": request_sha,
+                "device": device_name,
+                "accepted": False,
+            }
+            if on_target_reservation is not None \
+                    and not on_target_reservation(reservation_receipt, accepted.token):
+                target_cleanup = "unknown"
+                try:
+                    cancelled = client.cancel(
+                        accepted, rpc_id=f"fleet-cancel-owner-loss-{operation_id}"
+                    )
+                    target_cleanup = str(cancelled.get("status") or "unknown")
+                except TargetResourceError as exc:
+                    target_cleanup = f"unknown:{exc}"
+                memory_release = None
+                if reservation is not None:
+                    try:
+                        released = transport.release_memory_guard(
+                            reservation, reserved_only=True,
+                        )
+                        memory_release = _admission_receipt(released.payload)
+                    except Exception as exc:  # noqa: BLE001 - expiry is the backstop
+                        memory_release = {
+                            "status": "release_failed",
+                            "reason": type(exc).__name__,
+                        }
+                    reservation = None
+                if cleanup:
+                    _safe_delete(transport, stage)
+                response = {
+                    "ok": False,
+                    "device": device_name,
+                    "staged": staged,
+                    "error": "lost batch ownership before target launch",
+                    "completion_state": "not_started",
+                    "command_started": False,
+                    "ownership_lost": True,
+                    "target_operation": reservation_receipt,
+                    "target_reservation_cleanup": target_cleanup,
+                    "_memory_admission": admission_payload,
+                }
+                if memory_release is not None:
+                    response["memory_reservation_release"] = memory_release
+                return response
+            launch_status, execution = transport.launch_durable(
+                command,
+                stage,
+                run_id=operation_id,
+                resume_token=accepted.token,
+                observation=observation,
+                controller=controller_label(),
+                project_id="@fleet",
+                max_log_bytes=load_retention(config).max_log_bytes,
+                created_at=utc_now_iso(),
+                env=env,
+                telemetry=True,
+                memory_reservation=reservation,
+                target_acceptance={
+                    "runner_path": client.info.installed_path,
+                    "state_root": client.state_root,
+                    "operation_id": operation_id,
+                    "request_sha256": request_sha,
+                    "reservation": {
+                        "allocation_id": accepted.allocation_id,
+                        "fence": accepted.fence,
+                        "policy_generation": generation,
+                        "policy_digest": policy_sha,
+                    },
+                },
+            )
+            target_receipt = launch_status.get("target_acceptance")
+            if launch_status.get("acknowledged") is not True \
+                    or not isinstance(target_receipt, dict):
+                raise TransportError("target did not durably acknowledge the operation")
+            target_operation = {
+                "schema": 1,
+                "operation_id": operation_id,
+                "request_sha256": request_sha,
+                "accepted": True,
+                "command_started": launch_status.get("command_started"),
+                "state": launch_status.get("state"),
+            }
+            if on_target_acceptance is not None \
+                    and not on_target_acceptance(target_operation):
+                return {
+                    "ok": False,
+                    "device": device_name,
+                    "staged": staged,
+                    "error": "lost batch ownership after target acceptance",
+                    "completion_state": "unknown",
+                    "command_started": launch_status.get("command_started"),
+                    "ownership_lost": True,
+                    "cleanup_deferred": True,
+                    "stage_dir": stage,
+                    "target_operation": target_operation,
+                    "_memory_admission": admission_payload,
+                }
+            terminal = _wait_target_operation(transport, operation_id, accepted.token)
+            terminal_status = terminal.get("status", terminal)
+            if not isinstance(terminal_status, dict):
+                raise TransportError("target operation returned malformed terminal status")
+            target_operation.update(
+                command_started=terminal_status.get("command_started"),
+                state=terminal_status.get("state"),
+                cleanup=terminal_status.get("target_cleanup"),
+            )
+            if terminal_status.get("state") != "complete":
+                return {
+                    "ok": False,
+                    "device": device_name,
+                    "staged": staged,
+                    "error": str(
+                        terminal_status.get("error") or "target supervisor failed"
+                    ),
+                    "completion_state": "unknown",
+                    "command_started": terminal_status.get("command_started"),
+                    "cleanup_deferred": True,
+                    "stage_dir": stage,
+                    "target_operation": target_operation,
+                    "_memory_admission": admission_payload,
+                }
+            result = finalize_durable_result(terminal, execution)
+            durable_context = (operation_id, accepted.token)
+        else:
+            observed_exec = getattr(transport, "exec_observed", None)
+            if not active_job_observation_enabled() or observed_exec is None:
+                result = transport.exec(
+                    command, cwd=stage, telemetry=True, env=env,
+                    memory_reservation=reservation,
+                )
+            else:
+                observation = operation_observation(batch_id)
+                result = observed_exec(
+                    command, cwd=stage, telemetry=True, env=env,
+                    observation=observation, memory_reservation=reservation,
+                )
+    except TargetResourceError as exc:
+        if reservation is not None:
+            try:
+                transport.release_memory_guard(reservation, reserved_only=True)
+            except Exception:
+                pass
+        if cleanup:
+            _safe_delete(transport, stage)
+        return {
+            "ok": False,
+            "device": device_name,
+            "staged": staged,
+            "error": f"target acceptance failed before launch: {exc}",
+            "completion_state": "not_started",
+            "command_started": False,
+            "_memory_admission": admission_payload,
+        }
     except GuardFinalizationError as exc:
         prestart = exc.command_started is False
         if cleanup and prestart:
@@ -832,10 +1162,93 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             response.update({"cleanup_deferred": True, "stage_dir": stage})
         return response
     except TransportError as exc:
+        accepted = target_operation is not None
+        acceptance_unknown = False
+        ownership_lost = False
+        reservation_cleanup = None
+        if not accepted and target_resource_client is not None \
+                and target_reservation is not None:
+            try:
+                observed = target_resource_client.status(
+                    target_reservation,
+                    rpc_id=f"fleet-status-launch-failure-{operation_id}",
+                )
+                resource_receipt = observed.get("receipt")
+                if not isinstance(resource_receipt, dict):
+                    raise TargetResourceError("target status omitted its resource receipt")
+                resource_state = str(resource_receipt.get("state") or "UNKNOWN")
+                if resource_state == "RESERVED":
+                    cancelled = target_resource_client.cancel(
+                        target_reservation,
+                        rpc_id=f"fleet-cancel-launch-failure-{operation_id}",
+                    )
+                    reservation_cleanup = cancelled.get("status")
+                elif resource_state in {"CANCELLED", "EXPIRED"}:
+                    reservation_cleanup = resource_state.lower()
+                elif resource_state in {"CLAIMED", "QUARANTINED", "RELEASED"}:
+                    start_state = resource_receipt.get("command_start_state")
+                    command_started = (
+                        True if start_state == "YES" else
+                        False if start_state == "NO" else None
+                    )
+                    target_operation = {
+                        **(reservation_receipt or {}),
+                        "schema": 1,
+                        "operation_id": operation_id,
+                        "request_sha256": request_sha,
+                        "accepted": True,
+                        "command_started": command_started,
+                        "state": "unknown",
+                        "cleanup": resource_receipt,
+                    }
+                    accepted = True
+                    if on_target_acceptance is not None \
+                            and not on_target_acceptance(target_operation):
+                        ownership_lost = True
+                else:
+                    acceptance_unknown = True
+                    reservation_cleanup = f"unknown:{resource_state}"
+            except TargetResourceError as status_exc:
+                acceptance_unknown = True
+                reservation_cleanup = f"unknown:{status_exc}"
+        memory_release = None
+        safe_prestart = not accepted and not acceptance_unknown
+        if safe_prestart and reservation is not None:
+            try:
+                released = transport.release_memory_guard(
+                    reservation, reserved_only=True,
+                )
+                memory_release = _admission_receipt(released.payload)
+            except Exception as release_exc:  # noqa: BLE001 - expiry remains the backstop
+                memory_release = {
+                    "status": "release_failed",
+                    "reason": type(release_exc).__name__,
+                }
+            reservation = None
+        if cleanup and safe_prestart:
+            _safe_delete(transport, stage)
+        operation_receipt = target_operation or reservation_receipt
         return {"ok": False, "device": device_name, "staged": staged,
-                "error": f"exec failed: {exc}", "completion_state": "unknown",
-                "command_started": None, "cleanup_deferred": bool(cleanup),
-                "stage_dir": stage}
+                "error": f"exec failed: {exc}",
+                "completion_state": (
+                    "unknown" if accepted or acceptance_unknown else "not_started"
+                ),
+                "command_started": (
+                    target_operation.get("command_started")
+                    if target_operation is not None else
+                    None if acceptance_unknown else False
+                ),
+                "cleanup_deferred": bool(cleanup and (accepted or acceptance_unknown)),
+                **({"stage_dir": stage} if accepted or acceptance_unknown else {}),
+                **({"target_operation": operation_receipt}
+                   if operation_receipt is not None else {}),
+                **({"target_acceptance_unknown": True} if acceptance_unknown else {}),
+                **({"ownership_lost": True} if ownership_lost else {}),
+                **({"target_reservation_cleanup": reservation_cleanup}
+                   if reservation_cleanup is not None else {}),
+                **({"memory_reservation_release": memory_release}
+                   if memory_release is not None else {}),
+                "_memory_admission": admission_payload}
 
     elapsed = round(time.monotonic() - started, 3)
     rows: list[dict[str, Any]] = []
@@ -859,7 +1272,20 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 raise _OutputReturnOwnershipLost
         except ResultProtocolError as exc:
             evidence_error = str(exc)
-    if cleanup:
+    durable_cleanup_error = None
+    target_cleanup_state = None
+    if target_operation is not None and isinstance(target_operation.get("cleanup"), dict):
+        target_cleanup_state = target_operation["cleanup"].get("state")
+    target_cleanup_terminal = target_cleanup_state in {
+        "RELEASED", "CANCELLED", "EXPIRED", "REBOOTED",
+    }
+    retain_target_evidence = target_operation is not None and not target_cleanup_terminal
+    if cleanup and durable_context is not None and not retain_target_evidence:
+        try:
+            transport.durable_cleanup(*durable_context)
+        except TransportError as exc:
+            durable_cleanup_error = str(exc)
+    if cleanup and not retain_target_evidence:
         _safe_delete(transport, stage)
     delivery_complete = not any(
         row.get("failure_code") == "output_return_failed" for row in rows
@@ -873,6 +1299,16 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
         "stderr_tail": (result.stderr or "")[-500:],
         "_memory_admission": admission_payload,
     }
+    if target_operation is not None:
+        response["target_operation"] = target_operation
+    if durable_cleanup_error is not None:
+        response["target_cleanup_deferred"] = durable_cleanup_error
+    if retain_target_evidence:
+        response.update(
+            cleanup_deferred=True,
+            stage_dir=stage,
+            target_cleanup_deferred="target process cleanup is not terminal",
+        )
     if evidence_error:
         response.update({"error": evidence_error, "completion_evidence": "missing",
                          "no_retry": True})

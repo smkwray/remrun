@@ -47,6 +47,7 @@ _WIN_KEEPER_POLL_SECONDS = 1.0
 _WIN_KEEPER_CLEANUP_RETRIES = 50
 _SCHEMA_READY_ATTEMPTS = 25
 _SCHEMA_READY_DELAY_SECONDS = 0.02
+_START_GATE_TIMEOUT_SECONDS = 60.0
 _SAFE = re.compile(r"^[A-Za-z0-9._:@+-]+$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -2017,7 +2018,11 @@ def _query(root: Path, sample_interval: float) -> dict[str, object]:
 
 
 def _write_ready_file(
-    root: Path, ready_file: str | None, metadata: dict[str, object], owner_kind: str
+    root: Path,
+    ready_file: str | None,
+    metadata: dict[str, object],
+    owner_kind: str,
+    owner: dict[str, object] | None = None,
 ) -> None:
     """Durably acknowledge observation before durable user code may start."""
     if ready_file is None:
@@ -2034,6 +2039,88 @@ def _write_ready_file(
         "job_id": metadata["job_id"],
         "command_sha256": metadata["command_sha256"],
         "owner_kind": owner_kind,
+        "owner": owner,
+        "written_at_ns": time.time_ns(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + f".tmp-{os.getpid()}-{time.time_ns()}")
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+    os.replace(temp, path)
+    try:
+        directory = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory)
+    except OSError:
+        pass
+    finally:
+        os.close(directory)
+
+
+def _control_path(root: Path, raw: str, label: str) -> Path:
+    path = Path(raw)
+    try:
+        path.parent.resolve().relative_to(root.resolve())
+    except (OSError, ValueError) as exc:
+        raise RegistryError(f"observer {label} file is outside the target state root") from exc
+    return path
+
+
+def _control_identity(metadata: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "job_id": metadata["job_id"],
+        "command_sha256": metadata["command_sha256"],
+    }
+
+
+def _wait_start_gate(
+    root: Path, start_gate_file: str | None, metadata: dict[str, object]
+) -> None:
+    if start_gate_file is None:
+        return
+    path = _control_path(root, start_gate_file, "start gate")
+    deadline = time.monotonic() + _START_GATE_TIMEOUT_SECONDS
+    expected = _control_identity(metadata)
+    while time.monotonic() < deadline:
+        try:
+            raw = path.read_bytes()
+            value = json.loads(raw.decode("utf-8"))
+        except FileNotFoundError:
+            time.sleep(0.02)
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RegistryError("observer start gate is unreadable") from exc
+        if value != expected:
+            raise RegistryError("observer start gate identity mismatch")
+        return
+    raise RegistryError("observer start gate timed out before user launch")
+
+
+def _write_started_file(
+    root: Path,
+    started_file: str | None,
+    metadata: dict[str, object],
+    *,
+    user_pid: int,
+    user_identity: str,
+) -> None:
+    if started_file is None:
+        return
+    path = _control_path(root, started_file, "started")
+    payload = {
+        **_control_identity(metadata),
+        "user_pid": user_pid,
+        "user_identity": user_identity,
         "written_at_ns": time.time_ns(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2121,7 +2208,12 @@ def _best_witness(rows: list[ProcessRow], preferred: ProcessRow | None = None) -
 
 
 def _run_posix_command(
-    root: Path, metadata: dict[str, object], command: list[str], ready_file: str | None = None
+    root: Path,
+    metadata: dict[str, object],
+    command: list[str],
+    ready_file: str | None = None,
+    start_gate_file: str | None = None,
+    started_file: str | None = None,
 ) -> int:
     try:
         owner = _posix_owner_row()
@@ -2141,12 +2233,39 @@ def _run_posix_command(
         return _wait_popen(subprocess.Popen(command))
 
     try:
-        _write_ready_file(root, ready_file, metadata, "posix_pgid")
+        _write_ready_file(
+            root,
+            ready_file,
+            metadata,
+            "posix_pgid",
+            {
+                "kind": "posix_pgid",
+                "key": str(owner.pid),
+                "pid": owner.pid,
+                "start_id": owner.identity,
+                "root_pid": owner.pid,
+                "root_start_id": owner.identity,
+            },
+        )
+        _wait_start_gate(root, start_gate_file, metadata)
         proc = subprocess.Popen(command)
     except BaseException:
         _unregister(root, token)
         raise
     child = _child_row(proc)
+    if started_file is not None and (child is None or child.identity is None):
+        proc.terminate()
+        proc.wait()
+        _unregister(root, token)
+        raise RegistryError("started process identity is unavailable")
+    if child is not None and child.identity is not None:
+        _write_started_file(
+            root,
+            started_file,
+            metadata,
+            user_pid=child.pid,
+            user_identity=child.identity,
+        )
     if child is not None and child.identity is not None:
         try:
             _update_record_processes(root, token, root_process=child, witness=child)
@@ -2179,7 +2298,12 @@ def _run_posix_command(
 
 
 def _run_windows_command(
-    root: Path, metadata: dict[str, object], command: list[str], ready_file: str | None = None
+    root: Path,
+    metadata: dict[str, object],
+    command: list[str],
+    ready_file: str | None = None,
+    start_gate_file: str | None = None,
+    started_file: str | None = None,
 ) -> int:
     token = uuid.uuid4().hex
     job_name = _win_job_name(token)
@@ -2216,9 +2340,30 @@ def _run_windows_command(
             witness=keeper_row,
         )
         registered = True
-        _write_ready_file(root, ready_file, metadata, "windows_job_v2")
+        _write_ready_file(
+            root,
+            ready_file,
+            metadata,
+            "windows_job_v2",
+            {
+                "kind": "windows_job_v2",
+                "key": job_name,
+                "pid": keeper_row.pid,
+                "start_id": keeper_row.identity,
+                "root_pid": row.pid,
+                "root_start_id": row.identity,
+            },
+        )
+        _wait_start_gate(root, start_gate_file, metadata)
         _win_resume(process)
         started = True
+        _write_started_file(
+            root,
+            started_file,
+            metadata,
+            user_pid=row.pid,
+            user_identity=str(row.identity),
+        )
         _remove_keeper_ready(root, token)
     except Exception as exc:
         if registered:
@@ -2267,14 +2412,23 @@ def _run_windows_command(
 
 
 def _run_command(
-    root: Path, metadata: dict[str, object], command: list[str], ready_file: str | None = None
+    root: Path,
+    metadata: dict[str, object],
+    command: list[str],
+    ready_file: str | None = None,
+    start_gate_file: str | None = None,
+    started_file: str | None = None,
 ) -> int:
     if not command:
         raise ValueError("run requires an argv after --")
     if os.name == "nt":
-        return _run_windows_command(root, metadata, command, ready_file)
+        return _run_windows_command(
+            root, metadata, command, ready_file, start_gate_file, started_file
+        )
     if os.name == "posix":
-        return _run_posix_command(root, metadata, command, ready_file)
+        return _run_posix_command(
+            root, metadata, command, ready_file, start_gate_file, started_file
+        )
     if ready_file is not None:
         raise RegistryError("durable observation is unsupported on this platform")
     proc = subprocess.Popen(command)
@@ -2303,6 +2457,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--state-root", required=True)
     run.add_argument("--metadata-b64", required=True)
     run.add_argument("--ready-file")
+    run.add_argument("--start-gate-file")
+    run.add_argument("--started-file")
     run.add_argument("command", nargs=argparse.REMAINDER)
     query_parser = sub.add_parser("query")
     query_parser.add_argument("--state-root", required=True)
@@ -2322,7 +2478,16 @@ def main(argv: list[str] | None = None) -> int:
         if command and command[0] == "--":
             command = command[1:]
         metadata = _decode_metadata(args.metadata_b64)
-        return _run_command(root, metadata, command, args.ready_file)
+        if (args.start_gate_file is None) != (args.started_file is None):
+            raise ValueError("observer start gate and started receipt must be supplied together")
+        return _run_command(
+            root,
+            metadata,
+            command,
+            args.ready_file,
+            args.start_gate_file,
+            args.started_file,
+        )
     if args.operation == "hold-windows-job":
         token = _bounded_text(args.token, "token", 64)
         expected = _win_job_name(token)

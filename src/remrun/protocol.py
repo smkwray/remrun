@@ -14,18 +14,18 @@ def build_capabilities_document() -> dict[str, Any]:
     return {
         "schema": "remrun.capabilities",
         "version": 1,
-        "protocol": {"major": 1, "minor": 0},
+        "protocol": {"major": 1, "minor": 1},
         "package_version": __version__,
         "documents": {
-            "requests": [],
-            "receipts": [],
+            "requests": [{"schema": "remrun.target-resource-policy", "version": 1}],
+            "receipts": [{"schema": "remrun.target-resource-receipt", "version": 1}],
             "errors": [{"schema": "remrun.error", "version": 1}],
         },
         "features": {
             "capabilities": "stable",
             "task_preparation": "unavailable",
-            "target_fenced_admission": "unavailable",
-            "durable_fleet_launch": "unavailable",
+            "target_fenced_admission": "stable",
+            "durable_fleet_launch": "stable",
             "service_sessions": "unavailable",
         },
         "coordination": {

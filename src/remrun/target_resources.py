@@ -1,8 +1,7 @@
-"""Internal controller client for target-local resource admission.
+"""Controller client for explicit target-local resource admission.
 
-RWO 5 deliberately does not connect this module to fleet execution or advertise it
-through the public capabilities document. Later consumers must compose this client
-with durable target acceptance before enabling production launch paths.
+Fleet durable launch composes this authority with the existing observer and durable
+runner. Service lifecycle and cross-controller adoption remain outside this module.
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ from .transport import BaseTransport, make_transport
 POLICY_SCHEMA = "remrun.target-resource-policy"
 RECEIPT_SCHEMA = "remrun.target-resource-receipt"
 OWNER_REQUEST_SCHEMA = "remrun.target-resource-owner-request"
+EMPTY_POLICY_DIGEST = "0" * 64
 
 
 class TargetResourceError(RuntimeError):
@@ -167,8 +167,7 @@ class TargetResourceClient:
         except RunnerClientError as exc:
             raise TargetResourceError(str(exc)) from exc
         transport = make_transport(config.devices[device_name])
-        state_root = transport.expand_remote(config.devices[device_name].state_root)
-        return cls(config, device_name, info, transport, state_root)
+        return cls(config, device_name, info, transport, info.state_root)
 
     def _rpc(
         self, operation: str, body: dict[str, Any] | None = None, *, rpc_id: str | None = None

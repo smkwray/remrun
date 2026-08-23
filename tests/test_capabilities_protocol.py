@@ -8,18 +8,18 @@ from remrun.protocol import build_capabilities_document
 EXPECTED = {
     "schema": "remrun.capabilities",
     "version": 1,
-    "protocol": {"major": 1, "minor": 0},
+    "protocol": {"major": 1, "minor": 1},
     "package_version": "0.1.0",
     "documents": {
-        "requests": [],
-        "receipts": [],
+        "requests": [{"schema": "remrun.target-resource-policy", "version": 1}],
+        "receipts": [{"schema": "remrun.target-resource-receipt", "version": 1}],
         "errors": [{"schema": "remrun.error", "version": 1}],
     },
     "features": {
         "capabilities": "stable",
         "task_preparation": "unavailable",
-        "target_fenced_admission": "unavailable",
-        "durable_fleet_launch": "unavailable",
+        "target_fenced_admission": "stable",
+        "durable_fleet_launch": "stable",
         "service_sessions": "unavailable",
     },
     "coordination": {
@@ -113,8 +113,8 @@ def test_required_document_schema_must_be_declared() -> None:
     assert not _compatible(EXPECTED, required_documents=(("remrun.future", 1),))
 
 
-def test_inert_source_presence_cannot_promote_a_feature() -> None:
+def test_integrated_target_acceptance_is_explicitly_promoted() -> None:
     document = build_capabilities_document()
 
-    assert document["features"]["target_fenced_admission"] == "unavailable"
-    assert document["features"]["durable_fleet_launch"] == "unavailable"
+    assert document["features"]["target_fenced_admission"] == "stable"
+    assert document["features"]["durable_fleet_launch"] == "stable"

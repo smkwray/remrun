@@ -26,6 +26,7 @@ from remrun.fleet.queue import FleetQueue
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.memory_guard import MemoryAdmissionResult, MemoryReservation
 from remrun.models import Device
+from remrun.target_resources import EMPTY_POLICY_DIGEST, TargetReservation
 from remrun.transport import ExecResult
 
 MIB = 1024 * 1024
@@ -393,6 +394,58 @@ def test_definition_drift_releases_reserved_only_ledger_entry(
     assert result["memory_limit"]["release"]["status"] == "released"
     assert result["memory_limit"]["release"]["lease_released"] is True
     assert "must-never-persist" not in json.dumps(result["memory_limit"], sort_keys=True)
+
+
+def test_owner_loss_before_target_launch_releases_memory_and_target_reservations(
+        tmp_path: Path, monkeypatch) -> None:
+    _record, task = _raw_task(8192)
+    transport = GuardedTransport(tmp_path)
+    target_reservation = TargetReservation(
+        {
+            "allocation_id": "fleet-batch-a",
+            "operation_id": "fleet-batch-a",
+            "fence": 1,
+            "policy_generation": 0,
+            "policy_digest": EMPTY_POLICY_DIGEST,
+            "resource_keys": [],
+        },
+        "private-target-token",
+    )
+
+    class TargetClient:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def reserve(self, **_kwargs):  # noqa: ANN003
+            return target_reservation
+
+        def cancel(self, *_args, **_kwargs):  # noqa: ANN002, ANN003
+            self.cancelled = True
+            return {"status": "cancelled"}
+
+    target_client = TargetClient()
+    monkeypatch.setattr(executor, "make_transport", lambda _device: transport)
+    monkeypatch.setattr(executor, "_target_acceptance_supported", lambda _device: True)
+    monkeypatch.setattr(
+        executor, "_target_state_root", lambda _transport, _device: str(tmp_path / "target"),
+    )
+    monkeypatch.setattr(
+        executor.TargetResourceClient,
+        "connect",
+        lambda *_args, **_kwargs: target_client,
+    )
+
+    result = executor.run_batch(
+        "LOCAL_SIM", [task], _config(tmp_path), state_root=tmp_path / "state",
+        observation_id="batch-a", on_target_reservation=lambda _receipt, _token: False,
+    )
+
+    assert result["ownership_lost"] is True
+    assert result["command_started"] is False
+    assert target_client.cancelled is True
+    assert len(transport.release_calls) == 1
+    assert transport.release_calls[0][1] is True
+    assert result["memory_limit"]["release"]["lease_released"] is True
 
 
 def test_leased_definition_drift_persists_sanitized_release_receipt(

@@ -205,6 +205,7 @@ RESOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RESOURCE_RESERVATION_NS = 30_000_000_000
 MAX_RESOURCE_FENCE = (1 << 63) - 1
+EMPTY_RESOURCE_POLICY_DIGEST = "0" * 64
 
 _WIN_DWORD = ctypes.c_uint32
 _WIN_BOOL = ctypes.c_int
@@ -1925,8 +1926,8 @@ def _resource_sha256(value, label: str) -> str:
 
 
 def _resource_keys(value) -> list[str]:
-    if not isinstance(value, list) or not value or len(value) > 64:
-        raise RunnerError("resource_keys must be a non-empty bounded array")
+    if not isinstance(value, list) or len(value) > 64:
+        raise RunnerError("resource_keys must be a bounded array")
     keys = []
     for key in value:
         if not isinstance(key, str) or not RESOURCE_KEY_RE.fullmatch(key):
@@ -2146,10 +2147,15 @@ def _resource_reserve(conn, body: dict, boot_id: str, mono_ns: int) -> dict:
         raise RunnerError("expected policy generation is invalid")
     digest = _resource_sha256(body.get("expected_policy_digest"), "expected policy digest")
     _reconcile_resources(conn, boot_id, mono_ns)
-    _document, policy_keys = _require_resource_policy(conn, generation, digest)
-    unknown = [key for key in keys if key not in policy_keys]
-    if unknown:
-        raise RunnerError("resource key is absent from target policy: " + ", ".join(unknown))
+    if keys:
+        _document, policy_keys = _require_resource_policy(conn, generation, digest)
+        unknown = [key for key in keys if key not in policy_keys]
+        if unknown:
+            raise RunnerError(
+                "resource key is absent from target policy: " + ", ".join(unknown)
+            )
+    elif generation != 0 or digest != EMPTY_RESOURCE_POLICY_DIGEST:
+        raise RunnerError("resource-free operation must use the empty policy identity")
     spec = {
         "allocation_id": allocation_id,
         "operation_id": operation_id,
@@ -2233,10 +2239,15 @@ def _resource_renew(conn, body: dict, boot_id: str, mono_ns: int) -> dict:
     _reconcile_resources(conn, boot_id, mono_ns)
     row = _allocation(conn, str(row["allocation_id"]))
     assert row is not None
-    _require_resource_policy(
-        conn, body.get("expected_policy_generation"),
-        _resource_sha256(body.get("expected_policy_digest"), "expected policy digest"),
+    generation = body.get("expected_policy_generation")
+    digest = _resource_sha256(
+        body.get("expected_policy_digest"), "expected policy digest"
     )
+    if generation == 0 and digest == EMPTY_RESOURCE_POLICY_DIGEST:
+        if json.loads(bytes(row["resource_keys_json"]).decode("utf-8")):
+            raise RunnerError("resource-free renewal has a non-empty key set")
+    else:
+        _require_resource_policy(conn, generation, digest)
     if row["state"] != "RESERVED":
         return {"ok": True, "status": str(row["state"]).lower(),
                 "receipt": _resource_receipt(row, boot_id)}
@@ -2286,7 +2297,11 @@ def _resource_owner_claim(conn, body: dict, owner: dict, boot_id: str, mono_ns: 
     digest = _resource_sha256(body.get("policy_digest"), "owner policy digest")
     if generation != int(row["policy_generation"]) or digest != row["policy_digest"]:
         raise RunnerError("target owner policy identity mismatch")
-    _require_resource_policy(conn, generation, digest)
+    if generation == 0 and digest == EMPTY_RESOURCE_POLICY_DIGEST:
+        if json.loads(bytes(row["resource_keys_json"]).decode("utf-8")):
+            raise RunnerError("resource-free target owner has a non-empty key set")
+    else:
+        _require_resource_policy(conn, generation, digest)
     if mono_ns >= int(row["expires_mono_ns"]):
         _terminalize_resource(
             conn, str(row["allocation_id"]), "EXPIRED", "reservation_expired"
@@ -2298,7 +2313,9 @@ def _resource_owner_claim(conn, body: dict, owner: dict, boot_id: str, mono_ns: 
     if not isinstance(owner, dict) or set(owner) != required:
         raise RunnerError("target owner identity is malformed")
     kind = str(owner["kind"])
-    if kind not in {"posix_pgid_v1", "windows_job_v1"}:
+    if kind not in {
+        "posix_pgid_v1", "posix_pgid", "windows_job_v1", "windows_job_v2"
+    }:
         raise RunnerError("target owner kind is unsupported")
     owner_pid = owner["pid"]
     root_pid = owner["root_pid"]
@@ -2396,6 +2413,23 @@ def _resource_owner_quarantine(conn, body: dict, boot_id: str, reason: str) -> d
     return _resource_receipt(quarantined, boot_id)
 
 
+def _resource_owner_finish(conn, body: dict, boot_id: str) -> dict:
+    row = _resource_auth(conn, body, require_fence=True)
+    if row["state"] in {"RELEASED", "QUARANTINED"}:
+        return _resource_receipt(row, boot_id)
+    if row["state"] != "CLAIMED" or row["claim_boot_id"] != boot_id:
+        raise RunnerError("only a current target-owned claim may finish")
+    cleanup = _resource_owner_cleanup_state(row)
+    if cleanup == "gone":
+        return _resource_owner_release(conn, body, boot_id, "process_tree_exited")
+    reason = (
+        "process_tree_live_after_wrapper_exit"
+        if cleanup == "live"
+        else "process_cleanup_unverified"
+    )
+    return _resource_owner_quarantine(conn, body, boot_id, reason)
+
+
 def _resource_owner_mutation(state_root: str, operation: str, body: dict, **values) -> dict:
     conn, _runner_root, _meta = open_participant_store(state_root)
     try:
@@ -2420,6 +2454,10 @@ def _resource_owner_mutation(state_root: str, operation: str, body: dict, **valu
                 receipt = _resource_owner_release(conn, body, boot_id, values["reason"])
             elif operation == "quarantine":
                 receipt = _resource_owner_quarantine(conn, body, boot_id, values["reason"])
+            elif operation == "finish":
+                receipt = _resource_owner_finish(conn, body, boot_id)
+            elif operation == "status":
+                receipt = _resource_status(conn, body, boot_id, mono_ns)["receipt"]
             else:
                 raise RunnerError("unknown target owner mutation")
             conn.execute("COMMIT")
@@ -2887,7 +2925,7 @@ def _resource_owner_cleanup_state(row: dict) -> str:
     if os.environ.get("REMRUN_TEST_ONLY_FAULT_POINT") == "resource_cleanup_unknown":
         return "unknown"
     kind = str(row.get("owner_kind") or "")
-    if kind == "posix_pgid_v1":
+    if kind in {"posix_pgid_v1", "posix_pgid"}:
         try:
             pgid = int(row["owner_key"])
         except (TypeError, ValueError):
@@ -2896,7 +2934,7 @@ def _resource_owner_cleanup_state(row: dict) -> str:
         if members is None:
             return "unknown"
         return "live" if members else "gone"
-    if kind == "windows_job_v1":
+    if kind in {"windows_job_v1", "windows_job_v2"}:
         try:
             job = _win_open_resource_job(str(row["owner_key"]))
         except Exception:
@@ -3533,6 +3571,38 @@ def resource_owner_main(state_root: str) -> int:
     return 0
 
 
+def resource_operation_main(state_root: str) -> int:
+    """Apply one target-local accepted-operation transition.
+
+    This command is invoked only by the detached durable supervisor already
+    running on the target. External controller mutations remain authenticated
+    through the framed RPC surface.
+    """
+    try:
+        request = json.loads(sys.stdin.buffer.read((1 << 20) + 1).decode("utf-8"))
+        if not isinstance(request, dict) or set(request) != {
+            "operation", "reservation", "values"
+        }:
+            raise RunnerError("target operation transition is malformed")
+        operation = request["operation"]
+        reservation = request["reservation"]
+        values = request["values"]
+        if operation not in {
+            "claim", "start", "exec_confirm", "finish", "quarantine", "status"
+        }:
+            raise RunnerError("target operation transition is unsupported")
+        if not isinstance(reservation, dict) or not isinstance(values, dict):
+            raise RunnerError("target operation transition payload is malformed")
+        receipt = _resource_owner_mutation(
+            state_root, str(operation), dict(reservation), **dict(values)
+        )
+        sys.stdout.buffer.write(canonical_json({"ok": True, "receipt": receipt}))
+        return 0
+    except BaseException as exc:
+        sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
+        return 2
+
+
 def participant_rpc(state_root: str, header: dict, request: dict) -> dict:
     if header.get("v") != 2 or header.get("kind") != "rpc-request":
         raise RunnerError("not a versioned RPC request")
@@ -3705,6 +3775,8 @@ def main(argv) -> int:
         return resource_owner_main(argv[2])
     if len(argv) == 3 and argv[1] == "resource-owner-detached":
         return resource_owner_detached_main(argv[2])
+    if len(argv) == 3 and argv[1] == "resource-operation":
+        return resource_operation_main(argv[2])
     return legacy_main(argv)
 
 

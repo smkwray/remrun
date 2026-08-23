@@ -1297,11 +1297,13 @@ class BaseTransport:
         telemetry: bool = False,
         telemetry_request: TelemetryRequest | None = None,
         memory_reservation: MemoryReservation | None = None,
+        target_acceptance: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         del (
             command, cwd, run_id, resume_token, observation, controller, project_id,
             max_log_bytes, created_at, env, path_prepend, telemetry,
             telemetry_request, memory_reservation,
+            target_acceptance,
         )
         raise TransportError(
             f"durable ordinary runs are unsupported by transport {type(self).__name__}"
@@ -3073,12 +3075,15 @@ class SSHPosixTransport(_SSHCommon):
         env: dict[str, str] | None = None, path_prepend: list[str] | None = None,
         telemetry: bool = False, telemetry_request: TelemetryRequest | None = None,
         memory_reservation: MemoryReservation | None = None,
+        target_acceptance: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         root, observer = self._ensure_job_observer()
         durable_root, _durable = self._ensure_durable_runner()
         if durable_root != root:
             raise TransportError("durable and observer state roots disagree")
         ready_path = posixpath.join(root, "durable-runs", run_id, "observer-ready.json")
+        start_gate_path = posixpath.join(root, "durable-runs", run_id, "start-gate.json")
+        started_path = posixpath.join(root, "durable-runs", run_id, "started.json")
 
         parts: list[str] = []
         for key, value in (env or {}).items():
@@ -3095,6 +3100,11 @@ class SSHPosixTransport(_SSHCommon):
             "--state-root", root, "--metadata-b64", observation.encoded(),
             "--ready-file", ready_path, "--", *user_argv,
         ]
+        if target_acceptance is not None:
+            observed_argv[8:8] = [
+                "--start-gate-file", start_gate_path,
+                "--started-file", started_path,
+            ]
         final_argv = observed_argv
         execution: dict[str, object] = {"platform": "POSIX", "telemetry": "none"}
 
@@ -3154,14 +3164,24 @@ class SSHPosixTransport(_SSHCommon):
             "max_log_bytes": max_log_bytes,
             "created_at": created_at,
         }
+        if target_acceptance is not None:
+            spec["acceptance"] = {
+                **target_acceptance,
+                "schema": 1,
+                "start_gate_path": start_gate_path,
+                "started_path": started_path,
+            }
         raw = json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         try:
             status = self._durable_control("launch", input_bytes=raw, timeout=45.0)
-        except TransportError:
+        except TransportError as launch_exc:
             try:
                 status = self.durable_status(run_id, resume_token)
-            except TransportError:
-                raise
+            except TransportError as status_exc:
+                raise TransportError(
+                    f"durable launch failed: {launch_exc}; "
+                    f"status reconciliation failed: {status_exc}"
+                ) from launch_exc
             if not status.get("acknowledged"):
                 raise TransportError("durable launch connection was lost before acknowledgement")
             status = dict(status)
@@ -4009,6 +4029,7 @@ class SSHPowerShellTransport(_SSHCommon):
         env: dict[str, str] | None = None, path_prepend: list[str] | None = None,
         telemetry: bool = False, telemetry_request: TelemetryRequest | None = None,
         memory_reservation: MemoryReservation | None = None,
+        target_acceptance: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         if self.memory_guard is not None or memory_reservation is not None:
             raise TransportError("schema-3 memory guard is unsupported on ssh-powershell")
@@ -4020,6 +4041,8 @@ class SSHPowerShellTransport(_SSHCommon):
         if durable_root != root:
             raise TransportError("durable and observer state roots disagree")
         ready_path = self.native_join(root, "durable-runs", run_id, "observer-ready.json")
+        start_gate_path = self.native_join(root, "durable-runs", run_id, "start-gate.json")
+        started_path = self.native_join(root, "durable-runs", run_id, "started.json")
         boundary_marker, batch_marker, language_marker, not_found_marker = (
             _ps_boundary_markers(uuid.uuid4().hex)
         )
@@ -4055,6 +4078,11 @@ class SSHPowerShellTransport(_SSHCommon):
             "--state-root", root, "--metadata-b64", observation.encoded(),
             "--ready-file", ready_path, "--", *user_argv,
         ]
+        if target_acceptance is not None:
+            observed_argv[8:8] = [
+                "--start-gate-file", start_gate_path,
+                "--started-file", started_path,
+            ]
         final_argv = observed_argv
         telemetry_kind = "none"
         if telemetry_request is not None or telemetry:
@@ -4085,14 +4113,24 @@ class SSHPowerShellTransport(_SSHCommon):
             "max_log_bytes": max_log_bytes,
             "created_at": created_at,
         }
+        if target_acceptance is not None:
+            spec["acceptance"] = {
+                **target_acceptance,
+                "schema": 1,
+                "start_gate_path": start_gate_path,
+                "started_path": started_path,
+            }
         raw = json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         try:
             status = self._durable_control("launch", input_bytes=raw, timeout=45.0)
-        except TransportError:
+        except TransportError as launch_exc:
             try:
                 status = self.durable_status(run_id, resume_token)
-            except TransportError:
-                raise
+            except TransportError as status_exc:
+                raise TransportError(
+                    f"durable launch failed: {launch_exc}; "
+                    f"status reconciliation failed: {status_exc}"
+                ) from launch_exc
             if not status.get("acknowledged"):
                 raise TransportError("durable launch connection was lost before acknowledgement")
             status = dict(status)

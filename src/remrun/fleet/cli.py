@@ -15,6 +15,7 @@ from pathlib import Path
 from ..config import load_config
 from ..output import Reporter
 from ..state import default_state_root
+from ..target_resources import TargetResourceClient, canonical_json, policy_digest
 from . import adapters, executor, placement, probes
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
@@ -25,7 +26,9 @@ from .prepared import (
 )
 from .storage import StorageError, bind_device_root, enroll_local_root, load_registry
 from .task_contract import resolve_tasks
-from ..transport import make_transport, _posix_cancel_script, _powershell_cancel_script
+from ..transport import (
+    TransportError, _posix_cancel_script, _powershell_cancel_script, make_transport,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -571,12 +574,138 @@ def cmd_command(args, reporter: Reporter) -> int:
     return EXIT_OK if result.batches else EXIT_ERROR
 
 
+def _target_operation_status(
+    queue: FleetQueue, job: dict, *, refresh: bool, config=None,
+) -> tuple[dict | None, bool]:
+    stored = queue.target_operation_for_job(job["job_id"], include_token=refresh)
+    if stored is None:
+        return None, True
+    token = stored.pop("resume_token", None)
+    result = dict(stored)
+    if not refresh:
+        return result, True
+    try:
+        if config is None or stored["device"] not in config.devices:
+            raise TransportError("accepted target is absent from current device configuration")
+        status = make_transport(config.devices[stored["device"]]).durable_status(
+            stored["operation_id"], str(token)
+        )
+        if status.get("operation_id") != stored["operation_id"] \
+                or status.get("request_sha256") != stored["request_sha256"]:
+            raise TransportError("target status identity does not match the queue receipt")
+        result["query_status"] = "ok"
+        result["target_status"] = status
+        return result, True
+    except (OSError, TransportError, ValueError) as exc:
+        try:
+            attempt = json.loads(job.get("last_result") or "null")
+            finalized = attempt.get("target_operation") if isinstance(attempt, dict) else None
+        except (TypeError, json.JSONDecodeError):
+            finalized = None
+        if isinstance(finalized, dict) \
+                and finalized.get("operation_id") == stored["operation_id"] \
+                and finalized.get("request_sha256") == stored["request_sha256"] \
+                and finalized.get("state") == "complete":
+            result["query_status"] = "finalized_from_queue_receipt"
+            result["target_status"] = finalized
+            return result, True
+        result["query_status"] = "unknown"
+        result["query_error"] = str(exc)
+        return result, False
+
+
+def cmd_target_policy(args, reporter: Reporter) -> int:
+    """Inspect or explicitly install one target-local capacity-one resource policy."""
+    config = load_config()
+    device_name = str(args.device)
+    if device_name not in config.devices:
+        raise ValueError(f"unknown device {device_name!r}")
+    client = TargetResourceClient.connect(config, device_name, install=True)
+    current = client.policy_get()
+    if args.target_policy_action == "show":
+        payload = {"schema": 1, "device": device_name, **current}
+    else:
+        keys = sorted(set(args.resource or []))
+        if not keys:
+            raise ValueError("target-policy install requires at least one --resource")
+        installed = current.get("policy")
+        if current.get("status") == "installed" and isinstance(installed, dict):
+            generation = installed.get("generation")
+            digest = installed.get("digest")
+            document = installed.get("document")
+            if isinstance(generation, bool) or not isinstance(generation, int) \
+                    or not isinstance(digest, str) or not isinstance(document, dict):
+                raise ValueError("target returned a malformed installed policy")
+            expected_generation: int | None = generation
+            expected_digest: str | None = digest
+            desired_generation = generation + 1
+        elif current.get("status") == "absent" and installed is None:
+            expected_generation = None
+            expected_digest = None
+            desired_generation = 1
+            document = None
+        else:
+            raise ValueError("target returned an invalid policy status")
+        desired = {
+            "schema": "remrun.target-resource-policy",
+            "version": 1,
+            "generation": desired_generation,
+            "resources": [{"key": key, "capacity": 1} for key in keys],
+        }
+        if document is not None:
+            current_keys = sorted(
+                str(item.get("key")) for item in document.get("resources", [])
+                if isinstance(item, dict)
+            )
+            if current_keys == keys:
+                payload = {
+                    "schema": 1,
+                    "device": device_name,
+                    "status": "installed",
+                    "generation": expected_generation,
+                    "digest": expected_digest,
+                    "idempotent": True,
+                    "resources": keys,
+                }
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    reporter.event("target_policy", **payload)
+                return EXIT_OK
+        desired_digest = policy_digest(desired)
+        rpc_id = (
+            f"target-policy-{device_name}-{desired_generation}-{desired_digest[:20]}"
+        )
+        receipt = client.policy_install(
+            desired,
+            expected_generation=expected_generation,
+            expected_digest=expected_digest,
+            rpc_id=rpc_id,
+        )
+        payload = {
+            "schema": 1,
+            "device": device_name,
+            **receipt,
+            "resources": keys,
+        }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        printable = dict(payload)
+        if isinstance(printable.get("policy"), dict):
+            printable["policy"] = canonical_json(printable["policy"]).decode("utf-8")
+        reporter.event("target_policy", **printable)
+    return EXIT_OK
+
+
 def cmd_status(args, reporter: Reporter) -> int:
     q = FleetQueue(default_state_root() / "fleet" / "fleet.db")
     try:
         submission_id = getattr(args, "submission_id", None)
         request_id = getattr(args, "request_id", None)
         exact_job_ids = list(getattr(args, "job_id", None) or [])
+        refresh_target = bool(getattr(args, "refresh_target", False))
+        config = load_config() if refresh_target else None
         if submission_id is not None or request_id is not None:
             receipt = q.get_submission(
                 submission_id=submission_id, request_id=request_id,
@@ -584,6 +713,14 @@ def cmd_status(args, reporter: Reporter) -> int:
             if receipt is None:
                 raise ValueError("submission identity was not found")
             jobs = q.jobs_for_submission(receipt["submission_id"])
+            target_ok = True
+            for job in jobs:
+                operation, ok = _target_operation_status(
+                    q, job, refresh=refresh_target, config=config,
+                )
+                if operation is not None:
+                    job["target_operation"] = operation
+                target_ok = target_ok and ok
             payload = {"schema": 1, "submission": receipt, "jobs": jobs}
             if args.json:
                 print(json.dumps(payload, indent=2, sort_keys=True))
@@ -599,13 +736,20 @@ def cmd_status(args, reporter: Reporter) -> int:
                         state=job.get("state") or "pruned",
                         device=job.get("assigned_device") or "-",
                     )
-            return EXIT_OK
+            return EXIT_OK if target_ok else EXIT_ERROR
         if exact_job_ids:
             jobs = []
+            target_ok = True
             for job_id in exact_job_ids:
                 row = q.get(job_id)
                 if row is None:
                     raise ValueError(f"job {job_id!r} was not found")
+                operation, ok = _target_operation_status(
+                    q, row, refresh=refresh_target, config=config,
+                )
+                if operation is not None:
+                    row["target_operation"] = operation
+                target_ok = target_ok and ok
                 jobs.append(row)
             if args.json:
                 print(json.dumps({"schema": 1, "jobs": jobs}, indent=2, sort_keys=True))
@@ -615,7 +759,9 @@ def cmd_status(args, reporter: Reporter) -> int:
                         "job", job_id=job["job_id"], task=job["task_name"],
                         state=job["state"], device=job.get("assigned_device") or "-",
                     )
-            return EXIT_OK
+            return EXIT_OK if target_ok else EXIT_ERROR
+        if refresh_target:
+            raise ValueError("--refresh-target requires an exact job or submission identity")
         counts = q.counts()
         recent = q.list()[-getattr(args, "limit", 20):]
         active = q.active_by_device()
@@ -1165,6 +1311,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_scope.add_argument("--request-id",
                               help="look up the submission accepted for this caller request")
     pst.add_argument("--json", action="store_true")
+    pst.add_argument(
+        "--refresh-target", action="store_true",
+        help="for exact jobs/submissions, query the authenticated detached target operation",
+    )
     pd = sub.add_parser("dispatch", help="drain the queue: place + run batched jobs "
                                          "(loops until Ctrl-C; --once for one tick; --drain "
                                          "to run the queue empty then exit)")
@@ -1220,6 +1370,23 @@ def build_parser() -> argparse.ArgumentParser:
     pj.add_argument("--no-progress", dest="no_progress", action="store_true",
                     help="suppress progressive completion output")
     pj.add_argument("--json", action="store_true")
+    ptp = sub.add_parser(
+        "target-policy",
+        help="inspect or explicitly install one target-local resource authority",
+    )
+    target_policy_sub = ptp.add_subparsers(dest="target_policy_action", required=True)
+    ptps = target_policy_sub.add_parser("show", help="show one target's installed policy")
+    ptps.add_argument("--device", required=True)
+    ptps.add_argument("--json", action="store_true")
+    ptpi = target_policy_sub.add_parser(
+        "install", help="install the exact capacity-one resource key set",
+    )
+    ptpi.add_argument("--device", required=True)
+    ptpi.add_argument(
+        "--resource", action="append", required=True,
+        help="opaque target resource key such as pool/gpu (repeatable)",
+    )
+    ptpi.add_argument("--json", action="store_true")
     pm = sub.add_parser("mesh", help="who can ssh into whom: directed reachability matrix "
                                      "across the fleet (read-only, measured not inferred)")
     pm.add_argument("--device", action="append",
@@ -1276,6 +1443,8 @@ def main(argv: list[str]) -> int:
             return cmd_resources(args, reporter)
         if args.fleet_command == "jobs":
             return cmd_jobs(args, reporter)
+        if args.fleet_command == "target-policy":
+            return cmd_target_policy(args, reporter)
         if args.fleet_command == "mesh":
             return cmd_mesh(args, reporter)
         if args.fleet_command == "storage":

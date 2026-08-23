@@ -27,6 +27,7 @@ class RunnerClientError(RuntimeError):
 class RunnerInfo:
     device: str
     installed_path: str
+    state_root: str
     source_sha256: str
     reused: bool
     probe: dict
@@ -35,6 +36,7 @@ class RunnerInfo:
         return {
             "device": self.device,
             "installed_path": self.installed_path,
+            "state_root": self.state_root,
             "source_sha256": self.source_sha256,
             "reused": self.reused,
             "probe": self.probe,
@@ -140,6 +142,7 @@ def ensure_versioned_runner(
     return RunnerInfo(
         device=device_name,
         installed_path=installed_path,
+        state_root=state_root,
         source_sha256=source_sha,
         reused=reused,
         probe=probe,

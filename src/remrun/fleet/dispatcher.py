@@ -556,6 +556,33 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                     return False
                 batch_state = "fetching"
             return True
+        def record_target_reservation(receipt: dict[str, Any], resume_token: str) -> bool:
+            if heartbeat.ownership_lost.is_set():
+                return False
+            recorded = q.record_target_reservation(
+                batch_id,
+                operation_id=str(receipt.get("operation_id") or ""),
+                request_sha256=str(receipt.get("request_sha256") or ""),
+                resume_token=resume_token,
+                expected_state=batch_state,
+                owner_token=owner_token,
+            )
+            if not recorded:
+                heartbeat.ownership_lost.set()
+            return recorded
+        def record_target_acceptance(receipt: dict[str, Any]) -> bool:
+            if heartbeat.ownership_lost.is_set():
+                return False
+            recorded = q.record_target_acceptance(
+                batch_id,
+                operation_id=str(receipt.get("operation_id") or ""),
+                request_sha256=str(receipt.get("request_sha256") or ""),
+                expected_state=batch_state,
+                owner_token=owner_token,
+            )
+            if not recorded:
+                heartbeat.ownership_lost.set()
+            return recorded
         try:
             with BatchHeartbeat(
                 db_path, batch_id, owner_token, batch_state, lease_seconds,
@@ -566,6 +593,8 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                     device, btasks, config, state_root=state_root, job_ids=job_ids,
                     observation_id=batch_id, prelaunch_gate=frozen_launch_gate,
                     before_output_return=output_return_gate,
+                    on_target_reservation=record_target_reservation,
+                    on_target_acceptance=record_target_acceptance,
                 )
             latest_result = res
             attempt_record = executor.durable_attempt_record(head, res)

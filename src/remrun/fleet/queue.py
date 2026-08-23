@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at   TEXT NOT NULL, updated_at TEXT NOT NULL,
     lease_until  TEXT NOT NULL, heartbeat_at TEXT,
     estimated_finish_s REAL,                      -- NULL means duration is honestly unknown
+    target_operation_id TEXT,
+    target_request_sha256 TEXT,
+    target_resume_token TEXT,
+    target_reserved_at TEXT,
+    target_accepted_at TEXT,
     error        TEXT
 );
 -- One row per held resource slot. UNIQUE(device,pool) makes a configured pool a
@@ -255,7 +260,9 @@ class FleetQueue:
                         "last_result"}
         current_batches = {"batch_id", "owner_token", "state", "device", "task_name",
                            "engine", "bucket", "created_at", "updated_at", "lease_until",
-                           "heartbeat_at", "estimated_finish_s", "error"}
+                           "heartbeat_at", "estimated_finish_s", "target_operation_id",
+                           "target_request_sha256", "target_resume_token",
+                           "target_reserved_at", "target_accepted_at", "error"}
         index_row = self.db.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
             "AND name='ux_jobs_active_idem'"
@@ -279,6 +286,15 @@ class FleetQueue:
             if "estimated_finish_s" not in have_batches:
                 self.db.execute(
                     "ALTER TABLE batches ADD COLUMN estimated_finish_s REAL")
+            for column in (
+                "target_operation_id",
+                "target_request_sha256",
+                "target_resume_token",
+                "target_reserved_at",
+                "target_accepted_at",
+            ):
+                if column not in have_batches:
+                    self.db.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
 
             duplicate_rows = self.db.execute(
                 f"SELECT idempotency_key, job_id, state FROM jobs "
@@ -377,12 +393,19 @@ class FleetQueue:
                     lease_until TEXT NOT NULL,
                     heartbeat_at TEXT,
                     estimated_finish_s REAL,
+                    target_operation_id TEXT,
+                    target_request_sha256 TEXT,
+                    target_resume_token TEXT,
+                    target_reserved_at TEXT,
+                    target_accepted_at TEXT,
                     error TEXT
                 )
             """)
             names = (
                 "batch_id,owner_token,state,device,task_name,engine,bucket,created_at,"
-                "updated_at,lease_until,heartbeat_at,estimated_finish_s,error"
+                "updated_at,lease_until,heartbeat_at,estimated_finish_s,"
+                "target_operation_id,target_request_sha256,target_resume_token,"
+                "target_reserved_at,target_accepted_at,error"
             )
             self.db.execute(
                 f"INSERT INTO batches_nullable ({names}) SELECT {names} FROM batches"
@@ -1682,7 +1705,163 @@ class FleetQueue:
 
     def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        result = dict(row)
+        result.pop("target_resume_token", None)
+        return result
+
+    def record_target_reservation(
+        self,
+        batch_id: str,
+        *,
+        operation_id: str,
+        request_sha256: str,
+        resume_token: str,
+        expected_state: str,
+        owner_token: str,
+        now: str | None = None,
+    ) -> bool:
+        """Persist one exact target reservation under the live batch-owner fence.
+
+        The raw resume credential stays private inside the controller-local queue
+        database. Public queue/status receipts use :meth:`target_operation`, which
+        omits it. This happens before launch so a controller crash cannot lose the
+        credential for an operation that the target may subsequently accept. An
+        exact replay is idempotent; a different identity can never replace it.
+        """
+        if not operation_id or not resume_token \
+                or len(request_sha256) != 64 \
+                or any(ch not in "0123456789abcdef" for ch in request_sha256):
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            row = self.db.execute(
+                "SELECT target_operation_id,target_request_sha256,target_resume_token,"
+                "target_reserved_at,target_accepted_at FROM batches "
+                "WHERE batch_id=? AND state=? "
+                "AND owner_token=? AND lease_until>?",
+                (batch_id, expected_state, owner_token, now),
+            ).fetchone()
+            if row is None:
+                return False
+            existing = row["target_operation_id"]
+            if existing is not None:
+                return (
+                    existing == operation_id
+                    and row["target_request_sha256"] == request_sha256
+                    and row["target_resume_token"] == resume_token
+                    and isinstance(row["target_reserved_at"], str)
+                    and bool(row["target_reserved_at"])
+                )
+            if any(
+                row[name] is not None
+                for name in (
+                    "target_request_sha256", "target_resume_token", "target_reserved_at",
+                    "target_accepted_at",
+                )
+            ):
+                return False
+            cur = self.db.execute(
+                "UPDATE batches SET target_operation_id=?,target_request_sha256=?,"
+                "target_resume_token=?,target_reserved_at=?,updated_at=? "
+                "WHERE batch_id=? AND state=? AND owner_token=? AND lease_until>? "
+                "AND target_operation_id IS NULL AND target_request_sha256 IS NULL "
+                "AND target_resume_token IS NULL AND target_reserved_at IS NULL "
+                "AND target_accepted_at IS NULL",
+                (
+                    operation_id, request_sha256, resume_token, now, now,
+                    batch_id, expected_state, owner_token, now,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def record_target_acceptance(
+        self,
+        batch_id: str,
+        *,
+        operation_id: str,
+        request_sha256: str,
+        expected_state: str,
+        owner_token: str,
+        now: str | None = None,
+    ) -> bool:
+        """Mark the exact pre-recorded reservation positively accepted by its target."""
+        now = now or utc_now_iso()
+        with self._immediate():
+            row = self.db.execute(
+                "SELECT target_operation_id,target_request_sha256,target_reserved_at,"
+                "target_accepted_at FROM batches WHERE batch_id=? AND state=? "
+                "AND owner_token=? AND lease_until>?",
+                (batch_id, expected_state, owner_token, now),
+            ).fetchone()
+            if row is None \
+                    or row["target_operation_id"] != operation_id \
+                    or row["target_request_sha256"] != request_sha256 \
+                    or not isinstance(row["target_reserved_at"], str) \
+                    or not row["target_reserved_at"]:
+                return False
+            if row["target_accepted_at"] is not None:
+                return isinstance(row["target_accepted_at"], str) \
+                    and bool(row["target_accepted_at"])
+            cur = self.db.execute(
+                "UPDATE batches SET target_accepted_at=?,updated_at=? "
+                "WHERE batch_id=? AND state=? AND owner_token=? AND lease_until>? "
+                "AND target_operation_id=? AND target_request_sha256=? "
+                "AND target_reserved_at IS NOT NULL AND target_accepted_at IS NULL",
+                (
+                    now, now, batch_id, expected_state, owner_token, now,
+                    operation_id, request_sha256,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def target_operation(
+        self, batch_id: str, *, include_token: bool = False
+    ) -> dict[str, Any] | None:
+        """Return the accepted target identity, redacting its credential by default."""
+        row = self.db.execute(
+            "SELECT device,target_operation_id,target_request_sha256,target_resume_token,"
+            "target_reserved_at,target_accepted_at FROM batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if row is None or row["target_operation_id"] is None:
+            return None
+        required = (
+            row["target_operation_id"], row["target_request_sha256"],
+            row["target_resume_token"], row["target_reserved_at"],
+        )
+        if not all(isinstance(value, str) and value for value in required):
+            raise QueueMigrationError(
+                f"batch {batch_id!r} has a partial target-acceptance receipt"
+            )
+        result = {
+            "schema": 1,
+            "operation_id": row["target_operation_id"],
+            "request_sha256": row["target_request_sha256"],
+            "device": row["device"],
+            "reserved_at": row["target_reserved_at"],
+            "accepted": row["target_accepted_at"] is not None,
+        }
+        if row["target_accepted_at"] is not None:
+            if not isinstance(row["target_accepted_at"], str) or not row["target_accepted_at"]:
+                raise QueueMigrationError(
+                    f"batch {batch_id!r} has a malformed target acceptance time"
+                )
+            result["accepted_at"] = row["target_accepted_at"]
+        if include_token:
+            result["resume_token"] = row["target_resume_token"]
+        return result
+
+    def target_operation_for_job(
+        self, job_id: str, *, include_token: bool = False
+    ) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT batch_id FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if row is None or row["batch_id"] is None:
+            return None
+        return self.target_operation(str(row["batch_id"]), include_token=include_token)
 
     def lease_usage(self, now: str | None = None) -> dict[str, dict[str, int]]:
         """Held resource-pool slots per device: ``{device: {pool: count}}`` for leases still
