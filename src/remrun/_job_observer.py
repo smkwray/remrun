@@ -42,7 +42,12 @@ MAX_MIXED_RECORDS = MAX_ACTIVE_JOBS * 2
 DB_RELATIVE = ("jobs", "active-v1.sqlite3")
 LEGACY_TABLE = "active_jobs"
 OWNED_TABLE = "owned_jobs_v2"
-_WIN_KEEPER_READY_TIMEOUT = 5.0
+# A first execution from a freshly installed content-addressed helper can spend
+# several seconds in Windows application-control/antimalware inspection before
+# Python reaches the readiness write. Keep this bounded below the durable
+# launch acknowledgement timeout, but do not misclassify that cold start as a
+# keeper failure.
+_WIN_KEEPER_READY_TIMEOUT = 15.0
 _WIN_KEEPER_POLL_SECONDS = 1.0
 _WIN_KEEPER_CLEANUP_RETRIES = 50
 _SCHEMA_READY_ATTEMPTS = 25
