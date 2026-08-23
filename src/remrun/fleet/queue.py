@@ -138,6 +138,12 @@ CREATE TABLE IF NOT EXISTS fleet_profile_observations (
     recorded_at          TEXT NOT NULL
 );
 """
+_SCHEMA_OBJECTS = {
+    "jobs", "ix_jobs_state", "ix_jobs_batch", "batches", "resource_leases",
+    "cooldowns", "prepared_specs", "prepared_output_reservations", "submissions",
+    "submission_jobs", "ix_submission_jobs_job", "submission_plans",
+    "fleet_profile_observations",
+}
 
 # Terminal states. ``needs_review`` is a durable ANSWER — the worker examined the
 # work and refused it — not an error to retry: it must never be reopened by a
@@ -149,6 +155,7 @@ _FINAL_Q = ",".join("?" * len(_FINAL))
 _PRUNABLE = ("done", "failed_final")
 _BATCH_ACTIVE = ("leased", "staging", "running", "fetching")
 MAX_ATTEMPTS = 3
+_BUSY_TIMEOUT_MS = 30_000
 
 
 class QueueConfigurationError(RuntimeError):
@@ -204,6 +211,7 @@ class FleetQueue:
         self.sqlite_version = sqlite3.sqlite_version
         self.journal_mode = ""
         try:
+            self.db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             if not _wal_reset_safe(sqlite3.sqlite_version_info):
                 raise QueueConfigurationError(
                     f"SQLite {self.sqlite_version} is vulnerable to the WAL-reset race; "
@@ -216,8 +224,7 @@ class FleetQueue:
                     "fleet queue requires journal_mode=wal; "
                     f"SQLite reported {self.journal_mode or 'no mode'}"
                 )
-            self.db.execute("PRAGMA busy_timeout=5000")
-            self.db.executescript(_SCHEMA)
+            self._ensure_schema()
             self._migrate()
             self._migrate_nullable_batch_estimates()
             self._migrate_prepared_output_reservations()
@@ -225,6 +232,17 @@ class FleetQueue:
         except BaseException:
             self.db.close()
             raise
+
+    def _ensure_schema(self) -> None:
+        """Create missing schema objects without taking a DDL lock on every open."""
+        present = {
+            row["name"]
+            for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+            )
+        }
+        if not _SCHEMA_OBJECTS <= present:
+            self.db.executescript(_SCHEMA)
 
     def _migrate(self) -> None:
         """Upgrade the local queue without inventing or deleting queue history."""

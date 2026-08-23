@@ -140,12 +140,13 @@ def test_request_identity_replays_one_atomic_submission(tmp_path: Path) -> None:
 def test_concurrent_request_retries_produce_one_submission(tmp_path: Path) -> None:
     spec, records = _prepared_pair(tmp_path)
     db_path = tmp_path / "fleet.db"
+    FleetQueue(db_path).close()
     barrier = threading.Barrier(20)
 
     def submit() -> tuple[str, tuple[str, ...]]:
         queue = FleetQueue(db_path)
         try:
-            barrier.wait()
+            barrier.wait(timeout=20)
             receipt = queue.enqueue_submission(
                 records,
                 spec=spec,
