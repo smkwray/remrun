@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS prepared_output_reservations (
 -- stable controller-local identity; request_id is an optional caller-owned
 -- retry key and plan_id identifies an exact saved placement.
 CREATE TABLE IF NOT EXISTS submissions (
-    submission_id TEXT PRIMARY KEY,
+    submission_id TEXT PRIMARY KEY NOT NULL,
     request_id    TEXT UNIQUE,
     plan_id       TEXT UNIQUE,
     fingerprint   TEXT NOT NULL,
@@ -112,7 +112,7 @@ CREATE INDEX IF NOT EXISTS ix_submission_jobs_job ON submission_jobs(job_id);
 -- Saved plans are controller-local immutable prepared records with their
 -- selected devices already frozen into normal PreparedJob identities.
 CREATE TABLE IF NOT EXISTS submission_plans (
-    plan_id                 TEXT PRIMARY KEY,
+    plan_id                 TEXT PRIMARY KEY NOT NULL,
     plan_digest             TEXT NOT NULL,
     plan_json               TEXT NOT NULL,
     created_at              TEXT NOT NULL,
@@ -423,25 +423,42 @@ class FleetQueue:
                         )
 
     def _verify_submission_control_schema(self) -> None:
-        """Fail closed if a pre-existing table cannot enforce submission identity."""
-        expected = {
-            "submissions": {
-                "submission_id", "request_id", "plan_id", "fingerprint", "created_at",
-            },
-            "submission_jobs": {
-                "submission_id", "item_index", "job_id", "prepared_id",
-            },
-            "submission_plans": {
-                "plan_id", "plan_digest", "plan_json", "created_at",
-                "consumed_submission_id",
-            },
+        """Fail closed unless identity tables enforce the exact durable-key contract."""
+        expected_columns = {
+            "submissions": (
+                ("submission_id", "TEXT", 1, None, 1),
+                ("request_id", "TEXT", 0, None, 0),
+                ("plan_id", "TEXT", 0, None, 0),
+                ("fingerprint", "TEXT", 1, None, 0),
+                ("created_at", "TEXT", 1, None, 0),
+            ),
+            "submission_jobs": (
+                ("submission_id", "TEXT", 1, None, 1),
+                ("item_index", "INTEGER", 1, None, 2),
+                ("job_id", "TEXT", 1, None, 0),
+                ("prepared_id", "TEXT", 1, None, 0),
+            ),
+            "submission_plans": (
+                ("plan_id", "TEXT", 1, None, 1),
+                ("plan_digest", "TEXT", 1, None, 0),
+                ("plan_json", "TEXT", 1, None, 0),
+                ("created_at", "TEXT", 1, None, 0),
+                ("consumed_submission_id", "TEXT", 0, None, 0),
+            ),
         }
-        for table, columns in expected.items():
-            actual = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
-            if actual != columns:
+        for table, expected in expected_columns.items():
+            actual = tuple(
+                (
+                    str(row["name"]), str(row["type"]).upper(), int(row["notnull"]),
+                    row["dflt_value"], int(row["pk"]),
+                )
+                for row in self.db.execute(f"PRAGMA table_xinfo({table})")
+                if int(row["hidden"]) == 0
+            )
+            if actual != expected:
                 raise QueueMigrationError(
                     f"{table} schema cannot enforce durable submission identity; "
-                    f"expected {sorted(columns)}, found {sorted(actual)}"
+                    f"expected {expected!r}, found {actual!r}"
                 )
 
         required_unique = {
@@ -450,18 +467,28 @@ class FleetQueue:
             "submission_plans": {("plan_id",)},
         }
         for table, required in required_unique.items():
-            unique_columns = set()
+            unique_columns: set[tuple[str, ...]] = set()
             for index in self.db.execute(f"PRAGMA index_list({table})"):
-                if not int(index["unique"]):
+                if not int(index["unique"]) or int(index["partial"]):
                     continue
                 name = str(index["name"]).replace('"', '""')
-                unique_columns.add(tuple(
-                    row["name"]
-                    for row in self.db.execute(f'PRAGMA index_info("{name}")')
-                ))
+                key_rows = sorted(
+                    (
+                        row for row in self.db.execute(f'PRAGMA index_xinfo("{name}")')
+                        if int(row["key"])
+                    ),
+                    key=lambda row: int(row["seqno"]),
+                )
+                if any(
+                    row["name"] is None or str(row["coll"]).upper() != "BINARY"
+                    or int(row["desc"])
+                    for row in key_rows
+                ):
+                    continue
+                unique_columns.add(tuple(str(row["name"]) for row in key_rows))
             if not required <= unique_columns:
                 raise QueueMigrationError(
-                    f"{table} schema lacks a database uniqueness fence for identity"
+                    f"{table} schema lacks a full binary database uniqueness fence for identity"
                 )
 
     @contextlib.contextmanager
@@ -605,6 +632,14 @@ class FleetQueue:
                     "SELECT * FROM submissions WHERE request_id=?", (request_id,),
                 ).fetchone()
             if existing is not None:
+                if plan_id is not None and existing["plan_id"] != plan_id:
+                    raise ValueError(
+                        "request and plan identities do not name the same submission"
+                    )
+                if request_id is not None and existing["request_id"] != request_id:
+                    raise ValueError(
+                        "request and plan identities do not name the same submission"
+                    )
                 if existing["fingerprint"] != fingerprint:
                     raise ValueError(
                         "request or plan identity already names a different prepared submission"
@@ -698,13 +733,23 @@ class FleetQueue:
 
     def _submission_receipt(self, row: sqlite3.Row, *, replayed: bool) -> dict[str, Any]:
         jobs = self.db.execute(
-            "SELECT item_index,job_id,prepared_id FROM submission_jobs "
-            "WHERE submission_id=? ORDER BY item_index",
+            "SELECT sj.item_index,sj.job_id,sj.prepared_id,"
+            "j.job_id AS live_job_id,j.prepared_id AS live_prepared_id "
+            "FROM submission_jobs sj LEFT JOIN jobs j ON j.job_id=sj.job_id "
+            "WHERE sj.submission_id=? ORDER BY sj.item_index",
             (row["submission_id"],),
         ).fetchall()
         if not jobs or [job["item_index"] for job in jobs] != list(range(len(jobs))):
             raise QueueMigrationError(
                 f"submission {row['submission_id']} has incomplete durable membership"
+            )
+        if any(
+            job["live_job_id"] is not None
+            and job["live_prepared_id"] != job["prepared_id"]
+            for job in jobs
+        ):
+            raise QueueMigrationError(
+                f"submission {row['submission_id']} membership identity disagrees with its job row"
             )
         return {
             "schema": 1,

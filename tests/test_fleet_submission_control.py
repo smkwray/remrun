@@ -265,6 +265,8 @@ def test_submission_membership_corruption_fails_closed(tmp_path: Path) -> None:
             (receipt["submission_id"],),
         )
         with pytest.raises(QueueMigrationError, match="membership identity"):
+            queue.get_submission(submission_id=receipt["submission_id"])
+        with pytest.raises(QueueMigrationError, match="membership identity"):
             queue.jobs_for_submission(receipt["submission_id"])
     finally:
         queue.close()
@@ -527,3 +529,196 @@ def test_lifecycle_schema_and_version_cannot_be_overridden(capsys) -> None:
         "version": 1,
         "event": "dispatch_probe",
     }
+
+
+def test_saved_plan_request_collision_cannot_alias_an_unconsumed_plan(tmp_path: Path) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    pinned = [pin_prepared_job(records[0], "A", spec)]
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec, prepared_records=pinned,
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        direct = queue.enqueue_submission(
+            pinned, spec=spec, request_id="shared-request",
+            current_spec_id=lambda: spec["spec_id"],
+        )
+
+        with pytest.raises(ValueError, match="request and plan identities"):
+            queue.enqueue_saved_plan(
+                plan["plan_id"], request_id="shared-request",
+                current_spec_id=lambda: spec["spec_id"],
+            )
+
+        assert queue.get_submission(plan_id=plan["plan_id"]) is None
+        replay = queue.get_submission(request_id="shared-request")
+        assert replay is not None
+        assert replay["submission_id"] == direct["submission_id"]
+        assert replay["job_ids"] == direct["job_ids"]
+        assert queue.get_submission_plan(plan["plan_id"])["consumed_submission_id"] is None
+    finally:
+        queue.close()
+
+
+def test_submission_identity_primary_keys_are_database_non_null(tmp_path: Path) -> None:
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            queue.db.execute(
+                "INSERT INTO submissions "
+                "(submission_id,request_id,plan_id,fingerprint,created_at) "
+                "VALUES(NULL,NULL,NULL,'fingerprint','now')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            queue.db.execute(
+                "INSERT INTO submission_plans "
+                "(plan_id,plan_digest,plan_json,created_at,consumed_submission_id) "
+                "VALUES(NULL,'digest','{}','now',NULL)"
+            )
+    finally:
+        queue.close()
+
+
+def test_nullable_submission_primary_key_fails_at_queue_open(tmp_path: Path) -> None:
+    db_path = tmp_path / "fleet.db"
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute(
+            "CREATE TABLE submissions ("
+            "submission_id TEXT PRIMARY KEY,request_id TEXT UNIQUE,plan_id TEXT UNIQUE,"
+            "fingerprint TEXT NOT NULL,created_at TEXT NOT NULL)"
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(QueueMigrationError, match="submissions schema"):
+        FleetQueue(db_path)
+
+
+def test_partial_unique_request_index_fails_at_queue_open(tmp_path: Path) -> None:
+    db_path = tmp_path / "fleet.db"
+    db = sqlite3.connect(db_path)
+    try:
+        db.executescript(
+            "CREATE TABLE submissions ("
+            "submission_id TEXT PRIMARY KEY NOT NULL,request_id TEXT,plan_id TEXT UNIQUE,"
+            "fingerprint TEXT NOT NULL,created_at TEXT NOT NULL);"
+            "CREATE UNIQUE INDEX ux_partial_request ON submissions(request_id) "
+            "WHERE request_id LIKE 'guarded:%';"
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(QueueMigrationError, match="full binary.*uniqueness"):
+        FleetQueue(db_path)
+
+
+@pytest.mark.parametrize(
+    "request_index",
+    [
+        "CREATE UNIQUE INDEX ux_expression_request ON submissions(lower(request_id))",
+        "CREATE UNIQUE INDEX ux_nocase_request ON submissions(request_id COLLATE NOCASE)",
+        "CREATE UNIQUE INDEX ux_desc_request ON submissions(request_id DESC)",
+    ],
+)
+def test_nonexact_unique_request_index_fails_at_queue_open(
+    tmp_path: Path, request_index: str,
+) -> None:
+    db_path = tmp_path / "fleet.db"
+    db = sqlite3.connect(db_path)
+    try:
+        db.executescript(
+            "CREATE TABLE submissions ("
+            "submission_id TEXT PRIMARY KEY NOT NULL,request_id TEXT,plan_id TEXT UNIQUE,"
+            "fingerprint TEXT NOT NULL,created_at TEXT NOT NULL);"
+            + request_index
+            + ";"
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(QueueMigrationError, match="full binary.*uniqueness"):
+        FleetQueue(db_path)
+
+
+def test_concurrent_saved_plan_consumers_cannot_change_request_identity(tmp_path: Path) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    db_path = tmp_path / "fleet.db"
+    queue = FleetQueue(db_path)
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec,
+            prepared_records=[pin_prepared_job(records[0], "A", spec)],
+            current_spec_id=lambda: spec["spec_id"],
+        )
+    finally:
+        queue.close()
+    barrier = threading.Barrier(2)
+
+    def consume(request_id: str) -> tuple[str, str]:
+        local = FleetQueue(db_path)
+        try:
+            barrier.wait(timeout=20)
+            try:
+                receipt = local.enqueue_saved_plan(
+                    plan["plan_id"], request_id=request_id,
+                    current_spec_id=lambda: spec["spec_id"],
+                )
+                return "accepted", str(receipt["request_id"])
+            except ValueError as exc:
+                return "rejected", str(exc)
+        finally:
+            local.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(consume, ["request-a", "request-b"]))
+
+    assert sorted(outcome for outcome, _detail in outcomes) == ["accepted", "rejected"]
+    queue = FleetQueue(db_path)
+    try:
+        receipt = queue.get_submission(plan_id=plan["plan_id"])
+        assert receipt is not None
+        assert receipt["request_id"] in {"request-a", "request-b"}
+        assert queue.db.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 1
+    finally:
+        queue.close()
+
+
+def test_scoped_dispatch_rejects_redirected_submission_membership(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    state_root = tmp_path / "state"
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        wanted = queue.enqueue_submission(
+            [records[0]], spec=spec, request_id="wanted-membership",
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        unrelated = queue.enqueue_submission(
+            [records[1]], spec=spec, request_id="unrelated-membership",
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        queue.db.execute(
+            "UPDATE submission_jobs SET job_id=? WHERE submission_id=?",
+            (unrelated["job_ids"][0], wanted["submission_id"]),
+        )
+    finally:
+        queue.close()
+
+    monkeypatch.setattr(cli, "default_state_root", lambda: state_root)
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+
+    def must_not_dispatch(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("corrupt submission membership reached the dispatcher")
+
+    monkeypatch.setattr(dispatcher, "drain_once", must_not_dispatch)
+    args = cli.build_parser().parse_args([
+        "dispatch", "--once", "--submission", wanted["submission_id"],
+    ])
+    with pytest.raises(QueueMigrationError, match="membership identity"):
+        cli.cmd_dispatch(args, Reporter())
