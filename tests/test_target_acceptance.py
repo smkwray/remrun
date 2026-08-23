@@ -80,6 +80,20 @@ def _local_client(tmp_path: Path) -> TargetResourceClient:
     return TargetResourceClient.connect(config, "LOCAL", install=True)
 
 
+def _synthetic_ssh_device(tmp_path: Path) -> Device:
+    windows = os.name == "nt"
+    return Device.from_mapping(
+        "TARGET",
+        {
+            "kind": "ssh-powershell" if windows else "ssh-posix",
+            "os": "windows" if windows else "posix",
+            "project_root": str(tmp_path / "projects"),
+            "state_root": str(tmp_path / "target-state"),
+            "cache_root": str(tmp_path / "cache"),
+        },
+    )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX launch-gate proof")
 def test_observer_holds_user_code_until_exact_start_gate(tmp_path: Path) -> None:
     root = tmp_path / "state"
@@ -746,16 +760,7 @@ def test_live_executor_orders_acceptance_and_respects_target_cleanup_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_state: str,
 ) -> None:
     events: list[str] = []
-    device = Device.from_mapping(
-        "TARGET",
-        {
-            "kind": "ssh-posix",
-            "os": "posix",
-            "project_root": str(tmp_path / "projects"),
-            "state_root": str(tmp_path / "target-state"),
-            "cache_root": str(tmp_path / "cache"),
-        },
-    )
+    device = _synthetic_ssh_device(tmp_path)
     config = RemrunConfig(
         repo_root=tmp_path,
         defaults={"fleet": {"pools": {}}},
@@ -861,16 +866,7 @@ def test_live_executor_orders_acceptance_and_respects_target_cleanup_state(
 def test_lost_launch_response_with_claimed_target_remains_completion_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    device = Device.from_mapping(
-        "TARGET",
-        {
-            "kind": "ssh-posix",
-            "os": "posix",
-            "project_root": str(tmp_path / "projects"),
-            "state_root": str(tmp_path / "target-state"),
-            "cache_root": str(tmp_path / "cache"),
-        },
-    )
+    device = _synthetic_ssh_device(tmp_path)
     config = RemrunConfig(
         repo_root=tmp_path,
         defaults={"fleet": {"pools": {}}},
