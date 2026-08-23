@@ -879,12 +879,14 @@ def test_windows_keeper_creation_is_detached_breakaway_and_inherits_no_handles(
             return 1
 
     monkeypatch.setattr(observer, "_win_kernel32", lambda: FakeKernel32())
+    monkeypatch.setattr(observer.sys, "_base_executable", "C:\\Python314\\python.exe")
     process = observer._win_create_keeper_suspended(
         tmp_path, "abc123", observer._win_job_name("abc123")
     )
 
     assert isinstance(process, observer._WinProcessInformation)
-    assert seen["application"] == sys.executable
+    assert seen["application"] == "C:\\Python314\\python.exe"
+    assert seen["command_line"].startswith("C:\\Python314\\python.exe")
     assert "hold-windows-job" in seen["command_line"]
     assert seen["inherit_handles"] is False
     assert seen["flags"] & observer._WIN_CREATE_SUSPENDED

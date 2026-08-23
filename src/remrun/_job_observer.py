@@ -21,6 +21,7 @@ import argparse
 import base64
 import ctypes
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -42,12 +43,7 @@ MAX_MIXED_RECORDS = MAX_ACTIVE_JOBS * 2
 DB_RELATIVE = ("jobs", "active-v1.sqlite3")
 LEGACY_TABLE = "active_jobs"
 OWNED_TABLE = "owned_jobs_v2"
-# A first execution from a freshly installed content-addressed helper can spend
-# several seconds in Windows application-control/antimalware inspection before
-# Python reaches the readiness write. Keep this bounded below the durable
-# launch acknowledgement timeout, but do not misclassify that cold start as a
-# keeper failure.
-_WIN_KEEPER_READY_TIMEOUT = 15.0
+_WIN_KEEPER_READY_TIMEOUT = 5.0
 _WIN_KEEPER_POLL_SECONDS = 1.0
 _WIN_KEEPER_CLEANUP_RETRIES = 50
 _SCHEMA_READY_ATTEMPTS = 25
@@ -797,9 +793,17 @@ def _win_create_keeper_suspended(
 ) -> _WinProcessInformation:
     """Create the per-job handle keeper without inheriting SSH/command handles."""
     _bounded_text(token, "token", 64)
+    executable = sys.executable
+    base_executable = getattr(sys, "_base_executable", None)
+    if isinstance(base_executable, str) and ntpath.splitdrive(base_executable)[0] \
+            and ntpath.isabs(base_executable):
+        # A Windows venv python.exe is a redirector process. The base Python
+        # child owns the Job handle and writes the readiness receipt, so the
+        # process handle/PID we verify must name that child directly.
+        executable = base_executable
     helper = str(Path(__file__).resolve())
     command = [
-        sys.executable,
+        executable,
         "-S",
         helper,
         "hold-windows-job",
@@ -820,7 +824,7 @@ def _win_create_keeper_suspended(
         | _WIN_CREATE_BREAKAWAY_FROM_JOB
     )
     if not _win_kernel32().CreateProcessW(
-        sys.executable,
+        executable,
         command_line,
         None,
         None,
