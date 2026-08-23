@@ -221,6 +221,11 @@ def test_saved_plan_freezes_priority_for_response_loss_replay(tmp_path: Path) ->
         )
         assert first["job_ids"] == replay["job_ids"]
         assert queue.get(first["job_ids"][0])["priority"] == 7
+        with pytest.raises(ValueError, match="cannot change.*request identity"):
+            queue.enqueue_saved_plan(
+                plan["plan_id"], request_id="late-new-identity",
+                current_spec_id=lambda: None,
+            )
     finally:
         queue.close()
 
@@ -368,6 +373,19 @@ def test_cli_saved_plan_submission_and_exact_lookup(
     assert planned["plan_id"]
     assert planned["prepared_ids"] != [record["prepared_id"] for record in records]
 
+    text_plan_args = cli.build_parser().parse_args([
+        "plan", "arbitrary-unit", "--save", "--priority", "4",
+    ])
+    assert cli.cmd_plan(text_plan_args, Reporter()) == 0
+    text_events = capsys.readouterr().err
+    assert "plan_saved" in text_events
+    assert "priority=4" in text_events
+    inert_priority_args = cli.build_parser().parse_args([
+        "plan", "arbitrary-unit", "--priority", "4",
+    ])
+    with pytest.raises(ValueError, match="requires --save"):
+        cli.cmd_plan(inert_priority_args, Reporter())
+
     submit_args = cli.build_parser().parse_args([
         "submit", "--plan", planned["plan_id"],
         "--request-id", "ui-action-22", "--json",
@@ -385,6 +403,13 @@ def test_cli_saved_plan_submission_and_exact_lookup(
     status = json.loads(capsys.readouterr().out)
     assert status["submission"]["submission_id"] == submitted["submission_id"]
     assert [job["job_id"] for job in status["jobs"]] == submitted["job_ids"]
+
+    changed_request = cli.build_parser().parse_args([
+        "submit", "--plan", planned["plan_id"],
+        "--request-id", "different-action", "--json",
+    ])
+    with pytest.raises(ValueError, match="cannot change.*request identity"):
+        cli.cmd_submit(changed_request, Reporter())
 
 
 def test_scoped_dispatch_passes_only_submission_members(

@@ -239,6 +239,8 @@ def _route_line_multi(task_name: str, preview: dict, queued_total: int) -> str:
 
 
 def cmd_plan(args, reporter: Reporter) -> int:
+    if getattr(args, "priority", 0) and not getattr(args, "save", False):
+        raise ValueError("--priority on fleet plan requires --save")
     config = load_config()
     spec, records, tasks = _prepare_configured(args, config)
     fcfg = fleet_config(config)
@@ -334,6 +336,11 @@ def cmd_plan(args, reporter: Reporter) -> int:
             reporter.event("placement", **fields)
         for device, reason in sorted(result.skipped.items()):
             reporter.event("skipped", device=device, reason=reason)
+        if saved_plan is not None:
+            reporter.event(
+                "plan_saved", plan_id=saved_plan["plan_id"],
+                plan_digest=saved_plan["plan_digest"], priority=saved_plan["priority"],
+            )
     return EXIT_OK if result.batches else EXIT_ERROR
 
 
@@ -387,26 +394,21 @@ def cmd_submit(args, reporter: Reporter) -> int:
         state_root = default_state_root()
         q = FleetQueue(state_root / "fleet" / "fleet.db")
         try:
-            existing = q.get_submission(plan_id=plan_id)
             plan = q.get_submission_plan(plan_id)
-            if existing is None and plan is None:
+            if plan is None:
                 raise ValueError(f"unknown saved plan {plan_id!r}")
-            if existing is not None:
-                receipt = existing
-                task_name = plan["spec"]["task_name"] if plan is not None else "saved-plan"
-            else:
+            task_name = plan["spec"]["task_name"]
+
+            def current_spec_id() -> str | None:
                 config = load_config()
-                task_name = plan["spec"]["task_name"]
+                current = resolve_tasks(load_config(config.repo_root)).get(task_name)
+                return current.get("spec_id") if current else None
 
-                def current_spec_id() -> str | None:
-                    current = resolve_tasks(load_config(config.repo_root)).get(task_name)
-                    return current.get("spec_id") if current else None
-
-                receipt = q.enqueue_saved_plan(
-                    plan_id,
-                    request_id=getattr(args, "request_id", None),
-                    current_spec_id=current_spec_id,
-                )
+            receipt = q.enqueue_saved_plan(
+                plan_id,
+                request_id=getattr(args, "request_id", None),
+                current_spec_id=current_spec_id,
+            )
             queued_total = q.counts().get("queued", 0)
         finally:
             q.close()
