@@ -540,6 +540,41 @@ def _resource_start_certainty(receipt: object) -> bool | None | object:
     return NotImplemented
 
 
+_TARGET_CLEANUP_TERMINAL = {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}
+
+
+def _reconcile_target_cleanup(
+    rdir: Path,
+    spec: dict[str, Any],
+    status: dict[str, Any],
+    token: str,
+) -> dict[str, Any]:
+    """Refresh exact target cleanup whenever durable evidence is not finalizable.
+
+    Terminal durable state does not imply terminal target-resource state.  In
+    particular, the supervisor can fail before it persists its cleanup receipt.
+    Keep the durable directory as the recovery authority until the ledger proves
+    that cleanup reached one of its terminal states.
+    """
+    acceptance = spec.get("acceptance")
+    cleanup = status.get("target_cleanup")
+    if not isinstance(acceptance, dict) or (
+        isinstance(cleanup, dict) and cleanup.get("state") in _TARGET_CLEANUP_TERMINAL
+    ):
+        return status
+    try:
+        reconciled = _resource_transition(acceptance, token, "status", {})
+    except DurableError:
+        return status
+    if reconciled == cleanup:
+        return status
+    refreshed = dict(status)
+    refreshed["target_cleanup"] = reconciled
+    refreshed["updated_at"] = time.time()
+    _atomic_json(rdir / "status.json", refreshed)
+    return refreshed
+
+
 def _supervise(root: Path, run_id: str) -> int:
     rdir = _run_dir(root, run_id)
     try:
@@ -852,19 +887,7 @@ def _status(root: Path, run_id: str, token: str, include_logs: bool) -> dict[str
                 status["target_cleanup"] = cleanup
                 status["updated_at"] = time.time()
                 _atomic_json(rdir / "status.json", status)
-    cleanup = status.get("target_cleanup")
-    if isinstance(acceptance, dict) and isinstance(cleanup, dict) \
-            and cleanup.get("state") in {"CLAIMED", "QUARANTINED"}:
-        try:
-            reconciled = _resource_transition(acceptance, token, "status", {})
-        except DurableError:
-            pass
-        else:
-            if reconciled != cleanup:
-                status = dict(status)
-                status["target_cleanup"] = reconciled
-                status["updated_at"] = time.time()
-                _atomic_json(rdir / "status.json", status)
+    status = _reconcile_target_cleanup(rdir, spec, status, token)
     cleanup = status.get("target_cleanup")
     certainty = _resource_start_certainty(cleanup)
     if certainty is not NotImplemented and status.get("command_started") is not certainty:
@@ -889,15 +912,21 @@ def _status(root: Path, run_id: str, token: str, include_logs: bool) -> dict[str
 
 
 def _cleanup(root: Path, run_id: str, token: str) -> dict[str, Any]:
+    rdir = _run_dir(root, run_id)
+    if not rdir.exists():
+        # Recovery may prove that a target reservation never crossed the launch
+        # gate, then check cleanup in the required stage-before-durable order.
+        # Absence is already the desired postcondition and makes that check
+        # safely idempotent across controller crashes.
+        return {"schema": SCHEMA, "run_id": run_id, "cleaned": False, "absent": True}
     rdir, spec, status = _load_authenticated(root, run_id, token)
     if status.get("state") not in {"complete", "failed"}:
         raise DurableError("cannot clean an unresolved durable run")
     if spec.get("acceptance") is not None:
+        status = _reconcile_target_cleanup(rdir, spec, status, token)
         target_cleanup = status.get("target_cleanup")
         if not isinstance(target_cleanup, dict) \
-                or target_cleanup.get("state") not in {
-                    "RELEASED", "CANCELLED", "EXPIRED", "REBOOTED",
-                }:
+                or target_cleanup.get("state") not in _TARGET_CLEANUP_TERMINAL:
             raise DurableError(
                 "cannot clean durable target evidence before target cleanup is terminal"
             )

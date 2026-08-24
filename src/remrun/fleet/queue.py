@@ -53,11 +53,17 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at   TEXT NOT NULL, updated_at TEXT NOT NULL,
     lease_until  TEXT NOT NULL, heartbeat_at TEXT,
     estimated_finish_s REAL,                      -- NULL means duration is honestly unknown
+    target_protocol_version INTEGER,
     target_operation_id TEXT,
     target_request_sha256 TEXT,
     target_resume_token TEXT,
     target_reserved_at TEXT,
     target_accepted_at TEXT,
+    target_cleanup_state TEXT,
+    target_cleanup_at TEXT,
+    target_stage_cleaned_at TEXT,
+    target_durable_cleaned_at TEXT,
+    target_finalized_at TEXT,
     error        TEXT
 );
 -- One row per held resource slot. UNIQUE(device,pool) makes a configured pool a
@@ -260,9 +266,13 @@ class FleetQueue:
                         "last_result"}
         current_batches = {"batch_id", "owner_token", "state", "device", "task_name",
                            "engine", "bucket", "created_at", "updated_at", "lease_until",
-                           "heartbeat_at", "estimated_finish_s", "target_operation_id",
+                           "heartbeat_at", "estimated_finish_s", "target_protocol_version",
+                           "target_operation_id",
                            "target_request_sha256", "target_resume_token",
-                           "target_reserved_at", "target_accepted_at", "error"}
+                           "target_reserved_at", "target_accepted_at",
+                           "target_cleanup_state", "target_cleanup_at",
+                           "target_stage_cleaned_at", "target_durable_cleaned_at",
+                           "target_finalized_at", "error"}
         index_row = self.db.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
             "AND name='ux_jobs_active_idem'"
@@ -286,12 +296,21 @@ class FleetQueue:
             if "estimated_finish_s" not in have_batches:
                 self.db.execute(
                     "ALTER TABLE batches ADD COLUMN estimated_finish_s REAL")
+            if "target_protocol_version" not in have_batches:
+                self.db.execute(
+                    "ALTER TABLE batches ADD COLUMN target_protocol_version INTEGER"
+                )
             for column in (
                 "target_operation_id",
                 "target_request_sha256",
                 "target_resume_token",
                 "target_reserved_at",
                 "target_accepted_at",
+                "target_cleanup_state",
+                "target_cleanup_at",
+                "target_stage_cleaned_at",
+                "target_durable_cleaned_at",
+                "target_finalized_at",
             ):
                 if column not in have_batches:
                     self.db.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
@@ -393,19 +412,28 @@ class FleetQueue:
                     lease_until TEXT NOT NULL,
                     heartbeat_at TEXT,
                     estimated_finish_s REAL,
+                    target_protocol_version INTEGER,
                     target_operation_id TEXT,
                     target_request_sha256 TEXT,
                     target_resume_token TEXT,
                     target_reserved_at TEXT,
                     target_accepted_at TEXT,
+                    target_cleanup_state TEXT,
+                    target_cleanup_at TEXT,
+                    target_stage_cleaned_at TEXT,
+                    target_durable_cleaned_at TEXT,
+                    target_finalized_at TEXT,
                     error TEXT
                 )
             """)
             names = (
                 "batch_id,owner_token,state,device,task_name,engine,bucket,created_at,"
                 "updated_at,lease_until,heartbeat_at,estimated_finish_s,"
+                "target_protocol_version,"
                 "target_operation_id,target_request_sha256,target_resume_token,"
-                "target_reserved_at,target_accepted_at,error"
+                "target_reserved_at,target_accepted_at,target_cleanup_state,"
+                "target_cleanup_at,target_stage_cleaned_at,target_durable_cleaned_at,"
+                "target_finalized_at,error"
             )
             self.db.execute(
                 f"INSERT INTO batches_nullable ({names}) SELECT {names} FROM batches"
@@ -1110,6 +1138,7 @@ class FleetQueue:
     def claim_many(self, job_ids: list[str], device: str, *, batch_id: str,
                    lease_until: str, pool: str | None = "gpu", task_name: str = "",
                    engine: str = "", bucket: str = "", estimated_finish_s: float | None = 0.0,
+                   target_protocol_version: int | None = None,
                    now: str | None = None,
                    current_spec_ids: dict[str, str | None] |
                    Callable[[], dict[str, str | None]] | None = None,
@@ -1210,11 +1239,12 @@ class FleetQueue:
                         return None
                 self.db.execute(
                     "INSERT INTO batches (batch_id,owner_token,state,device,task_name,engine,bucket,"
-                    "created_at,updated_at,lease_until,heartbeat_at,estimated_finish_s) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "created_at,updated_at,lease_until,heartbeat_at,estimated_finish_s,"
+                    "target_protocol_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (batch_id, owner_token, "leased", device, task_name, engine, bucket, now, now,
                      lease_until, now,
-                     None if estimated_finish_s is None else float(estimated_finish_s)))
+                     None if estimated_finish_s is None else float(estimated_finish_s),
+                     target_protocol_version))
                 if pool:
                     self.db.execute(
                         "INSERT INTO resource_leases (device,pool,batch_id,lease_until) "
@@ -1261,11 +1291,10 @@ class FleetQueue:
                                         now: str | None = None) -> bool:
         """Persist a sanitized result after this owner revoked a prelaunch batch.
 
-        The target admission/release receipt does not exist until the executor's
-        launch gate returns, while :meth:`revoke_prelaunch_batch` must fence the
-        batch inside that gate.  The failed batch retains its owner token, so the
-        same fenced owner can attach the completed receipt afterwards without
-        reviving the batch or changing the terminal ``needs_review`` disposition.
+        Remote reservation and cleanup proof are finalized while the batch is
+        still owner-fenced; the same owner then revokes the batch and attaches
+        the completed receipt without reviving it or changing the terminal
+        ``needs_review`` disposition.
         """
         now = now or utc_now_iso()
         with self._immediate():
@@ -1643,12 +1672,14 @@ class FleetQueue:
         self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
 
     def _expire_batch(self, batch_id: str, *, now: str,
-                      max_attempts: int = MAX_ATTEMPTS) -> bool:
+                      max_attempts: int = MAX_ATTEMPTS,
+                      replay_safe: bool | None = None) -> bool:
         """Recovery-only transition authorized solely by an expired lease."""
         error = "lease expired (stale recovery)"
         with self._immediate():
             row = self.db.execute(
-                "SELECT state FROM batches WHERE batch_id=? AND lease_until<?",
+                "SELECT state,target_protocol_version,target_operation_id FROM batches "
+                "WHERE batch_id=? AND lease_until<?",
                 (batch_id, now),
             ).fetchone()
             if row is None or row["state"] not in _BATCH_ACTIVE:
@@ -1661,7 +1692,17 @@ class FleetQueue:
             )
             if not cur.rowcount:
                 return False
-            if state in {"leased", "staging"}:
+            if replay_safe is True:
+                self._finish_batch_failure(batch_id, error, now, max_attempts)
+            elif replay_safe is False:
+                self.db.execute(
+                    "UPDATE jobs SET state='completion_unknown',leased_until=NULL,"
+                    "last_error=?,updated_at=? WHERE batch_id=? "
+                    f"AND state NOT IN ({_FINAL_Q})",
+                    ("completion unknown after lease expiry", now, batch_id, *_FINAL),
+                )
+                self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
+            elif state in {"leased", "staging"}:
                 # Launch was never authorized, so bounded retry is safe.
                 self._finish_batch_failure(batch_id, error, now, max_attempts)
             elif self._batch_replay_policy(batch_id) == "idempotent-v1":
@@ -1678,6 +1719,20 @@ class FleetQueue:
                 )
                 self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
             return True
+
+    def expire_stale_batch(
+        self, batch_id: str, *, now: str, replay_safe: bool,
+        max_attempts: int = MAX_ATTEMPTS,
+    ) -> bool:
+        """Apply a separately-authorized expired-lease transition.
+
+        Target-aware callers must first reconcile target truth and remote stage
+        cleanup, then state explicitly whether replay is proven safe.  The queue
+        never infers remote facts and never performs remote I/O itself.
+        """
+        return self._expire_batch(
+            batch_id, now=now, max_attempts=max_attempts, replay_safe=replay_safe,
+        )
 
     def _batch_replay_policy(self, batch_id: str) -> str:
         """Frozen replay policy for a compatible batch; commands are at-most-once."""
@@ -1816,13 +1871,99 @@ class FleetQueue:
             )
             return cur.rowcount == 1
 
+    def record_target_finalization(
+        self,
+        batch_id: str,
+        *,
+        operation_id: str,
+        request_sha256: str,
+        cleanup_state: str,
+        stage_cleaned: bool,
+        durable_cleaned: bool,
+        expected_state: str,
+        owner_token: str,
+        now: str | None = None,
+    ) -> bool:
+        """Persist monotonic target cleanup proof under the live owner fence."""
+        terminal = {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}
+        if cleanup_state not in terminal or not stage_cleaned or not durable_cleaned:
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            row = self.db.execute(
+                "SELECT target_operation_id,target_request_sha256,target_cleanup_state,"
+                "target_cleanup_at,target_stage_cleaned_at,target_durable_cleaned_at,"
+                "target_finalized_at FROM batches WHERE batch_id=? AND state=? "
+                "AND owner_token=? AND lease_until>?",
+                (batch_id, expected_state, owner_token, now),
+            ).fetchone()
+            if row is None \
+                    or row["target_operation_id"] != operation_id \
+                    or row["target_request_sha256"] != request_sha256:
+                return False
+            existing_state = row["target_cleanup_state"]
+            if existing_state is not None and existing_state != cleanup_state:
+                return False
+            if row["target_finalized_at"] is not None:
+                return all(
+                    isinstance(row[name], str) and bool(row[name])
+                    for name in (
+                        "target_cleanup_at", "target_stage_cleaned_at",
+                        "target_durable_cleaned_at", "target_finalized_at",
+                    )
+                )
+            cur = self.db.execute(
+                "UPDATE batches SET target_cleanup_state=?,target_cleanup_at=?,"
+                "target_stage_cleaned_at=?,target_durable_cleaned_at=?,"
+                "target_finalized_at=?,updated_at=? WHERE batch_id=? AND state=? "
+                "AND owner_token=? AND lease_until>? AND target_operation_id=? "
+                "AND target_request_sha256=? AND target_finalized_at IS NULL",
+                (
+                    cleanup_state, now, now, now, now, now,
+                    batch_id, expected_state, owner_token, now,
+                    operation_id, request_sha256,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def record_expired_target_finalization(
+        self,
+        batch_id: str,
+        *,
+        operation_id: str,
+        request_sha256: str,
+        cleanup_state: str,
+        now: str,
+    ) -> bool:
+        """Persist complete cleanup proof under the expired-lease recovery fence."""
+        if cleanup_state not in {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}:
+            return False
+        with self._immediate():
+            cur = self.db.execute(
+                "UPDATE batches SET target_cleanup_state=?,target_cleanup_at="
+                "COALESCE(target_cleanup_at,?),target_stage_cleaned_at="
+                "COALESCE(target_stage_cleaned_at,?),target_durable_cleaned_at="
+                "COALESCE(target_durable_cleaned_at,?),target_finalized_at="
+                "COALESCE(target_finalized_at,?),updated_at=? WHERE batch_id=? "
+                "AND target_protocol_version=1 AND lease_until<? "
+                "AND target_operation_id=? AND target_request_sha256=? "
+                "AND (target_cleanup_state IS NULL OR target_cleanup_state=?)",
+                (
+                    cleanup_state, now, now, now, now, now, batch_id, now,
+                    operation_id, request_sha256, cleanup_state,
+                ),
+            )
+            return cur.rowcount == 1
+
     def target_operation(
         self, batch_id: str, *, include_token: bool = False
     ) -> dict[str, Any] | None:
         """Return the accepted target identity, redacting its credential by default."""
         row = self.db.execute(
             "SELECT device,target_operation_id,target_request_sha256,target_resume_token,"
-            "target_reserved_at,target_accepted_at FROM batches WHERE batch_id=?",
+            "target_reserved_at,target_accepted_at,target_cleanup_state,"
+            "target_cleanup_at,target_stage_cleaned_at,target_durable_cleaned_at,"
+            "target_finalized_at FROM batches WHERE batch_id=?",
             (batch_id,),
         ).fetchone()
         if row is None or row["target_operation_id"] is None:
@@ -1842,6 +1983,10 @@ class FleetQueue:
             "device": row["device"],
             "reserved_at": row["target_reserved_at"],
             "accepted": row["target_accepted_at"] is not None,
+            "cleanup_state": row["target_cleanup_state"],
+            "stage_cleaned": row["target_stage_cleaned_at"] is not None,
+            "durable_cleaned": row["target_durable_cleaned_at"] is not None,
+            "finalized": row["target_finalized_at"] is not None,
         }
         if row["target_accepted_at"] is not None:
             if not isinstance(row["target_accepted_at"], str) or not row["target_accepted_at"]:
@@ -1897,9 +2042,12 @@ class FleetQueue:
         self, now: str | None = None,
         job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> int:
-        """Fail any batch whose lease expired (controller/worker died mid-flight) — which
-        requeues its jobs and frees the device — plus orphan leases and singly-claimed
-        stale jobs. Returns the number of stale batches recovered."""
+        """Recover expired legacy batches without inventing target-side facts.
+
+        Protocol-v1 target batches are intentionally left for the dispatcher's
+        target-aware recovery coordinator, which can inspect and clean the exact
+        device stage before authorizing replay.
+        """
         now = now or utc_now_iso()
         if job_ids is not None and not job_ids:
             return 0
@@ -1914,7 +2062,7 @@ class FleetQueue:
             values.extend(ordered_ids)
         stale = self.db.execute(
             "SELECT batch_id FROM batches WHERE state NOT IN ('done','failed') "
-            "AND lease_until<?" + scope,
+            "AND lease_until<? AND target_protocol_version IS NULL" + scope,
             tuple(values),
         ).fetchall()
         recovered = 0
@@ -1923,6 +2071,35 @@ class FleetQueue:
         if job_ids is None:
             self.db.execute("DELETE FROM resource_leases WHERE lease_until<?", (now,))
         return recovered
+
+    def stale_target_batches(
+        self, now: str | None = None,
+        job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return expired protocol-v1 batches for target-aware reconciliation.
+
+        The private resume token is exposed only to this controller-internal
+        recovery surface.  Public status receipts remain redacted.
+        """
+        now = now or utc_now_iso()
+        if job_ids is not None and not job_ids:
+            return []
+        values: list[str] = [now]
+        scope = ""
+        if job_ids is not None:
+            ordered_ids = sorted(set(job_ids))
+            scope = (
+                " AND batch_id IN (SELECT DISTINCT batch_id FROM jobs WHERE job_id IN ("
+                + ",".join("?" * len(ordered_ids)) + ") AND batch_id IS NOT NULL)"
+            )
+            values.extend(ordered_ids)
+        rows = self.db.execute(
+            "SELECT batch_id,state,device,target_operation_id,target_request_sha256,"
+            "target_resume_token FROM batches WHERE state NOT IN ('done','failed') "
+            "AND lease_until<? AND target_protocol_version=1" + scope,
+            tuple(values),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     # --- cooldowns (Phase 3d failure backoff) -----------------------------
     def set_cooldown(self, device: str, until: str, *, engine: str = "", kind: str = "",
@@ -1965,23 +2142,51 @@ class FleetQueue:
         drops done/failed_final history. Returns counts of what was removed. Does NOT touch any
         worker already running on a device — kill that separately if needed."""
         with self._immediate():
+            protected = self.db.execute(
+                "SELECT COUNT(*) c FROM batches WHERE target_operation_id IS NOT NULL "
+                "AND target_finalized_at IS NULL"
+            ).fetchone()["c"]
+            removable = (
+                "(batch_id IS NULL OR batch_id NOT IN ("
+                "SELECT batch_id FROM batches WHERE target_operation_id IS NOT NULL "
+                "AND target_finalized_at IS NULL))"
+            )
             if include_final:
-                jobs = self.db.execute("DELETE FROM jobs").rowcount
-                self.db.execute("DELETE FROM batches")
+                jobs = self.db.execute(f"DELETE FROM jobs WHERE {removable}").rowcount
+                self.db.execute(
+                    "DELETE FROM batches WHERE target_operation_id IS NULL "
+                    "OR target_finalized_at IS NOT NULL"
+                )
             else:
                 jobs = self.db.execute(
-                    f"DELETE FROM jobs WHERE state NOT IN ({_FINAL_Q})", _FINAL).rowcount
-                self.db.execute("DELETE FROM batches WHERE state NOT IN ('done','failed')")
-            leases = self.db.execute("DELETE FROM resource_leases").rowcount
+                    f"DELETE FROM jobs WHERE state NOT IN ({_FINAL_Q}) AND {removable}",
+                    _FINAL,
+                ).rowcount
+                self.db.execute(
+                    "DELETE FROM batches WHERE state NOT IN ('done','failed') "
+                    "AND (target_operation_id IS NULL OR target_finalized_at IS NOT NULL)"
+                )
+            leases = self.db.execute(
+                "DELETE FROM resource_leases WHERE batch_id NOT IN ("
+                "SELECT batch_id FROM batches WHERE target_operation_id IS NOT NULL "
+                "AND target_finalized_at IS NULL)"
+            ).rowcount
             cooldowns = self.db.execute("DELETE FROM cooldowns").rowcount
-        return {"jobs": jobs, "leases": leases, "cooldowns": cooldowns}
+        return {
+            "jobs": jobs,
+            "leases": leases,
+            "cooldowns": cooldowns,
+            "protected_unfinalized": int(protected),
+        }
 
     def prune_final(self, keep: int = 500) -> int:
         """Bound the table: drop all but the most-recent ``keep`` final (done/failed_final)
         jobs, and any batch with no remaining jobs. Returns rows deleted."""
         rows = self.db.execute(
-            f"SELECT job_id FROM jobs WHERE state IN "
-            f"({','.join('?' * len(_PRUNABLE))}) ORDER BY updated_at DESC",
+            f"SELECT j.job_id FROM jobs j LEFT JOIN batches b ON b.batch_id=j.batch_id "
+            f"WHERE j.state IN ({','.join('?' * len(_PRUNABLE))}) "
+            "AND (j.batch_id IS NULL OR b.target_operation_id IS NULL "
+            "OR b.target_finalized_at IS NOT NULL) ORDER BY j.updated_at DESC",
             _PRUNABLE).fetchall()
         victims = [r["job_id"] for r in rows[keep:]]
         with self._immediate():
@@ -1991,7 +2196,8 @@ class FleetQueue:
             self.db.execute(
                 "DELETE FROM batches WHERE state IN ('done','failed') "
                 "AND batch_id NOT IN (SELECT DISTINCT batch_id FROM jobs WHERE batch_id IS NOT NULL) "
-                "AND batch_id NOT IN (SELECT batch_id FROM resource_leases)")
+                "AND batch_id NOT IN (SELECT batch_id FROM resource_leases) "
+                "AND (target_operation_id IS NULL OR target_finalized_at IS NOT NULL)")
         return len(victims)
 
 

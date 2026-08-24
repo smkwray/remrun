@@ -77,6 +77,16 @@ def test_ssh_opts_expand_controller_home():
     assert "~/.ssh/id_mesh" not in argv
 
 
+def test_remove_remote_tree_requires_verified_absence(monkeypatch):
+    t = SSHPosixTransport(device())
+    t._address = "h"
+    rec = Recorder(lambda argv, inp: cp(3, stderr=b"still present"))
+    monkeypatch.setattr(t, "_run", rec)
+    with pytest.raises(TransportError, match="remote tree deletion failed"):
+        t.remove_remote_tree("/tmp/stage")
+    assert "rm -rf /tmp/stage && test ! -e /tmp/stage" in rec.scripts[-1]
+
+
 def test_kill_workers_pkills_workers_and_releases_lock(monkeypatch):
     # `fleet cancel` -> run this device's configured best-effort kill/lock cleanup.
     t = SSHPosixTransport(device())

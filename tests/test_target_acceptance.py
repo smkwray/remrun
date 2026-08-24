@@ -514,9 +514,32 @@ def test_queue_persists_private_target_credential_and_public_acceptance_receipt(
             "reserved_at": "2099-01-01T00:00:02Z",
             "accepted": True,
             "accepted_at": "2099-01-01T00:00:03Z",
+            "cleanup_state": None,
+            "stage_cleaned": False,
+            "durable_cleaned": False,
+            "finalized": False,
         }
         assert private == {**public, "resume_token": "private-target-token"}
         assert "private-target-token" not in json.dumps(queue.get_batch("batch-a"))
+
+        assert queue.record_target_finalization(
+            "batch-a",
+            operation_id="fleet-batch-a",
+            request_sha256="a" * 64,
+            cleanup_state="RELEASED",
+            stage_cleaned=True,
+            durable_cleaned=True,
+            expected_state="running",
+            owner_token=owner,
+            now="2099-01-01T00:00:04Z",
+        )
+        finalized = queue.target_operation("batch-a")
+        assert finalized is not None
+        assert finalized["cleanup_state"] == "RELEASED"
+        assert finalized["stage_cleaned"] is True
+        assert finalized["durable_cleaned"] is True
+        assert finalized["finalized"] is True
+        private = {**finalized, "resume_token": "private-target-token"}
 
         assert not queue.record_target_reservation(
             "batch-a",
@@ -844,18 +867,26 @@ def test_live_executor_orders_acceptance_and_respects_target_cleanup_state(
         events.append("accepted")
         return True
 
+    def record_finalization(receipt):  # noqa: ANN001
+        assert receipt["cleanup_state"] == "RELEASED"
+        assert receipt["stage_cleaned"] is True
+        assert receipt["durable_cleaned"] is True
+        events.append("finalized")
+        return True
+
     result = fleet_executor.run_batch(
         "TARGET", [task], config,
         state_root=tmp_path / "controller-state",
         observation_id="batch-a",
         on_target_reservation=record_reservation,
         on_target_acceptance=record_acceptance,
+        on_target_finalization=record_finalization,
     )
     assert result["ok"] is True
     assert result["stdout_tail"] == "ok\n"
     operation_root = tmp_path / "target-state" / "fleet-operations" / "fleet-batch-a"
     if cleanup_state == "RELEASED":
-        assert events == ["reserved", "launched", "accepted", "cleaned"]
+        assert events == ["reserved", "launched", "accepted", "cleaned", "finalized"]
         assert not operation_root.exists()
     else:
         assert events == ["reserved", "launched", "accepted"]
@@ -934,6 +965,7 @@ def test_lost_launch_response_with_claimed_target_remains_completion_unknown(
     assert result["command_started"] is None
     assert result["cleanup_deferred"] is True
     assert Path(result["stage_dir"]).exists()
-    assert result["target_operation"]["accepted"] is True
+    assert result["target_operation"]["accepted"] is False
     assert result["target_operation"]["cleanup"]["state"] == "CLAIMED"
-    assert accepted == [result["target_operation"]]
+    assert result["target_acceptance_unknown"] is True
+    assert accepted == []

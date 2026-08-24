@@ -1869,7 +1869,12 @@ class LocalSimTransport(BaseTransport):
         return str(d)
 
     def remove_remote_tree(self, remote_path: str) -> None:
-        shutil.rmtree(remote_path, ignore_errors=True)
+        try:
+            shutil.rmtree(remote_path)
+        except FileNotFoundError:
+            return
+        if Path(remote_path).exists():
+            raise TransportError(f"remote tree deletion did not remove {remote_path}")
 
 
 def _cancel_list(cancel: dict, key: str) -> list[str]:
@@ -3603,7 +3608,13 @@ class SSHPosixTransport(_SSHCommon):
 
     def remove_remote_tree(self, remote_path: str) -> None:
         address = self._address_or_resolve()
-        self._remote(address, f"rm -rf {shlex.quote(self._expand_remote(remote_path))}")
+        path = self._expand_remote(remote_path)
+        quoted = shlex.quote(path)
+        proc = self._remote(address, f"rm -rf {quoted} && test ! -e {quoted}")
+        if proc.returncode != 0:
+            raise TransportError(
+                f"remote tree deletion failed: {proc.stderr.decode('utf-8', 'replace')}"
+            )
 
     def manifest(self, remote_root, exclude_patterns, hash_below_bytes=0) -> Manifest:  # noqa: ANN001
         address = self._address_or_resolve()
@@ -4623,8 +4634,16 @@ class SSHPowerShellTransport(_SSHCommon):
     def remove_remote_tree(self, remote_path: str) -> None:
         address = self._address_or_resolve()
         p = self._expand_remote(remote_path)
-        self._ps_remote(address, f"Remove-Item -LiteralPath {_ps_squote(p)} -Recurse "
-                                 "-Force -ErrorAction SilentlyContinue")
+        quoted = _ps_squote(p)
+        proc = self._ps_remote(
+            address,
+            f"Remove-Item -LiteralPath {quoted} -Recurse -Force -ErrorAction SilentlyContinue; "
+            f"if (Test-Path -LiteralPath {quoted}) {{ exit 3 }}",
+        )
+        if proc.returncode != 0:
+            raise TransportError(
+                f"remote tree deletion failed: {proc.stderr.decode('utf-8', 'replace')}"
+            )
 
     def manifest(self, remote_root, exclude_patterns, hash_below_bytes=0) -> Manifest:  # noqa: ANN001
         address = self._address_or_resolve()

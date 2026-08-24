@@ -101,6 +101,17 @@ def test_ps_encode_roundtrip():
     assert base64.b64decode(_ps_encode("Write-Output 1")).decode("utf-16-le") == "Write-Output 1"
 
 
+def test_remove_remote_tree_requires_verified_absence(monkeypatch):
+    t = SSHPowerShellTransport(device())
+    t._address = "h"
+    rec = Recorder(lambda argv, inp: cp(3, stderr=b"still present"))
+    monkeypatch.setattr(t, "_run", rec)
+    with pytest.raises(TransportError, match="remote tree deletion failed"):
+        t.remove_remote_tree(r"D:\remrun\stage")
+    script = decoded(rec.commands[-1])
+    assert "Test-Path -LiteralPath 'D:\\remrun\\stage'" in script
+
+
 def test_extract_windows_exit_marker_requires_terminated_record():
     marker = "__REMRUN_EXIT_test__"
     for stderr in (

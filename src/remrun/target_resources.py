@@ -286,6 +286,23 @@ class TargetResourceClient:
         response["receipt"] = _receipt(response.get("receipt"))
         return response
 
+    def status_identity(
+        self, allocation_id: str, token: str, *, rpc_id: str | None = None
+    ) -> dict[str, Any]:
+        """Read an exact persisted allocation without reconstructing a receipt.
+
+        Stale-controller recovery durably retains only the allocation identity
+        and its private token.  The target returns the fenced receipt needed for
+        any subsequent transition.
+        """
+        response = self._rpc(
+            "target_resource_status",
+            {"allocation_id": allocation_id, "token": token},
+            rpc_id=rpc_id,
+        )
+        response["receipt"] = _receipt(response.get("receipt"))
+        return response
+
     def owner_run(
         self,
         reservation: TargetReservation,

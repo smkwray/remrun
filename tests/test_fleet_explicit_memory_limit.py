@@ -396,7 +396,7 @@ def test_definition_drift_releases_reserved_only_ledger_entry(
     assert "must-never-persist" not in json.dumps(result["memory_limit"], sort_keys=True)
 
 
-def test_owner_loss_before_target_launch_releases_memory_and_target_reservations(
+def test_owner_loss_before_target_staging_cancels_target_before_memory_reservation(
         tmp_path: Path, monkeypatch) -> None:
     _record, task = _raw_task(8192)
     transport = GuardedTransport(tmp_path)
@@ -443,9 +443,9 @@ def test_owner_loss_before_target_launch_releases_memory_and_target_reservations
     assert result["ownership_lost"] is True
     assert result["command_started"] is False
     assert target_client.cancelled is True
-    assert len(transport.release_calls) == 1
-    assert transport.release_calls[0][1] is True
-    assert result["memory_limit"]["release"]["lease_released"] is True
+    assert transport.reserve_calls == []
+    assert transport.release_calls == []
+    assert "release" not in result["memory_limit"]
 
 
 def test_leased_definition_drift_persists_sanitized_release_receipt(

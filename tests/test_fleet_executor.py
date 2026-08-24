@@ -401,6 +401,9 @@ def test_stage_setup_failure_removes_remote_root_without_controller_snapshot(
         def native_join(self, *parts: str) -> str:
             return str(Path(*parts))
 
+        def expand_remote(self, path: str) -> str:
+            return path
+
         def ensure_remote_dir(self, _path: str) -> None:
             raise TransportError("synthetic stage failure")
 

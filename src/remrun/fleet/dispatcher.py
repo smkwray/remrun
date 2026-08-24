@@ -30,13 +30,14 @@ from ..config import RemrunConfig, global_excludes, load_config
 from ..output import Reporter
 from ..job_observation import JobObservation, active_job_observation_enabled
 from ..state import default_state_root, utc_now_iso
+from ..target_resources import TargetReservation, TargetResourceClient, TargetResourceError
 from . import adapters, executor, placement, probes, profiles
 from .config import fleet_config, idle_grace_s as configured_idle_grace_s, load_costs, safety_fraction
 from .models import DrainResultV1, FleetTask
 from .queue import BatchHeartbeat, FleetQueue
 from .prepared import RAW_COMMAND_SPEC_ID, as_fleet_task, prepared_memory_limit_mib
 from .task_contract import resolve_tasks
-from ..transport import make_transport
+from ..transport import TransportError, make_transport
 
 
 def _row_to_task(row: dict[str, Any], q: FleetQueue | None = None) -> FleetTask:
@@ -521,8 +522,9 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
         # must fail the batch (releasing its lease), not leak it.
         verify: dict[str, Any] = {"status": "skip", "detail": "run_batch did not succeed"}
         pre_output = _remote_output_mtimes(config, device, head)   # baseline the root BEFORE the run (2b)
+        definition_drift_reason: str | None = None
         def frozen_launch_gate() -> bool:
-            nonlocal batch_state
+            nonlocal batch_state, definition_drift_reason
             if not head.prepared or head.prepared["kind"] == "command":
                 current = head.prepared["spec_id"]
             else:
@@ -532,13 +534,9 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 except Exception:  # noqa: BLE001 - unreadable current config revokes launch
                     current = None
             if current != head.prepared["spec_id"]:
-                reason = "definition_missing" if current is None else "definition_changed"
-                revoked = q.revoke_prelaunch_batch(
-                    batch_id, owner_token=owner_token, reason=reason,
+                definition_drift_reason = (
+                    "definition_missing" if current is None else "definition_changed"
                 )
-                if revoked:
-                    reporter.event("dispatch_definition_drift", batch=batch_id,
-                                   device=device, reason=reason)
                 return False
             if not heartbeat.transition(q, "running"):
                 return False
@@ -583,6 +581,22 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
             if not recorded:
                 heartbeat.ownership_lost.set()
             return recorded
+        def record_target_finalization(receipt: dict[str, Any]) -> bool:
+            if heartbeat.ownership_lost.is_set():
+                return False
+            recorded = q.record_target_finalization(
+                batch_id,
+                operation_id=str(receipt.get("operation_id") or ""),
+                request_sha256=str(receipt.get("request_sha256") or ""),
+                cleanup_state=str(receipt.get("cleanup_state") or ""),
+                stage_cleaned=receipt.get("stage_cleaned") is True,
+                durable_cleaned=receipt.get("durable_cleaned") is True,
+                expected_state=batch_state,
+                owner_token=owner_token,
+            )
+            if not recorded:
+                heartbeat.ownership_lost.set()
+            return recorded
         try:
             with BatchHeartbeat(
                 db_path, batch_id, owner_token, batch_state, lease_seconds,
@@ -595,12 +609,22 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                     before_output_return=output_return_gate,
                     on_target_reservation=record_target_reservation,
                     on_target_acceptance=record_target_acceptance,
+                    on_target_finalization=record_target_finalization,
                 )
             latest_result = res
             attempt_record = executor.durable_attempt_record(head, res)
             if heartbeat.ownership_lost.is_set():
                 return ownership_lost("prelaunch_gate")
             if res.get("definition_drift"):
+                reason = definition_drift_reason or "definition_changed"
+                if not q.revoke_prelaunch_batch(
+                    batch_id, owner_token=owner_token, reason=reason,
+                ):
+                    return ownership_lost("definition_drift")
+                reporter.event(
+                    "dispatch_definition_drift", batch=batch_id,
+                    device=device, reason=reason,
+                )
                 if attempt_record is not None:
                     q.record_revoked_prelaunch_result(
                         batch_id, owner_token=owner_token,
@@ -935,6 +959,103 @@ def _reclaim_marginal_devices(config: RemrunConfig, groups: list[dict[str, Any]]
                            fits=bool(after is not None and need <= after * sf))
 
 
+def _recover_target_stale(
+    config: RemrunConfig,
+    queue: FleetQueue,
+    now: str,
+    *,
+    reporter: Reporter,
+    job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> int:
+    """Reconcile expired protocol-v1 batches against exact target truth."""
+    recovered = 0
+    terminal = {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}
+    for row in queue.stale_target_batches(now, job_ids=job_ids):
+        batch_id = str(row["batch_id"])
+        device_name = str(row["device"])
+        device = config.devices.get(device_name)
+        if device is None or not executor._target_acceptance_supported(device):
+            reporter.event(
+                "dispatch_stale_deferred", batch=batch_id, device=device_name,
+                reason="target device configuration unavailable",
+            )
+            continue
+        operation_id = executor._target_operation_identity(batch_id)
+        try:
+            transport = make_transport(device)
+            stage = transport.native_join(
+                executor._target_state_root(transport, device),
+                "fleet-operations",
+                operation_id,
+            )
+            stored_operation = row.get("target_operation_id")
+            if stored_operation is None:
+                # Reservation identity is persisted before the first stage byte,
+                # so no identity is positive proof that launch was impossible.
+                transport.remove_remote_tree(stage)
+                if queue.expire_stale_batch(batch_id, now=now, replay_safe=True):
+                    recovered += 1
+                continue
+
+            request_sha = row.get("target_request_sha256")
+            token = row.get("target_resume_token")
+            if stored_operation != operation_id or not isinstance(request_sha, str) \
+                    or not isinstance(token, str) or not token:
+                if queue.expire_stale_batch(batch_id, now=now, replay_safe=False):
+                    recovered += 1
+                continue
+
+            client = TargetResourceClient.connect(config, device_name, install=False)
+            status = client.status_identity(
+                operation_id, token, rpc_id=f"fleet-recover-status-{operation_id}",
+            )
+            receipt = status.get("receipt")
+            if not isinstance(receipt, dict) \
+                    or receipt.get("operation_id") != operation_id \
+                    or receipt.get("request_sha256") != request_sha:
+                if queue.expire_stale_batch(batch_id, now=now, replay_safe=False):
+                    recovered += 1
+                continue
+            state = str(receipt.get("state") or "")
+            if receipt.get("command_start_state") != "NO":
+                if queue.expire_stale_batch(batch_id, now=now, replay_safe=False):
+                    recovered += 1
+                continue
+            if state == "RESERVED":
+                cancelled = client.cancel(
+                    TargetReservation(receipt, token),
+                    rpc_id=f"fleet-recover-cancel-{operation_id}",
+                )
+                receipt = cancelled.get("receipt")
+                state = str(receipt.get("state") if isinstance(receipt, dict) else "")
+            if state not in terminal:
+                reporter.event(
+                    "dispatch_stale_deferred", batch=batch_id, device=device_name,
+                    reason=f"target cleanup state {state or 'unknown'} is not terminal",
+                )
+                continue
+
+            # The destructive evidence order is deliberate and crash-recoverable.
+            transport.remove_remote_tree(stage)
+            transport.durable_cleanup(operation_id, token)
+            if not queue.record_expired_target_finalization(
+                batch_id,
+                operation_id=operation_id,
+                request_sha256=request_sha,
+                cleanup_state=state,
+                now=now,
+            ):
+                continue
+            if queue.expire_stale_batch(batch_id, now=now, replay_safe=True):
+                recovered += 1
+        except (OSError, TargetResourceError, TransportError, ValueError) as exc:
+            reporter.event(
+                "dispatch_stale_deferred", batch=batch_id, device=device_name,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+    return recovered
+
+
 def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                debounce_s: float = 0.0, lease_seconds: int = 300,
                reporter: Reporter | None = None, max_parallel: int | None = None,
@@ -952,6 +1073,9 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
     try:
         now0 = utc_now_iso()
         summary["recovered"] = q.recover_stale(now0, job_ids=job_ids)
+        summary["recovered"] += _recover_target_stale(
+            config, q, now0, reporter=reporter, job_ids=job_ids,
+        )
         q.prune_cooldowns(now0)
 
         queued = q.list("queued", job_ids=job_ids)
@@ -1180,6 +1304,10 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                 pool=pool, task_name=head.task_name, engine=engine,
                 bucket=adapters.option_bucket(head),
                 estimated_finish_s=batch.estimated_finish_s, now=cnow,
+                target_protocol_version=(
+                    1 if executor._target_acceptance_supported(config.devices[batch.device])
+                    else None
+                ),
                 current_spec_ids=live_spec_ids,
             )
             if owner_token is None:
