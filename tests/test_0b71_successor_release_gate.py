@@ -8,6 +8,7 @@ predecessor target rows through target-aware migration/recovery.
 from __future__ import annotations
 
 import sqlite3
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,8 +36,12 @@ def _device(root: Path) -> Device:
     return Device.from_mapping(
         "TARGET",
         {
-            "kind": "ssh-posix",
-            "os": "posix",
+            # The target state root below is built from tmp_path, so it is a
+            # native path. Declare the matching family: _target_state_root checks
+            # absoluteness with PureWindowsPath/PurePosixPath per device.os, and a
+            # posix declaration cannot validate a C:\... path.
+            "kind": "ssh-powershell" if os.name == "nt" else "ssh-posix",
+            "os": "windows" if os.name == "nt" else "posix",
             "project_root": str(root / "projects"),
             "state_root": str(root / "target-state"),
             "cache_root": str(root / "cache"),
