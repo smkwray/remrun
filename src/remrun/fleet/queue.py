@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS batches (
     target_stage_cleaned_at TEXT,
     target_durable_cleaned_at TEXT,
     target_finalized_at TEXT,
+    target_finalization_disposition TEXT,
     error        TEXT
 );
 -- One row per held resource slot. UNIQUE(device,pool) makes a configured pool a
@@ -167,6 +168,28 @@ _PRUNABLE = ("done", "failed_final")
 _BATCH_ACTIVE = ("leased", "staging", "running", "fetching")
 MAX_ATTEMPTS = 3
 _BUSY_TIMEOUT_MS = 30_000
+
+FINALIZATION_PENDING = "known_outcome_cleanup_pending"
+FINALIZATION_REPLAYABLE = "proven_no_start_replayable"
+FINALIZATION_FENCED = "completion_unknown_or_started"
+FINALIZATION_FINALIZED = "fully_finalized"
+FINALIZATION_MALFORMED = "malformed_target_identity"
+FINALIZATION_RECONCILE = "target_reconciliation_pending"
+_FINALIZATION_DISPOSITIONS = {
+    FINALIZATION_PENDING,
+    FINALIZATION_REPLAYABLE,
+    FINALIZATION_FENCED,
+    FINALIZATION_FINALIZED,
+    FINALIZATION_MALFORMED,
+    FINALIZATION_RECONCILE,
+}
+_TARGET_COLUMNS = (
+    "target_protocol_version", "target_operation_id", "target_request_sha256",
+    "target_resume_token", "target_reserved_at", "target_accepted_at",
+    "target_cleanup_state", "target_cleanup_at", "target_stage_cleaned_at",
+    "target_durable_cleaned_at", "target_finalized_at",
+    "target_finalization_disposition",
+)
 
 
 class QueueConfigurationError(RuntimeError):
@@ -272,7 +295,8 @@ class FleetQueue:
                            "target_reserved_at", "target_accepted_at",
                            "target_cleanup_state", "target_cleanup_at",
                            "target_stage_cleaned_at", "target_durable_cleaned_at",
-                           "target_finalized_at", "error"}
+                           "target_finalized_at", "target_finalization_disposition",
+                           "error"}
         index_row = self.db.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
             "AND name='ux_jobs_active_idem'"
@@ -281,39 +305,38 @@ class FleetQueue:
         have_unique = bool(
             index_row and " ".join(str(index_row["sql"] or "").lower().split()) == expected_index
         )
-        if have_jobs == current_jobs and have_batches == current_batches and have_unique:
-            return
-
-        with self._immediate():
-            have_jobs = {r["name"] for r in self.db.execute("PRAGMA table_info(jobs)")}
-            for column in ("prepared_id", "spec_id", "exclude_devices", "last_result",
-                           "output_manifest", "assigned_device", "leased_until", "batch_id"):
-                if column not in have_jobs:
-                    self.db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
-            have_batches = {r["name"] for r in self.db.execute("PRAGMA table_info(batches)")}
-            if "owner_token" not in have_batches:
-                self.db.execute("ALTER TABLE batches ADD COLUMN owner_token TEXT")
-            if "estimated_finish_s" not in have_batches:
-                self.db.execute(
-                    "ALTER TABLE batches ADD COLUMN estimated_finish_s REAL")
-            if "target_protocol_version" not in have_batches:
-                self.db.execute(
-                    "ALTER TABLE batches ADD COLUMN target_protocol_version INTEGER"
-                )
-            for column in (
-                "target_operation_id",
-                "target_request_sha256",
-                "target_resume_token",
-                "target_reserved_at",
-                "target_accepted_at",
-                "target_cleanup_state",
-                "target_cleanup_at",
-                "target_stage_cleaned_at",
-                "target_durable_cleaned_at",
-                "target_finalized_at",
-            ):
-                if column not in have_batches:
-                    self.db.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
+        if not (have_jobs == current_jobs and have_batches == current_batches and have_unique):
+            with self._immediate():
+                have_jobs = {r["name"] for r in self.db.execute("PRAGMA table_info(jobs)")}
+                for column in ("prepared_id", "spec_id", "exclude_devices", "last_result",
+                               "output_manifest", "assigned_device", "leased_until", "batch_id"):
+                    if column not in have_jobs:
+                        self.db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+                have_batches = {r["name"] for r in self.db.execute("PRAGMA table_info(batches)")}
+                if "owner_token" not in have_batches:
+                    self.db.execute("ALTER TABLE batches ADD COLUMN owner_token TEXT")
+                if "estimated_finish_s" not in have_batches:
+                    self.db.execute(
+                        "ALTER TABLE batches ADD COLUMN estimated_finish_s REAL")
+                if "target_protocol_version" not in have_batches:
+                    self.db.execute(
+                        "ALTER TABLE batches ADD COLUMN target_protocol_version INTEGER"
+                    )
+                for column in (
+                    "target_operation_id",
+                    "target_request_sha256",
+                    "target_resume_token",
+                    "target_reserved_at",
+                    "target_accepted_at",
+                    "target_cleanup_state",
+                    "target_cleanup_at",
+                    "target_stage_cleaned_at",
+                    "target_durable_cleaned_at",
+                    "target_finalized_at",
+                    "target_finalization_disposition",
+                ):
+                    if column not in have_batches:
+                        self.db.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
 
             duplicate_rows = self.db.execute(
                 f"SELECT idempotency_key, job_id, state FROM jobs "
@@ -385,6 +408,62 @@ class FleetQueue:
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_jobs_batch ON jobs(batch_id)")
             self.db.execute(_active_idempotency_index_sql())
 
+        self._migrate_target_rows()
+
+    @staticmethod
+    def _valid_target_digest(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(
+            char in "0123456789abcdef" for char in value
+        )
+
+    @classmethod
+    def _target_identity_complete(cls, row: sqlite3.Row) -> bool:
+        required = (
+            row["target_operation_id"], row["target_resume_token"],
+            row["target_reserved_at"],
+        )
+        if not all(isinstance(value, str) and value for value in required):
+            return False
+        if not cls._valid_target_digest(row["target_request_sha256"]):
+            return False
+        accepted = row["target_accepted_at"]
+        return accepted is None or (isinstance(accepted, str) and bool(accepted))
+
+    @classmethod
+    def _target_identity_present(cls, row: sqlite3.Row) -> bool:
+        return any(row[name] is not None for name in _TARGET_COLUMNS[1:])
+
+    def _migrate_target_rows(self) -> None:
+        """Classify predecessor target rows without fabricating missing identity.
+
+        A NULL protocol marker is legacy only when no target field exists. Any
+        predecessor target payload, including a malformed or partial one, is
+        routed away from generic stale recovery and retained for target-aware
+        reconciliation or owner review.
+        """
+        with self._immediate():
+            rows = self.db.execute(
+                "SELECT * FROM batches WHERE target_protocol_version IS NULL"
+            ).fetchall()
+            now = utc_now_iso()
+            for row in rows:
+                if not self._target_identity_present(row):
+                    continue
+                if self._target_identity_complete(row):
+                    disposition = (
+                        FINALIZATION_PENDING
+                        if row["state"] in {"done", "failed"}
+                        else FINALIZATION_RECONCILE
+                    )
+                else:
+                    disposition = FINALIZATION_MALFORMED
+                self.db.execute(
+                    "UPDATE batches SET target_protocol_version=1,"
+                    "target_finalization_disposition=?,updated_at=? "
+                    "WHERE batch_id=? AND target_protocol_version IS NULL",
+                    (disposition, now, row["batch_id"]),
+                )
+
     def _migrate_nullable_batch_estimates(self) -> None:
         """Rebuild only the local batch ledger when its old ETA column is NOT NULL.
 
@@ -423,6 +502,7 @@ class FleetQueue:
                     target_stage_cleaned_at TEXT,
                     target_durable_cleaned_at TEXT,
                     target_finalized_at TEXT,
+                    target_finalization_disposition TEXT,
                     error TEXT
                 )
             """)
@@ -433,7 +513,7 @@ class FleetQueue:
                 "target_operation_id,target_request_sha256,target_resume_token,"
                 "target_reserved_at,target_accepted_at,target_cleanup_state,"
                 "target_cleanup_at,target_stage_cleaned_at,target_durable_cleaned_at,"
-                "target_finalized_at,error"
+                "target_finalized_at,target_finalization_disposition,error"
             )
             self.db.execute(
                 f"INSERT INTO batches_nullable ({names}) SELECT {names} FROM batches"
@@ -1267,14 +1347,19 @@ class FleetQueue:
             return None   # couldn't even BEGIN (lock contention past busy_timeout)
 
     def revoke_prelaunch_batch(self, batch_id: str, *, owner_token: str,
-                               reason: str, now: str | None = None) -> bool:
+                               reason: str, now: str | None = None,
+                               finalization_disposition: str | None = None) -> bool:
         """Definition drift recovery before the user-process launch gate."""
         now = now or utc_now_iso()
         with self._immediate():
+            disposition = self._terminal_disposition(
+                batch_id, finalization_disposition, default=FINALIZATION_PENDING,
+            )
             cur = self.db.execute(
-                "UPDATE batches SET state='failed',error=?,updated_at=? WHERE batch_id=? "
+                "UPDATE batches SET state='failed',error=?,"
+                "target_finalization_disposition=?,updated_at=? WHERE batch_id=? "
                 "AND state IN ('leased','staging','running') AND owner_token=? AND lease_until>?",
-                (reason, now, batch_id, owner_token, now),
+                (reason, disposition, now, batch_id, owner_token, now),
             )
             if not cur.rowcount:
                 return False
@@ -1330,6 +1415,26 @@ class FleetQueue:
             )
             return True
 
+    def _terminal_disposition(
+        self, batch_id: str, supplied: str | None, *, default: str,
+    ) -> str | None:
+        """Resolve the normalized target disposition inside a terminal transition."""
+        row = self.db.execute(
+            "SELECT target_protocol_version,target_operation_id,"
+            "target_finalization_disposition FROM batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if row is None or row["target_protocol_version"] != 1:
+            return None
+        disposition = supplied or row["target_finalization_disposition"] or default
+        if disposition not in _FINALIZATION_DISPOSITIONS:
+            raise ValueError(f"unsupported target finalization disposition {disposition!r}")
+        if row["target_finalization_disposition"] == FINALIZATION_FINALIZED:
+            return FINALIZATION_FINALIZED
+        if supplied is None and row["target_operation_id"] is None:
+            return FINALIZATION_FINALIZED
+        return disposition
+
     def heartbeat(self, batch_id: str, lease_until: str, *, expected_state: str,
                   owner_token: str, now: str | None = None) -> bool:
         """Atomically extend a batch, its jobs, and its resource lease.
@@ -1359,14 +1464,19 @@ class FleetQueue:
     def complete_batch(self, batch_id: str, *, expected_state: str,
                        owner_token: str, now: str | None = None,
                        result_record: str | None = None,
-                       observation: dict[str, Any] | None = None) -> bool:
+                       observation: dict[str, Any] | None = None,
+                       finalization_disposition: str | None = None) -> bool:
         """Mark a batch done only for its current, unexpired owner."""
         now = now or utc_now_iso()
         with self._immediate():
+            disposition = self._terminal_disposition(
+                batch_id, finalization_disposition, default=FINALIZATION_PENDING,
+            )
             cur = self.db.execute(
-                "UPDATE batches SET state='done', updated_at=? WHERE batch_id=? "
+                "UPDATE batches SET state='done',target_finalization_disposition=?,"
+                "updated_at=? WHERE batch_id=? "
                 "AND state=? AND owner_token=? AND lease_until>?",
-                (now, batch_id, expected_state, owner_token, now),
+                (disposition, now, batch_id, expected_state, owner_token, now),
             )
             if not cur.rowcount:        # already terminal / recovered by someone else — no-op
                 return False
@@ -1389,7 +1499,8 @@ class FleetQueue:
                              dispositions: dict[str, str] | None = None,
                              results: dict[str, str] | None = None,
                              result_record: str | None = None,
-                             observation: dict[str, Any] | None = None) -> bool:
+                             observation: dict[str, Any] | None = None,
+                             finalization_disposition: str | None = None) -> bool:
         """Finish an ACTIVE batch from per-item worker results.
 
         ``succeeded`` maps job_id -> optional output_manifest JSON; those jobs become ``done``.
@@ -1403,6 +1514,9 @@ class FleetQueue:
         dispositions = dispositions or {}
         results = results or {}
         with self._immediate():
+            disposition = self._terminal_disposition(
+                batch_id, finalization_disposition, default=FINALIZATION_PENDING,
+            )
             owner = self.db.execute(
                 "SELECT 1 FROM batches WHERE batch_id=? AND state=? "
                 "AND owner_token=? AND lease_until>?",
@@ -1426,9 +1540,10 @@ class FleetQueue:
                 f"{jid}: {failed.get(jid) or 'missing item result'}"
                 for jid in sorted(failed_ids)[:5])
             cur = self.db.execute(
-                "UPDATE batches SET state=?, error=?, updated_at=? WHERE batch_id=? "
+                "UPDATE batches SET state=?,error=?,target_finalization_disposition=?,"
+                "updated_at=? WHERE batch_id=? "
                 "AND state=? AND owner_token=? AND lease_until>?",
-                (batch_state, batch_error or None, now, batch_id,
+                (batch_state, batch_error or None, disposition, now, batch_id,
                  expected_state, owner_token, now))
             if not cur.rowcount:
                 return False
@@ -1606,7 +1721,8 @@ class FleetQueue:
                    max_attempts: int = MAX_ATTEMPTS,
                    clear_force_device: bool = False,
                    result_record: str | None = None,
-                   observation: dict[str, Any] | None = None) -> bool:
+                   observation: dict[str, Any] | None = None,
+                   finalization_disposition: str | None = None) -> bool:
         """Fail a batch atomically only for its current, unexpired owner.
 
         Requeue jobs that have attempts left (clearing their batch + device),
@@ -1615,10 +1731,14 @@ class FleetQueue:
         call performed the transition (False = already terminal/recovered)."""
         now = now or utc_now_iso()
         with self._immediate():
+            disposition = self._terminal_disposition(
+                batch_id, finalization_disposition, default=FINALIZATION_PENDING,
+            )
             cur = self.db.execute(
-                "UPDATE batches SET state='failed', error=?, updated_at=? WHERE batch_id=? "
+                "UPDATE batches SET state='failed',error=?,"
+                "target_finalization_disposition=?,updated_at=? WHERE batch_id=? "
                 "AND state=? AND owner_token=? AND lease_until>?",
-                (error, now, batch_id, expected_state, owner_token, now),
+                (error, disposition, now, batch_id, expected_state, owner_token, now),
             )
             if not cur.rowcount:        # already terminal / recovered by someone else — no-op
                 return False
@@ -1631,16 +1751,21 @@ class FleetQueue:
     def mark_completion_unknown(self, batch_id: str, error: str, *, expected_state: str,
                                 owner_token: str, now: str | None = None,
                                 result_record: str | None = None,
-                                observation: dict[str, Any] | None = None) -> bool:
+                                observation: dict[str, Any] | None = None,
+                                finalization_disposition: str = FINALIZATION_FENCED) -> bool:
         """Fence ambiguous post-launch work without authorizing an automatic replay."""
         if expected_state not in {"running", "fetching"}:
+            return False
+        if finalization_disposition not in _FINALIZATION_DISPOSITIONS:
             return False
         now = now or utc_now_iso()
         with self._immediate():
             cur = self.db.execute(
-                "UPDATE batches SET state='failed',error=?,updated_at=? WHERE batch_id=? "
+                "UPDATE batches SET state='failed',error=?,"
+                "target_finalization_disposition=?,updated_at=? WHERE batch_id=? "
                 "AND state=? AND owner_token=? AND lease_until>?",
-                (error, now, batch_id, expected_state, owner_token, now),
+                (error, finalization_disposition, now, batch_id, expected_state,
+                 owner_token, now),
             )
             if not cur.rowcount:
                 return False
@@ -1678,17 +1803,34 @@ class FleetQueue:
         error = "lease expired (stale recovery)"
         with self._immediate():
             row = self.db.execute(
-                "SELECT state,target_protocol_version,target_operation_id FROM batches "
-                "WHERE batch_id=? AND lease_until<?",
+                "SELECT state,target_protocol_version,target_operation_id,target_finalized_at "
+                "FROM batches WHERE batch_id=? AND lease_until<?",
                 (batch_id, now),
             ).fetchone()
             if row is None or row["state"] not in _BATCH_ACTIVE:
                 return False
+            if (
+                replay_safe is True
+                and row["target_protocol_version"] == 1
+                and row["target_operation_id"] is not None
+                and row["target_finalized_at"] is None
+            ):
+                # A target-bearing row may only be replayed after its exact
+                # stage and durable evidence cleanup has been finalized.
+                return False
             state = str(row["state"])
+            disposition = None
+            if row["target_protocol_version"] == 1:
+                disposition = (
+                    FINALIZATION_FINALIZED if replay_safe is True
+                    else FINALIZATION_FENCED if replay_safe is False
+                    else FINALIZATION_PENDING
+                )
             cur = self.db.execute(
-                "UPDATE batches SET state='failed', error=?, updated_at=? WHERE batch_id=? "
-                "AND state=? AND lease_until<?",
-                (error, now, batch_id, state, now),
+                "UPDATE batches SET state='failed',error=?,"
+                "target_finalization_disposition=COALESCE(?,target_finalization_disposition),"
+                "updated_at=? WHERE batch_id=? AND state=? AND lease_until<?",
+                (error, disposition, now, batch_id, state, now),
             )
             if not cur.rowcount:
                 return False
@@ -1915,16 +2057,82 @@ class FleetQueue:
             cur = self.db.execute(
                 "UPDATE batches SET target_cleanup_state=?,target_cleanup_at=?,"
                 "target_stage_cleaned_at=?,target_durable_cleaned_at=?,"
-                "target_finalized_at=?,updated_at=? WHERE batch_id=? AND state=? "
+                "target_finalized_at=?,target_finalization_disposition=?,updated_at=? "
+                "WHERE batch_id=? AND state=? "
                 "AND owner_token=? AND lease_until>? AND target_operation_id=? "
                 "AND target_request_sha256=? AND target_finalized_at IS NULL",
                 (
-                    cleanup_state, now, now, now, now, now,
+                    cleanup_state, now, now, now, now, FINALIZATION_FINALIZED, now,
                     batch_id, expected_state, owner_token, now,
                     operation_id, request_sha256,
                 ),
             )
             return cur.rowcount == 1
+
+    def record_target_cleanup_progress(
+        self,
+        batch_id: str,
+        *,
+        operation_id: str,
+        request_sha256: str,
+        cleanup_state: str | None = None,
+        stage_cleaned: bool = False,
+        durable_cleaned: bool = False,
+        replayable: bool = False,
+        now: str,
+    ) -> bool:
+        """CAS-record one cleanup proof for an expired or terminal target row.
+
+        Each proof is monotonic and exact-identity fenced. Remote deletion is
+        intentionally performed before its corresponding proof is written, so
+        a controller crash only causes an absence-aware repeat of that step.
+        """
+        terminal = {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}
+        if cleanup_state is not None and cleanup_state not in terminal:
+            return False
+        if not stage_cleaned and not durable_cleaned and cleanup_state is None:
+            return False
+        with self._immediate():
+            row = self.db.execute(
+                "SELECT target_protocol_version,target_operation_id,target_request_sha256,"
+                "target_cleanup_state,target_cleanup_at,target_stage_cleaned_at,"
+                "target_durable_cleaned_at,target_finalized_at,target_finalization_disposition "
+                "FROM batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if row is None or row["target_protocol_version"] != 1 \
+                    or row["target_operation_id"] != operation_id \
+                    or row["target_request_sha256"] != request_sha256:
+                return False
+            current_state = row["target_cleanup_state"]
+            if current_state is not None and cleanup_state is not None \
+                    and current_state != cleanup_state:
+                return False
+            disposition = row["target_finalization_disposition"]
+            if disposition in {FINALIZATION_MALFORMED, FINALIZATION_FENCED}:
+                return False
+            if replayable:
+                disposition = FINALIZATION_REPLAYABLE
+            elif disposition is None:
+                disposition = FINALIZATION_PENDING
+            self.db.execute(
+                "UPDATE batches SET target_cleanup_state=COALESCE(?,target_cleanup_state),"
+                "target_cleanup_at=CASE WHEN ? IS NOT NULL THEN "
+                "COALESCE(target_cleanup_at,?) ELSE target_cleanup_at END,"
+                "target_stage_cleaned_at=CASE WHEN ? THEN COALESCE(target_stage_cleaned_at,?) "
+                "ELSE target_stage_cleaned_at END,"
+                "target_durable_cleaned_at=CASE WHEN ? THEN "
+                "COALESCE(target_durable_cleaned_at,?) ELSE target_durable_cleaned_at END,"
+                "target_finalization_disposition=?,updated_at=? WHERE batch_id=? "
+                "AND target_protocol_version=1 AND target_operation_id=? "
+                "AND target_request_sha256=?",
+                (
+                    cleanup_state, cleanup_state, now, stage_cleaned, now,
+                    durable_cleaned, now, disposition, now, batch_id,
+                    operation_id, request_sha256,
+                ),
+            )
+            return True
 
     def record_expired_target_finalization(
         self,
@@ -1944,13 +2152,13 @@ class FleetQueue:
                 "COALESCE(target_cleanup_at,?),target_stage_cleaned_at="
                 "COALESCE(target_stage_cleaned_at,?),target_durable_cleaned_at="
                 "COALESCE(target_durable_cleaned_at,?),target_finalized_at="
-                "COALESCE(target_finalized_at,?),updated_at=? WHERE batch_id=? "
-                "AND target_protocol_version=1 AND lease_until<? "
-                "AND target_operation_id=? AND target_request_sha256=? "
+                "COALESCE(target_finalized_at,?),target_finalization_disposition=?,"
+                "updated_at=? WHERE batch_id=? AND target_protocol_version=1 "
+                "AND lease_until<? AND target_operation_id=? AND target_request_sha256=? "
                 "AND (target_cleanup_state IS NULL OR target_cleanup_state=?)",
                 (
-                    cleanup_state, now, now, now, now, now, batch_id, now,
-                    operation_id, request_sha256, cleanup_state,
+                    cleanup_state, now, now, now, now, FINALIZATION_FINALIZED, now,
+                    batch_id, now, operation_id, request_sha256, cleanup_state,
                 ),
             )
             return cur.rowcount == 1
@@ -1963,7 +2171,7 @@ class FleetQueue:
             "SELECT device,target_operation_id,target_request_sha256,target_resume_token,"
             "target_reserved_at,target_accepted_at,target_cleanup_state,"
             "target_cleanup_at,target_stage_cleaned_at,target_durable_cleaned_at,"
-            "target_finalized_at FROM batches WHERE batch_id=?",
+            "target_finalized_at,target_finalization_disposition FROM batches WHERE batch_id=?",
             (batch_id,),
         ).fetchone()
         if row is None or row["target_operation_id"] is None:
@@ -2075,12 +2283,52 @@ class FleetQueue:
     def stale_target_batches(
         self, now: str | None = None,
         job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+        *, include_terminal: bool = True,
     ) -> list[dict[str, Any]]:
         """Return expired protocol-v1 batches for target-aware reconciliation.
 
         The private resume token is exposed only to this controller-internal
-        recovery surface.  Public status receipts remain redacted.
+        recovery surface. Public status receipts remain redacted. Terminal
+        known-outcome rows are included by default so callers can observe the
+        cleanup-only recovery boundary; active recovery opts out explicitly.
         """
+        now = now or utc_now_iso()
+        if job_ids is not None and not job_ids:
+            return []
+        values: list[str] = [now]
+        scope = ""
+        if job_ids is not None:
+            ordered_ids = sorted(set(job_ids))
+            scope = (
+                " AND batch_id IN (SELECT DISTINCT batch_id FROM jobs WHERE job_id IN ("
+                + ",".join("?" * len(ordered_ids)) + ") AND batch_id IS NOT NULL)"
+            )
+            values.extend(ordered_ids)
+        state_clause = (
+            "(state NOT IN ('done','failed') OR "
+            "(state IN ('done','failed') AND target_finalized_at IS NULL "
+            "AND target_finalization_disposition IN (?,?)))"
+            if include_terminal else "state NOT IN ('done','failed')"
+        )
+        state_values = (
+            FINALIZATION_PENDING, FINALIZATION_REPLAYABLE
+        ) if include_terminal else ()
+        rows = self.db.execute(
+            "SELECT batch_id,state,device,target_operation_id,target_request_sha256,"
+            "target_resume_token,target_reserved_at,target_accepted_at,"
+            "target_cleanup_state,target_stage_cleaned_at,"
+            "target_durable_cleaned_at,target_finalized_at,target_finalization_disposition "
+            "FROM batches WHERE " + state_clause + " AND lease_until<? "
+            "AND target_protocol_version=1" + scope,
+            (*state_values, *values),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def terminal_target_batches(
+        self, now: str | None = None,
+        job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return known-outcome terminal rows whose target cleanup is unfinished."""
         now = now or utc_now_iso()
         if job_ids is not None and not job_ids:
             return []
@@ -2095,9 +2343,13 @@ class FleetQueue:
             values.extend(ordered_ids)
         rows = self.db.execute(
             "SELECT batch_id,state,device,target_operation_id,target_request_sha256,"
-            "target_resume_token FROM batches WHERE state NOT IN ('done','failed') "
-            "AND lease_until<? AND target_protocol_version=1" + scope,
-            tuple(values),
+            "target_resume_token,target_reserved_at,target_accepted_at,"
+            "target_cleanup_state,target_stage_cleaned_at,"
+            "target_durable_cleaned_at,target_finalized_at,target_finalization_disposition "
+            "FROM batches WHERE state IN ('done','failed') AND target_protocol_version=1 "
+            "AND target_finalized_at IS NULL AND target_finalization_disposition IN (?,?) "
+            "AND lease_until<?" + scope,
+            (FINALIZATION_PENDING, FINALIZATION_REPLAYABLE, *values),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -2141,20 +2393,27 @@ class FleetQueue:
         batches, releases ALL resource leases, and clears ALL cooldowns. ``include_final`` also
         drops done/failed_final history. Returns counts of what was removed. Does NOT touch any
         worker already running on a device — kill that separately if needed."""
+        protected_target = (
+            "((target_protocol_version=1 AND "
+            "COALESCE(target_finalization_disposition,'') <> 'fully_finalized') OR "
+            "target_operation_id IS NOT NULL OR "
+            "target_request_sha256 IS NOT NULL OR target_resume_token IS NOT NULL OR "
+            "target_reserved_at IS NOT NULL OR target_accepted_at IS NOT NULL)"
+        )
         with self._immediate():
             protected = self.db.execute(
-                "SELECT COUNT(*) c FROM batches WHERE target_operation_id IS NOT NULL "
+                f"SELECT COUNT(*) c FROM batches WHERE {protected_target} "
                 "AND target_finalized_at IS NULL"
             ).fetchone()["c"]
             removable = (
                 "(batch_id IS NULL OR batch_id NOT IN ("
-                "SELECT batch_id FROM batches WHERE target_operation_id IS NOT NULL "
+                f"SELECT batch_id FROM batches WHERE {protected_target} "
                 "AND target_finalized_at IS NULL))"
             )
             if include_final:
                 jobs = self.db.execute(f"DELETE FROM jobs WHERE {removable}").rowcount
                 self.db.execute(
-                    "DELETE FROM batches WHERE target_operation_id IS NULL "
+                    f"DELETE FROM batches WHERE NOT {protected_target} "
                     "OR target_finalized_at IS NOT NULL"
                 )
             else:
@@ -2164,11 +2423,11 @@ class FleetQueue:
                 ).rowcount
                 self.db.execute(
                     "DELETE FROM batches WHERE state NOT IN ('done','failed') "
-                    "AND (target_operation_id IS NULL OR target_finalized_at IS NOT NULL)"
+                    f"AND (NOT {protected_target} OR target_finalized_at IS NOT NULL)"
                 )
             leases = self.db.execute(
                 "DELETE FROM resource_leases WHERE batch_id NOT IN ("
-                "SELECT batch_id FROM batches WHERE target_operation_id IS NOT NULL "
+                f"SELECT batch_id FROM batches WHERE {protected_target} "
                 "AND target_finalized_at IS NULL)"
             ).rowcount
             cooldowns = self.db.execute("DELETE FROM cooldowns").rowcount
@@ -2185,7 +2444,11 @@ class FleetQueue:
         rows = self.db.execute(
             f"SELECT j.job_id FROM jobs j LEFT JOIN batches b ON b.batch_id=j.batch_id "
             f"WHERE j.state IN ({','.join('?' * len(_PRUNABLE))}) "
-            "AND (j.batch_id IS NULL OR b.target_operation_id IS NULL "
+            "AND (j.batch_id IS NULL OR NOT ((b.target_protocol_version=1 AND "
+            "COALESCE(b.target_finalization_disposition,'') <> 'fully_finalized') OR "
+            "b.target_operation_id IS NOT NULL OR b.target_request_sha256 IS NOT NULL OR "
+            "b.target_resume_token IS NOT NULL OR b.target_reserved_at IS NOT NULL OR "
+            "b.target_accepted_at IS NOT NULL) "
             "OR b.target_finalized_at IS NOT NULL) ORDER BY j.updated_at DESC",
             _PRUNABLE).fetchall()
         victims = [r["job_id"] for r in rows[keep:]]
@@ -2197,7 +2460,12 @@ class FleetQueue:
                 "DELETE FROM batches WHERE state IN ('done','failed') "
                 "AND batch_id NOT IN (SELECT DISTINCT batch_id FROM jobs WHERE batch_id IS NOT NULL) "
                 "AND batch_id NOT IN (SELECT batch_id FROM resource_leases) "
-                "AND (target_operation_id IS NULL OR target_finalized_at IS NOT NULL)")
+                "AND (NOT ((target_protocol_version=1 AND "
+                "COALESCE(target_finalization_disposition,'') <> 'fully_finalized') OR "
+                "target_operation_id IS NOT NULL OR target_request_sha256 IS NOT NULL OR "
+                "target_resume_token IS NOT NULL OR "
+                "target_reserved_at IS NOT NULL OR target_accepted_at IS NOT NULL) "
+                "OR target_finalized_at IS NOT NULL)")
         return len(victims)
 
 

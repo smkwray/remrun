@@ -34,7 +34,11 @@ from ..target_resources import TargetReservation, TargetResourceClient, TargetRe
 from . import adapters, executor, placement, probes, profiles
 from .config import fleet_config, idle_grace_s as configured_idle_grace_s, load_costs, safety_fraction
 from .models import DrainResultV1, FleetTask
-from .queue import BatchHeartbeat, FleetQueue
+from .queue import (
+    FINALIZATION_FENCED,
+    BatchHeartbeat,
+    FleetQueue,
+)
 from .prepared import RAW_COMMAND_SPEC_ID, as_fleet_task, prepared_memory_limit_mib
 from .task_contract import resolve_tasks
 from ..transport import TransportError, make_transport
@@ -472,6 +476,10 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
     def fail_owned(error: str, **kwargs: Any) -> bool:
         kwargs.setdefault("result_record", attempt_record)
         kwargs.setdefault(
+            "finalization_disposition",
+            executor.target_finalization_disposition(latest_result),
+        )
+        kwargs.setdefault(
             "observation", _profile_observation(btasks, device, latest_result, attempt_record),
         )
         return q.fail_batch(
@@ -482,6 +490,10 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
     def complete_items_owned(succeeded: dict[str, str | None],
                              failed: dict[str, str], **kwargs: Any) -> bool:
         kwargs.setdefault("result_record", attempt_record)
+        kwargs.setdefault(
+            "finalization_disposition",
+            executor.target_finalization_disposition(latest_result),
+        )
         kwargs.setdefault(
             "observation", _profile_observation(btasks, device, latest_result, attempt_record),
         )
@@ -619,6 +631,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 reason = definition_drift_reason or "definition_changed"
                 if not q.revoke_prelaunch_batch(
                     batch_id, owner_token=owner_token, reason=reason,
+                    finalization_disposition=executor.target_finalization_disposition(res),
                 ):
                     return ownership_lost("definition_drift")
                 reporter.event(
@@ -664,6 +677,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 unknown = q.mark_completion_unknown(
                     batch_id, err, expected_state=batch_state, owner_token=owner_token,
                     result_record=attempt_record,
+                    finalization_disposition=FINALIZATION_FENCED,
                     observation=_profile_observation(
                         btasks, device, latest_result, attempt_record,
                     ),
@@ -693,6 +707,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
             if not q.mark_completion_unknown(
                 batch_id, error, expected_state=batch_state, owner_token=owner_token,
                 result_record=attempt_record,
+                finalization_disposition=FINALIZATION_FENCED,
                 observation=_profile_observation(btasks, device, latest_result, attempt_record),
             ):
                 return ownership_lost("completion_unknown")
@@ -708,6 +723,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 if not q.mark_completion_unknown(
                     batch_id, error, expected_state=batch_state, owner_token=owner_token,
                     result_record=attempt_record,
+                    finalization_disposition=FINALIZATION_FENCED,
                     observation=_profile_observation(
                         btasks, device, latest_result, attempt_record,
                     ),
@@ -818,6 +834,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
             if not q.complete_batch(
                 batch_id, expected_state=batch_state, owner_token=owner_token,
                 result_record=attempt_record,
+                finalization_disposition=executor.target_finalization_disposition(res),
                 observation=_profile_observation(btasks, device, latest_result, attempt_record),
             ):
                 return ownership_lost("completion")
@@ -842,6 +859,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                 held = q.mark_completion_unknown(
                     batch_id, error, expected_state=batch_state, owner_token=owner_token,
                     result_record=attempt_record,
+                    finalization_disposition=FINALIZATION_FENCED,
                     observation=_profile_observation(
                         btasks, device, latest_result, attempt_record,
                     ),
@@ -967,93 +985,202 @@ def _recover_target_stale(
     reporter: Reporter,
     job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> int:
-    """Reconcile expired protocol-v1 batches against exact target truth."""
+    """Reconcile expired active protocol-v1 batches against exact target truth."""
     recovered = 0
-    terminal = {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}
-    for row in queue.stale_target_batches(now, job_ids=job_ids):
-        batch_id = str(row["batch_id"])
-        device_name = str(row["device"])
-        device = config.devices.get(device_name)
-        if device is None or not executor._target_acceptance_supported(device):
-            reporter.event(
-                "dispatch_stale_deferred", batch=batch_id, device=device_name,
-                reason="target device configuration unavailable",
-            )
-            continue
-        operation_id = executor._target_operation_identity(batch_id)
+    for row in queue.stale_target_batches(
+        now, job_ids=job_ids, include_terminal=False,
+    ):
+        recovered += _recover_target_row(
+            config, queue, row, now, reporter=reporter, terminal_outcome=False,
+        )
+    return recovered
+
+
+def _recover_terminal_target_finalization(
+    config: RemrunConfig,
+    queue: FleetQueue,
+    now: str,
+    *,
+    reporter: Reporter,
+    job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> int:
+    """Finish target cleanup for terminal rows without changing job outcome."""
+    recovered = 0
+    for row in queue.terminal_target_batches(now, job_ids=job_ids):
+        recovered += _recover_target_row(
+            config, queue, row, now, reporter=reporter, terminal_outcome=True,
+        )
+    return recovered
+
+
+def _target_durable_identity_matches(
+    durable: object, operation_id: str, request_sha: str,
+) -> bool:
+    if not isinstance(durable, dict):
+        return False
+    acceptance = durable.get("target_acceptance")
+    if not isinstance(acceptance, dict):
+        acceptance = durable
+    return (
+        acceptance.get("operation_id") == operation_id
+        and acceptance.get("request_sha256") == request_sha
+    )
+
+
+def _recover_target_row(
+    config: RemrunConfig,
+    queue: FleetQueue,
+    row: dict[str, Any],
+    now: str,
+    *,
+    reporter: Reporter,
+    terminal_outcome: bool,
+) -> int:
+    """Run one exact, monotonic target cleanup state machine."""
+    batch_id = str(row["batch_id"])
+    device_name = str(row["device"])
+    device = config.devices.get(device_name)
+    if device is None or not executor._target_acceptance_supported(device):
+        reporter.event(
+            "dispatch_stale_deferred", batch=batch_id, device=device_name,
+            reason="target device configuration unavailable",
+        )
+        return 0
+    disposition = row.get("target_finalization_disposition")
+    if disposition == FINALIZATION_FENCED:
+        if terminal_outcome:
+            return 0
+        return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
+    if not terminal_outcome and row.get("target_finalized_at"):
+        return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=True))
+
+    operation_id = executor._target_operation_identity(batch_id)
+    stored_operation = row.get("target_operation_id")
+    if stored_operation is None:
+        # No persisted reservation identity proves that target launch could not
+        # have been authorized. The deterministic stage is still removed.
         try:
             transport = make_transport(device)
             stage = transport.native_join(
                 executor._target_state_root(transport, device),
-                "fleet-operations",
-                operation_id,
+                "fleet-operations", operation_id,
             )
-            stored_operation = row.get("target_operation_id")
-            if stored_operation is None:
-                # Reservation identity is persisted before the first stage byte,
-                # so no identity is positive proof that launch was impossible.
-                transport.remove_remote_tree(stage)
-                if queue.expire_stale_batch(batch_id, now=now, replay_safe=True):
-                    recovered += 1
-                continue
-
-            request_sha = row.get("target_request_sha256")
-            token = row.get("target_resume_token")
-            if stored_operation != operation_id or not isinstance(request_sha, str) \
-                    or not isinstance(token, str) or not token:
-                if queue.expire_stale_batch(batch_id, now=now, replay_safe=False):
-                    recovered += 1
-                continue
-
-            client = TargetResourceClient.connect(config, device_name, install=False)
-            status = client.status_identity(
-                operation_id, token, rpc_id=f"fleet-recover-status-{operation_id}",
-            )
-            receipt = status.get("receipt")
-            if not isinstance(receipt, dict) \
-                    or receipt.get("operation_id") != operation_id \
-                    or receipt.get("request_sha256") != request_sha:
-                if queue.expire_stale_batch(batch_id, now=now, replay_safe=False):
-                    recovered += 1
-                continue
-            state = str(receipt.get("state") or "")
-            if receipt.get("command_start_state") != "NO":
-                if queue.expire_stale_batch(batch_id, now=now, replay_safe=False):
-                    recovered += 1
-                continue
-            if state == "RESERVED":
-                cancelled = client.cancel(
-                    TargetReservation(receipt, token),
-                    rpc_id=f"fleet-recover-cancel-{operation_id}",
-                )
-                receipt = cancelled.get("receipt")
-                state = str(receipt.get("state") if isinstance(receipt, dict) else "")
-            if state not in terminal:
-                reporter.event(
-                    "dispatch_stale_deferred", batch=batch_id, device=device_name,
-                    reason=f"target cleanup state {state or 'unknown'} is not terminal",
-                )
-                continue
-
-            # The destructive evidence order is deliberate and crash-recoverable.
             transport.remove_remote_tree(stage)
-            transport.durable_cleanup(operation_id, token)
-            if not queue.record_expired_target_finalization(
-                batch_id,
-                operation_id=operation_id,
-                request_sha256=request_sha,
-                cleanup_state=state,
-                now=now,
-            ):
-                continue
-            if queue.expire_stale_batch(batch_id, now=now, replay_safe=True):
-                recovered += 1
         except (OSError, TargetResourceError, TransportError, ValueError) as exc:
             reporter.event(
                 "dispatch_stale_deferred", batch=batch_id, device=device_name,
                 reason=f"{type(exc).__name__}: {exc}",
             )
-    return recovered
+            return 0
+        if terminal_outcome:
+            return 0
+        return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=True))
+
+    request_sha = row.get("target_request_sha256")
+    token = row.get("target_resume_token")
+    if (
+        stored_operation != operation_id
+        or not FleetQueue._valid_target_digest(request_sha)
+        or not isinstance(token, str) or not token
+        or not FleetQueue._target_identity_complete(row)
+    ):
+        # Keep every malformed byte and fence it; never reconstruct a missing
+        # operation, digest, token, or timestamp from local queue state.
+        if terminal_outcome:
+            reporter.event(
+                "dispatch_stale_deferred", batch=batch_id, device=device_name,
+                reason="malformed target identity requires owner review",
+            )
+            return 0
+        return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
+
+    try:
+        transport = make_transport(device)
+        stage = transport.native_join(
+            executor._target_state_root(transport, device),
+            "fleet-operations", operation_id,
+        )
+        client = TargetResourceClient.connect(config, device_name, install=False)
+        status = client.status_identity(
+            operation_id, token, rpc_id=f"fleet-recover-status-{operation_id}",
+        )
+        receipt = status.get("receipt")
+        if not isinstance(receipt, dict) \
+                or receipt.get("operation_id") != operation_id \
+                or receipt.get("request_sha256") != request_sha:
+            if terminal_outcome:
+                return 0
+            return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
+        state = str(receipt.get("state") or "")
+        if not terminal_outcome and receipt.get("command_start_state") != "NO":
+            return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
+        if state == "RESERVED":
+            cancelled = client.cancel(
+                TargetReservation(receipt, token),
+                rpc_id=f"fleet-recover-cancel-{operation_id}",
+            )
+            receipt = cancelled.get("receipt")
+            state = str(receipt.get("state") if isinstance(receipt, dict) else "")
+        if state not in {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}:
+            reporter.event(
+                "dispatch_stale_deferred", batch=batch_id, device=device_name,
+                reason=f"target cleanup state {state or 'unknown'} is not terminal",
+            )
+            return 0
+
+        if not terminal_outcome:
+            if row.get("target_finalized_at"):
+                return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=True))
+            if not queue.record_target_cleanup_progress(
+                batch_id, operation_id=operation_id, request_sha256=request_sha,
+                cleanup_state=state, replayable=True, now=now,
+            ):
+                return 0
+        elif receipt.get("command_start_state") == "YES" \
+                and not row.get("target_stage_cleaned_at"):
+            durable = transport.durable_status(operation_id, token)
+            if not _target_durable_identity_matches(durable, operation_id, request_sha):
+                return 0
+            if not queue.record_target_cleanup_progress(
+                batch_id, operation_id=operation_id, request_sha256=request_sha,
+                cleanup_state=state, now=now,
+            ):
+                return 0
+        else:
+            if not queue.record_target_cleanup_progress(
+                batch_id, operation_id=operation_id, request_sha256=request_sha,
+                cleanup_state=state, now=now,
+            ):
+                return 0
+
+        if not row.get("target_stage_cleaned_at"):
+            transport.remove_remote_tree(stage)
+            if not queue.record_target_cleanup_progress(
+                batch_id, operation_id=operation_id, request_sha256=request_sha,
+                stage_cleaned=True, now=now,
+            ):
+                return 0
+        if not row.get("target_durable_cleaned_at"):
+            transport.durable_cleanup(operation_id, token)
+            if not queue.record_target_cleanup_progress(
+                batch_id, operation_id=operation_id, request_sha256=request_sha,
+                durable_cleaned=True, now=now,
+            ):
+                return 0
+        if not queue.record_expired_target_finalization(
+            batch_id, operation_id=operation_id, request_sha256=request_sha,
+            cleanup_state=state, now=now,
+        ):
+            return 0
+        if terminal_outcome:
+            return 1
+        return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=True))
+    except (OSError, TargetResourceError, TransportError, ValueError) as exc:
+        reporter.event(
+            "dispatch_stale_deferred", batch=batch_id, device=device_name,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        return 0
 
 
 def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
@@ -1074,6 +1201,9 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
         now0 = utc_now_iso()
         summary["recovered"] = q.recover_stale(now0, job_ids=job_ids)
         summary["recovered"] += _recover_target_stale(
+            config, q, now0, reporter=reporter, job_ids=job_ids,
+        )
+        summary["recovered"] += _recover_terminal_target_finalization(
             config, q, now0, reporter=reporter, job_ids=job_ids,
         )
         q.prune_cooldowns(now0)

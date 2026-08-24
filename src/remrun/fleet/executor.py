@@ -34,7 +34,14 @@ from .models import FleetTask
 from .prepared import (
     SourceChangedError, materialize_prepared_input, prepared_memory_limit_mib,
 )
-from .queue import BatchHeartbeat, FleetQueue
+from .queue import (
+    FINALIZATION_FENCED,
+    FINALIZATION_FINALIZED,
+    FINALIZATION_PENDING,
+    FINALIZATION_REPLAYABLE,
+    BatchHeartbeat,
+    FleetQueue,
+)
 from .result_protocol import ResultProtocolError, validate_result_envelope
 from .task_contract import resolve_tasks
 
@@ -317,6 +324,25 @@ def durable_attempt_record(task: FleetTask, result: dict[str, Any],
             # input text or target-local paths. Keep only validated JSON.
             pass
     return json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def target_finalization_disposition(result: dict[str, Any]) -> str | None:
+    """Translate one worker result into the queue's durable target disposition."""
+    target = result.get("target_operation")
+    if target is None and not result.get("cleanup_deferred"):
+        return None
+    if (
+        result.get("target_acceptance_unknown")
+        or result.get("completion_state") == "unknown"
+        or ("command_started" in result and result.get("command_started") is None)
+    ):
+        return FINALIZATION_FENCED
+    if result.get("cleanup_deferred"):
+        if result.get("completion_state") == "not_started" \
+                and result.get("command_started") is False:
+            return FINALIZATION_REPLAYABLE
+        return FINALIZATION_PENDING
+    return FINALIZATION_FINALIZED
 
 
 def _choose_device(task: FleetTask, features: Any, config: RemrunConfig, fcfg: dict,
@@ -632,11 +658,13 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 transitioned = queue.mark_completion_unknown(
                     batch_id, error, expected_state=batch_state, owner_token=owner_token,
                     result_record=attempt_record, observation=observation,
+                    finalization_disposition=FINALIZATION_FENCED,
                 )
             else:
                 transitioned = queue.fail_batch(
                     batch_id, error, expected_state=batch_state, owner_token=owner_token,
                     max_attempts=1, result_record=attempt_record, observation=observation,
+                    finalization_disposition=target_finalization_disposition(result),
                 )
             if not transitioned:
                 return {"ok": False, "device": device_name,
@@ -651,6 +679,7 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 batch_id,
                 owner_token=owner_token,
                 reason=definition_drift_reason or "definition_changed",
+                finalization_disposition=target_finalization_disposition(result),
             ):
                 return {**_ad_hoc_result(result), "ok": False, "ownership_lost": True,
                         "error": "lost batch ownership while recording definition drift"}
@@ -670,6 +699,7 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 batch_id, result.get("error") or "completion unknown after launch authorization",
                 expected_state=batch_state, owner_token=owner_token,
                 result_record=attempt_record, observation=observation,
+                finalization_disposition=FINALIZATION_FENCED,
             )
         elif not result.get("ok") and result.get("no_retry") \
                 and queue.batch_replay_policy(batch_id) == "at-most-once-v1":
@@ -677,6 +707,7 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 batch_id, result.get("error") or "worker completion evidence is incomplete",
                 expected_state=batch_state, owner_token=owner_token,
                 result_record=attempt_record, observation=observation,
+                finalization_disposition=FINALIZATION_FENCED,
             )
         else:
             if result.get("ok") and batch_state != "fetching":
@@ -701,17 +732,20 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                     results={job_id: record for job_id, record in terminal_records.items()
                              if record is not None},
                     result_record=attempt_record, observation=observation,
+                    finalization_disposition=target_finalization_disposition(result),
                 )
             elif result.get("ok"):
                 transitioned = queue.complete_batch(
                     batch_id, expected_state=batch_state, owner_token=owner_token,
                     result_record=attempt_record, observation=observation,
+                    finalization_disposition=target_finalization_disposition(result),
                 )
             else:
                 transitioned = queue.fail_batch(
                     batch_id, result.get("error") or f"exit {result.get('exit_code')}",
                     expected_state=batch_state, owner_token=owner_token, max_attempts=1,
                     result_record=attempt_record, observation=observation,
+                    finalization_disposition=target_finalization_disposition(result),
                 )
         if not transitioned:
             return {**_ad_hoc_result(result), "ok": False, "ownership_lost": True,
