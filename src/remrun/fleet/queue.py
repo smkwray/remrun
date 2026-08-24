@@ -450,11 +450,26 @@ class FleetQueue:
                 if not self._target_identity_present(row):
                     continue
                 if self._target_identity_complete(row):
-                    disposition = (
-                        FINALIZATION_PENDING
-                        if row["state"] in {"done", "failed"}
-                        else FINALIZATION_RECONCILE
-                    )
+                    if row["state"] in {"done", "failed"}:
+                        # Batch terminality alone is not a known job outcome.  The
+                        # predecessor represented acceptance/completion ambiguity as
+                        # a failed batch whose attached jobs were completion_unknown.
+                        # Fail closed for every still-associated non-final job state;
+                        # ordinary retryable known failures have already detached
+                        # their queued jobs from this historical batch.
+                        unresolved = self.db.execute(
+                            f"SELECT 1 FROM jobs WHERE batch_id=? "
+                            f"AND state NOT IN ({_FINAL_Q}) LIMIT 1",
+                            (row["batch_id"], *_FINAL),
+                        ).fetchone()
+                        if unresolved is not None:
+                            disposition = FINALIZATION_FENCED
+                        elif row["target_finalized_at"] is not None:
+                            disposition = FINALIZATION_FINALIZED
+                        else:
+                            disposition = FINALIZATION_PENDING
+                    else:
+                        disposition = FINALIZATION_RECONCILE
                 else:
                     disposition = FINALIZATION_MALFORMED
                 self.db.execute(
@@ -2283,14 +2298,14 @@ class FleetQueue:
     def stale_target_batches(
         self, now: str | None = None,
         job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
-        *, include_terminal: bool = True,
+        *, include_terminal: bool = False,
     ) -> list[dict[str, Any]]:
         """Return expired protocol-v1 batches for target-aware reconciliation.
 
         The private resume token is exposed only to this controller-internal
         recovery surface. Public status receipts remain redacted. Terminal
-        known-outcome rows are included by default so callers can observe the
-        cleanup-only recovery boundary; active recovery opts out explicitly.
+        known-outcome rows require an explicit opt-in; production uses the dedicated
+        cleanup-only selector instead of mixing them into active recovery.
         """
         now = now or utc_now_iso()
         if job_ids is not None and not job_ids:

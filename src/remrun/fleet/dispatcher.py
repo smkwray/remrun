@@ -36,6 +36,7 @@ from .config import fleet_config, idle_grace_s as configured_idle_grace_s, load_
 from .models import DrainResultV1, FleetTask
 from .queue import (
     FINALIZATION_FENCED,
+    FINALIZATION_MALFORMED,
     BatchHeartbeat,
     FleetQueue,
 )
@@ -1047,9 +1048,12 @@ def _recover_target_row(
         )
         return 0
     disposition = row.get("target_finalization_disposition")
-    if disposition == FINALIZATION_FENCED:
+    if disposition in {FINALIZATION_FENCED, FINALIZATION_MALFORMED}:
         if terminal_outcome:
             return 0
+        # Preserve every target byte for ambiguous or malformed predecessor
+        # state.  In particular, a missing operation ID is not proof that no
+        # reservation existed when other target identity fields are present.
         return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
     if not terminal_outcome and row.get("target_finalized_at"):
         return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=True))
@@ -1203,8 +1207,12 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
         summary["recovered"] += _recover_target_stale(
             config, q, now0, reporter=reporter, job_ids=job_ids,
         )
+        # Terminal target cleanup never claims or replays queue work.  Run it
+        # globally even during a scoped drain: retryable failure intentionally
+        # detaches the job from its historical batch, so current job.batch_id
+        # cannot express the old cleanup obligation.
         summary["recovered"] += _recover_terminal_target_finalization(
-            config, q, now0, reporter=reporter, job_ids=job_ids,
+            config, q, now0, reporter=reporter,
         )
         q.prune_cooldowns(now0)
 
