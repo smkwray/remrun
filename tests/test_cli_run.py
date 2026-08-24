@@ -2442,7 +2442,9 @@ def test_auto_memory_limit_skips_unguarded_target_before_mutation(two_device_env
             "\n[devices.SIM_B.memory_guard]\n"
             "schema = 3\n"
             "command_limit_fraction = 0.25\n"
-            "host_reserve_fraction = 0.25\n"
+            # Keep this candidate safely inside live capacity.  The test covers
+            # guarded failover, not refusal at a host-reserve boundary.
+            "host_reserve_fraction = 0.01\n"
         )
     (env["proj"] / "input.txt").write_text("source", encoding="utf-8")
 
