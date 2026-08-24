@@ -15,6 +15,10 @@ import pytest
 
 pytest.importorskip("resource")
 
+# _posix_telemetry imports fcntl at module scope, so this module cannot even be
+# collected off POSIX. Skip the module rather than aborting the whole run.
+pytest.importorskip("fcntl", reason="POSIX-only telemetry surface")
+
 from remrun import _posix_telemetry as telemetry
 
 

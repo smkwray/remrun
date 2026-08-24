@@ -5,6 +5,7 @@ import io
 import hashlib
 import json
 import os
+import stat
 import signal
 import subprocess
 import sys
@@ -569,7 +570,12 @@ def test_push_builds_mkdir_cat_and_mtime(monkeypatch, tmp_path: Path):
     assert "os.utime" in script
     assert "os.fchmod" in script
     assert script.index("os.open") < script.index("os.fchmod")
-    assert script.endswith(" 493 && trap - EXIT")
+    # transport.py mirrors this rule: POSIX modes are propagated, and a Windows
+    # controller sends a fixed 0o644 because its st_mode carries no POSIX bits.
+    # Asserting a literal 0o755 tested the host's chmod, not the transport, and
+    # left the Windows branch of that conditional with no coverage at all.
+    expected_mode = stat.S_IMODE(f.stat().st_mode) if os.name == "posix" else 0o644
+    assert script.endswith(f" {expected_mode} && trap - EXIT")
     assert rec.calls[-1]["input"] == b"payload"
 
 
@@ -590,7 +596,11 @@ def test_push_files_streams_tar_archive(monkeypatch, tmp_path: Path):
     archive.write_bytes(rec.calls[-1]["input"])
     with tarfile.open(archive, "r:*") as tf:
         assert sorted(tf.getnames()) == ["a.txt", "sub/b.txt"]
-        assert tf.getmember("sub/b.txt").mode == 0o755
+        # Same rule as push_file: propagate on POSIX, fixed 0o644 from Windows.
+        src_mode = stat.S_IMODE((local / "sub" / "b.txt").stat().st_mode)
+        assert tf.getmember("sub/b.txt").mode == (
+            src_mode if os.name == "posix" else 0o644
+        )
 
 
 def test_pull_files_extracts_tar_archive(monkeypatch, tmp_path: Path):
@@ -1065,6 +1075,11 @@ def test_ssh_posix_reserve_renew_and_guard_args_preserve_lease_capacity(
     assert decoded["capacity_bytes"] == reservation.capacity_bytes
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="_posix_telemetry imports fcntl, which does not exist on Windows; the "
+           "module under test is POSIX-only rather than merely unexercised here",
+)
 def test_ssh_posix_fair_share_helper_uses_new_filename_and_existing_ledger():
     from remrun import _posix_telemetry as telemetry
 
