@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,43 +31,47 @@ def _config(root: Path) -> RemrunConfig:
     )
 
 
-def _terminal_batch(tmp_path: Path) -> tuple[Path, Path, Device, str, str, str]:
+def _terminal_batch(
+    tmp_path: Path, *, suffix: str = "finalization",
+) -> tuple[Path, Path, Device, str, str, str]:
     db_path = tmp_path / "controller-state" / "fleet" / "fleet.db"
-    operation_id = "fleet-batch-finalization"
+    batch_id = f"batch-{suffix}"
+    job_id = f"job-{suffix}"
+    operation_id = f"fleet-{batch_id}"
     request_sha = "c" * 64
     token = "terminal-private-token"
     q = queue_mod.FleetQueue(db_path)
     prepared = prepare_raw_command([sys.executable, "-c", "print('ok')"], device="TARGET")
-    job_id = q.enqueue_prepared(prepared, spec=None, job_id="job-finalization", now=NOW)
+    job_id = q.enqueue_prepared(prepared, spec=None, job_id=job_id, now=NOW)
     owner = q.claim_many(
-        [job_id], "TARGET", batch_id="batch-finalization", lease_until=FUTURE,
+        [job_id], "TARGET", batch_id=batch_id, lease_until=FUTURE,
         pool=None, task_name="command", engine="raw", bucket="", now=NOW,
         target_protocol_version=1, current_spec_ids={job_id: RAW_COMMAND_SPEC_ID},
     )
     assert owner is not None
     assert q.record_target_reservation(
-        "batch-finalization", operation_id=operation_id, request_sha256=request_sha,
+        batch_id, operation_id=operation_id, request_sha256=request_sha,
         resume_token=token, expected_state="leased", owner_token=owner, now=NOW,
     )
     assert q.set_batch_state(
-        "batch-finalization", "staging", expected_state="leased", owner_token=owner, now=NOW,
+        batch_id, "staging", expected_state="leased", owner_token=owner, now=NOW,
     )
     assert q.set_batch_state(
-        "batch-finalization", "running", expected_state="staging", owner_token=owner, now=NOW,
+        batch_id, "running", expected_state="staging", owner_token=owner, now=NOW,
     )
     assert q.record_target_acceptance(
-        "batch-finalization", operation_id=operation_id, request_sha256=request_sha,
+        batch_id, operation_id=operation_id, request_sha256=request_sha,
         expected_state="running", owner_token=owner, now=NOW,
     )
     assert q.set_batch_state(
-        "batch-finalization", "fetching", expected_state="running", owner_token=owner, now=NOW,
+        batch_id, "fetching", expected_state="running", owner_token=owner, now=NOW,
     )
     assert q.complete_batch(
-        "batch-finalization", expected_state="fetching", owner_token=owner, now=NOW,
+        batch_id, expected_state="fetching", owner_token=owner, now=NOW,
         finalization_disposition=queue_mod.FINALIZATION_PENDING,
     )
     q.db.execute(
-        "UPDATE batches SET lease_until=? WHERE batch_id='batch-finalization'", (OLD,)
+        "UPDATE batches SET lease_until=? WHERE batch_id=?", (OLD, batch_id)
     )
     q.db.commit()
     q.close()
@@ -136,6 +141,193 @@ def _recovery_fakes(
 
     monkeypatch.setattr(dispatcher.TargetResourceClient, "connect", lambda *_a, **_k: Client())
     monkeypatch.setattr(dispatcher, "make_transport", lambda _device: Transport(device))
+
+
+def _event_reporter(events: list[tuple[str, dict]]) -> SimpleNamespace:
+    return SimpleNamespace(
+        event=lambda name, **fields: events.append((name, fields)),
+    )
+
+
+def test_terminal_cleanup_active_transport_cooldown_skips_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A global cleanup obligation must not probe a device already known to be unreachable."""
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    db_path, stage, device, _operation_id, _request_sha, _token = _terminal_batch(tmp_path)
+    q = queue_mod.FleetQueue(db_path)
+    q.set_cooldown(
+        "TARGET", FUTURE, kind="transport", reason="transport", now=NOW,
+    )
+    q.close()
+
+    probes: list[str] = []
+
+    class OfflineTransport(LocalSimTransport):
+        def probe(self):  # noqa: ANN201
+            probes.append(self.device.name)
+            return SimpleNamespace(reachable=False, detail="offline")
+
+    monkeypatch.setattr(dispatcher, "utc_now_iso", lambda: NOW)
+    monkeypatch.setattr(dispatcher, "make_transport", lambda _device: OfflineTransport(device))
+    events: list[tuple[str, dict]] = []
+    summary = dispatcher.drain_once(
+        _config(tmp_path), state_root=tmp_path / "controller-state",
+        reporter=_event_reporter(events),
+    )
+
+    assert summary["recovered"] == 0
+    assert probes == []
+    q = queue_mod.FleetQueue(db_path)
+    try:
+        batch = q.get_batch("batch-finalization")
+        assert [row["batch_id"] for row in q.terminal_target_batches(FUTURE)] == [
+            "batch-finalization"
+        ]
+    finally:
+        q.close()
+    assert batch is not None and batch["state"] == "done"
+    assert batch["target_finalized_at"] is None
+    assert stage.exists()
+    assert (
+        "dispatch_stale_deferred",
+        {
+            "batch": "batch-finalization",
+            "device": "TARGET",
+            "reason": "active transport cooldown",
+            "until": FUTURE,
+        },
+    ) in events
+
+
+def test_terminal_cleanup_resumes_after_transport_cooldown_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cooldown defers cleanup; expiry exposes the same obligation to normal finalization."""
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    db_path, stage, device, operation_id, request_sha, token = _terminal_batch(tmp_path)
+    cooldown_until = "2026-08-24T00:01:00Z"
+    after_cooldown = "2026-08-24T00:02:00Z"
+    q = queue_mod.FleetQueue(db_path)
+    q.set_cooldown(
+        "TARGET", cooldown_until, kind="transport", reason="transport", now=NOW,
+    )
+    q.close()
+    recovery_events: list[str] = []
+    _recovery_fakes(
+        monkeypatch, device, operation_id, request_sha, token, recovery_events,
+    )
+    clock = {"now": NOW}
+    monkeypatch.setattr(dispatcher, "utc_now_iso", lambda: clock["now"])
+
+    deferred = dispatcher.drain_once(
+        _config(tmp_path), state_root=tmp_path / "controller-state",
+        reporter=Reporter(json_events=False),
+    )
+    assert deferred["recovered"] == 0
+    assert recovery_events == []
+    assert stage.exists()
+
+    clock["now"] = after_cooldown
+    resumed = dispatcher.drain_once(
+        _config(tmp_path), state_root=tmp_path / "controller-state",
+        reporter=Reporter(json_events=False),
+    )
+    assert resumed["recovered"] == 1
+    q = queue_mod.FleetQueue(db_path)
+    try:
+        batch = q.get_batch("batch-finalization")
+        job = q.get("job-finalization")
+    finally:
+        q.close()
+    assert batch is not None and batch["state"] == "done"
+    assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_FINALIZED
+    assert batch["target_finalized_at"] == after_cooldown
+    assert job is not None and job["state"] == "done"
+    assert recovery_events == ["target_terminality", "stage_delete", "durable_delete"]
+    assert not stage.exists()
+
+
+def test_terminal_cleanup_probe_failure_sets_transport_cooldown_and_retains_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed cleanup probe backs off the device without changing or dropping known truth."""
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    db_path, stage, device, _operation_id, _request_sha, _token = _terminal_batch(tmp_path)
+    probes: list[str] = []
+
+    class OfflineTransport(LocalSimTransport):
+        def probe(self):  # noqa: ANN201
+            probes.append(self.device.name)
+            return SimpleNamespace(reachable=False, detail="offline")
+
+    monkeypatch.setattr(dispatcher, "utc_now_iso", lambda: NOW)
+    monkeypatch.setattr(dispatcher, "make_transport", lambda _device: OfflineTransport(device))
+    events: list[tuple[str, dict]] = []
+    summary = dispatcher.drain_once(
+        _config(tmp_path), state_root=tmp_path / "controller-state",
+        reporter=_event_reporter(events),
+    )
+
+    assert summary["recovered"] == 0
+    assert probes == ["TARGET"]
+    q = queue_mod.FleetQueue(db_path)
+    try:
+        batch = q.get_batch("batch-finalization")
+        job = q.get("job-finalization")
+        cooldowns = q.active_cooldowns(NOW)
+        obligations = q.terminal_target_batches(FUTURE)
+    finally:
+        q.close()
+    assert batch is not None and batch["state"] == "done"
+    assert batch["target_finalized_at"] is None
+    assert job is not None and job["state"] == "done"
+    assert [row["batch_id"] for row in obligations] == ["batch-finalization"]
+    assert len(cooldowns) == 1
+    assert cooldowns[0]["device"] == "TARGET"
+    assert cooldowns[0]["engine"] == ""
+    assert cooldowns[0]["kind"] == "transport"
+    assert cooldowns[0]["until"] > NOW
+    assert any(name == "dispatch_cooldown" for name, _fields in events)
+    assert any(name == "dispatch_stale_deferred" for name, _fields in events)
+    assert stage.exists()
+
+
+def test_terminal_cleanup_first_probe_failure_defers_later_rows_on_same_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One dead-device probe per tick is enough even when several cleanup rows target it."""
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    db_path, stage_one, device, _operation_id, _request_sha, _token = _terminal_batch(
+        tmp_path, suffix="one",
+    )
+    _db_path, stage_two, _device, _operation_id, _request_sha, _token = _terminal_batch(
+        tmp_path, suffix="two",
+    )
+    probes: list[str] = []
+
+    class OfflineTransport(LocalSimTransport):
+        def probe(self):  # noqa: ANN201
+            probes.append(self.device.name)
+            return SimpleNamespace(reachable=False, detail="offline")
+
+    monkeypatch.setattr(dispatcher, "utc_now_iso", lambda: NOW)
+    monkeypatch.setattr(dispatcher, "make_transport", lambda _device: OfflineTransport(device))
+    summary = dispatcher.drain_once(
+        _config(tmp_path), state_root=tmp_path / "controller-state",
+        reporter=Reporter(json_events=False),
+    )
+
+    assert summary["recovered"] == 0
+    assert probes == ["TARGET"]
+    q = queue_mod.FleetQueue(db_path)
+    try:
+        obligations = q.terminal_target_batches(FUTURE)
+    finally:
+        q.close()
+    assert sorted(row["batch_id"] for row in obligations) == ["batch-one", "batch-two"]
+    assert stage_one.exists()
+    assert stage_two.exists()
 
 
 @pytest.mark.parametrize("crash_after", ["target", "stage", "durable", "finalization"])

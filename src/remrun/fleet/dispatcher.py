@@ -1008,6 +1008,20 @@ def _recover_terminal_target_finalization(
     """Finish target cleanup for terminal rows without changing job outcome."""
     recovered = 0
     for row in queue.terminal_target_batches(now, job_ids=job_ids):
+        device_name = str(row["device"])
+        transport_cooldown = next((
+            cooldown for cooldown in queue.active_cooldowns(now)
+            if str(cooldown["device"]) == device_name
+            and not cooldown.get("engine")
+            and cooldown.get("kind") == "transport"
+        ), None)
+        if transport_cooldown is not None:
+            reporter.event(
+                "dispatch_stale_deferred", batch=str(row["batch_id"]),
+                device=device_name, reason="active transport cooldown",
+                until=str(transport_cooldown["until"]),
+            )
+            continue
         recovered += _recover_target_row(
             config, queue, row, now, reporter=reporter, terminal_outcome=True,
         )
@@ -1047,6 +1061,19 @@ def _recover_target_row(
             reason="target device configuration unavailable",
         )
         return 0
+
+    def target_state_root(transport: Any) -> str:
+        try:
+            return executor._target_state_root(transport, device)
+        except (OSError, TargetResourceError, TransportError, ValueError) as exc:
+            if terminal_outcome:
+                _apply_cooldown(
+                    queue, device_name, "",
+                    _classify_failure(f"{type(exc).__name__}: {exc}"),
+                    queue.batch_attempts(batch_id), utc_now_iso(), reporter,
+                )
+            raise
+
     disposition = row.get("target_finalization_disposition")
     if disposition in {FINALIZATION_FENCED, FINALIZATION_MALFORMED}:
         if terminal_outcome:
@@ -1066,7 +1093,7 @@ def _recover_target_row(
         try:
             transport = make_transport(device)
             stage = transport.native_join(
-                executor._target_state_root(transport, device),
+                target_state_root(transport),
                 "fleet-operations", operation_id,
             )
             transport.remove_remote_tree(stage)
@@ -1101,7 +1128,7 @@ def _recover_target_row(
     try:
         transport = make_transport(device)
         stage = transport.native_join(
-            executor._target_state_root(transport, device),
+            target_state_root(transport),
             "fleet-operations", operation_id,
         )
         client = TargetResourceClient.connect(config, device_name, install=False)
