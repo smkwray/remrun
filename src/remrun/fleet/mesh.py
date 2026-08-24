@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from ..models import Device
+from ..transport import _ssh_base_argv, make_transport
 from .resources import _NO_WINDOW_FLAG, _friendly_error
 
 # Cell states, most to least severe. `unknown` means untested, not failed.
@@ -31,6 +32,15 @@ DNS = "dns"
 HOSTKEY = "hostkey"
 UNKNOWN = "unknown"
 SELF = "self"
+
+# The order is the user-facing diagnostic priority: retain the first state in
+# this sequence when several address spellings fail.
+_STATUS_PRIORITY = {
+    status: priority
+    for priority, status in enumerate(
+        (OK, AUTH, REFUSED, OFFLINE, DNS, HOSTKEY, UNKNOWN, SELF)
+    )
+}
 
 # One-character glyphs for the matrix; the legend spells them out.
 GLYPH = {OK: "Y", AUTH: "!", REFUSED: "x", OFFLINE: ".", DNS: "?",
@@ -65,42 +75,23 @@ def _classify(stderr: str) -> tuple[str, str]:
     return OFFLINE, message
 
 
-def _target_spec(device: Device) -> str:
-    """`user@address` for ssh, preferring the tailnet IP.
-
-    A bare hostname only resolves when the CALLER's ~/.ssh/config has a matching
-    Host entry. That holds on this controller but not on a hop, where the same
-    alias may map to a different user or to nothing — so prefer an explicit IP,
-    and attach the user whenever config supplies one.
-    """
-    address = device.tailscale_ip or (device.all_addresses() or [device.name])[0]
-    return f"{device.user}@{address}" if device.user else address
+def _prefer_failure(
+    current: tuple[str, str] | None, detail: str,
+) -> tuple[str, str]:
+    """Keep the most informative classified failure, preserving raw detail."""
+    status, _ = _classify(detail)
+    candidate = (status, detail)
+    if current is None or _STATUS_PRIORITY[status] < _STATUS_PRIORITY[current[0]]:
+        return candidate
+    return current
 
 
 def _login_attempts(target: Device) -> list[str]:
-    """Login spellings to try, most trustworthy first.
-
-    The explicit `user@tailnet-IP` goes FIRST because it always names the real
-    device. The bare alias is tried second: it can succeed where the IP fails
-    (the caller's ~/.ssh/config may bind a specific IdentityFile to that Host,
-    with `IdentitiesOnly yes`), but it is resolved by whatever DNS the caller
-    uses — and a router that answers every unknown local name with its own
-    gateway address would otherwise silently redirect the probe at the router
-    and report the device as unreachable. Trying the IP first means a working
-    device is never misreported because of a hijacked name.
-    """
-    attempts = []
-    spec = _target_spec(target)
-    attempts.append(spec)
-    alias = target.name.lower()
-    if alias != spec:
-        attempts.append(alias)
-    return attempts
-
-
-def _ssh_prefix(timeout: int) -> list[str]:
-    return ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
-            "-o", "StrictHostKeyChecking=accept-new"]
+    """Use the same exact address spellings and order as the live transport."""
+    return [
+        f"{target.user}@{address}" if target.user else address
+        for address in target.all_addresses()
+    ]
 
 
 # The remote command must succeed on BOTH a POSIX shell and PowerShell, since a
@@ -129,19 +120,18 @@ def probe_edge_direct(target: Device, connect_timeout: int = 8,
                       timeout: float = 25.0) -> Edge:
     """Controller -> target, measured from this machine.
 
-    Tries the alias and the explicit user@IP for the same reason as the hop
-    path: they select different keys via ~/.ssh/config, so one can work where
-    the other is refused.
+    Delegate to the transport's own preflight. This is the same address, user,
+    identity-option, and SSH-config resolution path used by remrun itself.
     """
-    attempts = _login_attempts(target)
-
-    detail_last = ""
-    for spec in attempts:
-        code, text = _run([*_ssh_prefix(connect_timeout), spec, _PROBE_COMMAND], timeout)
-        if code == 0:
-            return Edge("", target.name, OK)
-        detail_last = text
-    status, detail = _classify(detail_last)
+    del connect_timeout, timeout
+    try:
+        result = make_transport(target).probe()
+    except Exception as exc:  # noqa: BLE001 - mesh must render a measured failure
+        status, detail = _classify(str(exc))
+        return Edge("", target.name, status, detail)
+    if result.reachable:
+        return Edge("", target.name, OK)
+    status, detail = _classify(result.detail)
     return Edge("", target.name, status, detail)
 
 
@@ -158,28 +148,37 @@ def probe_edge_via(hop: Device, target: Device, connect_timeout: int = 8,
     # shlex.quote() instead makes the whole line a single word, and the remote
     # shell reports "command not found: ssh -o BatchMode=yes ..." — a false
     # 'offline' for an edge that works.
-    # Try the device ALIAS first, then the explicit user@IP.
-    #
-    # These are genuinely different login attempts, not two spellings of one.
-    # A hop's own ~/.ssh/config selects the IdentityFile per Host alias, usually
-    # with `IdentitiesOnly yes`. Measured: `ssh <alias>` succeeds (the alias
-    # selects its configured IdentityFile) while `ssh <user>@<tailnet-ip>` is
-    # refused — the raw IP matches no Host block, so only the default keys are
-    # offered.
-    # Probing solely by IP therefore reports "no" for an edge the fleet can
-    # actually use. Reporting a working edge as broken is the failure to avoid,
-    # so success on EITHER spelling counts as reachable.
-    attempts = _login_attempts(target)
+    # Resolve the outer hop through the same runner preflight used by remrun,
+    # then build the inner command from the shared SSH argv seam. In particular,
+    # preserve each configured candidate's case and IdentityFile options.
+    try:
+        hop_probe = make_transport(hop).probe()
+    except Exception as exc:  # noqa: BLE001 - mesh must render a measured failure
+        status, detail = _classify(str(exc))
+        return Edge(hop.name, target.name, status, detail)
+    if not hop_probe.reachable or not hop_probe.address:
+        status, detail = _classify(hop_probe.detail)
+        return Edge(hop.name, target.name, status, detail)
 
-    detail_last = ""
-    for spec in attempts:
-        inner = [*_ssh_prefix(connect_timeout), spec, _PROBE_COMMAND]
-        outer = [*_ssh_prefix(connect_timeout), _target_spec(hop), *inner]
+    best_failure = None
+    outer_prefix = _ssh_base_argv(
+        hop, hop_probe.address, connect_timeout=connect_timeout,
+    )
+    for spec in _login_attempts(target):
+        address = spec.split("@", 1)[-1]
+        inner = [
+            *_ssh_base_argv(
+                target, address, connect_timeout=connect_timeout,
+                expand_user_paths=False,
+            ),
+            _PROBE_COMMAND,
+        ]
+        outer = [*outer_prefix, *inner]
         code, text = _run(outer, timeout)
         if code == 0:
             return Edge(hop.name, target.name, OK)
-        detail_last = text
-    status, detail = _classify(detail_last)
+        best_failure = _prefer_failure(best_failure, text)
+    status, detail = _classify(best_failure[1] if best_failure else "")
     return Edge(hop.name, target.name, status, detail)
 
 

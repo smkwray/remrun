@@ -43,6 +43,21 @@ _NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 _RUNNER_SOURCE: str | None = None
 
+
+def _best_probe_detail(details: Iterable[str]) -> str:
+    """Return the most informative failure across SSH address attempts.
+
+    Mesh owns the cell-state taxonomy. Import it only when a probe actually
+    needs failure selection so the transport module remains importable while
+    mesh imports the transport factory.
+    """
+    from .fleet.mesh import _prefer_failure
+
+    best = None
+    for detail in details:
+        best = _prefer_failure(best, detail)
+    return best[1] if best is not None else "no address candidates configured"
+
 # Tiny helper-integrity probe. Unlike ``hash_file()``, this does not upload the
 # full general-purpose remote runner on every observed launch/query. The remote
 # Python reads the already-staged helper and returns one 64-byte digest.
@@ -1968,6 +1983,34 @@ def _powershell_workers_running_script(cancel: dict) -> str:
     return "; ".join(parts)
 
 
+def _ssh_base_argv(
+    device: Device,
+    address: str,
+    connect_timeout: int | None = None,
+    *,
+    expand_user_paths: bool = True,
+) -> list[str]:
+    """Build the one SSH argv used by remrun and nested mesh probes.
+
+    The nested form leaves portable ``~`` paths for the hop's shell to expand;
+    the normal controller-side form expands them before ``subprocess`` bypasses
+    the shell. Both forms retain the exact configured alias, user, and options.
+    """
+    opts = [
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+    if connect_timeout:
+        opts += ["-o", f"ConnectTimeout={connect_timeout}"]
+    if expand_user_paths:
+        opts += [str(Path(opt).expanduser()) if opt.startswith(("~/", "~\\")) else opt
+                 for opt in device.ssh_opts]
+    else:
+        opts += list(device.ssh_opts)
+    target = f"{device.user}@{address}" if device.user else address
+    return ["ssh", *opts, target]
+
+
 class _SSHCommon(BaseTransport):
     """Shared OpenSSH plumbing for the ssh-posix and ssh-powershell backends."""
 
@@ -2015,19 +2058,7 @@ class _SSHCommon(BaseTransport):
             )
 
     def _ssh_base(self, address: str, connect_timeout: int | None = None) -> list[str]:
-        opts = [
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-        ]
-        if connect_timeout:
-            opts += ["-o", f"ConnectTimeout={connect_timeout}"]
-        # subprocess argv bypasses shell tilde expansion. Device config is synced
-        # across controllers, so keep identity paths portable instead of pinning a
-        # controller's absolute home directory.
-        opts += [str(Path(opt).expanduser()) if opt.startswith(("~/", "~\\")) else opt
-                 for opt in self.device.ssh_opts]
-        target = f"{self.device.user}@{address}" if self.device.user else address
-        return ["ssh", *opts, target]
+        return _ssh_base_argv(self.device, address, connect_timeout=connect_timeout)
 
     def _run(
         self,
@@ -2958,7 +2989,7 @@ class SSHPosixTransport(_SSHCommon):
 
     # --- diagnostics ------------------------------------------------------
     def probe(self) -> ProbeResult:
-        last_detail = "no address candidates configured"
+        failure_details = []
         for address in self.device.all_addresses():
             try:
                 proc = self._run(
@@ -2967,7 +2998,7 @@ class SSHPosixTransport(_SSHCommon):
                     timeout=20,
                 )
             except TransportError as exc:
-                last_detail = str(exc)
+                failure_details.append(str(exc))
                 continue
             if proc.returncode == 0 and b"remrun-ok" in proc.stdout:
                 lines = proc.stdout.decode("utf-8", "replace").splitlines()
@@ -2976,9 +3007,13 @@ class SSHPosixTransport(_SSHCommon):
                 self._address = address
                 return ProbeResult(reachable=True, address=address,
                                    detail="ssh ok", remote_os=remote_os)
-            last_detail = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip() \
+            failure_details.append(
+                (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
                 or f"exit {proc.returncode}"
-        return ProbeResult(reachable=False, address=None, detail=last_detail)
+            )
+        return ProbeResult(
+            reachable=False, address=None, detail=_best_probe_detail(failure_details)
+        )
 
     def sample_load(self) -> float | None:
         """Current interval CPU utilization %, or unknown.
@@ -3906,12 +3941,12 @@ class SSHPowerShellTransport(_SSHCommon):
             "Write-Output $PSVersionTable.PSVersion.ToString()"
         )
         encoded = _ps_remote_command(self._ps_exe(), script)
-        last_detail = "no address candidates configured"
+        failure_details = []
         for address in self.device.all_addresses():
             try:
                 proc = self._run([*self._ssh_base(address, connect_timeout=8), encoded], timeout=30)
             except TransportError as exc:
-                last_detail = str(exc)
+                failure_details.append(str(exc))
                 continue
             if proc.returncode == 0 and b"remrun-ok" in proc.stdout:
                 lines = [ln.strip() for ln in proc.stdout.decode("utf-8", "replace").splitlines()
@@ -3922,7 +3957,7 @@ class SSHPowerShellTransport(_SSHCommon):
                 except ValueError:
                     version = ()
                 if len(version) < 2 or version < (7, 3):
-                    last_detail = (
+                    failure_details.append(
                         "unsupported pwsh version "
                         f"{version_text or 'unknown'}; remrun requires pwsh 7.3+ "
                         "for exact native argv passing"
@@ -3932,9 +3967,13 @@ class SSHPowerShellTransport(_SSHCommon):
                 self._address = address
                 return ProbeResult(reachable=True, address=address, detail="ssh ok",
                                    remote_os="windows")
-            last_detail = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip() \
+            failure_details.append(
+                (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
                 or f"exit {proc.returncode}"
-        return ProbeResult(reachable=False, address=None, detail=last_detail)
+            )
+        return ProbeResult(
+            reachable=False, address=None, detail=_best_probe_detail(failure_details)
+        )
 
     def sample_load(self) -> float | None:
         """Current CPU utilization % via a 1-second performance-counter sample

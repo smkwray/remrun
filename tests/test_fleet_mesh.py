@@ -7,6 +7,8 @@ edges into a false "offline".
 """
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from remrun.fleet import mesh
@@ -18,11 +20,11 @@ from remrun.fleet.mesh import (
     SELF,
     Edge,
     _classify,
-    _target_spec,
     build_matrix,
 )
 from remrun.fleet.mesh_render import _asymmetries, _unreachable_by_anyone, render_matrix
 from remrun.models import Device
+from remrun.transport import ProbeResult, SSHPosixTransport, SSHPowerShellTransport
 
 
 def _device(name: str, **extra) -> Device:
@@ -53,10 +55,15 @@ def test_hop_command_is_passed_as_tokens_not_one_quoted_word(monkeypatch):
         captured["command"] = command
         return 0, ""
 
-    monkeypatch.setattr(mesh, "_run", fake_run)
     hop = _device("HOPBOX", tailscale_ip="192.0.2.12", user="user")
     target = _device("WINBOX", tailscale_ip="192.0.2.15", user="user", kind="ssh-powershell",
                      os="windows")
+    class FakeTransport:
+        def probe(self):
+            return ProbeResult(True, "192.0.2.12", "ssh ok", "windows")
+
+    monkeypatch.setattr(mesh, "_run", fake_run)
+    monkeypatch.setattr(mesh, "make_transport", lambda _device: FakeTransport())
     mesh.probe_edge_via(hop, target)
 
     command = captured["command"]
@@ -75,13 +82,17 @@ def test_explicit_ip_is_tried_before_the_bare_alias(monkeypatch):
     """
     tried = []
 
-    def fake_run(command, timeout):
-        spec = command[-2]
+    def fake_run(argv, timeout=None, **_kwargs):
+        spec = argv[-2]
         tried.append(spec)
-        return (0, "")
+        return subprocess.CompletedProcess(
+            argv, 0, b"remrun-ok\nLinux\n/home/user\n", b""
+        )
 
-    monkeypatch.setattr(mesh, "_run", fake_run)
     target = _device("POSIXBOX2", tailscale_ip="192.0.2.14", user="user")
+    runner = SSHPosixTransport(target)
+    monkeypatch.setattr(runner, "_run", fake_run)
+    monkeypatch.setattr(mesh, "make_transport", lambda _device: runner)
     assert mesh.probe_edge_direct(target).status == OK
     assert tried[0] == "user@192.0.2.14"      # IP first, never the alias
 
@@ -94,34 +105,169 @@ def test_alias_used_as_fallback_when_ip_is_refused(monkeypatch):
     """
     tried = []
 
-    def fake_run(command, timeout):
-        spec = command[-2]
+    def fake_run(argv, timeout=None, **_kwargs):
+        spec = argv[-2]
         tried.append(spec)
-        return (0, "") if spec == "macbox" else (255, "Permission denied (publickey)")
+        if spec == "user@macbox":
+            return subprocess.CompletedProcess(
+                argv, 0, b"remrun-ok\nLinux\n/home/user\n", b""
+            )
+        return subprocess.CompletedProcess(
+            argv, 255, b"", b"Permission denied (publickey)"
+        )
+
+    target = _device("MACBOX", tailscale_ip="192.0.2.11", user="user")
+    runner = SSHPosixTransport(target)
+    monkeypatch.setattr(runner, "_run", fake_run)
+    monkeypatch.setattr(mesh, "make_transport", lambda _device: runner)
+    assert mesh.probe_edge_direct(target).status == OK
+    assert tried == ["user@192.0.2.11", "user@macbox"]
+
+
+@pytest.mark.parametrize("identity_file", ["~/.ssh/id_ed25519", "~/.ssh/id_ed25519_mesh"])
+def test_mesh_probe_matches_runner_identity_and_case_sensitive_alias(
+    monkeypatch, identity_file,
+):
+    """Mesh must use the runner's exact alias/options, including a non-default key.
+
+    The live runner tries configured addresses in order and passes its configured
+    SSH options to every attempt. A lowercased device name is not an equivalent
+    alias: it can select a different Host block and therefore a different
+    IdentityFile. This models the field failure without opening a network socket.
+    """
+    target = _device(
+        "MIXBOX",
+        address_candidates=["192.0.2.15", "MiXbOx"],
+        user="runner",
+        ssh_opts=["-o", "IdentitiesOnly=yes", "-o", f"IdentityFile={identity_file}"],
+    )
+    runner = SSHPosixTransport(target)
+    expected_alias_argv = runner._ssh_base("MiXbOx", connect_timeout=8)
+    runner_argvs = {
+        tuple(runner._ssh_base(address, connect_timeout=8))
+        for address in target.all_addresses()
+    }
+    calls = []
+
+    def fake_run(argv, timeout=None, **_kwargs):
+        calls.append(argv)
+        if tuple(argv[:-1]) in runner_argvs:
+            code = 0 if argv[:-1] == expected_alias_argv else 255
+            return subprocess.CompletedProcess(
+                argv,
+                code,
+                b"remrun-ok\nLinux\n/home/runner\n" if code == 0 else b"",
+                b"" if code == 0 else b"Permission denied (publickey)",
+            )
+        # The old mesh path uses a different two-value subprocess seam.
+        return 255, "Permission denied (publickey)"
 
     monkeypatch.setattr(mesh, "_run", fake_run)
-    target = _device("MACBOX", tailscale_ip="192.0.2.11", user="user")
-    assert mesh.probe_edge_direct(target).status == OK
-    assert tried == ["user@192.0.2.11", "macbox"]
+    monkeypatch.setattr(runner, "_run", fake_run)
+    # The repaired mesh path delegates to the same transport instance used by
+    # remrun. `raising=False` keeps this test a genuine red test on the old tree,
+    # where mesh has no transport-resolution seam yet.
+    monkeypatch.setattr(mesh, "make_transport", lambda _device: runner, raising=False)
+
+    edge = mesh.probe_edge_direct(target)
+
+    assert edge.status == OK
+    probe_argv = calls[-1][:-1]
+    runner_argv = runner._ssh_base("MiXbOx", connect_timeout=8)
+    assert probe_argv == runner_argv
+    assert probe_argv[-1] == "runner@MiXbOx"
+    assert f"IdentityFile={identity_file}" in probe_argv
 
 
 def test_edge_fails_only_when_every_spelling_fails(monkeypatch):
-    monkeypatch.setattr(mesh, "_run",
-                        lambda c, t: (255, "user@x: Permission denied (publickey)"))
     target = _device("POSIXFS", tailscale_ip="192.0.2.13", user="user")
+    runner = SSHPosixTransport(target)
+    monkeypatch.setattr(
+        runner, "_run",
+        lambda argv, timeout=None, **_kwargs: subprocess.CompletedProcess(
+            argv, 255, b"", b"user@x: Permission denied (publickey)"
+        ),
+    )
+    monkeypatch.setattr(mesh, "make_transport", lambda _device: runner)
     edge = mesh.probe_edge_direct(target)
     assert edge.status == AUTH
 
 
-def test_target_spec_prefers_tailnet_ip_and_attaches_user():
-    """A hop does not share this controller's ~/.ssh/config, so a bare alias
-    there may map to a different user or nothing at all."""
-    device = _device("HOPBOX", tailscale_ip="192.0.2.12", user="user")
-    assert _target_spec(device) == "user@192.0.2.12"
-    # No tailnet IP configured: fall back to the first candidate, still with user.
-    assert _target_spec(_device("BOX", user="me")) == "me@box"
-    # No user configured: bare address (ssh then uses the local user).
-    assert _target_spec(_device("BOX")) == "box"
+@pytest.mark.parametrize(
+    ("transport_cls", "kind", "os_name", "shell"),
+    [
+        (SSHPosixTransport, "ssh-posix", "macos", "bash"),
+        (SSHPowerShellTransport, "ssh-powershell", "windows", "pwsh"),
+    ],
+)
+def test_auth_failure_survives_trailing_dns_attempt_for_mesh_users(
+    monkeypatch, transport_cls, kind, os_name, shell,
+):
+    """A late DNS miss must not hide an earlier key-installation signal.
+
+    The mesh glyph and physical-access advisory are what operators act on:
+    ``!`` says the host answered and needs a key, while ``?``/``.`` sends work
+    away as though the capacity were unavailable. Both SSH transports must
+    preserve the actionable result across all configured address spellings.
+    """
+    target = _device(
+        "FARBOX",
+        kind=kind,
+        os=os_name,
+        shell=shell,
+        user="runner",
+        address_candidates=["203.0.113.20", "FARBOX.local"],
+    )
+    runner = transport_cls(target)
+
+    def fake_run(argv, timeout=None, **_kwargs):
+        del timeout
+        address = argv[-2]
+        if address.endswith("203.0.113.20"):
+            return subprocess.CompletedProcess(
+                argv, 255, b"", b"Permission denied (publickey)"
+            )
+        return subprocess.CompletedProcess(
+            argv, 255, b"", b"ssh: Could not resolve hostname FARBOX.local: Name or service not known"
+        )
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+    monkeypatch.setattr(mesh, "make_transport", lambda _device: runner)
+
+    matrix = build_matrix([target], "NEARBOX", hops=False)
+    edge = matrix["edges"]["NEARBOX"]["FARBOX"]
+    table = render_matrix(matrix, "NEARBOX")
+
+    assert edge.status == AUTH
+    assert "FARBOX" in table and "!" in table
+    assert "No node can ssh into these (a key must be installed with physical/console access):" in table
+
+
+def test_hop_probe_preserves_auth_failure_before_trailing_dns(monkeypatch):
+    """A hop must retain the actionable failure from its inner SSH attempts."""
+    hop = _device("HOPBOX", user="runner")
+    target = _device(
+        "FARBOX",
+        user="runner",
+        address_candidates=["203.0.113.20", "FARBOX.local"],
+    )
+
+    class FakeHopTransport:
+        def probe(self):
+            return ProbeResult(True, "hopbox", "ssh ok", "macos")
+
+    def fake_run(argv, timeout):
+        del timeout
+        if argv[-2].endswith("203.0.113.20"):
+            return 255, "Permission denied (publickey)"
+        return 255, "ssh: Could not resolve hostname FARBOX.local: Name or service not known"
+
+    monkeypatch.setattr(mesh, "make_transport", lambda _device: FakeHopTransport())
+    monkeypatch.setattr(mesh, "_run", fake_run)
+
+    edge = mesh.probe_edge_via(hop, target)
+
+    assert edge.status == AUTH
 
 
 @pytest.mark.parametrize("stderr,expected", [
