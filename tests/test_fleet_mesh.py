@@ -86,7 +86,7 @@ def test_explicit_ip_is_tried_before_the_bare_alias(monkeypatch):
         spec = argv[-2]
         tried.append(spec)
         return subprocess.CompletedProcess(
-            argv, 0, b"remrun-ok\nLinux\n/home/user\n", b""
+            argv, 0, b"remrun-ok\nLinux\n/srv/user\n", b""
         )
 
     target = _device("POSIXBOX2", tailscale_ip="192.0.2.14", user="user")
@@ -110,7 +110,7 @@ def test_alias_used_as_fallback_when_ip_is_refused(monkeypatch):
         tried.append(spec)
         if spec == "user@macbox":
             return subprocess.CompletedProcess(
-                argv, 0, b"remrun-ok\nLinux\n/home/user\n", b""
+                argv, 0, b"remrun-ok\nLinux\n/srv/user\n", b""
             )
         return subprocess.CompletedProcess(
             argv, 255, b"", b"Permission denied (publickey)"
@@ -156,7 +156,7 @@ def test_mesh_probe_matches_runner_identity_and_case_sensitive_alias(
             return subprocess.CompletedProcess(
                 argv,
                 code,
-                b"remrun-ok\nLinux\n/home/runner\n" if code == 0 else b"",
+                b"remrun-ok\nLinux\n/srv/user\n" if code == 0 else b"",
                 b"" if code == 0 else b"Permission denied (publickey)",
             )
         # The old mesh path uses a different two-value subprocess seam.
