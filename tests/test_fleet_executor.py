@@ -11,7 +11,7 @@ import pytest
 
 from remrun import transport as transport_mod
 from remrun.config import RemrunConfig
-from remrun.fleet import executor, profiles
+from remrun.fleet import cli, executor, profiles
 from remrun.fleet.prepared import (
     RAW_COMMAND_SPEC,
     RAW_COMMAND_SPEC_ID,
@@ -22,6 +22,7 @@ from remrun.fleet.prepared import (
 from remrun.fleet.queue import FleetQueue
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.models import Device
+from remrun.output import Reporter
 from remrun.transport import TransportError, make_transport
 
 
@@ -80,6 +81,28 @@ def test_prepared_raw_command_runs_exact_argv_once_per_submission(tmp_path) -> N
     assert [json.loads(line) for line in marker.read_text(encoding="utf-8").splitlines()] == [
         hostile, hostile,
     ]
+
+
+def test_intrinsic_command_plan_produces_route_without_adapter(tmp_path, monkeypatch, capsys) -> None:
+    config = _config(tmp_path)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "default_state_root", lambda: tmp_path / "state")
+
+    args = type("CommandArgs", (), {
+        "command_action": "plan", "device": "LOCAL_SIM", "argv": [
+            "--", "python", "-c", "print(1)",
+        ], "input": [], "memory_limit_mib": None, "json": True,
+    })()
+
+    assert cli.cmd_command(args, Reporter(json_events=False)) == 0
+
+    planned = json.loads(capsys.readouterr().out)
+    assert planned["batches"] == [{
+        "device": "LOCAL_SIM", "estimate_reason": "uncalibrated",
+        "estimated_finish_s": None, "jobs": [0], "reason": "forced",
+        "selection_basis": "forced",
+    }]
+    assert planned["skipped"] == {}
 
 
 def test_materialize_input_reads_in_bounded_chunks_and_returns_receipt(

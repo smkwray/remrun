@@ -147,14 +147,15 @@ def _candidate_devices(task: FleetTask, config) -> list[str]:
 def _snapshots(task: FleetTask, config, fcfg, *, active_batches: dict[str, int] | None = None) -> dict:
     snaps = {}
     active_batches = active_batches or {}
+    configured_adapters = (task.resolved_spec or {}).get("adapters") or {}
     for name in _candidate_devices(task, config):
         dev = config.devices.get(name)
         if dev is not None:
             snaps[name] = probes.build_snapshot(
                 dev, None, fcfg,
                 active_jobs=active_batches.get(name, 0),
-                adapter_specs=[(task.resolved_spec or {})["adapters"][name]]
-                if task.resolved_spec and name in task.resolved_spec["adapters"] else [],
+                adapter_specs=[configured_adapters[name]]
+                if name in configured_adapters else [],
             )
     return snaps
 
