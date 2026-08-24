@@ -537,7 +537,11 @@ def test_target_supervisor_ack_order_no_duplicate_exact_result_and_bounded_clean
     stdout = base64.b64decode(result["stdout_b64"])
     stderr = base64.b64decode(result["stderr_b64"])
     assert len(stdout) <= 96
-    assert stderr == b"stderr-line\n"
+    # The helper writes this through Python's text stream, so the line terminator is
+    # the target platform's (CRLF on Windows). Compare the semantic line: the runner's
+    # contract is that it returns the child's bytes unaltered, not that it rewrites
+    # them to LF. Asserting a literal \n here tests the platform, not the runner.
+    assert stderr.decode().splitlines() == ["stderr-line"]
 
     wrong = _helper_call(
         helper, "status", "--state-root", str(root), "--run-id", "run-a",
