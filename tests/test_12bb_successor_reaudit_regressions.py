@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -14,27 +13,15 @@ from remrun.models import Device
 from remrun.output import Reporter
 from remrun.transport import LocalSimTransport
 
+from conftest import native_target_device
+
 OLD = "2000-01-01T00:00:00Z"
 NOW = "2026-08-24T00:00:00Z"
 FUTURE = "2099-01-01T00:00:00Z"
 
 
 def _device(root: Path) -> Device:
-    return Device.from_mapping(
-        "TARGET",
-        {
-            # Same platform rule as the other target-acceptance fixtures: the
-            # state root below is built from tmp_path, so declare the matching
-            # family. _target_state_root checks absoluteness with
-            # PureWindowsPath/PurePosixPath per device.os, and a posix
-            # declaration cannot validate a C:\... path.
-            "kind": "ssh-powershell" if os.name == "nt" else "ssh-posix",
-            "os": "windows" if os.name == "nt" else "posix",
-            "project_root": str(root / "projects"),
-            "state_root": str(root / "target-state"),
-            "cache_root": str(root / "cache"),
-        },
-    )
+    return native_target_device(root)
 
 
 def _config(root: Path) -> RemrunConfig:
