@@ -760,6 +760,9 @@ def test_stale_internal_owner_mutation_cannot_touch_newer_allocation(
         ("release", "RELEASED", {"reason": "repeat_release"}),
         ("release", "CANCELLED", {"reason": "cancelled_owner_exit"}),
         ("finish", "CANCELLED", {}),
+        ("finish", "RELEASED", {}),
+        ("finish", "QUARANTINED", {}),
+        ("quarantine", "QUARANTINED", {"reason": "repeat_quarantine"}),
     ],
 )
 def test_stale_owner_is_refused_on_rr1_idempotent_terminal_paths(
@@ -824,6 +827,30 @@ def test_stale_owner_is_refused_on_rr1_idempotent_terminal_paths(
         remote_runner._resource_owner_mutation(
             state_root, operation, body, **values
         )
+
+
+def test_posix_termination_kills_exact_present_identity_matching_root(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    row = {
+        "owner_kind": "posix_pgid_v1",
+        "owner_key": "321",
+        "root_pid": 321,
+        "root_start_id": "linux:321:original",
+    }
+    states = iter(["live", "gone"])
+    killed: list[int] = []
+    monkeypatch.setattr(
+        remote_runner, "_resource_owner_cleanup_state", lambda _row: next(states)
+    )
+    monkeypatch.setattr(remote_runner, "_posix_group_members", lambda _pgid: [321, 999])
+    monkeypatch.setattr(
+        remote_runner, "_process_start_id", lambda _pid: "linux:321:original"
+    )
+    monkeypatch.setattr(remote_runner, "_kill_posix_group", killed.append)
+
+    assert remote_runner._terminate_resource_owner(row) is True
+    assert killed == [321]
 
 
 def test_fence_increases_after_terminal_release_and_reallocation(tmp_path: Path):

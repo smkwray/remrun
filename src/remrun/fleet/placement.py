@@ -382,34 +382,22 @@ def assign_group(indices: list[int], tasks: list[FleetTask], features: list[JobF
     ) for d, ix in split_assign.items()]
     split_makespan = max(_eff(ix, d) for d, ix in split_assign.items())
 
-    hysteresis = _split_hysteresis(indices, t0, features, profiles, fitting, fleet_cfg,
-                                   best_finish=min(same_eff, split_makespan))
+    hysteresis = _split_hysteresis(
+        fleet_cfg, best_finish=min(same_eff, split_makespan),
+    )
     if split_makespan + hysteresis < same_eff:
         return split_batches, skipped
     return [same], skipped
 
 
-def _split_hysteresis(indices: list[int], t0: FleetTask, features: list[JobFeatures],
-                      profiles: dict, fitting: list[str], fleet_cfg: dict, *,
-                      best_finish: float) -> float:
-    """Adaptive tie-break margin a split must beat the single-batch finish by, to stop
-    flip-flopping near a crossover (Phase 3c). ``max`` of: a small floor, a fraction of the
-    better finish, and the configured unit uncertainty. Replaces the fixed
-    ``hysteresis_s=1.0`` (far too small versus a substantial cold load)."""
+def _split_hysteresis(fleet_cfg: dict, *, best_finish: float) -> float:
+    """Adaptive tie-break margin for split placement near a crossover.
+
+    The margin is the larger of a small floor and a fraction of the better finish.
+    """
     min_h = float(fleet_cfg.get("min_hysteresis_s", fleet_cfg.get("hysteresis_s", 5.0)))
     frac = float(fleet_cfg.get("hysteresis_finish_frac", 0.05))
-    margin = max(min_h, frac * max(best_finish, 0.0))
-    uncertain_units = sum(
-        float(features[index].prepared_units or 0.0)
-        * float(features[index].relative_uncertainty or 0.0)
-        for index in indices
-    )
-    if uncertain_units > 0:
-        var_rate = max((float((_profile(t0, device, profiles).var_per_unit_s
-                               if _profile(t0, device, profiles) else 0.0) or 0.0)
-                        for device in fitting), default=0.0)
-        margin = max(margin, var_rate * uncertain_units)
-    return margin
+    return max(min_h, frac * max(best_finish, 0.0))
 
 
 def plan_jobs(tasks: list[FleetTask], features: list[JobFeatures],

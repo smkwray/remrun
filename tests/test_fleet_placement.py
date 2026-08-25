@@ -72,6 +72,42 @@ def _cfg() -> dict:
             "pools": {"gpu": 1}}
 
 
+@pytest.mark.parametrize(
+    ("min_hysteresis_s", "hysteresis_finish_frac", "batch_count"),
+    [(1.0, 0.05, 2), (3.0, 0.05, 1), (1.0, 0.30, 1)],
+)
+def test_split_placement_applies_floor_and_finish_fraction(
+    tmp_path,
+    min_hysteresis_s: float,
+    hysteresis_finish_frac: float,
+    batch_count: int,
+) -> None:
+    tasks = [_task(tmp_path), _task(tmp_path)]
+    features = [prepared_features(task.prepared) for task in tasks]
+    profiles = {}
+    for task in tasks:
+        profiles[prepared_profile_key(task, "A")] = {
+            "fixed_load_s": 0.0, "var_per_unit_s": 1.0,
+            "peak_rss_mb": 1000.0, "peak_vram_mb": 0.0, "n": 5,
+        }
+        profiles[prepared_profile_key(task, "B")] = {
+            "fixed_load_s": 0.0, "var_per_unit_s": 1.6,
+            "peak_rss_mb": 1000.0, "peak_vram_mb": 0.0, "n": 5,
+        }
+    config = {
+        **_cfg(),
+        "min_hysteresis_s": min_hysteresis_s,
+        "hysteresis_finish_frac": hysteresis_finish_frac,
+    }
+
+    result = placement.plan_jobs(
+        tasks, features, {"A": _snap("A"), "B": _snap("B")}, profiles, config,
+        device_backlog={"A": 0.0, "B": 0.0},
+    )
+
+    assert len(result.batches) == batch_count
+
+
 def test_automatic_route_requires_positive_capability_qualification(tmp_path) -> None:
     task = _task(tmp_path)
     result = placement.plan_jobs(

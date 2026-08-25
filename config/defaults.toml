@@ -159,8 +159,8 @@ transfer_mbps = 200.0      # pessimistic input-transfer throughput (LAN/Tailscal
 per_file_overhead_s = 0.05
 ssh_setup_s = 0.6          # ~stage/exec/fetch connection overhead (fleet skips project reconcile)
 # Split hysteresis: prefer one batched device over a split unless the split wins by this
-# much. The margin is max(min_hysteresis_s, hysteresis_finish_frac * best_finish, and for
-# prepared-unit uncertainty). The old fixed `hysteresis_s = 1.0` was removed on
+# much. The margin is max(min_hysteresis_s, hysteresis_finish_frac * best_finish). The old
+# fixed `hysteresis_s = 1.0` was removed on
 # 2026-07-25: it had been superseded by these two and could never take effect, so editing
 # it silently did nothing.
 min_hysteresis_s = 5.0        # floor, in seconds

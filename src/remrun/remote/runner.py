@@ -2418,9 +2418,11 @@ def _resource_owner_release(conn, body: dict, boot_id: str, reason: str) -> dict
 
 def _resource_owner_quarantine(conn, body: dict, boot_id: str, reason: str) -> dict:
     row = _resource_auth(conn, body, require_fence=True)
+    if row["claim_boot_id"] != boot_id:
+        raise RunnerError("target resource claim boot identity mismatch")
     if row["state"] == "QUARANTINED":
         return _resource_receipt(row, boot_id)
-    if row["state"] != "CLAIMED" or row["claim_boot_id"] != boot_id:
+    if row["state"] != "CLAIMED":
         raise RunnerError("only a current target-owned claim may be quarantined")
     conn.execute(
         "UPDATE target_resource_allocations SET state='QUARANTINED',terminal_reason=?,"
@@ -2434,10 +2436,10 @@ def _resource_owner_quarantine(conn, body: dict, boot_id: str, reason: str) -> d
 
 def _resource_owner_finish(conn, body: dict, boot_id: str) -> dict:
     row = _resource_auth(conn, body, require_fence=True)
-    if row["state"] in {"RELEASED", "QUARANTINED"}:
-        return _resource_receipt(row, boot_id)
     if row["claim_boot_id"] != boot_id:
         raise RunnerError("target resource claim boot identity mismatch")
+    if row["state"] in {"RELEASED", "QUARANTINED"}:
+        return _resource_receipt(row, boot_id)
     if row["state"] == "CANCELLED":
         return _resource_receipt(row, boot_id)
     if row["state"] != "CLAIMED":
@@ -3008,12 +3010,13 @@ def _terminate_resource_owner(row: dict) -> bool:
         members = _posix_group_members(pgid)
         if members is None:
             return False
-        if root_pid in members:
-            try:
-                if _process_start_id(root_pid) != row.get("root_start_id"):
-                    return False
-            except RunnerError:
+        if root_pid not in members:
+            return False
+        try:
+            if _process_start_id(root_pid) != row.get("root_start_id"):
                 return False
+        except RunnerError:
+            return False
         _kill_posix_group(pgid)
     elif kind in {"windows_job_v1", "windows_job_v2"}:
         try:
