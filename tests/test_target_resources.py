@@ -24,6 +24,11 @@ from remrun.target_resources import TargetReservation, TargetResourceClient
 from remrun.transport import make_transport
 
 
+_POSIX_EXEC_RECORD = pytest.mark.skipif(
+    os.name != "posix", reason="POSIX-only exec-record framing uses POSIX pipe descriptors"
+)
+
+
 def _config(tmp_path: Path) -> RemrunConfig:
     device = Device.from_mapping(
         "LOCAL_SIM",
@@ -1005,6 +1010,7 @@ def test_linux_proc_malformed_stat_is_unknown(monkeypatch, stat_text: str):
     assert remote_runner._posix_group_members(777) is None
 
 
+@_POSIX_EXEC_RECORD
 @pytest.mark.parametrize(
     "raw",
     [
@@ -1032,6 +1038,7 @@ def test_posix_exec_record_rejects_eof_truncation_and_malformed_data(raw: bytes)
             os.close(write_fd)
 
 
+@_POSIX_EXEC_RECORD
 def test_posix_exec_record_accepts_one_bounded_object():
     payload = b'{"kind":"EXEC_CONFIRMED","user_pid":42,"user_start_id":"exact"}'
     read_fd, write_fd = os.pipe()
