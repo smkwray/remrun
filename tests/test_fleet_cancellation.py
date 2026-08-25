@@ -30,9 +30,22 @@ FUTURE = "2099-01-01T00:00:00Z"
 
 
 def _device(root: Path, name: str = "TARGET", *, kind: str = "local-sim") -> Device:
+    """A device whose declared OS family matches the native paths below it.
+
+    The roots come from pytest's native `tmp_path`, and `_target_state_root`
+    validates absoluteness with PureWindowsPath or PurePosixPath according to
+    `device.os`. Declaring posix while handing it a C:\... root fails before the
+    behaviour under test runs. This mismatch has now been introduced four times
+    in separate files; `tests/conftest.py::native_target_device` exists so it
+    stops happening, and this helper follows the same rule for the kinds it
+    additionally needs.
+    """
+    windows = os.name == "nt"
+    if kind == "ssh-posix" and windows:
+        kind = "ssh-powershell"
     return Device.from_mapping(name, {
         "kind": kind,
-        "os": "posix",
+        "os": "windows" if windows else "posix",
         "project_root": str(root / name / "projects"),
         "state_root": str(root / name / "state"),
         "cache_root": str(root / name / "cache"),
