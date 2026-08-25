@@ -224,6 +224,7 @@ _WIN_WAIT_TIMEOUT = 258
 _WIN_WAIT_FAILED = 0xFFFFFFFF
 _WIN_DWORD_MINUS_ONE = 0xFFFFFFFF
 _WIN_JOB_OBJECT_QUERY = 0x0004
+_WIN_JOB_OBJECT_TERMINATE = 0x0008
 _WIN_JOB_BASIC_PROCESS_ID_LIST = 3
 _WIN_JOB_EXTENDED_LIMIT_INFORMATION = 9
 _WIN_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -2269,8 +2270,24 @@ def _resource_cancel(conn, body: dict, boot_id: str, mono_ns: int) -> dict:
     assert row is not None
     if row["state"] == "CANCELLED":
         return {"ok": True, "status": "cancelled", "receipt": _resource_receipt(row, boot_id)}
-    if row["state"] != "RESERVED":
-        raise RunnerError("only a reserved target resource allocation may be cancelled")
+    if row["state"] in {"RELEASED", "EXPIRED", "REBOOTED"}:
+        return {"ok": True, "status": str(row["state"]).lower(),
+                "receipt": _resource_receipt(row, boot_id)}
+    if row["state"] in {"CLAIMED", "QUARANTINED"}:
+        if not _terminate_resource_owner(row):
+            if row["state"] == "CLAIMED":
+                conn.execute(
+                    "UPDATE target_resource_allocations SET state='QUARANTINED',"
+                    "terminal_reason='cancel_cleanup_unverified',updated_at_ns=? "
+                    "WHERE allocation_id=? AND state='CLAIMED'",
+                    (time.time_ns(), row["allocation_id"]),
+                )
+            blocked = _allocation(conn, str(row["allocation_id"]))
+            assert blocked is not None
+            return {"ok": True, "status": "could_not_stop",
+                    "receipt": _resource_receipt(blocked, boot_id)}
+    elif row["state"] != "RESERVED":
+        raise RunnerError("target resource allocation has an invalid cancellation state")
     _terminalize_resource(conn, str(row["allocation_id"]), "CANCELLED", "controller_cancelled")
     cancelled = _allocation(conn, str(row["allocation_id"]))
     assert cancelled is not None
@@ -2387,10 +2404,12 @@ def _resource_owner_exec_confirm(
 
 def _resource_owner_release(conn, body: dict, boot_id: str, reason: str) -> dict:
     row = _resource_auth(conn, body, require_fence=True)
-    if row["state"] not in {"CLAIMED", "QUARANTINED"}:
-        raise RunnerError("only a target-owned claim may be released")
     if row["claim_boot_id"] != boot_id:
         raise RunnerError("target resource claim boot identity mismatch")
+    if row["state"] in {"RELEASED", "CANCELLED"}:
+        return _resource_receipt(row, boot_id)
+    if row["state"] not in {"CLAIMED", "QUARANTINED"}:
+        raise RunnerError("only a target-owned claim may be released")
     _terminalize_resource(conn, str(row["allocation_id"]), "RELEASED", reason)
     released = _allocation(conn, str(row["allocation_id"]))
     assert released is not None
@@ -2417,7 +2436,11 @@ def _resource_owner_finish(conn, body: dict, boot_id: str) -> dict:
     row = _resource_auth(conn, body, require_fence=True)
     if row["state"] in {"RELEASED", "QUARANTINED"}:
         return _resource_receipt(row, boot_id)
-    if row["state"] != "CLAIMED" or row["claim_boot_id"] != boot_id:
+    if row["claim_boot_id"] != boot_id:
+        raise RunnerError("target resource claim boot identity mismatch")
+    if row["state"] == "CANCELLED":
+        return _resource_receipt(row, boot_id)
+    if row["state"] != "CLAIMED":
         raise RunnerError("only a current target-owned claim may finish")
     cleanup = _resource_owner_cleanup_state(row)
     if cleanup == "gone":
@@ -2594,6 +2617,8 @@ def _win_kernel32():
             ctypes.POINTER(_WIN_DWORD),
         )
         k32.QueryInformationJobObject.restype = _WIN_BOOL
+        k32.TerminateJobObject.argtypes = (_WIN_HANDLE, _WIN_DWORD)
+        k32.TerminateJobObject.restype = _WIN_BOOL
         k32.CreateProcessW.argtypes = (
             ctypes.c_wchar_p, ctypes.c_wchar_p, _WIN_LPVOID, _WIN_LPVOID, _WIN_BOOL,
             _WIN_DWORD, _WIN_LPVOID, ctypes.c_wchar_p,
@@ -2666,9 +2691,10 @@ def _win_create_resource_job(name: str):
     return handle
 
 
-def _win_open_resource_job(name: str):
+def _win_open_resource_job(name: str, *, terminate: bool = False):
     ctypes.set_last_error(0)
-    handle = _win_kernel32().OpenJobObjectW(_WIN_JOB_OBJECT_QUERY, False, name)
+    access = _WIN_JOB_OBJECT_QUERY | (_WIN_JOB_OBJECT_TERMINATE if terminate else 0)
+    handle = _win_kernel32().OpenJobObjectW(access, False, name)
     if _win_valid_handle(handle):
         return handle
     if ctypes.get_last_error() == _WIN_ERROR_FILE_NOT_FOUND:
@@ -2963,6 +2989,58 @@ def _resource_owner_cleanup_state(row: dict) -> str:
             _win_close(handle)
         return "unknown" if current == row.get("root_start_id") else "gone"
     return "unknown"
+
+
+def _terminate_resource_owner(row: dict) -> bool:
+    """Terminate and verify the exact process tree already owned by this allocation."""
+    cleanup = _resource_owner_cleanup_state(row)
+    if cleanup == "gone":
+        return True
+    if cleanup != "live":
+        return False
+    kind = str(row.get("owner_kind") or "")
+    if kind in {"posix_pgid_v1", "posix_pgid"}:
+        try:
+            pgid = int(row["owner_key"])
+            root_pid = int(row["root_pid"])
+        except (TypeError, ValueError):
+            return False
+        members = _posix_group_members(pgid)
+        if members is None:
+            return False
+        if root_pid in members:
+            try:
+                if _process_start_id(root_pid) != row.get("root_start_id"):
+                    return False
+            except RunnerError:
+                return False
+        _kill_posix_group(pgid)
+    elif kind in {"windows_job_v1", "windows_job_v2"}:
+        try:
+            job = _win_open_resource_job(str(row["owner_key"]), terminate=True)
+        except Exception:
+            return False
+        if job is None:
+            return _resource_owner_cleanup_state(row) == "gone"
+        try:
+            if not _win_kernel32().TerminateJobObject(job, 125):
+                try:
+                    return not _win_resource_job_pids(job)
+                except Exception:
+                    return False
+        finally:
+            _win_close(job)
+    else:
+        return False
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        state = _resource_owner_cleanup_state(row)
+        if state == "gone":
+            return True
+        if state == "unknown":
+            return False
+        time.sleep(0.02)
+    return _resource_owner_cleanup_state(row) == "gone"
 
 
 def _atomic_json(path: str, value: dict) -> None:

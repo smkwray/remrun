@@ -38,6 +38,9 @@ def normalize_capabilities(raw, field_name: str) -> tuple[str, ...]:  # noqa: AN
 JOB_STATES = (
     "queued", "leased", "staging", "running", "fetching", "done",
     "failed_retryable", "failed_final",
+    # Explicit operator cancellation is retained as history but may be
+    # resubmitted as a new attempt. It is never selected by dispatch.
+    "cancelled",
     # A structured refusal the worker has already adjudicated. Terminal like
     # failed_final, but deliberately distinct: it is an answer awaiting a person,
     # not an error a different device or a later attempt could fix.

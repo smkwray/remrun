@@ -15,7 +15,10 @@ from pathlib import Path
 from ..config import load_config
 from ..output import Reporter
 from ..state import default_state_root
-from ..target_resources import TargetResourceClient, canonical_json, policy_digest
+from ..target_resources import (
+    TargetReservation, TargetResourceClient, TargetResourceError, canonical_json,
+    policy_digest,
+)
 from . import adapters, executor, placement, probes
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
@@ -884,26 +887,221 @@ def _kill_local_workers(device=None) -> bool:  # noqa: ANN001
     try:
         if platform.system() == "Windows":
             script = _powershell_cancel_script(cancel)
-            subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                           capture_output=True, timeout=25, creationflags=nowin)
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, timeout=25, creationflags=nowin,
+            )
         else:
             script = _posix_cancel_script(cancel)
-            subprocess.run(["sh", "-lc", script], capture_output=True, timeout=25)
-        return True
+            result = subprocess.run(
+                ["sh", "-lc", script], capture_output=True, timeout=25,
+            )
+        return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
 
+def _cancel_scope(args, queue: FleetQueue) -> list[str] | None:  # noqa: ANN001
+    """Resolve the same exact job/submission/request vocabulary used by dispatch."""
+    job_ids = list(getattr(args, "job_id", None) or [])
+    submission_id = getattr(args, "submission_id", None)
+    request_id = getattr(args, "request_id", None)
+    if submission_id is None and request_id is None and not job_ids:
+        return None
+    if submission_id is not None or request_id is not None:
+        receipt = queue.get_submission(
+            submission_id=submission_id, request_id=request_id,
+        )
+        if receipt is None:
+            raise ValueError("targeted cancel submission identity was not found")
+        job_ids = list(receipt["job_ids"])
+    job_ids = list(dict.fromkeys(job_ids))
+    missing = [job_id for job_id in job_ids if queue.get(job_id) is None]
+    if missing:
+        raise ValueError("targeted cancel job was not found: " + ", ".join(missing))
+    return job_ids
+
+
+def _already_finished(state: str) -> bool:
+    return state in {"done", "failed_final", "needs_review"}
+
+
+def _stop_target_operation(config, operation: dict) -> tuple[str, str | None, str | None]:  # noqa: ANN001
+    """Stop one exact target-owned tree, returning disposition, error, cleanup state."""
+    device_name = operation["device"]
+    if device_name not in config.devices:
+        return "could_not_stop", f"target device {device_name!r} is not configured", None
+    operation_id = operation["operation_id"]
+    request_sha = operation["request_sha256"]
+    token = operation["resume_token"]
+    try:
+        client = TargetResourceClient.connect(config, device_name)
+        observed = client.status_identity(operation_id, token)
+        receipt = observed.get("receipt")
+        if not isinstance(receipt, dict) \
+                or receipt.get("operation_id") != operation_id \
+                or receipt.get("request_sha256") != request_sha:
+            return "could_not_stop", "target cancellation identity did not match", None
+        state = str(receipt.get("state") or "")
+        if state in {"RESERVED", "CLAIMED", "QUARANTINED"}:
+            stopped = client.cancel(TargetReservation(receipt, token))
+            stopped_receipt = stopped.get("receipt")
+            if not isinstance(stopped_receipt, dict) \
+                    or stopped_receipt.get("operation_id") != operation_id \
+                    or stopped_receipt.get("request_sha256") != request_sha:
+                return "could_not_stop", "target cancellation receipt did not match", None
+            if stopped.get("status") == "could_not_stop":
+                return (
+                    "could_not_stop",
+                    str(stopped_receipt.get("terminal_reason") or
+                        "target process-tree termination could not be verified"),
+                    None,
+                )
+            receipt = stopped_receipt
+            state = str(receipt.get("state") or "")
+    except (OSError, TargetResourceError, TransportError, ValueError) as exc:
+        return "could_not_stop", str(exc), None
+    if state == "RELEASED":
+        return "already_finished", None, state
+    if state not in {"CANCELLED", "EXPIRED", "REBOOTED"}:
+        return "could_not_stop", f"target process tree remained {state or 'unknown'}", None
+    return "stopped", None, state
+
+
+def _target_operation_for_cancel(
+    queue: FleetQueue, batch_id: str,
+) -> tuple[dict | None, str | None]:
+    try:
+        operation = queue.target_operation(batch_id, include_token=True)
+    except Exception as exc:  # noqa: BLE001 - malformed durable identity must remain untouched
+        return None, str(exc)
+    if operation is None:
+        return None, "job has no exact target operation"
+    return operation, None
+
+
+def _cancel_active_batch(
+    config, queue: FleetQueue, batch_id: str, job_ids: list[str],  # noqa: ANN001
+) -> tuple[str, str | None]:
+    """Stop one exact active worker invocation and retain all its evidence."""
+    batch = queue.get_batch(batch_id)
+    if batch is None or batch.get("state") not in {"leased", "staging", "running", "fetching"}:
+        return "already_finished", None
+    active_members = {
+        row["job_id"] for row in queue.jobs_for_batch(batch_id)
+        if row["state"] in {"leased", "staging", "running", "fetching"}
+    }
+    if active_members != set(job_ids):
+        return "could_not_stop", "active batch also contains untargeted jobs"
+    operation, error = _target_operation_for_cancel(queue, batch_id)
+    if operation is None:
+        return "could_not_stop", error
+    disposition, error, cleanup_state = _stop_target_operation(config, operation)
+    if disposition != "stopped":
+        return disposition, error
+    assert cleanup_state is not None
+    if not queue.cancel_active_batch(batch_id, job_ids, cleanup_state=cleanup_state):
+        rows = [queue.get(job_id) for job_id in job_ids]
+        if all(row is not None and row["state"] == "cancelled" for row in rows):
+            return "stopped", None
+        if all(row is not None and _already_finished(row["state"]) for row in rows):
+            return "already_finished", None
+        return "could_not_stop", "queue ownership changed during cancellation"
+    return "stopped", None
+
+
+def _cancel_fenced_batch(
+    config, queue: FleetQueue, batch_id: str, job_ids: list[str],  # noqa: ANN001
+) -> tuple[str, str | None]:
+    """Stop exact completion-unknown work without weakening its replay fence."""
+    fenced_members = {
+        row["job_id"] for row in queue.jobs_for_batch(batch_id)
+        if row["state"] == "completion_unknown"
+    }
+    if fenced_members != set(job_ids):
+        return "could_not_stop", "fenced batch also contains untargeted jobs"
+    operation, error = _target_operation_for_cancel(queue, batch_id)
+    if operation is None:
+        return "could_not_stop", error
+    disposition, error, cleanup_state = _stop_target_operation(config, operation)
+    if disposition != "stopped":
+        return disposition, error
+    assert cleanup_state is not None
+    if not queue.record_fenced_cancellation(batch_id, cleanup_state=cleanup_state):
+        return "could_not_stop", "fenced queue state changed during cancellation"
+    return "stopped", None
+
+
+def _cmd_cancel_targeted(args, config, queue: FleetQueue, job_ids: list[str]) -> int:  # noqa: ANN001
+    results: dict[str, dict[str, str]] = {}
+    active: dict[str, list[str]] = {}
+    fenced: dict[str, list[str]] = {}
+    for job_id in job_ids:
+        row = queue.get(job_id)
+        assert row is not None
+        state = str(row["state"])
+        if state == "queued":
+            if queue.cancel_queued(job_id):
+                results[job_id] = {"job_id": job_id, "disposition": "stopped"}
+                continue
+            row = queue.get(job_id)
+            assert row is not None
+            state = str(row["state"])
+        if state == "cancelled":
+            results[job_id] = {"job_id": job_id, "disposition": "stopped"}
+        elif state == "completion_unknown" and row["batch_id"]:
+            fenced.setdefault(str(row["batch_id"]), []).append(job_id)
+        elif _already_finished(state):
+            results[job_id] = {"job_id": job_id, "disposition": "already_finished"}
+        elif state in {"leased", "staging", "running", "fetching"} and row["batch_id"]:
+            active.setdefault(str(row["batch_id"]), []).append(job_id)
+        else:
+            results[job_id] = {
+                "job_id": job_id,
+                "disposition": "could_not_stop",
+                "error": f"job state {state!r} is not cancellable",
+            }
+    for batch_id, selected in active.items():
+        disposition, error = _cancel_active_batch(config, queue, batch_id, selected)
+        for job_id in selected:
+            result = {"job_id": job_id, "disposition": disposition}
+            if error is not None:
+                result["error"] = error
+            results[job_id] = result
+    for batch_id, selected in fenced.items():
+        disposition, error = _cancel_fenced_batch(config, queue, batch_id, selected)
+        for job_id in selected:
+            result = {"job_id": job_id, "disposition": disposition}
+            if error is not None:
+                result["error"] = error
+            results[job_id] = result
+    payload = {"schema": 1, "jobs": [results[job_id] for job_id in job_ids]}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        for result in payload["jobs"]:
+            suffix = f": {result['error']}" if result.get("error") else ""
+            print(f"{result['job_id']}: {result['disposition']}{suffix}")
+    return (
+        EXIT_ERROR
+        if any(result["disposition"] == "could_not_stop" for result in payload["jobs"])
+        else EXIT_OK
+    )
+
+
 def cmd_cancel(args, reporter: Reporter) -> int:
-    """Cancel the fleet best-effort: clear queue state and run each device's
-    configured cancel actions. Heavier than `clear`, which only clears the DB
-    queue and leaves already-running external workers alone. If a remote kill
-    fails on a device matching the controller OS, also try a direct local kill so
-    a controller-runner can stop its own jobs without ssh-to-self.
+    """Cancel an exact job scope, or retain the legacy whole-fleet sweep.
+
+    Scoped cancellation preserves queue/history rows and addresses only exact
+    target-owned process trees. With no scope, the existing global clear plus
+    configured device-worker sweep remains available for Stop all fleet work.
     """
     config = load_config()
     q = FleetQueue(default_state_root() / "fleet" / "fleet.db")
     try:
+        scope = _cancel_scope(args, q)
+        if scope is not None:
+            return _cmd_cancel_targeted(args, config, q, scope)
         res = q.clear(include_final=getattr(args, "all", False))
     finally:
         q.close()
@@ -930,7 +1128,7 @@ def cmd_cancel(args, reporter: Reporter) -> int:
     else:
         print(f"cancelled: cleared {res['jobs']} job(s), {res['leases']} lease(s); "
               f"stopped workers on {', '.join(ok) if ok else '(none reachable)'}")
-    return EXIT_OK
+    return EXIT_OK if all(stopped.values()) else EXIT_ERROR
 
 
 def cmd_resources(args, reporter: Reporter) -> int:
@@ -1339,9 +1537,26 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--all", action="store_true",
                     help="also wipe done/failed job history (default keeps it for `status`)")
     pc.add_argument("--json", action="store_true")
-    px = sub.add_parser("cancel", help="cancel everything: clear the queue AND stop configured in-flight "
-                                       "workers on every device, releasing configured resource locks")
-    px.add_argument("--all", action="store_true", help="also wipe done/failed job history")
+    px = sub.add_parser(
+        "cancel",
+        help="cancel exact jobs, or with no scope clear the queue and stop every device",
+    )
+    cancel_scope = px.add_mutually_exclusive_group()
+    cancel_scope.add_argument(
+        "--job", dest="job_id", action="append",
+        help="cancel this exact job (repeatable)",
+    )
+    cancel_scope.add_argument(
+        "--submission", dest="submission_id",
+        help="cancel the immutable jobs in this submission",
+    )
+    cancel_scope.add_argument(
+        "--request-id",
+        help="cancel the submission accepted for this caller request",
+    )
+    cancel_scope.add_argument(
+        "--all", action="store_true", help="global sweep: also wipe done/failed job history",
+    )
     px.add_argument("--json", action="store_true")
     prs = sub.add_parser("resources", help="live CPU / RAM / GPU / disk for every configured "
                                            "device (hardware, not the job queue)")

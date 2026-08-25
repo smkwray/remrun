@@ -754,6 +754,78 @@ def test_stale_internal_owner_mutation_cannot_touch_newer_allocation(
     client.cancel(newer)
 
 
+@pytest.mark.parametrize(
+    ("operation", "terminal_state", "values"),
+    [
+        ("release", "RELEASED", {"reason": "repeat_release"}),
+        ("release", "CANCELLED", {"reason": "cancelled_owner_exit"}),
+        ("finish", "CANCELLED", {}),
+    ],
+)
+def test_stale_owner_is_refused_on_rr1_idempotent_terminal_paths(
+    tmp_path: Path,
+    monkeypatch,
+    operation: str,
+    terminal_state: str,
+    values: dict[str, str],
+):
+    state_root = str(tmp_path / "state")
+    monkeypatch.setattr(
+        remote_runner,
+        "filesystem_probe",
+        lambda path: {"local": True, "kind": "test", "path": path},
+    )
+    monkeypatch.setattr(remote_runner, "_strict_boot_id", lambda: "current-boot")
+    monkeypatch.setattr(remote_runner, "_strict_monotonic_ns", lambda: 1)
+    document, digest = _policy("pool/gpu")
+    conn, _runner_root, _meta = remote_runner.open_participant_store(state_root)
+    try:
+        remote_runner._resource_policy_install(
+            conn,
+            {
+                "expected_generation": None,
+                "expected_digest": None,
+                "policy_document": document,
+                "supplied_digest": digest,
+            },
+        )
+        reserved = remote_runner._resource_reserve(
+            conn,
+            {
+                "allocation_id": "stale-owner-terminal",
+                "operation_id": "operation-stale-owner-terminal",
+                "request_sha256": hashlib.sha256(b"stale-owner-terminal").hexdigest(),
+                "resource_keys": ["pool/gpu"],
+                "expected_policy_generation": 1,
+                "expected_policy_digest": digest,
+            },
+            "current-boot",
+            1,
+        )
+        conn.execute(
+            "DELETE FROM target_resource_holds WHERE allocation_id=?",
+            ("stale-owner-terminal",),
+        )
+        conn.execute(
+            "UPDATE target_resource_allocations SET state=?,claim_boot_id=? "
+            "WHERE allocation_id=?",
+            (terminal_state, "stale-owner-boot", "stale-owner-terminal"),
+        )
+    finally:
+        conn.close()
+
+    body = {
+        "allocation_id": "stale-owner-terminal",
+        "fence": reserved["receipt"]["fence"],
+        "token": reserved["token"],
+    }
+
+    with pytest.raises(remote_runner.RunnerError, match="boot identity mismatch"):
+        remote_runner._resource_owner_mutation(
+            state_root, operation, body, **values
+        )
+
+
 def test_fence_increases_after_terminal_release_and_reallocation(tmp_path: Path):
     client, first, digest = _client_reservation(tmp_path, "first-fence")
     client.cancel(first)

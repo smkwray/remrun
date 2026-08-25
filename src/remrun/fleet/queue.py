@@ -157,10 +157,10 @@ _SCHEMA_OBJECTS = {
     "fleet_profile_observations",
 }
 
-# Terminal states. ``needs_review`` is a durable ANSWER — the worker examined the
-# work and refused it — not an error to retry: it must never be reopened by a
-# late completer and must not block a fresh submission of the same key.
-_FINAL = ("done", "failed_final", "needs_review")
+# Terminal rows do not participate in active idempotency. ``needs_review`` is a
+# durable worker answer; ``cancelled`` is retained evidence that permits an
+# explicitly new submission while never being selected by dispatch.
+_FINAL = ("done", "failed_final", "needs_review", "cancelled")
 _FINAL_Q = ",".join("?" * len(_FINAL))
 # History that volume may evict. A review answer is waiting for a PERSON, so it
 # is never discarded to make room for ordinary throughput.
@@ -1121,6 +1121,13 @@ class FleetQueue:
         row = self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
+    def jobs_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        """Return the retained job rows attached to one worker invocation."""
+        rows = self.db.execute(
+            "SELECT * FROM jobs WHERE batch_id=? ORDER BY created_at,job_id", (batch_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def list(self, state: str | None = None,
              job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
              ) -> list[dict[str, Any]]:
@@ -1409,6 +1416,96 @@ class FleetQueue:
                 "UPDATE jobs SET last_result=?,updated_at=? WHERE batch_id=? "
                 "AND state='needs_review'",
                 (result_record, now, batch_id),
+            )
+        return bool(cur.rowcount)
+
+    def cancel_queued(self, job_id: str, *, now: str | None = None) -> bool:
+        """Atomically fence one queued job without deleting any durable record."""
+        now = now or utc_now_iso()
+        with self._immediate():
+            cur = self.db.execute(
+                "UPDATE jobs SET state='cancelled',last_error=?,updated_at=? "
+                "WHERE job_id=? AND state='queued'",
+                ("cancelled by operator", now, job_id),
+            )
+            return bool(cur.rowcount)
+
+    def cancel_active_batch(
+        self,
+        batch_id: str,
+        job_ids: list[str] | tuple[str, ...] | set[str],
+        *,
+        cleanup_state: str,
+        now: str | None = None,
+    ) -> bool:
+        """Record a verified exact process-tree stop without deleting its evidence.
+
+        A worker invocation is the smallest killable unit. The transition is
+        refused unless every still-active job in that batch was explicitly named.
+        Target cleanup/finalization remains fenced: cancellation proves the tree
+        stopped, not that an already-started operation produced no external effect.
+        """
+        selected = set(job_ids)
+        if not selected or not cleanup_state:
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            batch = self.db.execute(
+                "SELECT state,target_protocol_version FROM batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None or batch["state"] not in _BATCH_ACTIVE:
+                return False
+            active_rows = self.db.execute(
+                "SELECT job_id,state FROM jobs WHERE batch_id=? "
+                "AND state IN ('leased','staging','running','fetching')",
+                (batch_id,),
+            ).fetchall()
+            active_ids = {str(row["job_id"]) for row in active_rows}
+            if not active_ids or active_ids != selected:
+                return False
+            disposition = (
+                FINALIZATION_FENCED if batch["target_protocol_version"] == 1 else None
+            )
+            cur = self.db.execute(
+                "UPDATE batches SET state='failed',error=?,target_cleanup_state=?,"
+                "target_cleanup_at=?,target_finalization_disposition=?,updated_at=? "
+                "WHERE batch_id=? AND state=?",
+                (
+                    "cancelled by operator", cleanup_state, now, disposition, now,
+                    batch_id, batch["state"],
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            ordered = sorted(selected)
+            qmarks = ",".join("?" * len(ordered))
+            updated = self.db.execute(
+                "UPDATE jobs SET state='cancelled',leased_until=NULL,last_error=?,"
+                f"updated_at=? WHERE batch_id=? AND job_id IN ({qmarks}) "
+                "AND state IN ('leased','staging','running','fetching')",
+                ("cancelled by operator", now, batch_id, *ordered),
+            ).rowcount
+            if updated != len(ordered):
+                raise QueueMigrationError(
+                    f"batch {batch_id!r} cancellation changed incomplete job membership"
+                )
+            self.db.execute("DELETE FROM resource_leases WHERE batch_id=?", (batch_id,))
+            return True
+
+    def record_fenced_cancellation(
+        self, batch_id: str, *, cleanup_state: str, now: str | None = None,
+    ) -> bool:
+        """Retain an unknown-completion fence while recording a verified tree stop."""
+        if not cleanup_state:
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            cur = self.db.execute(
+                "UPDATE batches SET target_cleanup_state=?,target_cleanup_at=?,updated_at=? "
+                "WHERE batch_id=? AND state='failed' AND target_protocol_version=1 "
+                "AND target_finalization_disposition=? AND target_finalized_at IS NULL",
+                (cleanup_state, now, now, batch_id, FINALIZATION_FENCED),
             )
             return bool(cur.rowcount)
 
