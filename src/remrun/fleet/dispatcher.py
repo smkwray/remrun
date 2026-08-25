@@ -991,10 +991,133 @@ def _recover_target_stale(
     for row in queue.stale_target_batches(
         now, job_ids=job_ids, include_terminal=False,
     ):
-        recovered += _recover_target_row(
-            config, queue, row, now, reporter=reporter, terminal_outcome=False,
-        )
+        if row.get("state") == "cancelling":
+            recovered += _recover_target_cancellation(
+                config, queue, row, now, reporter=reporter,
+            )
+        else:
+            recovered += _recover_target_row(
+                config, queue, row, now, reporter=reporter, terminal_outcome=False,
+            )
     return recovered
+
+
+def _recover_target_cancellation(
+    config: RemrunConfig,
+    queue: FleetQueue,
+    row: dict[str, Any],
+    now: str,
+    *,
+    reporter: Reporter,
+) -> int:
+    """Resume durable cancellation without replay or target-evidence cleanup."""
+    batch_id = str(row["batch_id"])
+    device_name = str(row["device"])
+    device = config.devices.get(device_name)
+    if device is None or not executor._target_acceptance_supported(device):
+        reporter.event(
+            "dispatch_cancel_deferred",
+            batch=batch_id,
+            device=device_name,
+            reason="target device configuration unavailable",
+        )
+        return 0
+
+    operation_id = executor._target_operation_identity(batch_id)
+    request_sha = row.get("target_request_sha256")
+    token = row.get("target_resume_token")
+    if (
+        row.get("target_finalization_disposition") != FINALIZATION_FENCED
+        or row.get("target_operation_id") != operation_id
+        or not FleetQueue._valid_target_digest(request_sha)
+        or not isinstance(token, str)
+        or not token
+        or not FleetQueue._target_identity_complete(row)
+    ):
+        return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
+
+    try:
+        client = TargetResourceClient.connect(config, device_name, install=False)
+        observed = client.status_identity(
+            operation_id,
+            token,
+            rpc_id=f"fleet-cancel-recover-status-{operation_id}",
+        )
+        receipt = observed.get("receipt")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("operation_id") != operation_id
+            or receipt.get("request_sha256") != request_sha
+        ):
+            return int(queue.expire_stale_batch(
+                batch_id, now=now, replay_safe=False,
+            ))
+
+        state = str(receipt.get("state") or "")
+        if state in {"RESERVED", "CLAIMED", "QUARANTINED"}:
+            stopped = client.cancel(
+                TargetReservation(receipt, token),
+                rpc_id=f"fleet-cancel-recover-stop-{operation_id}",
+            )
+            stopped_receipt = stopped.get("receipt")
+            if (
+                not isinstance(stopped_receipt, dict)
+                or stopped_receipt.get("operation_id") != operation_id
+                or stopped_receipt.get("request_sha256") != request_sha
+            ):
+                return int(queue.expire_stale_batch(
+                    batch_id, now=now, replay_safe=False,
+                ))
+            if stopped.get("status") == "could_not_stop":
+                reporter.event(
+                    "dispatch_cancel_deferred",
+                    batch=batch_id,
+                    device=device_name,
+                    reason=str(
+                        stopped_receipt.get("terminal_reason")
+                        or "target process-tree termination could not be verified"
+                    ),
+                )
+                return 0
+            receipt = stopped_receipt
+            state = str(receipt.get("state") or "")
+
+        job_ids = [
+            str(job["job_id"])
+            for job in queue.jobs_for_batch(batch_id)
+            if job["state"] in {"leased", "staging", "running", "fetching"}
+        ]
+        if state == "RELEASED":
+            return int(queue.mark_active_cancellation_unknown(
+                batch_id,
+                job_ids,
+                reason=(
+                    "target completed before cancellation; "
+                    "completion retained for review"
+                ),
+                now=now,
+            ))
+        if state not in {"CANCELLED", "EXPIRED", "REBOOTED"}:
+            reporter.event(
+                "dispatch_cancel_deferred",
+                batch=batch_id,
+                device=device_name,
+                reason=f"target cancellation state {state or 'unknown'} is not terminal",
+            )
+            return 0
+        if not job_ids:
+            return 0
+        return int(queue.cancel_active_batch(
+            batch_id, job_ids, cleanup_state=state, now=now,
+        ))
+    except (OSError, TargetResourceError, TransportError, ValueError) as exc:
+        reporter.event(
+            "dispatch_cancel_deferred",
+            batch=batch_id,
+            device=device_name,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        return 0
 
 
 def _recover_terminal_target_finalization(

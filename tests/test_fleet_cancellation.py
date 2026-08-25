@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from remrun.config import RemrunConfig
-from remrun.fleet import cli, queue as queue_mod
+from remrun.fleet import cli, dispatcher, executor, queue as queue_mod
 from remrun.fleet.prepared import RAW_COMMAND_SPEC_ID, prepare_raw_command
 from remrun.models import Device
 from remrun.output import Reporter
@@ -593,3 +594,285 @@ def test_global_cancel_sweep_remains_available_and_reports_failure(
         assert q.get("global") is None
     finally:
         q.close()
+
+
+EXPIRED = "2000-01-01T00:00:00Z"
+RECOVER = "2099-02-01T00:00:00Z"
+
+
+def _expire_for_cancellation_recovery(
+    q: queue_mod.FleetQueue, batch_id: str, job_id: str,
+) -> None:
+    q.db.execute(
+        "UPDATE batches SET lease_until=? WHERE batch_id=?", (EXPIRED, batch_id),
+    )
+    q.db.execute(
+        "UPDATE jobs SET leased_until=? WHERE job_id=?", (EXPIRED, job_id),
+    )
+    q.db.commit()
+
+
+def _recover_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    q: queue_mod.FleetQueue,
+    client: object,
+) -> int:
+    monkeypatch.setattr(
+        dispatcher.TargetResourceClient, "connect", lambda *_args, **_kwargs: client,
+    )
+    return dispatcher._recover_target_stale(
+        _config(tmp_path, _device(tmp_path, kind="ssh-posix")),
+        q,
+        RECOVER,
+        reporter=Reporter(json_events=False),
+    )
+
+
+def _recoverable_active_target_job(
+    q: queue_mod.FleetQueue, job_id: str,
+) -> tuple[str, str, str, str]:
+    batch_id = f"batch-{job_id}"
+    return _active_target_job(
+        q,
+        job_id,
+        batch_id=batch_id,
+        operation_id=executor._target_operation_identity(batch_id),
+    )
+
+
+def test_cancel_recovery_resumes_intent_after_loss_before_target_rpc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A committed intent is the recovery authority when no RPC was attempted."""
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha, owner = _recoverable_active_target_job(
+        q, "before-rpc",
+    )
+    assert not q.cancel_active_batch(
+        batch_id, ["before-rpc"], cleanup_state="CANCELLED", now=NOW,
+    )
+    assert q.begin_active_cancellation(batch_id, ["before-rpc"], now=NOW)
+    assert not q.set_batch_state(
+        batch_id, "fetching", expected_state="running", owner_token=owner, now=NOW,
+    )
+    assert not q.heartbeat(
+        batch_id, FUTURE, expected_state="running", owner_token=owner, now=NOW,
+    )
+    _expire_for_cancellation_recovery(q, batch_id, "before-rpc")
+    cancelled: list[str] = []
+
+    class Client:
+        def status_identity(self, operation: str, token: str, **_kwargs):  # noqa: ANN003, ANN201
+            assert (operation, token) == (operation_id, "private-target-token")
+            return {
+                "status": "found",
+                "receipt": {
+                    "operation_id": operation,
+                    "request_sha256": request_sha,
+                    "state": "RESERVED",
+                    "command_start_state": "NO",
+                    "fence": 1,
+                },
+            }
+
+        def cancel(self, reservation, **_kwargs):  # noqa: ANN001, ANN003, ANN201
+            cancelled.append(reservation.receipt["operation_id"])
+            return {
+                "status": "cancelled",
+                "receipt": {**reservation.receipt, "state": "CANCELLED"},
+            }
+
+    assert _recover_cancellation(monkeypatch, tmp_path, q, Client()) == 1
+    assert cancelled == [operation_id]
+    assert q.get("before-rpc")["state"] == "cancelled"
+    batch = q.get_batch(batch_id)
+    assert batch["state"] == "failed"
+    assert batch["target_cleanup_state"] == "CANCELLED"
+    assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_FENCED
+    assert batch["target_finalized_at"] is None
+    q.close()
+
+
+def test_cancel_recovery_finishes_after_remote_stop_before_local_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-stop crash resumes cancellation without generic replay cleanup."""
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha, _owner = _recoverable_active_target_job(
+        q, "after-rpc",
+    )
+    monkeypatch.setattr(
+        cli, "_stop_target_operation",
+        lambda _config, _operation: ("stopped", None, "CANCELLED"),
+    )
+
+    class ControllerLoss(BaseException):
+        pass
+
+    original_finalize = q.cancel_active_batch
+    crash_once = True
+
+    def crash_after_stop(*args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal crash_once
+        if crash_once:
+            crash_once = False
+            raise ControllerLoss()
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(q, "cancel_active_batch", crash_after_stop)
+    with pytest.raises(ControllerLoss):
+        cli._cancel_active_batch(
+            _config(tmp_path, _device(tmp_path)), q, batch_id, ["after-rpc"],
+        )
+    assert q.get_batch(batch_id)["state"] == "cancelling"
+    _expire_for_cancellation_recovery(q, batch_id, "after-rpc")
+
+    class Client:
+        def status_identity(self, operation: str, token: str, **_kwargs):  # noqa: ANN003, ANN201
+            assert (operation, token) == (operation_id, "private-target-token")
+            return {
+                "status": "found",
+                "receipt": {
+                    "operation_id": operation,
+                    "request_sha256": request_sha,
+                    "state": "CANCELLED",
+                    "command_start_state": "NO",
+                    "fence": 1,
+                },
+            }
+
+    assert _recover_cancellation(monkeypatch, tmp_path, q, Client()) == 1
+    assert q.get("after-rpc")["state"] == "cancelled"
+    assert q.get_batch(batch_id)["target_finalized_at"] is None
+    q.close()
+
+
+def test_cancel_recovery_fences_released_race_as_completion_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target release racing cancellation is not proof of no external effect."""
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha, _owner = _recoverable_active_target_job(
+        q, "released",
+    )
+    assert q.begin_active_cancellation(batch_id, ["released"], now=NOW)
+    _expire_for_cancellation_recovery(q, batch_id, "released")
+
+    class Client:
+        def status_identity(self, operation: str, token: str, **_kwargs):  # noqa: ANN003, ANN201
+            assert (operation, token) == (operation_id, "private-target-token")
+            return {
+                "status": "found",
+                "receipt": {
+                    "operation_id": operation,
+                    "request_sha256": request_sha,
+                    "state": "RELEASED",
+                    "command_start_state": "YES",
+                    "fence": 1,
+                },
+            }
+
+        def cancel(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN201
+            raise AssertionError("a released target must not receive a cancel RPC")
+
+    assert _recover_cancellation(monkeypatch, tmp_path, q, Client()) == 1
+    assert q.get("released")["state"] == "completion_unknown"
+    batch = q.get_batch(batch_id)
+    assert batch["state"] == "failed"
+    assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_FENCED
+    assert batch["target_finalized_at"] is None
+    q.close()
+
+
+def test_could_not_stop_retains_retryable_cancellation_intent_and_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unverified stop remains cancelling, fenced, credentialed, and recoverable."""
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha, owner = _recoverable_active_target_job(
+        q, "unstopped",
+    )
+    cancel_calls: list[str] = []
+
+    class Client:
+        def status_identity(self, operation: str, token: str, **_kwargs):  # noqa: ANN003, ANN201
+            assert (operation, token) == (operation_id, "private-target-token")
+            return {
+                "status": "found",
+                "receipt": {
+                    "operation_id": operation,
+                    "request_sha256": request_sha,
+                    "state": "CLAIMED",
+                    "command_start_state": "YES",
+                    "fence": 1,
+                },
+            }
+
+        def cancel(self, reservation, **_kwargs):  # noqa: ANN001, ANN003, ANN201
+            cancel_calls.append(reservation.receipt["operation_id"])
+            return {
+                "status": "could_not_stop",
+                "receipt": {
+                    **reservation.receipt,
+                    "state": "QUARANTINED",
+                    "terminal_reason": "process-tree termination could not be verified",
+                },
+            }
+
+    monkeypatch.setattr(
+        cli.TargetResourceClient, "connect", lambda *_args, **_kwargs: Client(),
+    )
+    disposition, error = cli._cancel_active_batch(
+        _config(tmp_path, _device(tmp_path)), q, batch_id, ["unstopped"],
+    )
+    assert disposition == "could_not_stop"
+    assert error == "process-tree termination could not be verified"
+    assert cancel_calls == [operation_id]
+    batch = q.get_batch(batch_id)
+    assert batch["state"] == "cancelling"
+    operation = q.target_operation(batch_id, include_token=True)
+    assert operation is not None
+    assert operation["resume_token"] == "private-target-token"
+    assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_FENCED
+    assert batch["target_finalized_at"] is None
+    assert q.get("unstopped")["state"] == "running"
+    assert not q.set_batch_state(
+        batch_id, "fetching", expected_state="running", owner_token=owner, now=NOW,
+    )
+
+    _expire_for_cancellation_recovery(q, batch_id, "unstopped")
+    assert _recover_cancellation(monkeypatch, tmp_path, q, Client()) == 0
+    assert cancel_calls == [operation_id, operation_id]
+    assert q.get_batch(batch_id)["state"] == "cancelling"
+    assert q.get("unstopped")["state"] == "running"
+    q.close()
+
+
+def test_pre_cancellation_database_opens_and_adopts_durable_intent_state(
+    tmp_path: Path,
+) -> None:
+    """A database whose schema predates ``cancelling`` remains usable in place."""
+    db = _state_root(tmp_path) / "fleet" / "fleet.db"
+    db.parent.mkdir(parents=True)
+    predecessor = sqlite3.connect(db)
+    predecessor.executescript(
+        queue_mod._SCHEMA.replace("|cancelling", ""),  # noqa: SLF001
+    )
+    predecessor.close()
+    q = queue_mod.FleetQueue(db)
+    batch_id, _operation_id, _request_sha, _owner = _active_target_job(q, "migrated")
+    schema = q.db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='batches'",
+    ).fetchone()["sql"]
+    assert "cancelling" not in schema
+    q.close()
+
+    reopened = queue_mod.FleetQueue(db)
+    assert reopened.begin_active_cancellation(batch_id, ["migrated"], now=NOW)
+    assert reopened.get_batch(batch_id)["state"] == "cancelling"
+    assert reopened.clear()["protected_unfinalized"] == 1
+    assert reopened.get("migrated") is not None
+    assert reopened.prune_final(keep=0) == 0
+    assert reopened.get_batch(batch_id) is not None
+    reopened.close()

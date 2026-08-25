@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS ix_jobs_batch ON jobs(batch_id);
 CREATE TABLE IF NOT EXISTS batches (
     batch_id     TEXT PRIMARY KEY,
     owner_token  TEXT,                   -- per-claim fence; NULL only on legacy rows
-    state        TEXT NOT NULL,          -- leased|staging|running|fetching|done|failed
+    state        TEXT NOT NULL,          -- leased|staging|running|fetching|cancelling|done|failed
     device       TEXT NOT NULL,
     task_name    TEXT, engine TEXT, bucket TEXT,
     created_at   TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -165,7 +165,11 @@ _FINAL_Q = ",".join("?" * len(_FINAL))
 # History that volume may evict. A review answer is waiting for a PERSON, so it
 # is never discarded to make room for ordinary throughput.
 _PRUNABLE = ("done", "failed_final")
-_BATCH_ACTIVE = ("leased", "staging", "running", "fetching")
+_BATCH_EXECUTING = ("leased", "staging", "running", "fetching")
+# ``cancelling`` is a durable controller intent that revokes the execution
+# owner before the target-side stop RPC. It remains active only for retry and
+# dedicated cancellation recovery.
+_BATCH_ACTIVE = (*_BATCH_EXECUTING, "cancelling")
 MAX_ATTEMPTS = 3
 _BUSY_TIMEOUT_MS = 30_000
 
@@ -1430,6 +1434,128 @@ class FleetQueue:
             )
             return bool(cur.rowcount)
 
+    def begin_active_cancellation(
+        self,
+        batch_id: str,
+        job_ids: list[str] | tuple[str, ...] | set[str],
+        *,
+        now: str | None = None,
+    ) -> bool:
+        """Durably revoke an execution owner before a target stop side effect.
+
+        The exact target identity remains attached. Changing the batch state to
+        ``cancelling`` invalidates the owner's state and heartbeat CAS while the
+        finalization fence prevents ordinary stale recovery from authorizing a
+        replay or deleting target evidence.
+        """
+        selected = set(job_ids)
+        if not selected:
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            batch = self.db.execute(
+                "SELECT state,target_protocol_version,"
+                "target_finalized_at,target_finalization_disposition "
+                "FROM batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if (
+                batch is None
+                or batch["target_protocol_version"] != 1
+                or batch["target_finalized_at"] is not None
+                or batch["target_finalization_disposition"]
+                == FINALIZATION_FINALIZED
+            ):
+                return False
+            active_rows = self.db.execute(
+                "SELECT job_id FROM jobs WHERE batch_id=? "
+                "AND state IN ('leased','staging','running','fetching')",
+                (batch_id,),
+            ).fetchall()
+            active_ids = {str(row["job_id"]) for row in active_rows}
+            if not active_ids or active_ids != selected:
+                return False
+            if batch["state"] == "cancelling":
+                return (
+                    batch["target_finalization_disposition"]
+                    == FINALIZATION_FENCED
+                )
+            if batch["state"] not in _BATCH_EXECUTING:
+                return False
+            cur = self.db.execute(
+                "UPDATE batches SET state='cancelling',error=?,"
+                "target_finalization_disposition=?,updated_at=? "
+                "WHERE batch_id=? AND state=? AND target_protocol_version=1",
+                (
+                    "cancellation requested by operator",
+                    FINALIZATION_FENCED,
+                    now,
+                    batch_id,
+                    batch["state"],
+                ),
+            )
+            return cur.rowcount == 1
+
+    def mark_active_cancellation_unknown(
+        self,
+        batch_id: str,
+        job_ids: list[str] | tuple[str, ...] | set[str],
+        *,
+        reason: str,
+        now: str | None = None,
+    ) -> bool:
+        """Close a cancellation that raced target completion, retaining evidence."""
+        selected = set(job_ids)
+        if not selected or not reason:
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            batch = self.db.execute(
+                "SELECT state,target_protocol_version,"
+                "target_finalization_disposition FROM batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if (
+                batch is None
+                or batch["state"] != "cancelling"
+                or batch["target_protocol_version"] != 1
+                or batch["target_finalization_disposition"]
+                != FINALIZATION_FENCED
+            ):
+                return False
+            active_rows = self.db.execute(
+                "SELECT job_id FROM jobs WHERE batch_id=? "
+                "AND state IN ('leased','staging','running','fetching')",
+                (batch_id,),
+            ).fetchall()
+            active_ids = {str(row["job_id"]) for row in active_rows}
+            if active_ids != selected:
+                return False
+            cur = self.db.execute(
+                "UPDATE batches SET state='failed',error=?,updated_at=? "
+                "WHERE batch_id=? AND state='cancelling'",
+                (reason, now, batch_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            ordered = sorted(selected)
+            qmarks = ",".join("?" * len(ordered))
+            updated = self.db.execute(
+                "UPDATE jobs SET state='completion_unknown',leased_until=NULL,"
+                "last_error=?,updated_at=? WHERE batch_id=? "
+                f"AND job_id IN ({qmarks}) "
+                "AND state IN ('leased','staging','running','fetching')",
+                (reason, now, batch_id, *ordered),
+            ).rowcount
+            if updated != len(ordered):
+                raise QueueMigrationError(
+                    f"batch {batch_id!r} cancellation changed incomplete job membership"
+                )
+            self.db.execute(
+                "DELETE FROM resource_leases WHERE batch_id=?", (batch_id,),
+            )
+            return True
+
     def cancel_active_batch(
         self,
         batch_id: str,
@@ -1451,10 +1577,18 @@ class FleetQueue:
         now = now or utc_now_iso()
         with self._immediate():
             batch = self.db.execute(
-                "SELECT state,target_protocol_version FROM batches WHERE batch_id=?",
+                "SELECT state,target_protocol_version,target_finalized_at,"
+                "target_finalization_disposition FROM batches WHERE batch_id=?",
                 (batch_id,),
             ).fetchone()
-            if batch is None or batch["state"] not in _BATCH_ACTIVE:
+            if (
+                batch is None
+                or batch["state"] != "cancelling"
+                or batch["target_protocol_version"] != 1
+                or batch["target_finalized_at"] is not None
+                or batch["target_finalization_disposition"]
+                != FINALIZATION_FENCED
+            ):
                 return False
             active_rows = self.db.execute(
                 "SELECT job_id,state FROM jobs WHERE batch_id=? "
@@ -1464,15 +1598,13 @@ class FleetQueue:
             active_ids = {str(row["job_id"]) for row in active_rows}
             if not active_ids or active_ids != selected:
                 return False
-            disposition = (
-                FINALIZATION_FENCED if batch["target_protocol_version"] == 1 else None
-            )
             cur = self.db.execute(
                 "UPDATE batches SET state='failed',error=?,target_cleanup_state=?,"
                 "target_cleanup_at=?,target_finalization_disposition=?,updated_at=? "
                 "WHERE batch_id=? AND state=?",
                 (
-                    "cancelled by operator", cleanup_state, now, disposition, now,
+                    "cancelled by operator", cleanup_state, now,
+                    FINALIZATION_FENCED, now,
                     batch_id, batch["state"],
                 ),
             )

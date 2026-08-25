@@ -985,7 +985,9 @@ def _cancel_active_batch(
 ) -> tuple[str, str | None]:
     """Stop one exact active worker invocation and retain all its evidence."""
     batch = queue.get_batch(batch_id)
-    if batch is None or batch.get("state") not in {"leased", "staging", "running", "fetching"}:
+    if batch is None or batch.get("state") not in {
+        "leased", "staging", "running", "fetching", "cancelling",
+    }:
         return "already_finished", None
     active_members = {
         row["job_id"] for row in queue.jobs_for_batch(batch_id)
@@ -996,7 +998,19 @@ def _cancel_active_batch(
     operation, error = _target_operation_for_cancel(queue, batch_id)
     if operation is None:
         return "could_not_stop", error
+    # Commit the intent and revoke the execution owner's CAS before the first
+    # target-side mutation. Recovery can then distinguish cancellation from
+    # ordinary stale execution even if this controller disappears mid-call.
+    if not queue.begin_active_cancellation(batch_id, job_ids):
+        return "could_not_stop", "queue ownership changed before cancellation"
     disposition, error, cleanup_state = _stop_target_operation(config, operation)
+    if disposition == "already_finished":
+        reason = "target completed before cancellation; completion retained for review"
+        if not queue.mark_active_cancellation_unknown(
+            batch_id, job_ids, reason=reason,
+        ):
+            return "could_not_stop", "queue ownership changed during cancellation"
+        return "already_finished", reason
     if disposition != "stopped":
         return disposition, error
     assert cleanup_state is not None
