@@ -22,6 +22,7 @@ from remrun.target_resources import (
     EMPTY_POLICY_DIGEST,
     TargetResourceError,
 )
+from remrun.transport import LocalSimTransport
 
 
 NOW = "2026-08-24T00:00:00Z"
@@ -639,6 +640,194 @@ def _recoverable_active_target_job(
         batch_id=batch_id,
         operation_id=executor._target_operation_identity(batch_id),
     )
+
+
+def test_cleanup_authorization_wins_before_targeted_cancellation_rpc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleanup-authorized owner wins the durable race before any stop RPC."""
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha, owner = _recoverable_active_target_job(
+        q, "cleanup-won",
+    )
+    assert q.authorize_target_cleanup(
+        batch_id,
+        operation_id=operation_id,
+        request_sha256=request_sha,
+        cleanup_state="RELEASED",
+        expected_state="running",
+        owner_token=owner,
+        now=NOW,
+    )
+    stop_calls: list[str] = []
+
+    def stop_target(_config, operation):  # noqa: ANN001, ANN202
+        stop_calls.append(operation["operation_id"])
+        return "stopped", None, "CANCELLED"
+
+    monkeypatch.setattr(cli, "_stop_target_operation", stop_target)
+    disposition, error = cli._cancel_active_batch(
+        _config(tmp_path, _device(tmp_path)), q, batch_id, ["cleanup-won"],
+    )
+
+    assert disposition == "could_not_stop"
+    assert error == "queue ownership changed before cancellation"
+    assert stop_calls == []
+    batch = q.get_batch(batch_id)
+    assert batch["state"] == "running"
+    assert batch["target_cleanup_state"] == "RELEASED"
+    assert batch["target_cleanup_at"] == NOW
+    assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_PENDING
+    q.close()
+
+
+def test_cleanup_authorization_validates_exact_live_owner_and_target_identity(
+    tmp_path: Path,
+) -> None:
+    """Malformed, stale, or mismatched authority never becomes cleanup permission."""
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha, owner = _recoverable_active_target_job(
+        q, "cleanup-validation",
+    )
+    common = {
+        "operation_id": operation_id,
+        "request_sha256": request_sha,
+        "cleanup_state": "RELEASED",
+        "expected_state": "running",
+        "owner_token": owner,
+        "now": NOW,
+    }
+    assert not q.authorize_target_cleanup(
+        batch_id, **{**common, "operation_id": "wrong-operation"},
+    )
+    assert not q.authorize_target_cleanup(
+        batch_id, **{**common, "request_sha256": "not-a-digest"},
+    )
+    assert not q.authorize_target_cleanup(
+        batch_id, **{**common, "cleanup_state": "CLAIMED"},
+    )
+    assert not q.authorize_target_cleanup(
+        batch_id, **{**common, "expected_state": "fetching"},
+    )
+    assert not q.authorize_target_cleanup(
+        batch_id, **{**common, "owner_token": "revoked-owner"},
+    )
+    assert not q.authorize_target_cleanup(
+        batch_id, **{**common, "now": "9999-01-01T00:00:00Z"},
+    )
+    assert q.authorize_target_cleanup(batch_id, **common)
+    assert q.authorize_target_cleanup(batch_id, **common)
+    assert not q.authorize_target_cleanup(
+        batch_id, **{**common, "cleanup_state": "CANCELLED"},
+    )
+    q.close()
+
+
+@pytest.mark.parametrize(
+    ("marker", "value"),
+    [
+        ("target_cleanup_state", "RELEASED"),
+        ("target_cleanup_at", NOW),
+        ("target_stage_cleaned_at", NOW),
+        ("target_durable_cleaned_at", NOW),
+        ("target_finalized_at", NOW),
+    ],
+)
+def test_active_cancellation_rejects_every_existing_cleanup_marker(
+    tmp_path: Path, marker: str, value: str,
+) -> None:
+    """No partial cleanup record can be crossed by a later cancellation intent."""
+    q = _queue(tmp_path)
+    job_id = f"marker-{marker}"
+    batch_id, _operation_id, _request_sha, _owner = _recoverable_active_target_job(
+        q, job_id,
+    )
+    q.db.execute(f"UPDATE batches SET {marker}=? WHERE batch_id=?", (value, batch_id))
+    q.db.commit()
+
+    assert not q.begin_active_cancellation(batch_id, [job_id], now=NOW)
+    assert q.get_batch(batch_id)["state"] == "running"
+    q.close()
+
+
+def test_loss_after_cleanup_authorization_retains_evidence_and_never_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner loss after authorization preserves target proof and at-most-once state."""
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha, owner = _recoverable_active_target_job(
+        q, "cleanup-crash",
+    )
+    assert q.record_target_acceptance(
+        batch_id,
+        operation_id=operation_id,
+        request_sha256=request_sha,
+        expected_state="running",
+        owner_token=owner,
+        now=NOW,
+    )
+    assert q.authorize_target_cleanup(
+        batch_id,
+        operation_id=operation_id,
+        request_sha256=request_sha,
+        cleanup_state="RELEASED",
+        expected_state="running",
+        owner_token=owner,
+        now=NOW,
+    )
+    stage = tmp_path / "TARGET" / "state" / "fleet-operations" / operation_id
+    stage.mkdir(parents=True)
+    stage_evidence = stage / "stage-evidence.bin"
+    stage_evidence.write_bytes(b"stage evidence")
+    durable_evidence = tmp_path / "durable-evidence.bin"
+    durable_evidence.write_bytes(b"durable evidence")
+    _expire_for_cancellation_recovery(q, batch_id, "cleanup-crash")
+    q.close()
+    q = _queue(tmp_path)
+
+    class Client:
+        def status_identity(self, operation, token, **_kwargs):  # noqa: ANN001, ANN003, ANN201
+            assert (operation, token) == (operation_id, "private-target-token")
+            return {
+                "status": "found",
+                "receipt": {
+                    "operation_id": operation_id,
+                    "request_sha256": request_sha,
+                    "state": "RELEASED",
+                    "command_start_state": "YES",
+                },
+            }
+
+    class Transport(LocalSimTransport):
+        def remove_remote_tree(self, _path):  # noqa: ANN001, ANN201
+            raise AssertionError("authorized evidence must survive ambiguous owner loss")
+
+        def durable_cleanup(self, _operation, _token):  # noqa: ANN001, ANN201
+            raise AssertionError("durable evidence must survive ambiguous owner loss")
+
+    monkeypatch.setattr(
+        dispatcher.TargetResourceClient, "connect", lambda *_args, **_kwargs: Client(),
+    )
+    monkeypatch.setattr(
+        dispatcher, "make_transport", lambda _device: Transport(_device),
+    )
+
+    assert dispatcher._recover_target_stale(
+        _config(tmp_path, _device(tmp_path, kind="ssh-posix")),
+        q,
+        RECOVER,
+        reporter=Reporter(json_events=False),
+    ) == 1
+    assert q.get("cleanup-crash")["state"] == "completion_unknown"
+    batch = q.get_batch(batch_id)
+    assert batch["target_cleanup_state"] == "RELEASED"
+    assert batch["target_cleanup_at"] == NOW
+    assert batch["target_stage_cleaned_at"] is None
+    assert batch["target_durable_cleaned_at"] is None
+    assert batch["target_finalized_at"] is None
+    assert stage_evidence.read_bytes() == b"stage evidence"
+    assert durable_evidence.read_bytes() == b"durable evidence"
+    q.close()
 
 
 def test_cancel_recovery_resumes_intent_after_loss_before_target_rpc(

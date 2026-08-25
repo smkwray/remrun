@@ -594,6 +594,20 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
             if not recorded:
                 heartbeat.ownership_lost.set()
             return recorded
+        def authorize_target_cleanup(receipt: dict[str, Any]) -> bool:
+            if heartbeat.ownership_lost.is_set():
+                return False
+            recorded = q.authorize_target_cleanup(
+                batch_id,
+                operation_id=str(receipt.get("operation_id") or ""),
+                request_sha256=str(receipt.get("request_sha256") or ""),
+                cleanup_state=str(receipt.get("cleanup_state") or ""),
+                expected_state=batch_state,
+                owner_token=owner_token,
+            )
+            if not recorded:
+                heartbeat.ownership_lost.set()
+            return recorded
         def record_target_finalization(receipt: dict[str, Any]) -> bool:
             if heartbeat.ownership_lost.is_set():
                 return False
@@ -622,6 +636,7 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
                     before_output_return=output_return_gate,
                     on_target_reservation=record_target_reservation,
                     on_target_acceptance=record_target_acceptance,
+                    before_target_cleanup=authorize_target_cleanup,
                     on_target_finalization=record_target_finalization,
                 )
             latest_result = res

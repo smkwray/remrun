@@ -874,19 +874,29 @@ def test_live_executor_orders_acceptance_and_respects_target_cleanup_state(
         events.append("finalized")
         return True
 
+    def authorize_cleanup(receipt):  # noqa: ANN001
+        assert receipt["cleanup_state"] == "RELEASED"
+        assert "stage_cleaned" not in receipt
+        assert "durable_cleaned" not in receipt
+        events.append("authorized")
+        return True
+
     result = fleet_executor.run_batch(
         "TARGET", [task], config,
         state_root=tmp_path / "controller-state",
         observation_id="batch-a",
         on_target_reservation=record_reservation,
         on_target_acceptance=record_acceptance,
+        before_target_cleanup=authorize_cleanup,
         on_target_finalization=record_finalization,
     )
     assert result["ok"] is True
     assert result["stdout_tail"] == "ok\n"
     operation_root = tmp_path / "target-state" / "fleet-operations" / "fleet-batch-a"
     if cleanup_state == "RELEASED":
-        assert events == ["reserved", "launched", "accepted", "cleaned", "finalized"]
+        assert events == [
+            "reserved", "launched", "accepted", "authorized", "cleaned", "finalized",
+        ]
         assert not operation_root.exists()
     else:
         assert events == ["reserved", "launched", "accepted"]

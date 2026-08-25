@@ -102,8 +102,15 @@ def test_known_terminal_cleanup_deferred_is_recoverable(
         assert kwargs["on_target_acceptance"](
             {"operation_id": operation_id, "request_sha256": request_sha}
         )
+        assert kwargs["before_target_cleanup"]({
+            "schema": 1,
+            "operation_id": operation_id,
+            "request_sha256": request_sha,
+            "cleanup_state": "RELEASED",
+        })
         # The command result is known, but a checked stage deletion failed. The
-        # executor therefore correctly withholds target finalization.
+        # executor therefore keeps the authorization marker while correctly
+        # withholding post-deletion target finalization.
         return {
             "ok": True,
             "exit_code": 0,

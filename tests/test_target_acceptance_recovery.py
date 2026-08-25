@@ -299,12 +299,15 @@ def test_stage_delete_is_proved_before_durable_evidence_cleanup(
         observation_id="batch-a",
         on_target_reservation=lambda _receipt, _token: True,
         on_target_acceptance=lambda _receipt: True,
+        before_target_cleanup=lambda _receipt: True,
     )
 
     assert events == ["stage_delete"]
     assert result["cleanup_deferred"] is True
     assert result["stage_dir"].endswith("fleet-batch-a")
-    assert result["target_cleanup_deferred"] == "target stage deletion failed"
+    assert result["target_cleanup_deferred"] == (
+        "target stage deletion failed: simulated stage deletion failure"
+    )
 
 
 def test_target_reservation_is_persisted_before_first_stage_write(
@@ -356,6 +359,7 @@ def test_target_reservation_is_persisted_before_first_stage_write(
         observation_id="batch-before-stage",
         prelaunch_gate=lambda: False,
         on_target_reservation=lambda _receipt, _token: events.append("persist") is None,
+        before_target_cleanup=lambda _receipt: events.append("authorize") is None,
         on_target_finalization=lambda receipt: (
             events.append("finalize") or finalized.append(receipt) or True
         ),
@@ -363,7 +367,9 @@ def test_target_reservation_is_persisted_before_first_stage_write(
 
     assert result["definition_drift"] is True
     assert events.index("reserve") < events.index("persist") < events.index("stage_write")
-    assert events[-4:] == ["cancel", "stage_delete", "durable_cleanup", "finalize"]
+    assert events[-5:] == [
+        "cancel", "authorize", "stage_delete", "durable_cleanup", "finalize",
+    ]
     assert finalized[0]["cleanup_state"] == "CANCELLED"
 
 
@@ -423,13 +429,91 @@ def test_terminal_prestart_failure_finalizes_before_retry(
         observation_id="batch-prestart-failed",
         on_target_reservation=lambda _receipt, _token: True,
         on_target_acceptance=lambda _receipt: True,
+        before_target_cleanup=lambda _receipt: events.append("authorize") is None,
         on_target_finalization=lambda _receipt: events.append("finalize") is None,
     )
 
     assert result["completion_state"] == "not_started"
     assert result["command_started"] is False
     assert result.get("cleanup_deferred") is not True
-    assert events == ["stage_delete", "durable_cleanup", "finalize"]
+    assert events == ["authorize", "stage_delete", "durable_cleanup", "finalize"]
+
+
+def test_guard_finalization_prestart_cleanup_is_authorized_before_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard receipt failure uses the same pre-delete owner authorization gate."""
+    device, config, task = _raw_task(tmp_path)
+    reservation = _reservation("fleet-batch-guard-finalization")
+    events: list[str] = []
+
+    class Client:
+        state_root = str(tmp_path / "target-state")
+        info = SimpleNamespace(installed_path=str(tmp_path / "runner.py"))
+
+        def reserve(self, **_kwargs):  # noqa: ANN003
+            return reservation
+
+    class Transport(LocalSimTransport):
+        def launch_durable(self, _command, _cwd, **_kwargs):  # noqa: ANN001, ANN003
+            return (
+                {
+                    "acknowledged": True,
+                    "command_started": False,
+                    "state": "pending",
+                    "target_acceptance": {"state": "CLAIMED"},
+                },
+                {"platform": "POSIX", "telemetry": "none"},
+            )
+
+        def durable_status(self, _run_id, _token, *, include_logs=False):  # noqa: ANN001
+            status = {
+                "state": "complete",
+                "command_started": False,
+                "wrapper_exit_code": 0,
+                "target_cleanup": {"state": "RELEASED"},
+            }
+            return {"status": status} if include_logs else status
+
+        def remove_remote_tree(self, path):  # noqa: ANN001
+            events.append("stage_delete")
+            return super().remove_remote_tree(path)
+
+        def durable_cleanup(self, _run_id, _token):  # noqa: ANN001
+            events.append("durable_cleanup")
+            return {"cleaned": True}
+
+    monkeypatch.setattr(fleet_executor, "make_transport", lambda _device: Transport(device))
+    monkeypatch.setattr(
+        fleet_executor.TargetResourceClient,
+        "connect",
+        lambda *_args, **_kwargs: Client(),
+    )
+    monkeypatch.setattr(
+        fleet_executor,
+        "finalize_durable_result",
+        lambda _terminal, _execution: (_ for _ in ()).throw(
+            fleet_executor.GuardFinalizationError(
+                "simulated guard finalization loss", command_started=False,
+            )
+        ),
+    )
+
+    result = fleet_executor.run_batch(
+        "TARGET",
+        [task],
+        config,
+        state_root=tmp_path / "controller-state",
+        observation_id="batch-guard-finalization",
+        on_target_reservation=lambda _receipt, _token: True,
+        on_target_acceptance=lambda _receipt: True,
+        before_target_cleanup=lambda _receipt: events.append("authorize") is None,
+        on_target_finalization=lambda _receipt: events.append("finalize") is None,
+    )
+
+    assert result["completion_state"] == "not_started"
+    assert result["command_started"] is False
+    assert events == ["authorize", "stage_delete", "durable_cleanup", "finalize"]
 
 
 def _open_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202

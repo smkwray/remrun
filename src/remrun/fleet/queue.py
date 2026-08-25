@@ -1455,14 +1455,25 @@ class FleetQueue:
         with self._immediate():
             batch = self.db.execute(
                 "SELECT state,target_protocol_version,"
-                "target_finalized_at,target_finalization_disposition "
+                "target_cleanup_state,target_cleanup_at,target_stage_cleaned_at,"
+                "target_durable_cleaned_at,target_finalized_at,"
+                "target_finalization_disposition "
                 "FROM batches WHERE batch_id=?",
                 (batch_id,),
             ).fetchone()
             if (
                 batch is None
                 or batch["target_protocol_version"] != 1
-                or batch["target_finalized_at"] is not None
+                or any(
+                    batch[name] is not None
+                    for name in (
+                        "target_cleanup_state",
+                        "target_cleanup_at",
+                        "target_stage_cleaned_at",
+                        "target_durable_cleaned_at",
+                        "target_finalized_at",
+                    )
+                )
                 or batch["target_finalization_disposition"]
                 == FINALIZATION_FINALIZED
             ):
@@ -2257,6 +2268,94 @@ class FleetQueue:
             )
             return cur.rowcount == 1
 
+    def authorize_target_cleanup(
+        self,
+        batch_id: str,
+        *,
+        operation_id: str,
+        request_sha256: str,
+        cleanup_state: str,
+        expected_state: str,
+        owner_token: str,
+        now: str | None = None,
+    ) -> bool:
+        """Linearize execution-owner cleanup against operator cancellation.
+
+        The terminal cleanup observation is the durable authorization marker.
+        Destructive target cleanup may begin only after this live-owner CAS;
+        finalization remains a separate post-deletion proof.
+        """
+        if (
+            not operation_id
+            or not self._valid_target_digest(request_sha256)
+            or cleanup_state not in {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}
+        ):
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            row = self.db.execute(
+                "SELECT target_protocol_version,target_operation_id,"
+                "target_request_sha256,target_reserved_at,target_cleanup_state,"
+                "target_cleanup_at,target_stage_cleaned_at,target_durable_cleaned_at,"
+                "target_finalized_at,target_finalization_disposition "
+                "FROM batches WHERE batch_id=? AND state=? AND owner_token=? "
+                "AND lease_until>?",
+                (batch_id, expected_state, owner_token, now),
+            ).fetchone()
+            if (
+                row is None
+                or row["target_protocol_version"] != 1
+                or row["target_operation_id"] != operation_id
+                or row["target_request_sha256"] != request_sha256
+                or not isinstance(row["target_reserved_at"], str)
+                or not row["target_reserved_at"]
+                or row["target_finalized_at"] is not None
+                or row["target_finalization_disposition"]
+                in {FINALIZATION_FENCED, FINALIZATION_MALFORMED, FINALIZATION_FINALIZED}
+            ):
+                return False
+            existing_state = row["target_cleanup_state"]
+            existing_at = row["target_cleanup_at"]
+            if existing_state is not None or existing_at is not None:
+                return (
+                    existing_state == cleanup_state
+                    and isinstance(existing_at, str)
+                    and bool(existing_at)
+                    and row["target_stage_cleaned_at"] is None
+                    and row["target_durable_cleaned_at"] is None
+                    and row["target_finalization_disposition"] == FINALIZATION_PENDING
+                )
+            if (
+                row["target_stage_cleaned_at"] is not None
+                or row["target_durable_cleaned_at"] is not None
+                or row["target_finalization_disposition"] is not None
+            ):
+                return False
+            cur = self.db.execute(
+                "UPDATE batches SET target_cleanup_state=?,target_cleanup_at=?,"
+                "target_finalization_disposition=?,updated_at=? WHERE batch_id=? "
+                "AND state=? AND owner_token=? AND lease_until>? "
+                "AND target_protocol_version=1 AND target_operation_id=? "
+                "AND target_request_sha256=? AND target_reserved_at IS NOT NULL "
+                "AND target_cleanup_state IS NULL AND target_cleanup_at IS NULL "
+                "AND target_stage_cleaned_at IS NULL "
+                "AND target_durable_cleaned_at IS NULL AND target_finalized_at IS NULL "
+                "AND target_finalization_disposition IS NULL",
+                (
+                    cleanup_state,
+                    now,
+                    FINALIZATION_PENDING,
+                    now,
+                    batch_id,
+                    expected_state,
+                    owner_token,
+                    now,
+                    operation_id,
+                    request_sha256,
+                ),
+            )
+            return cur.rowcount == 1
+
     def record_target_finalization(
         self,
         batch_id: str,
@@ -2299,7 +2398,8 @@ class FleetQueue:
                     )
                 )
             cur = self.db.execute(
-                "UPDATE batches SET target_cleanup_state=?,target_cleanup_at=?,"
+                "UPDATE batches SET target_cleanup_state=?,"
+                "target_cleanup_at=COALESCE(target_cleanup_at,?),"
                 "target_stage_cleaned_at=?,target_durable_cleaned_at=?,"
                 "target_finalized_at=?,target_finalization_disposition=?,updated_at=? "
                 "WHERE batch_id=? AND state=? "

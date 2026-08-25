@@ -609,6 +609,21 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                 heartbeat.ownership_lost.set()
             return recorded
 
+        def authorize_target_cleanup(receipt: dict[str, Any]) -> bool:
+            if heartbeat is None or heartbeat.ownership_lost.is_set():
+                return False
+            recorded = queue.authorize_target_cleanup(
+                batch_id,
+                operation_id=str(receipt.get("operation_id") or ""),
+                request_sha256=str(receipt.get("request_sha256") or ""),
+                cleanup_state=str(receipt.get("cleanup_state") or ""),
+                expected_state=batch_state,
+                owner_token=owner_token,
+            )
+            if not recorded:
+                heartbeat.ownership_lost.set()
+            return recorded
+
         def record_target_finalization(receipt: dict[str, Any]) -> bool:
             if heartbeat is None or heartbeat.ownership_lost.is_set():
                 return False
@@ -641,6 +656,7 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
                     before_output_return=output_return_gate,
                     on_target_reservation=record_target_reservation,
                     on_target_acceptance=record_target_acceptance,
+                    before_target_cleanup=authorize_target_cleanup,
                     on_target_finalization=record_target_finalization,
                 )
             attempt_record = durable_attempt_record(task, result)
@@ -763,6 +779,7 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
               before_output_return: Callable[[], bool] | None = None,
               on_target_reservation: Callable[[dict[str, Any], str], bool] | None = None,
               on_target_acceptance: Callable[[dict[str, Any]], bool] | None = None,
+              before_target_cleanup: Callable[[dict[str, Any]], bool] | None = None,
               on_target_finalization: Callable[[dict[str, Any]], bool] | None = None,
               ) -> dict[str, Any]:
     """Run one already-placed compatible prepared batch."""
@@ -795,6 +812,7 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
             prelaunch_gate=prelaunch_gate, before_output_return=before_output_return,
             on_target_reservation=on_target_reservation,
             on_target_acceptance=on_target_acceptance,
+            before_target_cleanup=before_target_cleanup,
             on_target_finalization=on_target_finalization,
         )
     except _OutputReturnOwnershipLost:
@@ -819,6 +837,7 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                         before_output_return: Callable[[], bool] | None,
                         on_target_reservation: Callable[[dict[str, Any], str], bool] | None,
                         on_target_acceptance: Callable[[dict[str, Any]], bool] | None,
+                        before_target_cleanup: Callable[[dict[str, Any]], bool] | None,
                         on_target_finalization: Callable[[dict[str, Any]], bool] | None,
                         ) -> dict[str, Any]:
     device = config.devices[device_name]
@@ -868,6 +887,65 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             target_heartbeat.__exit__(None, None, None)
             target_heartbeat = None
 
+    def cleanup_terminal_target(
+        cleanup_state: str,
+        durable: tuple[str, str],
+    ) -> dict[str, Any]:
+        """Authorize, delete, then prove cleanup for one terminal target operation."""
+        authorization = {
+            "schema": 1,
+            "operation_id": operation_id,
+            "request_sha256": request_sha,
+            "cleanup_state": cleanup_state,
+        }
+        if before_target_cleanup is None or not before_target_cleanup(authorization):
+            deferred = {
+                "cleanup_deferred": True,
+                "stage_dir": stage,
+                "target_cleanup_deferred": (
+                    "controller queue rejected target cleanup authorization"
+                ),
+            }
+            # The finalization surface remains the post-deletion proof. Sending
+            # an explicitly incomplete receipt lets an attached controller
+            # reject and durably report that no proof was recorded.
+            if on_target_finalization is not None and not on_target_finalization({
+                **authorization,
+                "stage_cleaned": False,
+                "durable_cleaned": False,
+            }):
+                deferred["target_finalization_deferred"] = (
+                    "controller queue rejected target finalization proof"
+                )
+            return deferred
+        try:
+            transport.remove_remote_tree(stage)
+        except (OSError, TransportError, NotImplementedError) as exc:
+            return {
+                "cleanup_deferred": True,
+                "stage_dir": stage,
+                "target_cleanup_deferred": f"target stage deletion failed: {exc}",
+            }
+        try:
+            transport.durable_cleanup(*durable)
+        except TransportError as exc:
+            return {
+                "cleanup_deferred": True,
+                "target_cleanup_deferred": f"durable evidence cleanup failed: {exc}",
+            }
+        if on_target_finalization is not None and not on_target_finalization({
+            **authorization,
+            "stage_cleaned": True,
+            "durable_cleaned": True,
+        }):
+            return {
+                "cleanup_deferred": True,
+                "target_finalization_deferred": (
+                    "controller queue rejected target finalization proof"
+                ),
+            }
+        return {}
+
     def finalize_prelaunch_target(
         known_cleanup_state: str | None = None,
     ) -> dict[str, Any]:
@@ -900,39 +978,9 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             return extra
         if not cleanup:
             return extra
-        try:
-            transport.remove_remote_tree(stage)
-        except (OSError, TransportError, NotImplementedError) as exc:
-            extra.update(
-                cleanup_deferred=True,
-                stage_dir=stage,
-                target_cleanup_deferred=f"target stage deletion failed: {exc}",
-            )
-            return extra
-        try:
-            transport.durable_cleanup(operation_id, target_reservation.token)
-        except TransportError as exc:
-            extra.update(
-                cleanup_deferred=True,
-                target_cleanup_deferred=f"durable evidence cleanup failed: {exc}",
-            )
-            return extra
-        if on_target_finalization is not None:
-            finalization = {
-                "schema": 1,
-                "operation_id": operation_id,
-                "request_sha256": request_sha,
-                "cleanup_state": cleanup_state,
-                "stage_cleaned": True,
-                "durable_cleaned": True,
-            }
-            if not on_target_finalization(finalization):
-                extra.update(
-                    cleanup_deferred=True,
-                    target_finalization_deferred=(
-                        "controller queue rejected target finalization proof"
-                    ),
-                )
+        extra.update(cleanup_terminal_target(
+            cleanup_state, (operation_id, target_reservation.token),
+        ))
         return extra
     try:
         transport = make_transport(device)
@@ -1339,40 +1387,9 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 if cleanup and prestart and cleanup_state in {
                     "RELEASED", "CANCELLED", "EXPIRED", "REBOOTED",
                 }:
-                    try:
-                        transport.remove_remote_tree(stage)
-                    except (OSError, TransportError, NotImplementedError):
-                        cleanup_result.update(
-                            cleanup_deferred=True,
-                            stage_dir=stage,
-                            target_cleanup_deferred="target stage deletion failed",
-                        )
-                    else:
-                        try:
-                            transport.durable_cleanup(*durable_context)
-                        except TransportError as cleanup_exc:
-                            cleanup_result.update(
-                                cleanup_deferred=True,
-                                target_cleanup_deferred=(
-                                    f"durable evidence cleanup failed: {cleanup_exc}"
-                                ),
-                            )
-                        else:
-                            if on_target_finalization is not None and not \
-                                    on_target_finalization({
-                                        "schema": 1,
-                                        "operation_id": operation_id,
-                                        "request_sha256": request_sha,
-                                        "cleanup_state": cleanup_state,
-                                        "stage_cleaned": True,
-                                        "durable_cleaned": True,
-                                    }):
-                                cleanup_result.update(
-                                    cleanup_deferred=True,
-                                    target_finalization_deferred=(
-                                        "controller queue rejected target finalization proof"
-                                    ),
-                                )
+                    cleanup_result.update(
+                        cleanup_terminal_target(cleanup_state, durable_context)
+                    )
                 else:
                     cleanup_result.update(cleanup_deferred=bool(cleanup), stage_dir=stage)
                 return {
@@ -1431,39 +1448,9 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 and target_cleanup_state in {
                     "RELEASED", "CANCELLED", "EXPIRED", "REBOOTED",
                 }:
-            try:
-                transport.remove_remote_tree(stage)
-            except (OSError, TransportError, NotImplementedError):
-                cleanup_result.update(
-                    cleanup_deferred=True,
-                    stage_dir=stage,
-                    target_cleanup_deferred="target stage deletion failed",
-                )
-            else:
-                try:
-                    transport.durable_cleanup(*durable_context)
-                except TransportError as cleanup_exc:
-                    cleanup_result.update(
-                        cleanup_deferred=True,
-                        target_cleanup_deferred=(
-                            f"durable evidence cleanup failed: {cleanup_exc}"
-                        ),
-                    )
-                else:
-                    if on_target_finalization is not None and not on_target_finalization({
-                        "schema": 1,
-                        "operation_id": operation_id,
-                        "request_sha256": request_sha,
-                        "cleanup_state": target_cleanup_state,
-                        "stage_cleaned": True,
-                        "durable_cleaned": True,
-                    }):
-                        cleanup_result.update(
-                            cleanup_deferred=True,
-                            target_finalization_deferred=(
-                                "controller queue rejected target finalization proof"
-                            ),
-                        )
+            cleanup_result.update(
+                cleanup_terminal_target(target_cleanup_state, durable_context)
+            )
         elif cleanup and prestart and target_operation is None:
             _safe_delete(transport, stage)
         elif cleanup and prestart:
@@ -1626,9 +1613,8 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 raise _OutputReturnOwnershipLost
         except ResultProtocolError as exc:
             evidence_error = str(exc)
-    durable_cleanup_error = None
     stage_cleanup_error = None
-    target_finalization_error = None
+    target_cleanup_result: dict[str, Any] = {}
     target_cleanup_state = None
     if target_operation is not None and isinstance(target_operation.get("cleanup"), dict):
         target_cleanup_state = target_operation["cleanup"].get("state")
@@ -1636,28 +1622,15 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
         "RELEASED", "CANCELLED", "EXPIRED", "REBOOTED",
     }
     retain_target_evidence = target_operation is not None and not target_cleanup_terminal
-    if cleanup and not retain_target_evidence:
+    if cleanup and target_cleanup_terminal and durable_context is not None:
+        target_cleanup_result.update(
+            cleanup_terminal_target(target_cleanup_state, durable_context)
+        )
+    elif cleanup and target_operation is None:
         try:
             transport.remove_remote_tree(stage)
         except (OSError, TransportError, NotImplementedError) as exc:
             stage_cleanup_error = str(exc)
-        if stage_cleanup_error is None and durable_context is not None:
-            try:
-                transport.durable_cleanup(*durable_context)
-            except TransportError as exc:
-                durable_cleanup_error = str(exc)
-        if stage_cleanup_error is None and durable_cleanup_error is None \
-                and target_cleanup_terminal and on_target_finalization is not None:
-            finalization = {
-                "schema": 1,
-                "operation_id": operation_id,
-                "request_sha256": request_sha,
-                "cleanup_state": target_cleanup_state,
-                "stage_cleaned": True,
-                "durable_cleaned": True,
-            }
-            if not on_target_finalization(finalization):
-                target_finalization_error = "controller queue rejected target finalization proof"
     delivery_complete = not any(
         row.get("failure_code") == "output_return_failed" for row in rows
     )
@@ -1672,16 +1645,7 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
     }
     if target_operation is not None:
         response["target_operation"] = target_operation
-    if durable_cleanup_error is not None:
-        response.update(
-            cleanup_deferred=True,
-            target_cleanup_deferred=f"durable evidence cleanup failed: {durable_cleanup_error}",
-        )
-    if target_finalization_error is not None:
-        response.update(
-            cleanup_deferred=True,
-            target_finalization_deferred=target_finalization_error,
-        )
+    response.update(target_cleanup_result)
     if stage_cleanup_error is not None:
         response.update(
             cleanup_deferred=True,
