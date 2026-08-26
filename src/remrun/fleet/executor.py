@@ -456,9 +456,22 @@ def run_group(tasks: list[FleetTask], config: RemrunConfig, *,
             current = None
         return current == head.prepared["spec_id"]
 
+    def unmanaged_cleanup_authority(_receipt: dict[str, Any]) -> bool:
+        """Grant cleanup unconditionally: this mode has no arbiter to lose to.
+
+        The shared helper refuses to delete without authorization, which is right
+        for queue-managed execution, where a targeted cancellation can commit
+        between a decision and the delete. This path has no queue owner, no lease
+        and no cancellation transaction, so nothing can win that race and there is
+        no marker to consult. Granting explicitly keeps the helper's default
+        fail-closed for managed callers rather than weakening it for everyone.
+        """
+        return True
+
     return _ad_hoc_result(run_batch(
         device_name, tasks, config, state_root=state_root, cleanup=cleanup,
         prelaunch_gate=live_launch_gate,
+        before_target_cleanup=unmanaged_cleanup_authority,
     ))
 
 

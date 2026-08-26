@@ -675,3 +675,85 @@ def test_stale_pre_reservation_rows_do_not_leak_stage_or_claim_uncertain_start(
         assert not stages["running"].exists()
     finally:
         q.close()
+
+
+def test_unleased_execution_still_cleans_target_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unmanaged execution must clean up, not silently retain target state.
+
+    The shared cleanup helper refuses to delete without authorization, which is
+    correct for queue-managed runs where a targeted cancellation can commit
+    between the decision and the delete. The unleased path has no queue owner and
+    no cancellation transaction, so it must grant that authority explicitly. When
+    it did not, every successful `--no-lease` run against a protocol-v1 target
+    left its stage and durable record behind, and repeated runs accumulated them
+    on the target -- while still reporting ok.
+    """
+    device, config, task = _raw_task(tmp_path)
+    reservation = _reservation("fleet-batch-unleased")
+    events: list[str] = []
+
+    class Client:
+        state_root = str(tmp_path / "target-state")
+        info = SimpleNamespace(installed_path=str(tmp_path / "runner.py"))
+
+        def reserve(self, **_kwargs):  # noqa: ANN003
+            return reservation
+
+    class Transport(LocalSimTransport):
+        def launch_durable(self, _command, _cwd, **_kwargs):  # noqa: ANN001, ANN003
+            return (
+                {
+                    "acknowledged": True,
+                    "command_started": True,
+                    "state": "running",
+                    "target_acceptance": {"state": "CLAIMED"},
+                },
+                {"platform": "POSIX", "telemetry": "none"},
+            )
+
+        def durable_status(self, _run_id, _token, *, include_logs=False):  # noqa: ANN001
+            status = {
+                "state": "complete",
+                "command_started": True,
+                "wrapper_exit_code": 0,
+                "target_cleanup": {"state": "RELEASED"},
+            }
+            if include_logs:
+                return {
+                    "status": status,
+                    "stdout_b64": base64.b64encode(b"ok\n").decode("ascii"),
+                    "stderr_b64": base64.b64encode(b"").decode("ascii"),
+                }
+            return status
+
+        def remove_remote_tree(self, path):  # noqa: ANN001
+            events.append("stage_delete")
+            return super().remove_remote_tree(path)
+
+        def durable_cleanup(self, _run_id, _token):  # noqa: ANN001
+            events.append("durable_cleanup")
+            return {"cleaned": True}
+
+    monkeypatch.setattr(fleet_executor, "make_transport", lambda _device: Transport(device))
+    monkeypatch.setattr(
+        fleet_executor.TargetResourceClient,
+        "connect",
+        lambda *_args, **_kwargs: Client(),
+    )
+
+    # Placement probes the real device; force it so the test exercises the
+    # unleased execution path rather than device selection.
+    monkeypatch.setattr(
+        fleet_executor, "_choose_device", lambda *_args, **_kwargs: ("TARGET", {}),
+    )
+    result = fleet_executor.run_group(
+        [task], config, state_root=tmp_path / "controller-state", use_lease=False,
+    )
+
+    assert result.get("error") is None
+    # The whole point: an unmanaged run reaches the shared helper with authority,
+    # so both classes of target evidence are removed rather than retained forever.
+    assert events == ["stage_delete", "durable_cleanup"]
+    assert result.get("cleanup_deferred") is not True

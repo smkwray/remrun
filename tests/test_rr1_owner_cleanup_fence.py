@@ -198,6 +198,25 @@ def test_cancellation_fence_prevents_execution_owner_from_deleting_target_eviden
             now=NOW,
         )
 
+    def authorization_cb(receipt):  # noqa: ANN001, ANN202
+        """Call the real queue CAS, so the fence is what refuses -- not an absent hook.
+
+        Without this the executor's helper short-circuits on a missing callback and
+        the test passes whatever the queue does, which would keep it green even if
+        authorize_target_cleanup() were deleted outright.
+        """
+        accepted = q.authorize_target_cleanup(
+            batch_id,
+            operation_id=receipt["operation_id"],
+            request_sha256=receipt["request_sha256"],
+            cleanup_state=receipt["cleanup_state"],
+            expected_state="running",
+            owner_token=owner,
+            now=NOW,
+        )
+        events.append(f"authorization_accepted={accepted}")
+        return accepted
+
     def finalization_cb(receipt):  # noqa: ANN001, ANN202
         accepted = q.record_target_finalization(
             batch_id,
@@ -224,6 +243,7 @@ def test_cancellation_fence_prevents_execution_owner_from_deleting_target_eviden
         prelaunch_gate=launch_gate,
         on_target_reservation=reservation_cb,
         on_target_acceptance=acceptance_cb,
+        before_target_cleanup=authorization_cb,
         on_target_finalization=finalization_cb,
     )
 
@@ -231,7 +251,18 @@ def test_cancellation_fence_prevents_execution_owner_from_deleting_target_eviden
     assert result["target_finalization_deferred"] == (
         "controller queue rejected target finalization proof"
     )
-    assert "finalization_accepted=False" in events
+    assert "authorization_accepted=False" in events
+    # The exact order matters: cancellation must commit first, then the owner's
+    # real CAS must be refused, and only then may finalization be refused.
+    assert [e for e in events if e in {
+        "cancellation_committed",
+        "authorization_accepted=False",
+        "finalization_accepted=False",
+    }] == [
+        "cancellation_committed",
+        "authorization_accepted=False",
+        "finalization_accepted=False",
+    ]
 
     # Safety contract: once the cancellation fence wins, the old owner may not
     # erase either class of target evidence before or after its rejected CAS.
