@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .resources import ResourceView
 
-HEADERS = ("DEVICE", "CPU", "LOAD", "RAM", "GPU", "VRAM", "DISK", "STATUS")
+HEADERS = ("DEVICE", "CPU", "LOAD", "RAM", "GPU", "VRAM", "DISK", "NET", "STATUS")
 USAGE_DISPLAYS = frozenset({"percent", "amounts"})
 USAGE_ALERT_PCT = 85.0
 LOAD_ALERT_PER_CORE = 1.0
@@ -104,6 +104,16 @@ def _disk_amount_cell(view: ResourceView) -> str:
     return f"{disk.used_bytes / 1_000_000_000:.0f}/{disk.total_bytes / 1_000_000_000:.0f} GB"
 
 
+def _network_cell(view: ResourceView) -> str:
+    if (
+        view.network_status != "measured"
+        or view.network_upload_mbps is None
+        or view.network_download_mbps is None
+    ):
+        return "-"
+    return f"{view.network_upload_mbps}/{view.network_download_mbps}"
+
+
 _SHORT_DETAILS = (
     ("ssh key missing", "key missing"),
     ("ssh auth refused", "auth refused"),
@@ -145,7 +155,7 @@ def _view_row(view: ResourceView, usage_display: str) -> list[str]:
     label = view.name
     if not view.reachable:
         # A dash in every metric column would read as "measured zero".
-        return [label, "-", "-", "-", "-", "-", "-", _status_cell(view)]
+        return [label, "-", "-", "-", "-", "-", "-", "-", _status_cell(view)]
     if usage_display == "percent":
         ram = _pct_cell(view.ram_used_pct)
         vram = _pct_cell(view.vram_used_pct)
@@ -162,6 +172,7 @@ def _view_row(view: ResourceView, usage_display: str) -> list[str]:
         _pct_cell(view.gpu_util_pct),
         vram,
         disk,
+        _network_cell(view),
         _status_cell(view),
     ]
 
@@ -188,6 +199,8 @@ def _footnotes(views: list[ResourceView]) -> list[str]:
         notes.append("LOAD = 1-min demand/core; not CPU%")
     elif has_windows_queue:
         notes.append("LOAD: q=ready waiters/core; not CPU%")
+    if any(view.network_status != "unavailable" for view in views):
+        notes.append("NET = upload/download Mbps; rounded 1-second passive sample")
     if any(_has_alert(view) for view in views):
         notes.append("* alert: usage >=85%; LOAD >=1.0x/q")
     return notes
@@ -204,7 +217,7 @@ class IncrementalTable:
             )
         self.usage_display = usage_display
         if usage_display == "percent":
-            widest = ["", "100%", "9999.9x", "100%", "100%", "100%", "100%", ""]
+            widest = ["", "100%", "9999.9x", "100%", "100%", "100%", "100%", "9999/9999", ""]
         else:
             widest = [
                 "",
@@ -214,6 +227,7 @@ class IncrementalTable:
                 "100%",
                 "9999/9999 GB",
                 "99999/99999 GB",
+                "9999/9999",
                 "",
             ]
         widest[0] = max([*device_labels, HEADERS[0]], key=len)
@@ -269,15 +283,29 @@ def to_dict(view: ResourceView) -> dict:
         "load_per_core": view.load_per_core,
         "processor_queue_length": view.processor_queue_length,
         "processor_queue_per_core": view.processor_queue_per_core,
+        "network": {
+            "interface": view.network_interface,
+            "status": view.network_status,
+            "detail": view.network_detail,
+            "upload_mbps": view.network_upload_mbps,
+            "download_mbps": view.network_download_mbps,
+        },
         "ram_free_mb": view.ram_free_mb,
         "ram_total_mb": view.ram_total_mb,
         "ram_used_pct": view.ram_used_pct,
         "gpu_name": view.gpu_name,
         "gpu_util_pct": view.gpu_util_pct,
         "gpu_unified": view.gpu_unified,
+        "gpu_memory_topology": view.gpu_memory_topology,
         "vram_free_mb": view.vram_free_mb,
         "vram_total_mb": view.vram_total_mb,
         "vram_used_pct": view.vram_used_pct,
+        "gpu_raw": {
+            "kind": view.gpu_raw_kind,
+            "status": view.gpu_raw_status,
+            "detail": view.gpu_raw_detail,
+            **view.gpu_raw,
+        },
         "disk": {
             "mount": view.primary_disk.mount,
             "total_bytes": view.primary_disk.total_bytes,

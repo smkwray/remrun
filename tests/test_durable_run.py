@@ -95,6 +95,7 @@ class _FakeDurableTransport(LocalSimTransport):
         self.status: dict[str, object] | None = None
         self.stdout = ""
         self.stderr = ""
+        self.command_seen: list[str] = []
         self.reservation_seen: MemoryReservation | None = None
         self.load: float | None = None
 
@@ -128,6 +129,7 @@ class _FakeDurableTransport(LocalSimTransport):
     ) -> tuple[dict[str, object], dict[str, object]]:
         del resume_token, max_log_bytes, created_at, telemetry, telemetry_request
         self.launch_calls += 1
+        self.command_seen = list(command)
         self.reservation_seen = memory_reservation
         identity = {
             "schema": 1,
@@ -254,6 +256,51 @@ def test_complete_result_logs_and_pullback_finalize_exactly_once(
     assert fake.launch_calls == 1
     assert fake.cleanup_calls == 1
     assert pullbacks == 1
+
+
+def test_durable_managed_command_dispatches_absolute_entrypoint(
+    durable_env, monkeypatch, capsys
+):
+    devices = Path(durable_env["state"]).parent / "remrun" / "config" / "devices.toml"
+    device_config = devices.read_text(encoding="utf-8")
+    venv_root = Path(durable_env["state"]).parent / "venvs"
+    devices.write_text(
+        device_config.replace(
+            'address_candidates = ["test.invalid"]\n',
+            'address_candidates = ["test.invalid"]\n'
+            f'venv_root = "{_posix(venv_root)}"\n',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    (durable_env["project"] / "uv.lock").write_text("lock-v1", encoding="utf-8")
+    cfgdir = durable_env["project"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    step = (
+        "import sys; from pathlib import Path; "
+        "v=Path(sys.argv[1]); b=v/'bin'; b.mkdir(parents=True,exist_ok=True); "
+        "p=b/'python'; p.exists() or p.symlink_to(sys.executable)"
+    )
+    (cfgdir / "remrun.toml").write_text(
+        "[run]\n"
+        "use_venv = true\n"
+        "venv_layout = \"external\"\n"
+        "[run.bootstrap]\n"
+        "schema = 1\n"
+        'lock_inputs = ["uv.lock"]\n'
+        f"argv = [\"{{python}}\", \"-c\", {json.dumps(step)}, \"{{venv}}\"]\n",
+        encoding="utf-8",
+    )
+    holder = _install_fake(monkeypatch)
+
+    assert main([
+        "run", "--durable", "TEST", "--", "python", "-c", "print('ok')"
+    ]) == EXIT_OK
+    capsys.readouterr()
+    fake = holder["transport"]
+    assert fake.command_seen == [
+        str(venv_root / "proj1" / "bin" / "python"), "-c", "print('ok')"
+    ]
 
 
 def test_resume_completes_finalization_checkpoint_without_second_pullback(
@@ -554,6 +601,152 @@ def test_target_supervisor_ack_order_no_duplicate_exact_result_and_bounded_clean
     )
     assert cleanup.returncode == 0
     assert not (root / "durable-runs" / "run-a").exists()
+
+
+def test_status_cannot_replace_terminal_write_after_its_fresh_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "target-state"
+    run_id = "run-terminal-race"
+    token = "secret-token"
+    rdir = root / "durable-runs" / run_id
+    ready = rdir / "observer-ready.json"
+    gate = rdir / "start-gate.json"
+    started = rdir / "started.json"
+    release = tmp_path / "release-command"
+    ledger = tmp_path / "resource-ledger.json"
+    operations = tmp_path / "resource-operations.log"
+    resource_runner = tmp_path / "resource-runner.py"
+    request_sha = hashlib.sha256(b"terminal-status-race").hexdigest()
+    receipt = {
+        "allocation_id": run_id,
+        "operation_id": run_id,
+        "request_sha256": request_sha,
+        "fence": 1,
+        "policy_generation": 0,
+        "policy_digest": "0" * 64,
+        "state": "RESERVED",
+        "command_start_state": "NO",
+    }
+    ledger.write_text(json.dumps(receipt), encoding="utf-8")
+    resource_runner.write_text(
+        """from __future__ import annotations
+import json
+import sys
+from pathlib import Path
+
+request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+ledger = Path(sys.argv[2]) / "resource-ledger.json"
+operations = Path(sys.argv[2]) / "resource-operations.log"
+receipt = json.loads(ledger.read_text(encoding="utf-8"))
+operation = request["operation"]
+with operations.open("a", encoding="utf-8") as handle:
+    handle.write(operation + "\\n")
+if operation == "claim":
+    receipt.update(state="CLAIMED", command_start_state="NO")
+elif operation == "start":
+    receipt["command_start_state"] = request["values"]["state"]
+elif operation == "exec_confirm":
+    receipt["command_start_state"] = "YES"
+elif operation == "finish":
+    receipt.update(state="RELEASED", terminal_reason="explicit_finish")
+ledger.write_text(json.dumps(receipt), encoding="utf-8")
+sys.stdout.write(json.dumps({"ok": True, "receipt": receipt}))
+""",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        "-S",
+        "-c",
+        (
+            "import sys,time\n"
+            "from pathlib import Path\n"
+            "path=Path(sys.argv[1])\n"
+            "while not path.exists(): time.sleep(0.01)\n"
+        ),
+        str(release),
+    ]
+    observation = JobObservation.for_command(
+        job_id=run_id,
+        project="@fleet",
+        source_controller="controller-a",
+        target="TARGET",
+        phase="fleet-worker",
+        command=command,
+    )
+    spec = {
+        "schema": 1,
+        "run_id": run_id,
+        "resume_token": token,
+        "controller": "controller-a",
+        "project_id": "@fleet",
+        "target": "TARGET",
+        "command_sha256": observation.command_sha256,
+        "argv": [
+            sys.executable,
+            "-S",
+            str(Path(cli.__file__).with_name("_job_observer.py")),
+            "run",
+            "--state-root", str(root),
+            "--metadata-b64", observation.encoded(),
+            "--ready-file", str(ready),
+            "--start-gate-file", str(gate),
+            "--started-file", str(started),
+            "--",
+            *command,
+        ],
+        "ready_path": str(ready),
+        "max_log_bytes": 1024 * 1024,
+        "created_at": "2026-08-26T00:00:00Z",
+        "acceptance": {
+            "schema": 1,
+            "runner_path": str(resource_runner),
+            "state_root": str(tmp_path),
+            "operation_id": run_id,
+            "request_sha256": request_sha,
+            "reservation": {
+                "allocation_id": run_id,
+                "fence": 1,
+                "policy_generation": 0,
+                "policy_digest": "0" * 64,
+            },
+            "start_gate_path": str(gate),
+            "started_path": str(started),
+        },
+    }
+    launched = durable_runner._launch(
+        root, json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
+    )
+    assert launched["state"] == "running"
+    assert launched["command_started"] is True
+
+    def finish_after_supervisor_commits(
+        _acceptance: dict[str, object], _token: str,
+        operation: str, _values: dict[str, object],
+    ) -> dict[str, object]:
+        assert operation == "finish"
+        release.write_text("go", encoding="utf-8")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            terminal = json.loads((rdir / "status.json").read_text(encoding="utf-8"))
+            if terminal.get("state") == "complete":
+                return json.loads(ledger.read_text(encoding="utf-8"))
+            time.sleep(0.01)
+        pytest.fail("real supervisor did not commit its terminal status")
+
+    # Force the real status path into its absent-supervisor recovery branch, then
+    # arrange for the real detached supervisor to commit complete after the
+    # branch's authenticated re-read but before its attempted failed write.
+    monkeypatch.setattr(durable_runner, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(durable_runner, "_resource_transition", finish_after_supervisor_commits)
+
+    observed = durable_runner._status(root, run_id, token, False)
+
+    assert observed["state"] == "complete"
+    assert observed["wrapper_exit_code"] == 0
+    assert json.loads((rdir / "status.json").read_text(encoding="utf-8"))["state"] == "complete"
+    assert operations.read_text(encoding="utf-8").splitlines()[-1] == "finish"
 
 
 def test_target_corrupt_or_missing_state_fails_closed(tmp_path: Path):

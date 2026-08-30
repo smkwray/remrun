@@ -16,7 +16,7 @@ from remrun.config import RemrunConfig
 from remrun.fleet import cli, dispatcher
 from remrun.fleet.models import DeviceSnapshot, DrainResultV1, PlacedBatch, PlacementResult
 from remrun.fleet.prepared import as_fleet_task, pin_prepared_job, prepare_task_job
-from remrun.fleet.queue import FleetQueue, QueueMigrationError
+from remrun.fleet.queue import FleetQueue, QueueMigrationError, TaskSpecDriftRefusal
 from remrun.fleet.task_contract import resolve_task_spec
 from remrun.output import Reporter
 
@@ -230,6 +230,183 @@ def test_saved_plan_freezes_priority_for_response_loss_replay(tmp_path: Path) ->
         queue.close()
 
 
+def test_saved_plan_spec_drift_is_durable_idempotent_and_payload_free(
+    tmp_path: Path,
+) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    pinned = [pin_prepared_job(records[0], "A", spec)]
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec, prepared_records=pinned,
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        with pytest.raises(TaskSpecDriftRefusal) as first:
+            queue.enqueue_saved_plan(
+                plan["plan_id"], request_id="drift-request",
+                current_spec_id=lambda: "sha256:" + "0" * 64,
+            )
+        refusal = first.value.document
+        assert set(refusal) == {
+            "schema", "version", "status", "reason", "plan_id", "request_id", "fingerprint",
+        }
+        assert refusal["schema"] == "remrun.fleet.submission-refusal"
+        assert refusal["version"] == 1
+        assert refusal["status"] == "refused"
+        assert refusal["reason"] == "task_spec_drift"
+        assert refusal["plan_id"] == plan["plan_id"]
+        assert refusal["request_id"] == "drift-request"
+        assert spec["spec_id"] not in json.dumps(refusal)
+        assert queue.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+        assert queue.db.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+
+        def must_not_read_config() -> str:
+            raise AssertionError("an exact refusal replay must not consult mutable config")
+
+        with pytest.raises(TaskSpecDriftRefusal) as replay:
+            queue.enqueue_saved_plan(
+                plan["plan_id"], request_id="drift-request",
+                current_spec_id=must_not_read_config,
+            )
+        assert replay.value.document == refusal
+        assert queue.get_submission_refusal(request_id="drift-request") == refusal
+        assert queue.get_submission_refusal(plan_id=plan["plan_id"]) == refusal
+
+        # Restoring the old definition cannot resurrect the tombstoned identity. A new request is
+        # a distinct caller identity and may make its own fresh decision against the restored spec.
+        with pytest.raises(TaskSpecDriftRefusal):
+            queue.enqueue_saved_plan(
+                plan["plan_id"], request_id="drift-request",
+                current_spec_id=lambda: spec["spec_id"],
+            )
+
+        # A caller identity cannot be silently rebound to another saved plan or fingerprint. The
+        # database uniqueness fence must surface a fixed conflict rather than leaking sqlite's
+        # implementation error or creating a second refusal under the same request id.
+        other_plan = queue.save_submission_plan(
+            spec=spec,
+            prepared_records=[pin_prepared_job(records[1], "A", spec)],
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        with pytest.raises(QueueMigrationError, match="different durable refusal"):
+            queue.enqueue_saved_plan(
+                other_plan["plan_id"], request_id="drift-request",
+                current_spec_id=lambda: "sha256:" + "0" * 64,
+            )
+    finally:
+        queue.close()
+
+
+def test_request_refusal_fences_different_submission_identity(tmp_path: Path) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec,
+            prepared_records=[pin_prepared_job(records[0], "A", spec)],
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        with pytest.raises(TaskSpecDriftRefusal) as first:
+            queue.enqueue_saved_plan(
+                plan["plan_id"], request_id="cross-table-request",
+                current_spec_id=lambda: "sha256:" + "0" * 64,
+            )
+        refusal = first.value.document
+
+        # A direct submission with the same caller request but different work must not
+        # bypass the refusal just because it has no saved-plan identity of its own.
+        with pytest.raises(QueueMigrationError, match="different durable refusal"):
+            queue.enqueue_submission(
+                [records[1]], spec=spec, request_id="cross-table-request",
+                current_spec_id=lambda: spec["spec_id"],
+            )
+
+        assert queue.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+        assert queue.db.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+        assert queue.get_submission_refusal(request_id="cross-table-request") == refusal
+    finally:
+        queue.close()
+
+
+def test_submission_status_rejects_cross_table_request_collision(tmp_path: Path) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec,
+            prepared_records=[pin_prepared_job(records[0], "A", spec)],
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        with pytest.raises(TaskSpecDriftRefusal):
+            queue.enqueue_saved_plan(
+                plan["plan_id"], request_id="collision-request",
+                current_spec_id=lambda: "sha256:" + "0" * 64,
+            )
+        accepted = queue.enqueue_submission(
+            [records[1]], spec=spec, request_id="accepted-request",
+            current_spec_id=lambda: spec["spec_id"],
+        )
+        # Simulate a damaged database where independent durable outcome tables share a request.
+        queue.db.execute(
+            "UPDATE submissions SET request_id=? WHERE submission_id=?",
+            ("collision-request", accepted["submission_id"]),
+        )
+
+        with pytest.raises(QueueMigrationError, match="both accepted submission and durable refusal"):
+            queue.get_submission(request_id="collision-request")
+    finally:
+        queue.close()
+
+
+def test_cli_submit_and_request_status_share_closed_drift_refusal(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    spec, records = _prepared_pair(tmp_path)
+    state_root = tmp_path / "state"
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        plan = queue.save_submission_plan(
+            spec=spec,
+            prepared_records=[pin_prepared_job(records[0], "A", spec)],
+            current_spec_id=lambda: spec["spec_id"],
+        )
+    finally:
+        queue.close()
+
+    config = SimpleNamespace(repo_root=tmp_path)
+    monkeypatch.setattr(cli, "default_state_root", lambda: state_root)
+    monkeypatch.setattr(cli, "load_config", lambda _root=None: config)
+    monkeypatch.setattr(
+        cli,
+        "resolve_tasks",
+        lambda _config: {"arbitrary-unit": {"spec_id": "sha256:" + "0" * 64}},
+    )
+
+    submit_args = cli.build_parser().parse_args([
+        "submit", "--plan", plan["plan_id"], "--request-id", "request-1", "--json",
+    ])
+    assert cli.cmd_submit(submit_args, Reporter()) == 1
+    refusal = json.loads(capsys.readouterr().out)
+    assert refusal["reason"] == "task_spec_drift"
+    assert set(refusal) == {
+        "schema", "version", "status", "reason", "plan_id", "request_id", "fingerprint",
+    }
+
+    status_args = cli.build_parser().parse_args([
+        "status", "--request-id", "request-1", "--json",
+    ])
+    assert cli.cmd_status(status_args, Reporter()) == 0
+    assert json.loads(capsys.readouterr().out) == refusal
+
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        assert queue.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+        assert queue.db.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+        assert queue.db.execute("SELECT COUNT(*) FROM submission_refusals").fetchone()[0] == 1
+    finally:
+        queue.close()
+
+
 def test_submission_scope_selects_only_its_jobs(tmp_path: Path) -> None:
     spec, records = _prepared_pair(tmp_path)
     queue = FleetQueue(tmp_path / "fleet.db")
@@ -353,7 +530,7 @@ def test_cli_saved_plan_submission_and_exact_lookup(
         cli.probes,
         "build_snapshot",
         lambda device, *_args, **_kwargs: DeviceSnapshot(
-            name=device.name, reachable=True, max_jobs=1,
+            name=device.name, reachable=True, enabled=True, max_jobs=1,
             engine_status={"generic": "present"},
         ),
     )

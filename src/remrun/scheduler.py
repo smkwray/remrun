@@ -93,19 +93,26 @@ def order_devices(
     command: list[str] | None = None,
     scheduler_cfg: dict[str, Any] | None = None,
 ) -> list[Device]:
-    """Static preference-ordered list of candidate devices (enabled only).
+    """Static preference-ordered list of candidate devices.
 
-    Explicit targets resolve to a single-element list. For ``auto`` the order is:
-    project [placement] hints, then the configured ``[scheduler]`` primary and
-    fallback, then any remaining enabled non-controller devices as a last resort.
+    Explicit targets resolve to a single-element list when enabled or explicitly
+    opted into ordinary runs. For ``auto`` the order is project [placement] hints,
+    then the configured ``[scheduler]`` primary and fallback, then any remaining
+    enabled non-controller devices as a last resort.
     Reachability and load are evaluated later by the caller, walking this order.
     """
-    enabled = {name: d for name, d in devices.items() if d.enabled}
     if target and target != "auto":
-        device = enabled.get(target)
-        if not device:
+        device = devices.get(target)
+        if not device or (
+            not device.enabled
+            and getattr(device, "allow_explicit_run", False) is not True
+        ):
             raise SchedulingError(f"Unknown or disabled target device: {target}")
         return [device]
+
+    # Automatic placement is deliberately narrower than explicit ordinary runs:
+    # an explicit-only device must never become an auto candidate.
+    enabled = {name: d for name, d in devices.items() if d.enabled}
 
     sched = scheduler_cfg or {}
     order: list[str] = list(_placement_order(project_config, command or []))

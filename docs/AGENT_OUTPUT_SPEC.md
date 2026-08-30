@@ -112,9 +112,12 @@ frozen `limits` object. Synchronous execution includes a token-free `memory_limi
 Durable queue status exposes the same evidence in `last_result` as a
 `kind="fleet-attempt-receipt"` record. Treat `requested_mib` as an intentional hard
 containment boundary; do not report it as predicted or observed demand. The target's
-`allowance_basis="explicit_command_limit"`, `enforced_command_limit_bytes`, policy ceiling,
-host reserve, final `memory_metric`, peak, command-start state, and cleanup fields are the
-authoritative execution evidence. Lease tokens, lease IDs, and target state paths are never
+`allowance_basis="explicit_command_limit"`, `command_limit_enforced=true`,
+`enforced_command_limit_bytes`, policy ceiling, host reserve, final `memory_metric`, peak,
+command-start state, and cleanup fields are the authoritative execution evidence.
+Allowance-only learned or unprofiled runs carry `command_limit_enforced=false` and a null
+enforced limit; their allowance records candidate sizing without vetoing later inferred work,
+while host-reserve enforcement remains active. Lease tokens, lease IDs, and target state paths are never
 part of this public receipt.
 
 ## Final summary
@@ -155,16 +158,18 @@ distinguish those cases.
 
 For a successful non-durable guarded run, the final summary also contains a
 token-free `memory_admission` object. Unknown-command receipts identify
-`allocation_rule="unprofiled_open_slot_fair_share_v1"`, the allowance and control
-overhead, remaining backed capacity, open slots and per-slot capacity at sizing, the
-policy ceiling, and the strict margin. Never expect or expose the private lease token.
+`allocation_rule="unprofiled_live_headroom_v1"`, the allowance and control
+overhead, remaining live-backed capacity, the effective policy ceiling, and the
+strict margin. Learned receipts also retain the original predicted RSS, the
+calculated learned allowance, the exact live-backed allowance (when clipped),
+and the allowance basis. Never expect or expose the private lease token.
 
-If an unprofiled command in a non-durable run reaches that fair-share ceiling,
-remrun emits `memory_limit_guidance` and records the same object in the final
-summary. It reports the fair-share limit, the observed peak as a lower bound, the
-target policy ceiling, `partial_effects_may_exist=true`,
-`profile_recorded=false`, and the intentional `--memory-limit-mib N` rerun seam.
-Remrun does not retry the command automatically.
+An unprofiled or learned command is not terminated merely for exceeding its live-backed
+admission allowance. A learned estimate that is not currently backed is clipped to the
+live-backed allowance and retained in the admission receipt; it is never a pre-start veto.
+If host available memory reaches the configured reserve, remrun terminates the guarded
+process tree and reports that host-reserve trigger. An explicit owner limit remains a hard
+command-tree ceiling. Remrun does not retry a post-start guard termination automatically.
 
 ## Avoiding agent confusion
 

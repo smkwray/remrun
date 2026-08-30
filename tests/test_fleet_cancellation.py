@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -75,6 +76,54 @@ def _prepared(label: str = "work") -> dict:
     )
 
 
+def test_targeted_cancel_never_installs_or_upgrades_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_sha = hashlib.sha256(b"cancel-without-install").hexdigest()
+    operation = {
+        "device": "TARGET",
+        "operation_id": "cancel-without-install",
+        "request_sha256": request_sha,
+        "resume_token": "private-target-token",
+    }
+
+    class ExistingClient:
+        def status_identity(self, operation_id: str, token: str) -> dict:
+            assert operation_id == operation["operation_id"]
+            assert token == operation["resume_token"]
+            return {
+                "receipt": {
+                    "operation_id": operation_id,
+                    "request_sha256": request_sha,
+                    "state": "CANCELLED",
+                },
+            }
+
+    def connect(_config, device_name: str, *, install: bool = True):  # noqa: ANN001
+        assert device_name == "TARGET"
+        assert install is False
+        return ExistingClient()
+
+    monkeypatch.setattr(cli.TargetResourceClient, "connect", connect)
+
+    assert cli._stop_target_operation(
+        _config(tmp_path, _device(tmp_path)), operation
+    ) == ("stopped", None, "CANCELLED")
+
+    for state in ("missing", "corrupt"):
+        def unavailable(
+            _config, device_name: str, *, install: bool = True,  # noqa: ANN001
+        ):
+            assert device_name == "TARGET"
+            assert install is False
+            raise TargetResourceError(f"versioned runner {state}")
+
+        monkeypatch.setattr(cli.TargetResourceClient, "connect", unavailable)
+        assert cli._stop_target_operation(
+            _config(tmp_path, _device(tmp_path)), operation
+        ) == ("could_not_stop", f"versioned runner {state}", None)
+
+
 def _active_target_job(
     q: queue_mod.FleetQueue,
     job_id: str,
@@ -120,6 +169,468 @@ def _cancel(argv: list[str]) -> tuple[int, object]:
     args = cli.build_parser().parse_args(["cancel", *argv, "--json"])
     code = cli.cmd_cancel(args, Reporter(json_events=False))
     return code, args
+
+
+def _release(argv: list[str]) -> tuple[int, object]:
+    args = cli.build_parser().parse_args(["release", *argv, "--json"])
+    code = cli.cmd_release(args, Reporter(json_events=False))
+    return code, args
+
+
+def _cancelled_target_job(
+    q: queue_mod.FleetQueue, job_id: str = "release",
+) -> tuple[str, str, str]:
+    batch_id = f"batch-{job_id}"
+    operation_id = executor._target_operation_identity(batch_id)
+    batch_id, operation_id, request_sha, _owner = _active_target_job(
+        q, job_id, batch_id=batch_id, operation_id=operation_id,
+    )
+    assert q.begin_active_cancellation(batch_id, [job_id], now=NOW)
+    assert q.cancel_active_batch(
+        batch_id, [job_id], cleanup_state="CANCELLED", now=NOW,
+    )
+    return batch_id, operation_id, request_sha
+
+
+def _release_target_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    operation_id: str,
+    request_sha: str,
+    events: list[str],
+    *,
+    command_start_state: str | None,
+) -> None:
+    class Transport:
+        def probe(self):  # noqa: ANN201
+            return SimpleNamespace(reachable=True)
+
+        def expand_remote(self, value: str) -> str:
+            return value
+
+        def native_join(self, *parts: str) -> str:
+            return "/" + "/".join(part.strip("/") for part in parts)
+
+        def durable_status(self, supplied_operation: str, token: str):  # noqa: ANN201
+            assert (supplied_operation, token) == (
+                operation_id, "private-target-token",
+            )
+            events.append("durable_status")
+            return {
+                "target_acceptance": {
+                    "operation_id": operation_id,
+                    "request_sha256": request_sha,
+                },
+            }
+
+        def remove_remote_tree(self, path: str) -> None:
+            assert path.endswith(f"fleet-operations/{operation_id}")
+            events.append("stage_delete")
+
+        def durable_cleanup(self, supplied_operation: str, token: str) -> None:
+            assert (supplied_operation, token) == (
+                operation_id, "private-target-token",
+            )
+            events.append("durable_cleanup")
+
+    class Client:
+        def status_identity(self, supplied_operation: str, token: str, **_kwargs):  # noqa: ANN003, ANN201
+            assert (supplied_operation, token) == (
+                operation_id, "private-target-token",
+            )
+            receipt = {
+                "operation_id": operation_id,
+                "request_sha256": request_sha,
+                "state": "CANCELLED",
+                "fence": 1,
+            }
+            if command_start_state is not None:
+                receipt["command_start_state"] = command_start_state
+            return {"status": "found", "receipt": receipt}
+
+    monkeypatch.setattr(dispatcher, "make_transport", lambda _device: Transport())
+    monkeypatch.setattr(
+        dispatcher.TargetResourceClient, "connect", lambda *_args, **_kwargs: Client(),
+    )
+
+
+def test_owner_release_proven_no_start_finalizes_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    q.close()
+    config = _config(tmp_path, _device(tmp_path, kind="ssh-posix"))
+    _patch_cli_state(monkeypatch, tmp_path, config)
+    events: list[str] = []
+    _release_target_fakes(
+        monkeypatch, operation_id, request_sha, events, command_start_state="NO",
+    )
+
+    code, _args = _release([
+        "execute", "--operation", operation_id, "--request-sha256", request_sha,
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == cli.EXIT_OK
+    assert payload == {
+        "schema": 1,
+        "operations": [{
+            "operation_id": operation_id,
+            "request_sha256": request_sha,
+            "disposition": "released",
+        }],
+    }
+    assert events == ["stage_delete", "durable_cleanup"]
+    q = _queue(tmp_path)
+    try:
+        batch = q.get_batch(batch_id)
+        assert batch is not None
+        assert batch["target_release_authorized_at"] is not None
+        assert batch["target_release_effects_acknowledged_at"] is None
+        assert batch["target_finalized_at"] is not None
+        assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_FINALIZED
+        assert q.get("release")["state"] == "cancelled"
+        assert q.list(state="queued", job_ids=["release"]) == []
+    finally:
+        q.close()
+
+
+def test_owner_release_rechecks_truth_after_no_start_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    q.close()
+    _patch_cli_state(
+        monkeypatch, tmp_path, _config(tmp_path, _device(tmp_path, kind="ssh-posix")),
+    )
+    status_calls = 0
+
+    class Transport:
+        def probe(self):  # noqa: ANN201
+            return SimpleNamespace(reachable=True)
+
+        def expand_remote(self, value: str) -> str:
+            return value
+
+        def native_join(self, *parts: str) -> str:
+            return "/" + "/".join(part.strip("/") for part in parts)
+
+        def remove_remote_tree(self, _path: str) -> None:
+            raise AssertionError("changed target truth must block stage deletion")
+
+    class Client:
+        def status_identity(self, supplied_operation: str, token: str, **_kwargs):  # noqa: ANN003, ANN201
+            nonlocal status_calls
+            assert (supplied_operation, token) == (
+                operation_id, "private-target-token",
+            )
+            status_calls += 1
+            return {
+                "status": "found",
+                "receipt": {
+                    "operation_id": operation_id,
+                    "request_sha256": request_sha,
+                    "state": "CANCELLED",
+                    "command_start_state": "NO" if status_calls == 1 else "YES",
+                    "fence": 1,
+                },
+            }
+
+    monkeypatch.setattr(dispatcher, "make_transport", lambda _device: Transport())
+    monkeypatch.setattr(
+        dispatcher.TargetResourceClient, "connect", lambda *_args, **_kwargs: Client(),
+    )
+    code, _args = _release([
+        "execute", "--operation", operation_id, "--request-sha256", request_sha,
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == cli.EXIT_ERROR
+    assert payload["operations"][0]["disposition"] == "could_not_release"
+    assert status_calls == 2
+    q = _queue(tmp_path)
+    try:
+        batch = q.get_batch(batch_id)
+        assert batch["target_release_authorized_at"] is not None
+        assert batch["target_release_effects_acknowledged_at"] is None
+        assert batch["target_stage_cleaned_at"] is None
+        assert batch["target_durable_cleaned_at"] is None
+        assert batch["target_finalized_at"] is None
+        assert q.get("release")["state"] == "cancelled"
+    finally:
+        q.close()
+
+
+@pytest.mark.parametrize("command_start_state", ["YES", "MAYBE", None])
+def test_owner_release_requires_distinct_effects_acknowledgement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command_start_state: str | None,
+) -> None:
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    q.close()
+    _patch_cli_state(
+        monkeypatch, tmp_path, _config(tmp_path, _device(tmp_path, kind="ssh-posix")),
+    )
+    events: list[str] = []
+    _release_target_fakes(
+        monkeypatch, operation_id, request_sha, events,
+        command_start_state=command_start_state,
+    )
+
+    code, _args = _release([
+        "execute", "--operation", operation_id, "--request-sha256", request_sha,
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == cli.EXIT_ERROR
+    assert payload["operations"][0]["disposition"] == "acknowledgement_required"
+    assert events == []
+    q = _queue(tmp_path)
+    try:
+        batch = q.get_batch(batch_id)
+        assert batch["target_release_authorized_at"] is None
+        assert batch["target_release_effects_acknowledged_at"] is None
+        assert batch["target_finalized_at"] is None
+        assert q.get("release")["state"] == "cancelled"
+    finally:
+        q.close()
+
+
+def test_owner_effects_acknowledgement_is_durable_separate_act(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    q.db.execute(
+        "UPDATE jobs SET state='completion_unknown' WHERE job_id='release'",
+    )
+    q.db.commit()
+    q.close()
+    _patch_cli_state(
+        monkeypatch, tmp_path, _config(tmp_path, _device(tmp_path, kind="ssh-posix")),
+    )
+    events: list[str] = []
+    _release_target_fakes(
+        monkeypatch, operation_id, request_sha, events, command_start_state="YES",
+    )
+
+    acknowledge_code, _args = _release([
+        "acknowledge-effects", "--operation", operation_id,
+        "--request-sha256", request_sha,
+    ])
+    acknowledgement = json.loads(capsys.readouterr().out)
+    assert acknowledge_code == cli.EXIT_OK
+    assert acknowledgement["operations"][0]["disposition"] == "effects_acknowledged"
+    assert events == []
+    q = _queue(tmp_path)
+    try:
+        authorized_at = q.get_batch(batch_id)["target_release_authorized_at"]
+        acknowledged_at = q.get_batch(batch_id)[
+            "target_release_effects_acknowledged_at"
+        ]
+    finally:
+        q.close()
+    assert authorized_at is not None
+    assert acknowledged_at == authorized_at
+
+    release_code, _args = _release([
+        "execute", "--operation", operation_id, "--request-sha256", request_sha,
+    ])
+    released = json.loads(capsys.readouterr().out)
+    assert release_code == cli.EXIT_OK
+    assert released["operations"][0]["disposition"] == "released"
+    assert events == ["durable_status", "stage_delete", "durable_cleanup"]
+    q = _queue(tmp_path)
+    try:
+        assert q.get("release")["state"] == "completion_unknown"
+        assert q.list(state="queued", job_ids=["release"]) == []
+        assert q.get_batch(batch_id)["target_finalized_at"] is not None
+    finally:
+        q.close()
+
+
+@pytest.mark.parametrize("field", ["operation", "request_sha256"])
+def test_owner_release_mismatched_exact_identity_mutates_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+) -> None:
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    before_batch = q.get_batch(batch_id)
+    before_job = q.get("release")
+    q.close()
+    _patch_cli_state(
+        monkeypatch, tmp_path, _config(tmp_path, _device(tmp_path, kind="ssh-posix")),
+    )
+    monkeypatch.setattr(
+        dispatcher.TargetResourceClient,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("identity mismatch must not contact target"),
+    )
+    supplied_operation = "wrong-operation" if field == "operation" else operation_id
+    supplied_sha = "b" * 64 if field == "request_sha256" else request_sha
+
+    code, _args = _release([
+        "execute", "--operation", supplied_operation,
+        "--request-sha256", supplied_sha,
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == cli.EXIT_ERROR
+    assert payload["operations"][0]["disposition"] == "identity_mismatch"
+    q = _queue(tmp_path)
+    try:
+        assert q.get_batch(batch_id) == before_batch
+        assert q.get("release") == before_job
+    finally:
+        q.close()
+
+
+def test_owner_release_recovers_after_loss_following_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    q.close()
+    _patch_cli_state(
+        monkeypatch, tmp_path, _config(tmp_path, _device(tmp_path, kind="ssh-posix")),
+    )
+    events: list[str] = []
+    _release_target_fakes(
+        monkeypatch, operation_id, request_sha, events, command_start_state="NO",
+    )
+
+    class ControllerLoss(BaseException):
+        pass
+
+    original_recover = dispatcher._recover_target_row
+    monkeypatch.setattr(
+        dispatcher,
+        "_recover_target_row",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ControllerLoss()),
+    )
+    with pytest.raises(ControllerLoss):
+        _release([
+            "execute", "--operation", operation_id,
+            "--request-sha256", request_sha,
+        ])
+    capsys.readouterr()
+    q = _queue(tmp_path)
+    try:
+        batch = q.get_batch(batch_id)
+        assert batch["target_release_authorized_at"] is not None
+        assert batch["target_finalized_at"] is None
+        assert q.get("release")["state"] == "cancelled"
+        assert q.list(state="queued", job_ids=["release"]) == []
+    finally:
+        q.close()
+    assert events == []
+
+    monkeypatch.setattr(dispatcher, "_recover_target_row", original_recover)
+    code, _args = _release([
+        "execute", "--operation", operation_id, "--request-sha256", request_sha,
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == cli.EXIT_OK
+    assert payload["operations"][0]["disposition"] == "released"
+    assert events == ["stage_delete", "durable_cleanup"]
+    q = _queue(tmp_path)
+    try:
+        assert q.get("release")["state"] == "cancelled"
+        assert q.get_batch(batch_id)["target_finalized_at"] is not None
+    finally:
+        q.close()
+
+
+def test_malformed_target_identity_can_never_be_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A malformed predecessor identity is unreleasable, even by an explicit owner.
+
+    Release exists so an owner can resolve work that cancellation deliberately fenced.
+    Malformed identity is a different thing: remrun does not know what the target is
+    holding, so there is no exact operation to authorize and no truth to recheck. The
+    owner override must therefore stop at the fence rather than widen to it, or the
+    audited guarantee that malformed predecessor rows are retained for review becomes
+    reachable-around.
+    """
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    # Same row, degraded exactly as the migration degrades an unparsable predecessor.
+    q.db.execute(
+        "UPDATE batches SET target_finalization_disposition=? WHERE batch_id=?",
+        (queue_mod.FINALIZATION_MALFORMED, batch_id),
+    )
+    q.db.commit()
+    q.close()
+
+    config = _config(tmp_path, _device(tmp_path, kind="ssh-posix"))
+    _patch_cli_state(monkeypatch, tmp_path, config)
+
+    for verb in ("execute", "acknowledge-effects"):
+        code, _args = _release([
+            verb, "--operation", operation_id, "--request-sha256", request_sha,
+        ])
+        capsys.readouterr()
+        assert code != cli.EXIT_OK, f"{verb} must refuse a malformed identity"
+
+    q = _queue(tmp_path)
+    batch = q.get_batch(batch_id)
+    assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_MALFORMED
+    assert batch["target_release_authorized_at"] is None
+    assert batch["target_release_effects_acknowledged_at"] is None
+    assert batch["target_finalized_at"] is None
+    # and the automatic paths still refuse it too
+    assert q.terminal_target_batches(RECOVER) == []
+    assert q.clear(include_final=True)["protected_unfinalized"] == 1
+    assert q.prune_final(keep=0) == 0
+    q.close()
+
+
+def test_owner_release_authorization_never_widens_automatic_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = _queue(tmp_path)
+    batch_id, operation_id, request_sha = _cancelled_target_job(q)
+    q.close()
+    config = _config(tmp_path, _device(tmp_path, kind="ssh-posix"))
+    _patch_cli_state(monkeypatch, tmp_path, config)
+    code, _args = _release([
+        "acknowledge-effects", "--operation", operation_id,
+        "--request-sha256", request_sha,
+    ])
+    capsys.readouterr()
+    assert code == cli.EXIT_OK
+
+    q = _queue(tmp_path)
+    automatic_target_calls: list[str] = []
+    monkeypatch.setattr(
+        dispatcher.TargetResourceClient,
+        "connect",
+        lambda *_args, **_kwargs: automatic_target_calls.append("connect"),
+    )
+    assert q.terminal_target_batches(RECOVER) == []
+    assert q.stale_target_batches(RECOVER) == []
+    assert dispatcher._recover_terminal_target_finalization(
+        config, q, RECOVER, reporter=Reporter(json_events=False),
+    ) == 0
+    assert dispatcher._recover_target_stale(
+        config, q, RECOVER, reporter=Reporter(json_events=False),
+    ) == 0
+    assert q.clear(include_final=True)["protected_unfinalized"] == 1
+    assert q.prune_final(keep=0) == 0
+    assert automatic_target_calls == []
+    assert q.get("release")["state"] == "cancelled"
+    batch = q.get_batch(batch_id)
+    assert batch["target_finalization_disposition"] == queue_mod.FINALIZATION_FENCED
+    assert batch["target_finalized_at"] is None
+    q.close()
 
 
 def test_targeted_submission_cancel_stops_only_named_queue_rows(

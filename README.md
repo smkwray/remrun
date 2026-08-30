@@ -18,13 +18,15 @@ The core runner is implemented and tested on POSIX/macOS and Windows SSH targets
 safe project reconciliation and pullback, conflict preservation, target scheduling,
 resource telemetry, external-tree `sync`, commit-only `git-sync`, allowlisted target
 actions, and optional fleet dispatch with live resource, job, and SSH-mesh views.
-POSIX targets can opt into a RAM-relative hard memory guard that admits work before
-project mutation and terminates only the protected command tree if its granted limit
-or host reserve is breached. An unknown command receives a fair share of capacity
-that is live and fully backed across the remaining `max_jobs` slots, bounded by the
-configured per-command maximum; it does not monopolize every open slot merely because
-no profile exists. Learned commands use their
-observed process-tree RSS high-water mark plus guard headroom. The guard cannot govern
+POSIX targets can opt into a RAM-relative memory guard that admits work before
+project mutation and terminates only the protected command tree if an explicit owner
+limit or the host reserve is breached. An unknown command receives all capacity that
+is live and fully backed above the host reserve, bounded by an explicitly configured
+per-command maximum when one is present; it is never assigned a smaller allowance
+merely because no profile exists. Learned commands use their observed process-tree RSS
+high-water mark plus guard headroom for admission/concurrency only. Learned and
+unprofiled allowances are not RSS kill ceilings; receipts state whether a command
+limit is enforced. The guard cannot govern
 GPU or unified-memory allocations that the operating
 system does not attribute to process-tree RSS; do not use it as containment for those
 workloads. The Windows `ssh-powershell` command surface requires `pwsh` 7.3+ and supports
@@ -241,7 +243,8 @@ The most common failure modes and their fixes:
    `C:\...\remrun\bin\remrun.cmd run macbox -- <cmd>` from PowerShell arrives clean.
 2. **Python projects: bare `python` is usually NOT on the remote login-shell PATH.**
    Either set `[run] use_venv = true` in `<project>/do/remrun/remrun.toml`
-   (activates the project-local `.venv` on the target device), or wrap the command:
+   (activates the configured venv), optionally declare `[run.bootstrap]` so the first
+   run creates and populates it from pinned project inputs, or wrap the command:
    `remrun run macbox -- uv run python script.py` (uv resolves the project venv itself).
 3. **Big gitignored data trees are NOT excluded by default** — remrun deliberately
    does not read `.gitignore` (outputs are often gitignored but load-bearing). A
@@ -450,8 +453,9 @@ Per device: `kind` (`ssh-posix` / `ssh-powershell` / `local-sim`),
   your normal environment — needed to find e.g. Homebrew's `Rscript`; Windows
   `ssh-powershell` targets require `shell = "pwsh"` with PowerShell 7.3 or newer,
   and reject top-level `.cmd`/`.bat` commands)
-- `venv_root` — base dir for external per-project virtualenvs, used only when a
-  project sets `[run] venv_layout = "external"` (the default is project-local `.venv`)
+- `venv_root` — absolute (or `~`-relative) base dir for external per-project
+  virtualenvs. It is required by `[run.bootstrap]`; ordinary `use_venv` runs may
+  still use the project-local `.venv` default.
 - `path` (list, prepended to PATH) and `[devices.<NAME>.env]` (env vars) — declare
   per-device tool locations here, especially on Windows where there's no login shell
 
@@ -488,9 +492,9 @@ project root.
 
 ```toml
 [run]
-use_venv = true            # project-local .venv on each device (bin/ or Scripts\ on PATH, VIRTUAL_ENV set)
-# venv_layout = "external" # instead use <device.venv_root>/<project leaf>
-# [run.venv] macbox = "~/venvs/foo"   # or pin explicit paths per device
+use_venv = true            # required by [run.bootstrap]
+# venv_layout = "external" # required by [run.bootstrap] unless [run.venv] overrides
+# [run.venv] macbox = "~/venvs/foo"   # must be beneath device.venv_root for bootstrap
 
 [env]
 OMP_NUM_THREADS = "4"      # env vars for every command in this project
@@ -520,12 +524,17 @@ scope, preserving the escaped remote file under the state root rather than pulli
 it into the project. Scoped and unscoped runs currently serialize per project; the
 scope is a safety/validation boundary, not a parallel-writer guarantee.
 
-By default the venv is **project-local** — `<project>/.venv` on each device. It is
-device-local and not synced (it holds platform binaries; `.venv` is excluded from
-transfer). Create it yourself on each device; `use_venv` just activates it. Set
-`venv_layout = "external"` to instead use `~/venvs/<project>` (macOS) /
-`C:\venvs\<project>` (Windows) — useful only for a project synced by a raw
-cloud-storage mount that would churn on an in-tree `.venv`.
+By default an ordinary `use_venv` run uses a **project-local** `<project>/.venv` on
+each device. It is device-local and not synced (it holds platform binaries; `.venv` is
+excluded from transfer). A project that declares `[run.bootstrap]` must instead opt
+into `use_venv = true` and use an external environment strictly beneath the device's
+configured `venv_root` (or a confined per-device override). The first run creates or
+populates that environment; later runs reuse it only while its expected interpreter
+and fingerprint-bound environment marker remain present. Bootstrap accepts arbitrary
+argv arrays and is not a filesystem write sandbox; steps therefore remain responsible
+for idempotence and must not mutate declared lock inputs. See
+`docs/PROJECT_CONFIG.md` for the complete generic bootstrap example and fail-closed
+behavior.
 
 ## State, retention, telemetry
 

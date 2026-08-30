@@ -17,9 +17,11 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import time
 import uuid
 import dataclasses
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +37,7 @@ from . import adapters, executor, placement, probes, profiles
 from .config import fleet_config, idle_grace_s as configured_idle_grace_s, load_costs, safety_fraction
 from .models import DrainResultV1, FleetTask
 from .queue import (
+    _BUSY_TIMEOUT_MS,
     FINALIZATION_FENCED,
     FINALIZATION_MALFORMED,
     BatchHeartbeat,
@@ -114,6 +117,120 @@ _RETRY_LATER_COOLDOWN_S = 600.0
 EXCLUDE_DEVICES_OPT = "_exclude_devices"
 _MAX_IDLE_GRACE_S = 240.0    # Invariant 0: never linger close to the 5-minute unload boundary
 _TIMELINE_EXHAUSTIVE_GROUPS = 6
+# FleetQueue permits a contended SQLite operation to wait 30 seconds.  Leave a
+# small scheduling/read margin so an ordinary successful wait does not falsely
+# report that the graceful-stop bound was exceeded.
+DEFAULT_STOP_TIMEOUT_S = (_BUSY_TIMEOUT_MS / 1000.0) + 5.0
+_ACTIVE_JOB_STATES = {"leased", "staging", "running", "fetching"}
+_TERMINAL_JOB_STATES = {
+    "done", "failed_final", "needs_review", "cancelled",
+}
+
+
+class _DrainLedger:
+    """Thread-safe identities whose production launch gate was crossed."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started: dict[str, dict[str, Any]] = {}
+
+    def record_started(self, claim: dict[str, Any]) -> None:
+        row = {
+            "batch_id": str(claim["batch_id"]),
+            "job_ids": [str(job_id) for job_id in claim.get("job_ids") or []],
+        }
+        with self._lock:
+            self._started[row["batch_id"]] = row
+
+    def started(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {"batch_id": row["batch_id"], "job_ids": list(row["job_ids"])}
+                for row in self._started.values()
+            ]
+
+
+class _LedgerReporter:
+    """Observe the existing launch event while preserving the reporter contract."""
+
+    def __init__(
+        self, reporter: Reporter, ledger: _DrainLedger | None, claim: dict[str, Any],
+    ) -> None:
+        self._reporter = reporter
+        self._ledger = ledger
+        self._claim = claim
+
+    def event(self, event: str, **fields: Any) -> None:
+        if event == "dispatch_run" and self._ledger is not None:
+            self._ledger.record_started(self._claim)
+        self._reporter.event(event, **fields)
+
+
+class DrainStopEvent(threading.Event):
+    """A signal-safe stop flag that retains when the caller asked to return."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested_at: float | None = None
+
+    def set(self) -> None:
+        if self.requested_at is None:
+            self.requested_at = time.monotonic()
+        super().set()
+
+
+def _drain_identities(
+    state_root: Path,
+    ledger: _DrainLedger,
+    job_ids: list[str] | tuple[str, ...] | set[str] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read one reconciliation-ready identity snapshot without changing queue state."""
+    started = ledger.started()
+    q = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        rows = q.list(job_ids=job_ids)
+        by_job = {str(row["job_id"]): row for row in rows}
+        completed: list[dict[str, Any]] = []
+        for batch in started:
+            terminal = []
+            for job_id in batch["job_ids"]:
+                row = by_job.get(job_id)
+                if row is not None and row["state"] in _TERMINAL_JOB_STATES:
+                    terminal.append({"job_id": job_id, "state": str(row["state"])})
+            if terminal:
+                durable = q.get_batch(batch["batch_id"])
+                completed.append({
+                    "batch_id": batch["batch_id"],
+                    "device": (
+                        str(durable["device"])
+                        if durable is not None else None
+                    ),
+                    "jobs": terminal,
+                })
+
+        active: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row["state"] not in _ACTIVE_JOB_STATES or not row.get("batch_id"):
+                continue
+            batch_id = str(row["batch_id"])
+            item = active.get(batch_id)
+            if item is None:
+                durable = q.get_batch(batch_id)
+                item = {
+                    "batch_id": batch_id,
+                    "device": str(row.get("assigned_device") or ""),
+                    "job_ids": [],
+                    "state": (
+                        str(durable["state"])
+                        if durable is not None else str(row["state"])
+                    ),
+                }
+                active[batch_id] = item
+            item["job_ids"].append(str(row["job_id"]))
+        left_running = list(active.values())
+        return started, completed, left_running
+    finally:
+        q.close()
 
 
 def _classify_failure(error: str, stderr: str = "", exit_code: int | None = None,
@@ -593,6 +710,22 @@ def _run_claimed_batch(config: RemrunConfig, state_root: Path, claim: dict[str, 
             )
             if not recorded:
                 heartbeat.ownership_lost.set()
+            else:
+                command_started = receipt.get("command_started")
+                command_start_state = (
+                    "YES" if command_started is True else
+                    "NO" if command_started is False else
+                    "MAYBE"
+                )
+                reporter.event(
+                    "dispatch_target_acknowledged",
+                    batch=batch_id,
+                    device=device,
+                    operation_id=str(receipt.get("operation_id") or ""),
+                    request_sha256=str(receipt.get("request_sha256") or ""),
+                    accepted=True,
+                    command_start_state=command_start_state,
+                )
             return recorded
         def authorize_target_cleanup(receipt: dict[str, Any]) -> bool:
             if heartbeat.ownership_lost.is_set():
@@ -956,7 +1089,8 @@ def _reclaim_marginal_devices(config: RemrunConfig, groups: list[dict[str, Any]]
     A no-op when no device configures reclaim, so this is opt-in and cannot change behavior for a
     fleet that doesn't ask for it. Updates ``snap_cache`` in place with the post-reclaim snapshot."""
     for name, dev in config.devices.items():
-        if dev.kind == "local-sim" or not (getattr(dev, "reclaim", {}) or {}).get("command"):
+        if (not dev.enabled or dev.kind == "local-sim"
+                or not (getattr(dev, "reclaim", {}) or {}).get("command")):
             continue
         if lease_used.get(name):            # a pool lease is held -> device busy, don't disturb it
             continue
@@ -1188,6 +1322,7 @@ def _recover_target_row(
     *,
     reporter: Reporter,
     terminal_outcome: bool,
+    owner_release: bool = False,
 ) -> int:
     """Run one exact, monotonic target cleanup state machine."""
     batch_id = str(row["batch_id"])
@@ -1213,12 +1348,18 @@ def _recover_target_row(
             raise
 
     disposition = row.get("target_finalization_disposition")
-    if disposition in {FINALIZATION_FENCED, FINALIZATION_MALFORMED}:
+    if disposition == FINALIZATION_MALFORMED:
         if terminal_outcome:
             return 0
         # Preserve every target byte for ambiguous or malformed predecessor
         # state.  In particular, a missing operation ID is not proof that no
         # reservation existed when other target identity fields are present.
+        return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
+    if disposition == FINALIZATION_FENCED and (
+        not owner_release or not row.get("target_release_authorized_at")
+    ):
+        if terminal_outcome:
+            return 0
         return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
     if not terminal_outcome and row.get("target_finalized_at"):
         return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=True))
@@ -1280,6 +1421,9 @@ def _recover_target_row(
             if terminal_outcome:
                 return 0
             return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
+        if owner_release and receipt.get("command_start_state") != "NO" \
+                and not row.get("target_release_effects_acknowledged_at"):
+            return 0
         state = str(receipt.get("state") or "")
         if not terminal_outcome and receipt.get("command_start_state") != "NO":
             return int(queue.expire_stale_batch(batch_id, now=now, replay_safe=False))
@@ -1303,6 +1447,7 @@ def _recover_target_row(
             if not queue.record_target_cleanup_progress(
                 batch_id, operation_id=operation_id, request_sha256=request_sha,
                 cleanup_state=state, replayable=True, now=now,
+                owner_release=owner_release,
             ):
                 return 0
         elif receipt.get("command_start_state") == "YES" \
@@ -1313,12 +1458,14 @@ def _recover_target_row(
             if not queue.record_target_cleanup_progress(
                 batch_id, operation_id=operation_id, request_sha256=request_sha,
                 cleanup_state=state, now=now,
+                owner_release=owner_release,
             ):
                 return 0
         else:
             if not queue.record_target_cleanup_progress(
                 batch_id, operation_id=operation_id, request_sha256=request_sha,
                 cleanup_state=state, now=now,
+                owner_release=owner_release,
             ):
                 return 0
 
@@ -1327,6 +1474,7 @@ def _recover_target_row(
             if not queue.record_target_cleanup_progress(
                 batch_id, operation_id=operation_id, request_sha256=request_sha,
                 stage_cleaned=True, now=now,
+                owner_release=owner_release,
             ):
                 return 0
         if not row.get("target_durable_cleaned_at"):
@@ -1334,11 +1482,13 @@ def _recover_target_row(
             if not queue.record_target_cleanup_progress(
                 batch_id, operation_id=operation_id, request_sha256=request_sha,
                 durable_cleaned=True, now=now,
+                owner_release=owner_release,
             ):
                 return 0
         if not queue.record_expired_target_finalization(
             batch_id, operation_id=operation_id, request_sha256=request_sha,
             cleanup_state=state, now=now,
+            owner_release=owner_release,
         ):
             return 0
         if terminal_outcome:
@@ -1352,10 +1502,112 @@ def _recover_target_row(
         return 0
 
 
+def release_target_operation(
+    config: RemrunConfig,
+    queue: FleetQueue,
+    operation_id: str,
+    request_sha256: str,
+    *,
+    reporter: Reporter,
+) -> tuple[str, str | None]:
+    """Execute one exact owner-authorized cleanup-only release."""
+    row = queue.target_release_operation(operation_id, request_sha256)
+    if row is None:
+        return "identity_mismatch", "exact target operation identity was not found"
+    if row.get("target_finalized_at"):
+        return "already_released", None
+    if (
+        row.get("state") != "failed"
+        or row.get("target_protocol_version") != 1
+        or row.get("target_finalization_disposition") != FINALIZATION_FENCED
+    ):
+        return "not_releasable", "operation is not a fenced cancelled target row"
+
+    device_name = str(row["device"])
+    device = config.devices.get(device_name)
+    if device is None or not executor._target_acceptance_supported(device):
+        if not row.get("target_release_effects_acknowledged_at"):
+            return (
+                "acknowledgement_required",
+                "target truth is unavailable because device configuration is missing; "
+                "acknowledge possible external effects first",
+            )
+        return "could_not_release", "target device configuration unavailable"
+    token = row.get("target_resume_token")
+    if not isinstance(token, str) or not token or not FleetQueue._target_identity_complete(row):
+        if not row.get("target_release_effects_acknowledged_at"):
+            return (
+                "acknowledgement_required",
+                "target truth is malformed; acknowledge possible external effects first",
+            )
+        return "could_not_release", "malformed target identity requires owner repair"
+
+    try:
+        client = TargetResourceClient.connect(config, device_name, install=False)
+        observed = client.status_identity(
+            operation_id, token, rpc_id=f"fleet-release-status-{operation_id}",
+        )
+        receipt = observed.get("receipt")
+    except (OSError, TargetResourceError, TransportError, ValueError) as exc:
+        if not row.get("target_release_effects_acknowledged_at"):
+            return (
+                "acknowledgement_required",
+                f"target truth is unavailable ({type(exc).__name__}: {exc}); "
+                "acknowledge possible external effects first",
+            )
+        return "could_not_release", f"{type(exc).__name__}: {exc}"
+
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("operation_id") != operation_id
+        or receipt.get("request_sha256") != request_sha256
+    ):
+        if not row.get("target_release_effects_acknowledged_at"):
+            return (
+                "acknowledgement_required",
+                "target truth is malformed; acknowledge possible external effects first",
+            )
+        return "could_not_release", "target status identity did not match"
+
+    command_start_state = receipt.get("command_start_state")
+    acknowledged = bool(row.get("target_release_effects_acknowledged_at"))
+    if command_start_state != "NO" and not acknowledged:
+        truth = command_start_state if command_start_state in {"YES", "MAYBE"} else "unknown"
+        return (
+            "acknowledgement_required",
+            f"command_start_state={truth}; acknowledge possible external effects first",
+        )
+    if not row.get("target_release_authorized_at"):
+        if command_start_state != "NO":
+            return "acknowledgement_required", "release authorization is absent"
+        if not queue.authorize_target_release_no_start(
+            operation_id, request_sha256, now=utc_now_iso(),
+        ):
+            return "could_not_release", "queue state changed before release authorization"
+        row = queue.target_release_operation(operation_id, request_sha256)
+        if row is None:
+            return "could_not_release", "authorized release row disappeared"
+
+    recovered = _recover_target_row(
+        config,
+        queue,
+        row,
+        utc_now_iso(),
+        reporter=reporter,
+        terminal_outcome=True,
+        owner_release=True,
+    )
+    if recovered == 1:
+        return "released", None
+    return "could_not_release", "target cleanup did not complete; retry this exact release"
+
+
 def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                debounce_s: float = 0.0, lease_seconds: int = 300,
                reporter: Reporter | None = None, max_parallel: int | None = None,
                job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+               stop_event: threading.Event | None = None,
+               _ledger: _DrainLedger | None = None,
                sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     """Run ONE dispatcher tick: place + claim every runnable group (lease/cooldown-aware), then
     execute the claimed batches CONCURRENTLY (one per device — Phase 3a). Returns a summary dict
@@ -1519,18 +1771,26 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                 g = groups[gi]
                 head = g["tasks"][0]
                 snaps = {}
+                dispatch_rejected: dict[str, tuple[str, str]] = {}
                 for name in _candidate_names(config, head):
                     eng = adapters.engine_for(head, name)
                     why = _is_cooled(cooled_lookup, name, eng)
                     if why:
                         skipped.setdefault(name, f"cooldown: {why}")
+                        dispatch_rejected[name] = ("cooldown", why)
                         continue
                     if name in used_devices:
                         skipped.setdefault(name, "device already planned this tick")
+                        dispatch_rejected[name] = (
+                            "scheduler_reserved", "device already planned this tick",
+                        )
                         continue
                     if name not in snap_cache:
                         dev = config.devices.get(name)
                         if dev is None:
+                            dispatch_rejected[name] = (
+                                "device_unconfigured", "device absent from current configuration",
+                            )
                             continue
                         snap_cache[name] = probes.build_snapshot(
                             dev, None, fcfg,
@@ -1542,6 +1802,7 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                     continue
                 result = placement.plan_jobs(g["tasks"], g["features"], snaps, profs, fcfg,
                                              safety_fraction(config), device_backlog=timeline)
+                result = placement.add_ineligible_alternatives(result, dispatch_rejected)
                 if not result.batches:
                     skipped.update(result.skipped)
                     continue
@@ -1581,6 +1842,9 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
         summary["skipped"].update((best_plan or {"skipped": {}})["skipped"])
 
         for planned in planned_batches:
+            if stop_event is not None and stop_event.is_set():
+                summary["stop_requested"] = True
+                break
             if max_parallel and len(claimed) >= max_parallel:
                 break       # don't claim more than will start heartbeating now (audit F4)
             batch = planned["batch"]
@@ -1607,6 +1871,7 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                 pool=pool, task_name=head.task_name, engine=engine,
                 bucket=adapters.option_bucket(head),
                 estimated_finish_s=batch.estimated_finish_s, now=cnow,
+                placement_explanation=batch.explanation,
                 target_protocol_version=(
                     1 if executor._target_acceptance_supported(config.devices[batch.device])
                     else None
@@ -1630,17 +1895,53 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
         # --- execute phase (concurrent; one worker per claimed batch, each its own conn) -----
         if claimed:
             workers = max(1, max_parallel or len(claimed))
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                outs = list(ex.map(
-                    lambda c: _run_claimed_batch(config, state_root, c, lease_seconds, reporter),
-                    claimed))
+            if stop_event is None:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    outs = list(ex.map(
+                        lambda c: _run_claimed_batch(
+                            config, state_root, c, lease_seconds,
+                            _LedgerReporter(reporter, _ledger, c),
+                        ),
+                        claimed))
+            else:
+                outs_by_index: dict[int, dict[str, Any]] = {}
+                outs_lock = threading.Lock()
+                finished = threading.Event()
+
+                def run_claim(index: int, claim: dict[str, Any]) -> None:
+                    out = _run_claimed_batch(
+                        config, state_root, claim, lease_seconds,
+                        _LedgerReporter(reporter, _ledger, claim),
+                    )
+                    with outs_lock:
+                        outs_by_index[index] = out
+                        if len(outs_by_index) == len(claimed):
+                            finished.set()
+
+                threads = []
+                if not stop_event.is_set():
+                    for index, claim in enumerate(claimed[:workers]):
+                        thread = threading.Thread(
+                            target=run_claim, args=(index, claim), daemon=True,
+                            name=f"remrun-drain-{claim['batch_id']}",
+                        )
+                        thread.start()
+                        threads.append(thread)
+                while threads and not finished.wait(0.05):
+                    if stop_event.is_set():
+                        summary["stop_requested"] = True
+                        break
+                with outs_lock:
+                    outs = [outs_by_index[index] for index in sorted(outs_by_index)]
             for o in outs:
                 summary["ran"] += o["ran"]
                 summary["ok"] += o["ok"]
                 summary["failed"] += o["failed"]
                 summary["review"] += o.get("review", 0)
 
-        if job_ids is None:
+        if stop_event is not None and stop_event.is_set():
+            summary["stop_requested"] = True
+        if job_ids is None and not summary.get("stop_requested"):
             q.prune_final()
         return summary
     finally:
@@ -1652,6 +1953,8 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         until_empty: bool = False, reporter: Reporter | None = None,
         job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
         idle_grace_s: float | None = None,
+        stop_event: threading.Event | None = None,
+        stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic) -> DrainResultV1:
     """Continuous dispatcher: drain ticks until interrupted (or ``max_ticks`` for tests).
@@ -1671,6 +1974,14 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
     last_skipped: dict[str, str] = {}
     last_queued = 0
     last_active = 0
+    ledger = _DrainLedger()
+    last_identities: tuple[
+        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
+    ] = ([], [], [])
+
+    if (isinstance(stop_timeout_s, bool) or not isinstance(stop_timeout_s, (int, float))
+            or not math.isfinite(float(stop_timeout_s)) or stop_timeout_s <= 0):
+        raise ValueError("stop_timeout_s must be positive")
 
     def queue_counts() -> tuple[int, int]:
         queue = FleetQueue(sr / "fleet" / "fleet.db")
@@ -1688,18 +1999,135 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         except Exception:  # noqa: BLE001 - final result must survive a broken queue reader
             return last_queued, last_active
 
+    def best_effort_identities() -> tuple[
+        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
+    ]:
+        nonlocal last_identities
+        try:
+            last_identities = _drain_identities(sr, ledger, job_ids)
+        except Exception:  # noqa: BLE001 - preserve the final document on broken storage
+            last_identities = (ledger.started(), last_identities[1], last_identities[2])
+        return last_identities
+
+    def identity_fields() -> dict[str, list[dict[str, Any]]]:
+        started, completed, left_running = best_effort_identities()
+        return {
+            "started": started,
+            "completed": completed,
+            "left_running": left_running,
+        }
+
+    def stopped_result(request_observed_at: float) -> DrainResultV1:
+        snapshot: list[tuple[
+            tuple[int, int],
+            tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]],
+        ]] = []
+        snapshot_done = threading.Event()
+
+        def read_snapshot() -> None:
+            try:
+                snapshot.append((queue_counts(), _drain_identities(sr, ledger, job_ids)))
+            except Exception:  # noqa: BLE001 - bounded fallback is explicit in the document
+                pass
+            finally:
+                snapshot_done.set()
+
+        threading.Thread(
+            target=read_snapshot, daemon=True, name="remrun-drain-final-snapshot",
+        ).start()
+        remaining = max(
+            0.0,
+            float(stop_timeout_s) - max(0.0, monotonic() - request_observed_at),
+        )
+        snapshot_done.wait(remaining)
+        snapshot_complete = bool(snapshot)
+        if snapshot_complete:
+            (queued, active), identities = snapshot[0]
+            started, completed, left_running = identities
+        else:
+            queued, active = last_queued, last_active
+            started, completed, left_running = (
+                ledger.started(), last_identities[1], last_identities[2],
+            )
+        elapsed = max(0.0, monotonic() - request_observed_at)
+        bound_exceeded = not snapshot_complete or elapsed > float(stop_timeout_s)
+        if snapshot_complete and queued + active == 0:
+            return DrainResultV1(
+                status="drained", queued=0, active=0, skipped={}, error=None,
+                started=started, completed=completed, left_running=[], **totals,
+            )
+        reporter.event(
+            "dispatch_stop", return_bound_s=stop_timeout_s,
+            queued=queued, active=active, left_running=len(left_running),
+        )
+        return DrainResultV1(
+            status="stopped", queued=queued, active=active,
+            skipped=last_skipped, error=None,
+            started=started, completed=completed, left_running=left_running,
+            stop={
+                "reason": "signal",
+                "return_bound_s": float(stop_timeout_s),
+                "bound_exceeded": bound_exceeded,
+            },
+            **totals,
+        )
+
+    def next_tick() -> tuple[dict[str, Any] | None, float | None]:
+        """Run a tick normally, or make its controller work detachable on stop."""
+        kwargs = {
+            "state_root": sr,
+            "debounce_s": debounce_s,
+            "lease_seconds": lease_seconds,
+            "reporter": reporter,
+            "job_ids": job_ids,
+            "sleep": sleep,
+            "stop_event": stop_event,
+            "_ledger": ledger,
+        }
+        if stop_event is None:
+            return drain_once(config, **kwargs), None
+        result: dict[str, Any] = {}
+        failure: list[BaseException] = []
+        done = threading.Event()
+
+        def invoke() -> None:
+            try:
+                result.update(drain_once(config, **kwargs))
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the dispatcher thread
+                failure.append(exc)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=invoke, daemon=True, name="remrun-drain-tick")
+        thread.start()
+        while not done.wait(min(0.05, float(stop_timeout_s))):
+            if stop_event.is_set():
+                requested_at = getattr(stop_event, "requested_at", None)
+                return None, float(requested_at) if requested_at is not None else monotonic()
+        if failure:
+            raise failure[0]
+        return result, monotonic() if stop_event.is_set() else None
+
     try:
         grace_s = _bounded_idle_grace_s(config, idle_grace_s) if until_empty else 0.0
         reporter.event("dispatch_loop_start", poll_s=poll_s, debounce_s=debounce_s,
                        drain=until_empty, idle_grace_s=grace_s)
         while max_ticks is None or ticks < max_ticks:
-            summary = drain_once(config, state_root=sr, debounce_s=debounce_s,
-                                 lease_seconds=lease_seconds, reporter=reporter,
-                                 job_ids=job_ids, sleep=sleep)
+            if stop_event is not None and stop_event.is_set():
+                requested_at = getattr(stop_event, "requested_at", None)
+                return stopped_result(
+                    float(requested_at) if requested_at is not None else monotonic()
+                )
+            summary, stop_observed_at = next_tick()
+            if summary is None:
+                assert stop_observed_at is not None
+                return stopped_result(stop_observed_at)
             ticks += 1
             for key in totals:
                 totals[key] += int(summary.get(key, 0) or 0)
             last_skipped = dict(summary.get("skipped") or {})
+            if stop_observed_at is not None:
+                return stopped_result(stop_observed_at)
             if until_empty:
                 queued, active = queue_counts()
                 last_queued, last_active = queued, active
@@ -1708,6 +2136,7 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
                         reporter.event("dispatch_drain_idle", waited_s=0.0)
                         return DrainResultV1(
                             status="drained", queued=0, active=0, skipped={}, error=None,
+                            **identity_fields(),
                             **totals,
                         )
                     now = monotonic()
@@ -1719,6 +2148,7 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
                         reporter.event("dispatch_drain_idle", waited_s=grace_s)
                         return DrainResultV1(
                             status="drained", queued=0, active=0, skipped={}, error=None,
+                            **identity_fields(),
                             **totals,
                         )
                     sleep(min(max(poll_s, 0.001), remaining))
@@ -1728,22 +2158,29 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
                     reporter.event("dispatch_drain_stuck", queued=queued)
                     return DrainResultV1(
                         status="stuck_unplaceable", queued=queued, active=0,
-                        skipped=last_skipped, error=None, **totals,
+                        skipped=last_skipped, error=None,
+                        **identity_fields(), **totals,
                     )
             if summary["ran"] == 0:
                 sleep(poll_s)
     except KeyboardInterrupt:
+        # A second signal restores and invokes Python's prior SIGINT handler.
+        # Never reinterpret that explicit immediate-exit request as cancellation.
+        if stop_event is not None and stop_event.is_set():
+            raise
         queued, active = best_effort_counts()
         return DrainResultV1(
             status="cancelled", queued=queued, active=active, skipped=last_skipped,
-            error={"kind": "interrupted", "message": "dispatcher interrupted"}, **totals,
+            error={"kind": "interrupted", "message": "dispatcher interrupted"},
+            **identity_fields(), **totals,
         )
     except Exception as exc:  # noqa: BLE001 - stable drain error document
         queued, active = best_effort_counts()
         return DrainResultV1(
             status="infrastructure_error", queued=queued, active=active,
             skipped=last_skipped,
-            error={"kind": type(exc).__name__, "message": str(exc)}, **totals,
+            error={"kind": type(exc).__name__, "message": str(exc)},
+            **identity_fields(), **totals,
         )
     try:
         queued, active = queue_counts()
@@ -1751,9 +2188,12 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         return DrainResultV1(
             status="infrastructure_error", queued=last_queued, active=last_active,
             skipped=last_skipped,
-            error={"kind": type(exc).__name__, "message": str(exc)}, **totals,
+            error={"kind": type(exc).__name__, "message": str(exc)},
+            **identity_fields(), **totals,
         )
+    started, completed, left_running = best_effort_identities()
     return DrainResultV1(
         status="drained" if queued + active == 0 else "stuck_unplaceable",
-        queued=queued, active=active, skipped=last_skipped, error=None, **totals,
+        queued=queued, active=active, skipped=last_skipped, error=None,
+        started=started, completed=completed, left_running=left_running, **totals,
     )

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .models import Device
+from .gpu_topology import GpuTopologyError, resolve_gpu_memory_topology
 from .resource_envelope import Metric
 from .transport import BaseTransport, TransportError
 
@@ -211,20 +212,46 @@ _PROBE_PROGRAM = textwrap.dedent(
                 malformed_rows += 1
                 continue
             try:
+                identifier = row[0].strip()
+                name = row[1].strip()
+                if not identifier or not name:
+                    raise ValueError("GPU row is missing identity")
+
+                def counter(text):
+                    try:
+                        value = float(text)
+                    except (TypeError, ValueError):
+                        return None
+                    return value if value >= 0 else None
+
+                util = counter(row[2])
+                free_mib = counter(row[3])
+                total_mib = counter(row[4])
+                if util is not None and util > 100:
+                    util = None
                 devices.append({
-                    "id": row[0].strip(),
-                    "name": row[1].strip(),
-                    "util_pct": float(row[2]),
-                    "vram_free_bytes": int(float(row[3]) * 1024 * 1024),
-                    "vram_total_bytes": int(float(row[4]) * 1024 * 1024),
+                    "id": identifier,
+                    "name": name,
+                    "util_pct": util,
+                    "vram_free_bytes": (
+                        int(free_mib * 1024 * 1024) if free_mib is not None else None
+                    ),
+                    "vram_total_bytes": (
+                        int(total_mib * 1024 * 1024) if total_mib is not None else None
+                    ),
                 })
             except Exception:
                 malformed_rows += 1
                 continue
         if devices:
+            has_separate_memory = any(
+                row["vram_free_bytes"] is not None
+                and row["vram_total_bytes"] is not None
+                for row in devices
+            )
             status = "partial" if malformed_rows else "measured"
             detail = f"{malformed_rows} malformed nvidia-smi row(s)" if malformed_rows else ""
-            return "discrete", devices, status, detail
+            return ("discrete" if has_separate_memory else "unknown"), devices, status, detail
         if nvidia_status == "measured" and out.strip():
             return "unknown", [], "malformed", "nvidia-smi returned no valid device rows"
         if system == "darwin" and machine in ("arm64", "aarch64"):
@@ -305,6 +332,14 @@ class ResourceSnapshot:
     gpu_kind: Literal["discrete", "unified", "none", "unknown"]
     gpus: tuple[GPUResourceSnapshot, ...] = ()
     detail: str = ""
+    # The resolved topology is explicit even when no GPU capacity is usable.
+    # Keep raw probe kind/status/rows separately so normalization never erases
+    # what the target actually measured.
+    gpu_memory_topology: str = "auto"
+    raw_gpu_kind: str = "unknown"
+    raw_gpu_status: str = "unavailable"
+    raw_gpu_detail: str = ""
+    raw_gpus: tuple[GPUResourceSnapshot, ...] = ()
 
 
 def _unknown_metric(status: str, source: str = "resource-probe") -> Metric:
@@ -325,6 +360,8 @@ def unavailable_snapshot(status: str, detail: str) -> ResourceSnapshot:
         ram_available_bytes=metric,
         gpu_kind="unknown",
         detail=detail,
+        gpu_memory_topology="unknown",
+        raw_gpu_detail=detail,
     )
 
 
@@ -346,7 +383,7 @@ def _metric(
     return Metric(normalized, "measured", source, confidence)
 
 
-def parse_resource_probe(text: str) -> ResourceSnapshot:
+def parse_resource_probe(text: str, *, gpu_memory_topology: object = "auto") -> ResourceSnapshot:
     try:
         payload = json.loads(text)
     except (TypeError, json.JSONDecodeError):
@@ -402,6 +439,7 @@ def parse_resource_probe(text: str) -> ResourceSnapshot:
     kind: Literal["discrete", "unified", "none", "unknown"] = (
         raw_kind if raw_kind in {"discrete", "unified", "none"} else "unknown"
     )
+    raw_kind_text = kind
     gpu_issues: list[str] = []
     raw_gpu_status = gpu.get("status")
     if raw_gpu_status in {"partial", "malformed", "timeout", "unavailable"}:
@@ -413,6 +451,7 @@ def parse_resource_probe(text: str) -> ResourceSnapshot:
     elif kind == "unknown":
         gpu_issues.append("gpu kind is unknown")
     devices: list[GPUResourceSnapshot] = []
+    raw_devices_snapshots: list[GPUResourceSnapshot] = []
     raw_devices = gpu.get("devices")
     if isinstance(raw_devices, list):
         for raw in raw_devices:
@@ -430,20 +469,31 @@ def parse_resource_probe(text: str) -> ResourceSnapshot:
                 confidence="device-counter",
                 maximum=100,
             )
+            raw_free = _metric(
+                raw.get("vram_free_bytes"),
+                source="nvidia-smi",
+                confidence="device-counter",
+            )
+            raw_total = _metric(
+                raw.get("vram_total_bytes"),
+                source="nvidia-smi",
+                confidence="device-counter",
+            )
+            raw_devices_snapshots.append(
+                GPUResourceSnapshot(
+                    id=identifier,
+                    name=name,
+                    util_pct=util,
+                    vram_free_bytes=raw_free,
+                    vram_total_bytes=raw_total,
+                )
+            )
+            free = raw_free
+            gpu_total = raw_total
             if kind == "unified":
                 free = _unknown_metric("not_applicable", "unified-memory")
                 gpu_total = _unknown_metric("not_applicable", "unified-memory")
             else:
-                free = _metric(
-                    raw.get("vram_free_bytes"),
-                    source="nvidia-smi",
-                    confidence="device-counter",
-                )
-                gpu_total = _metric(
-                    raw.get("vram_total_bytes"),
-                    source="nvidia-smi",
-                    confidence="device-counter",
-                )
                 if (
                     free.value is not None
                     and gpu_total.value is not None
@@ -465,6 +515,77 @@ def parse_resource_probe(text: str) -> ResourceSnapshot:
         gpu_issues.append("gpu devices must be a list")
     if kind == "discrete" and not devices:
         gpu_issues.append("discrete gpu probe returned no valid device rows")
+
+    raw_status = (
+        raw_gpu_status
+        if raw_gpu_status in {"measured", "partial", "malformed", "timeout", "unavailable"}
+        else ("measured" if devices else "unavailable")
+    )
+    try:
+        resolved = resolve_gpu_memory_topology(
+            gpu_memory_topology,
+            raw_kind_text,
+            context="resource probe",
+            observed_authoritative=raw_kind_text in {"unified", "none"},
+        )
+    except GpuTopologyError as exc:
+        resolved = "unknown"
+        gpu_issues.append(str(exc))
+
+    normalized_kind: Literal["discrete", "unified", "none", "unknown"] = (
+        resolved if resolved in {"discrete", "unified", "none", "unknown"} else "unknown"
+    )
+    if normalized_kind == "unified":
+        normalized_devices = [
+            GPUResourceSnapshot(
+                id=gpu.id,
+                name=gpu.name,
+                util_pct=gpu.util_pct,
+                vram_free_bytes=_unknown_metric("not_applicable", "unified-memory"),
+                vram_total_bytes=_unknown_metric("not_applicable", "unified-memory"),
+            )
+            for gpu in devices
+        ]
+    elif normalized_kind == "unknown":
+        # Keep identity/utilization for diagnostics, but never expose a
+        # contradictory or unqualified VRAM value to a consumer.
+        normalized_devices = [
+            GPUResourceSnapshot(
+                id=gpu.id,
+                name=gpu.name,
+                util_pct=gpu.util_pct,
+                vram_free_bytes=_unknown_metric("unavailable", "unresolved-topology"),
+                vram_total_bytes=_unknown_metric("unavailable", "unresolved-topology"),
+            )
+            for gpu in devices
+        ]
+    else:
+        normalized_devices = devices
+
+    # A shared-memory declaration makes missing VRAM counters expected, not a
+    # degraded normalized resource. Raw status and metric statuses remain intact.
+    expected_unified_missing_vram = (
+        normalized_kind == "unified"
+        and bool(raw_devices_snapshots)
+        and all(
+            gpu.util_pct.status == "measured"
+            and gpu.vram_free_bytes.value is None
+            and gpu.vram_total_bytes.value is None
+            for gpu in raw_devices_snapshots
+        )
+    )
+    if normalized_kind == "unified":
+        gpu_issues = [
+            issue for issue in gpu_issues
+            if not (
+                expected_unified_missing_vram
+                and (
+                    "gpu kind is unknown" in issue
+                    or "unavailable counters" in issue
+                )
+            )
+            and not (expected_unified_missing_vram and "incomplete" in issue)
+        ]
 
     essentials = (effective, busy, total, available)
     status = (
@@ -488,9 +609,14 @@ def parse_resource_probe(text: str) -> ResourceSnapshot:
         cpu_sample_interval_ms=sample_interval,
         ram_total_bytes=total,
         ram_available_bytes=available,
-        gpu_kind=kind,
-        gpus=tuple(devices),
+        gpu_kind=normalized_kind,
+        gpus=tuple(normalized_devices),
         detail="; ".join(dict.fromkeys(gpu_issues)),
+        gpu_memory_topology=resolved,
+        raw_gpu_kind=raw_kind_text,
+        raw_gpu_status=raw_status,
+        raw_gpu_detail=str(gpu.get("detail") or ""),
+        raw_gpus=tuple(raw_devices_snapshots),
     )
 
 
@@ -525,4 +651,7 @@ def probe_target_resources(
             "unavailable",
             (result.stderr or result.stdout or f"probe exit {result.exit_code}").strip(),
         )
-    return parse_resource_probe(result.stdout)
+    return parse_resource_probe(
+        result.stdout,
+        gpu_memory_topology=device.gpu_memory_topology,
+    )

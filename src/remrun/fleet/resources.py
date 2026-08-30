@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from threading import Lock
 
 from ..models import Device
+from ..gpu_topology import GpuTopologyError, resolve_gpu_memory_topology
 from ..transport import BaseTransport, TransportError, make_transport
 
 # No console-window flash on Windows when invoked from a GUI trigger; 0 elsewhere.
@@ -55,6 +56,80 @@ elif [ -r /proc/stat ]; then
         printf "CPUUSAGE:CPU usage: %.2f%% busy, %.2f%% idle\n", 100-idle_pct, idle_pct
       }
     }'
+fi
+# Passive network usage estimate on the interface selected by the default
+# route.  This reads kernel adapter counters twice; it never runs a bandwidth
+# test or sends traffic.  Keep the interface/counters separate from CPU and
+# memory so a missing adapter or counter remains explicitly unavailable.
+network_interface=""
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  network_interface=$(route -n get default 2>/dev/null \
+    | awk '/^[[:space:]]*interface:/{print $2; exit}')
+else
+  network_interface=$(ip route show default 2>/dev/null \
+    | awk '$1 == "default" { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+fi
+if [ -z "$network_interface" ] && command -v route >/dev/null 2>&1; then
+  network_interface=$(route -n get default 2>/dev/null \
+    | awk '/^[[:space:]]*interface:/{print $2; exit}')
+fi
+if [ -z "$network_interface" ] && [ -r /proc/net/route ]; then
+  network_interface=$(awk '$2 == "00000000" && $1 != "lo" {print $1; exit}' /proc/net/route)
+fi
+printf 'NETWORK_INTERFACE=%s\n' "$network_interface"
+network_counters() {
+  if [ -z "$network_interface" ]; then
+    return
+  fi
+  if [ -r "/sys/class/net/$network_interface/statistics/rx_bytes" ] \
+      && [ -r "/sys/class/net/$network_interface/statistics/tx_bytes" ]; then
+    cat "/sys/class/net/$network_interface/statistics/rx_bytes" \
+      "/sys/class/net/$network_interface/statistics/tx_bytes" 2>/dev/null \
+      | awk 'NR == 1 {rx = $1} NR == 2 {tx = $1} END {if (rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/) print rx, tx}'
+    return
+  fi
+  # macOS/BSD expose link-layer byte counters through netstat -ib.  Discover
+  # Ibytes/Obytes from the header because column order differs across releases;
+  # restrict this to the Link row so address rows cannot be mistaken for it.
+  netstat -ib 2>/dev/null \
+    | awk -v iface="$network_interface" \
+      '$1 == "Name" {
+         for (i = 1; i <= NF; i++) {
+           if ($i == "Ibytes") ib = i
+           if ($i == "Obytes") ob = i
+         }
+         next
+       }
+       ib && ob && $1 == iface && $3 ~ /^<Link/ &&
+         $ib ~ /^[0-9]+$/ && $ob ~ /^[0-9]+$/ {print $ib, $ob; exit}'
+}
+set -- $(network_counters)
+network_rx1=${1:-}
+network_tx1=${2:-}
+sleep 1
+set -- $(network_counters)
+network_rx2=${1:-}
+network_tx2=${2:-}
+if [ -n "$network_rx1" ] && [ -n "$network_tx1" ] \
+    && [ -n "$network_rx2" ] && [ -n "$network_tx2" ]; then
+  network_report=$(awk -v rx1="$network_rx1" -v tx1="$network_tx1" \
+    -v rx2="$network_rx2" -v tx2="$network_tx2" 'BEGIN {
+      if (rx1 !~ /^[0-9]+$/ || tx1 !~ /^[0-9]+$/ ||
+          rx2 !~ /^[0-9]+$/ || tx2 !~ /^[0-9]+$/) {
+        print "NETWORK_STATUS=malformed"
+      } else if (rx2 < rx1 || tx2 < tx1) {
+        print "NETWORK_STATUS=counter_reset"
+      } else {
+        # Decimal megabits/s: bytes * 8 / 1,000,000 over this 1-second sample.
+        printf "NETWORK_STATUS=measured\nNETWORK_DOWNLOAD_MBPS=%d\nNETWORK_UPLOAD_MBPS=%d\n", \
+          int((rx2-rx1) * 8 / 1000000 + 0.5), int((tx2-tx1) * 8 / 1000000 + 0.5)
+      }
+    }')
+  printf '%s\n' "$network_report"
+elif [ -n "$network_interface" ]; then
+  printf 'NETWORK_STATUS=unavailable\nNETWORK_DETAIL=interface counters unavailable\n'
+else
+  printf 'NETWORK_STATUS=unavailable\nNETWORK_DETAIL=default-route interface unavailable\n'
 fi
 vm_stat 2>/dev/null | sed 's/^/VMSTAT:/'
 if [ -r /proc/meminfo ]; then sed 's/^/MEMINFO:/' /proc/meminfo 2>/dev/null | head -5; fi
@@ -118,6 +193,58 @@ Write-Output "CPU_QUEUE=$($s.ProcessorQueueLength)"
 $c = @(Get-CimInstance Win32_Processor)
 Write-Output "NCPU=$($c[0].NumberOfLogicalProcessors)"
 Write-Output "CHIP=$($c[0].Name)"
+# Passive adapter-counter sample on the active IPv4 default-route interface.
+# This is a rough local usage estimate, not an active speed test.
+$networkInterface = ''
+$default = @(Get-NetIPConfiguration |
+    Where-Object { $_.IPv4DefaultGateway -ne $null } |
+    Sort-Object InterfaceMetric |
+    Select-Object -First 1)
+if ($default) { $networkInterface = [string]$default[0].InterfaceAlias }
+if (-not $networkInterface) {
+    $route = @(Get-CimInstance Win32_IP4RouteTable |
+        Where-Object { $_.Destination -eq '0.0.0.0' -and $_.Mask -eq '0.0.0.0' } |
+        Sort-Object Metric1 |
+        Select-Object -First 1)
+    if ($route) {
+        $adapter = Get-CimInstance Win32_NetworkAdapterConfiguration |
+            Where-Object { $_.InterfaceIndex -eq $route[0].InterfaceIndex }
+        if ($adapter) { $networkInterface = [string]$adapter.Description }
+    }
+}
+Write-Output "NETWORK_INTERFACE=$networkInterface"
+function Get-NetworkCounters {
+    if (-not $networkInterface) { return }
+    $stats = @(Get-NetAdapterStatistics -Name $networkInterface)
+    if ($stats -and $null -ne $stats[0].ReceivedBytes -and $null -ne $stats[0].SentBytes) {
+        Write-Output "$([uint64]$stats[0].ReceivedBytes) $([uint64]$stats[0].SentBytes)"
+    }
+}
+$firstNetwork = @(Get-NetworkCounters)
+Start-Sleep -Milliseconds 1000
+$secondNetwork = @(Get-NetworkCounters)
+if ($firstNetwork.Count -eq 1 -and $secondNetwork.Count -eq 1) {
+    $firstParts = $firstNetwork[0] -split '\s+'
+    $secondParts = $secondNetwork[0] -split '\s+'
+    try {
+        $rx1 = [uint64]$firstParts[0]; $tx1 = [uint64]$firstParts[1]
+        $rx2 = [uint64]$secondParts[0]; $tx2 = [uint64]$secondParts[1]
+        if ($rx2 -lt $rx1 -or $tx2 -lt $tx1) {
+            Write-Output 'NETWORK_STATUS=counter_reset'
+        } else {
+            $down = [int64][math]::Round(([double]($rx2 - $rx1) * 8) / 1000000, 0, [MidpointRounding]::AwayFromZero)
+            $up = [int64][math]::Round(([double]($tx2 - $tx1) * 8) / 1000000, 0, [MidpointRounding]::AwayFromZero)
+            Write-Output 'NETWORK_STATUS=measured'
+            Write-Output "NETWORK_DOWNLOAD_MBPS=$down"
+            Write-Output "NETWORK_UPLOAD_MBPS=$up"
+        }
+    } catch {
+        Write-Output 'NETWORK_STATUS=malformed'
+    }
+} else {
+    Write-Output 'NETWORK_STATUS=unavailable'
+    Write-Output 'NETWORK_DETAIL=interface counters unavailable'
+}
 $g = nvidia-smi --query-gpu=name,utilization.gpu,memory.free,memory.total --format=csv,noheader,nounits
 if ($g) { Write-Output "NVIDIA:$(@($g)[0])" }
 $drive = $env:SystemDrive
@@ -185,6 +312,13 @@ class ResourceView:
     # not a one-minute average.
     processor_queue_length: float | None = None
     processor_queue_per_core: float | None = None
+    # Rough one-second passive adapter-counter estimate. Values are decimal
+    # Mbps rounded to whole numbers; None is unavailable, not zero.
+    network_interface: str = ""
+    network_status: str = "unavailable"
+    network_detail: str = ""
+    network_upload_mbps: int | None = None
+    network_download_mbps: int | None = None
     ram_free_mb: float | None = None
     ram_total_mb: float | None = None
     gpu_name: str = ""
@@ -194,6 +328,14 @@ class ResourceView:
     # True when the GPU shares system RAM (Apple silicon), so a VRAM figure
     # would be a fiction rather than a measurement.
     gpu_unified: bool = False
+    # Device declaration resolution and the unmodified telemetry row.  The
+    # normalized vram fields above are intentionally cleared for unified
+    # topology; this record keeps the source values/status inspectable.
+    gpu_memory_topology: str = "auto"
+    gpu_raw_kind: str = "unknown"
+    gpu_raw_status: str = "unavailable"
+    gpu_raw_detail: str = ""
+    gpu_raw: dict[str, object] = field(default_factory=dict)
     primary_disk: PrimaryDiskView = field(default_factory=PrimaryDiskView)
     # Set when this row is the controller running the command.
     is_local: bool = False
@@ -221,6 +363,35 @@ class ResourceView:
         if self.gpu_unified or not self.vram_total_mb or self.vram_free_mb is None:
             return None
         return max(0.0, min(100.0, (1.0 - self.vram_free_mb / self.vram_total_mb) * 100.0))
+
+
+def apply_gpu_memory_topology(view: ResourceView, device: Device) -> ResourceView:
+    """Resolve a device declaration without discarding raw GPU telemetry."""
+    try:
+        view.gpu_memory_topology = resolve_gpu_memory_topology(
+            device.gpu_memory_topology,
+            view.gpu_raw_kind,
+            context=f"device {device.name}",
+            observed_authoritative=view.gpu_raw_kind in {"unified", "none"},
+        )
+    except GpuTopologyError as exc:
+        view.gpu_memory_topology = "unknown"
+        view.gpu_raw_detail = str(exc)
+        view.detail = "; ".join(filter(None, (view.detail, str(exc))))
+
+    if view.gpu_memory_topology == "unified":
+        view.gpu_unified = True
+        view.vram_free_mb = None
+        view.vram_total_mb = None
+    elif view.gpu_memory_topology == "unknown":
+        # Contradictory or unqualified evidence is not a usable VRAM offer.
+        # The original row remains in gpu_raw for diagnosis.
+        view.gpu_unified = False
+        view.vram_free_mb = None
+        view.vram_total_mb = None
+    else:
+        view.gpu_unified = False
+    return view
 
 
 def _kv(out: str) -> dict[str, str]:
@@ -252,15 +423,76 @@ def _num(text: str | None) -> float | None:
         return None
 
 
+def _network_mbps(value: str | None) -> int | None:
+    """Parse one already-rounded, non-negative Mbps field strictly."""
+    if value is None or not re.fullmatch(r"\d+", value.strip()):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _parse_network(kv: dict[str, str], view: ResourceView) -> None:
+    """Parse the passive network section emitted by both fleet probe scripts."""
+    if not any(key.startswith("NETWORK_") for key in kv):
+        return
+    view.network_interface = kv.get("NETWORK_INTERFACE", "")
+    status = kv.get("NETWORK_STATUS", "unavailable")
+    upload = _network_mbps(kv.get("NETWORK_UPLOAD_MBPS"))
+    download = _network_mbps(kv.get("NETWORK_DOWNLOAD_MBPS"))
+    view.network_detail = kv.get("NETWORK_DETAIL", "")
+    if status == "measured":
+        if upload is None or download is None:
+            view.network_status = "malformed"
+            view.network_detail = "measured network rates are incomplete"
+            return
+        view.network_status = status
+        view.network_upload_mbps = upload
+        view.network_download_mbps = download
+        return
+    if status not in {"unavailable", "counter_reset", "malformed", "timeout"}:
+        view.network_status = "malformed"
+        view.network_detail = "unknown network status"
+        return
+    # Even if a broken probe supplied numeric-looking rates alongside a
+    # non-measured status, discard them. Only an explicitly measured pair can
+    # authorize a displayed zero or non-zero value.
+    view.network_status = status
+    view.network_upload_mbps = None
+    view.network_download_mbps = None
+
+
 def _parse_nvidia(line: str, view: ResourceView) -> None:
     """`name, util%, free_mb, total_mb` from nvidia-smi's CSV row."""
     parts = [p.strip() for p in line.split(",")]
     if len(parts) < 4:
+        view.gpu_raw_status = "malformed"
+        view.gpu_raw_detail = "nvidia-smi row has missing fields"
         return
-    view.gpu_name = parts[0]
-    view.gpu_util_pct = _num(parts[1])
-    view.vram_free_mb = _num(parts[2])
-    view.vram_total_mb = _num(parts[3])
+    name, util, free, total = parts[:4]
+    if not name:
+        view.gpu_raw_status = "malformed"
+        view.gpu_raw_detail = "nvidia-smi row is missing GPU identity"
+        return
+    view.gpu_raw = {
+        "name": name,
+        "util_pct": util,
+        "vram_free_mb": free,
+        "vram_total_mb": total,
+    }
+    view.gpu_raw_status = "measured"
+    view.gpu_raw_kind = (
+        "discrete" if _num(free) is not None and _num(total) is not None else "unknown"
+    )
+    if view.gpu_raw_kind == "discrete":
+        # Numeric counters preserve the established auto-placement shape, but
+        # apply_gpu_memory_topology treats them as non-authoritative evidence.
+        view.gpu_memory_topology = "discrete"
+    view.gpu_name = name
+    view.gpu_util_pct = _num(util)
+    view.vram_free_mb = _num(free)
+    view.vram_total_mb = _num(total)
 
 
 def _byte_count(value: object) -> int | None:
@@ -336,6 +568,7 @@ def _parse_posix(out: str, view: ResourceView) -> None:
     if total:
         view.ram_total_mb = total / (1024.0 * 1024.0)   # bytes -> MB
     _parse_disk_json(kv.get("DISK_JSON"), view)
+    _parse_network(kv, view)
 
     vm_lines = [ln[len("VMSTAT:"):] for ln in out.splitlines()
                 if ln.startswith("VMSTAT:")]
@@ -375,8 +608,20 @@ def _parse_posix(out: str, view: ResourceView) -> None:
 
     for line in out.splitlines():
         if line.startswith("AGX:"):
-            view.gpu_unified = True
             view.gpu_util_pct = _num(line)
+            view.gpu_raw_kind = "unified"
+            view.gpu_memory_topology = "unified"
+            view.gpu_raw_status = "measured" if view.gpu_util_pct is not None else "partial"
+            view.gpu_raw_detail = (
+                "" if view.gpu_util_pct is not None else "GPU utilization unavailable"
+            )
+            view.gpu_raw = {
+                "name": view.gpu_name or view.chip or "GPU",
+                "util_pct": view.gpu_util_pct,
+                "vram_free_mb": None,
+                "vram_total_mb": None,
+            }
+            view.gpu_unified = True
             if not view.gpu_name:
                 view.gpu_name = view.chip or "Apple GPU"
         elif line.startswith("NVIDIA:"):
@@ -390,6 +635,7 @@ def _parse_windows(out: str, view: ResourceView) -> None:
     ncpu = _num(kv.get("NCPU"))
     view.cpu_count = int(ncpu) if ncpu else None
     _parse_disk_json(kv.get("DISK_JSON"), view)
+    _parse_network(kv, view)
 
     total_kb = _num(kv.get("MEMTOTAL_KB"))
     if total_kb:
@@ -595,12 +841,18 @@ def probe_device(device: Device, transport: BaseTransport | None = None,
     else:
         _parse_posix(out, view)
 
+    apply_gpu_memory_topology(view, device)
+
     # Configured hardware fills only what the probe could not measure, and says
     # so; a static figure must never masquerade as a live reading.
     if view.ram_total_mb is None and device.ram_gb:
         view.ram_total_mb = device.ram_gb * 1024.0
         view.notes.append("ram_total from config")
-    if view.vram_total_mb is None and device.vram_gb:
+    if (
+        view.vram_total_mb is None
+        and device.vram_gb
+        and view.gpu_memory_topology == "discrete"
+    ):
         view.vram_total_mb = device.vram_gb * 1024.0
         view.notes.append("vram_total from config")
     if not view.reachable and not view.detail:

@@ -7,12 +7,29 @@ and completion policy.
 from __future__ import annotations
 
 from .models import FleetTask, JobFeatures
+from .task_contract import resolved_route_eligibility
 
 
 def _frozen_adapter(task: FleetTask, device: str) -> dict | None:
     if task.resolved_spec is None:
         return None
     return (task.resolved_spec.get("adapters") or {}).get(device)
+
+
+def route_eligibility(
+    task: FleetTask,
+    device: str,
+    *,
+    device_exists: bool = True,
+    device_enabled: bool | None = None,
+) -> tuple[str, str]:
+    """Return the shared static task/device route eligibility predicate."""
+    return resolved_route_eligibility(
+        task.resolved_spec, device,
+        device_exists=device_exists,
+        device_enabled=device_enabled,
+        requires_adapter=not bool(task.prepared and task.prepared.get("kind") == "command"),
+    )
 
 
 def candidate_devices(task: FleetTask) -> list[str]:

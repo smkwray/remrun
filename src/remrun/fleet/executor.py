@@ -197,17 +197,20 @@ def _guard_outcome_fields(memory_guard: dict[str, Any]) -> dict[str, Any]:
 
 def _admission_guard_payload(transport: Any, admission: Any) -> dict[str, Any]:
     guard = transport.memory_guard
-    return {
+    payload = {
         "schema": 1, "status": "refused", "reason": admission.reason,
         "detail": admission.detail, "command_started": False,
         "command_exit_code": None, "helper_exit_code": 125,
         "max_command_bytes": None, "min_available_bytes": None,
-        "command_limit_fraction": getattr(guard, "command_limit_fraction", None),
         "host_reserve_fraction": getattr(guard, "host_reserve_fraction", None),
         "peak_command_bytes": None, "min_host_available_bytes": None,
         "sample_count": 0, "platform": "controller",
         "memory_admission": admission.payload,
     }
+    fraction = getattr(guard, "command_limit_fraction", None)
+    if fraction is not None:
+        payload["command_limit_fraction"] = fraction
+    return payload
 
 def _first_value(*values: Any) -> Any:
     for value in values:
@@ -223,25 +226,66 @@ def _admission_receipt(payload: Any) -> dict[str, Any] | None:
     policy = payload.get("policy") if isinstance(payload.get("policy"), dict) else {}
     capacity = payload.get("capacity") if isinstance(payload.get("capacity"), dict) else {}
     lease = payload.get("lease") if isinstance(payload.get("lease"), dict) else {}
+    allowance_basis = _first_value(
+        lease.get("allowance_basis"), capacity.get("allowance_basis"),
+    )
+    command_limit = _first_value(
+        lease.get("command_limit_bytes"), capacity.get("command_limit_bytes"),
+    )
+    if command_limit is None and allowance_basis == "explicit_command_limit":
+        # Compatibility with a pre-repair explicit response: its basis is
+        # sufficient to distinguish the hard owner limit from an allowance.
+        command_limit = _first_value(
+            lease.get("enforced_command_limit_bytes"),
+            capacity.get("enforced_command_limit_bytes"),
+            lease.get("allowance_bytes"),
+            capacity.get("allowance_bytes"),
+        )
     return {
         "status": payload.get("status"),
         "reason": payload.get("reason"),
         "active_leases": payload.get("active_leases"),
         "lease_released": payload.get("lease_released"),
-        "allowance_basis": _first_value(
-            lease.get("allowance_basis"), capacity.get("allowance_basis"),
+        "allowance_bytes": _first_value(
+            lease.get("allowance_bytes"), capacity.get("allowance_bytes"),
         ),
+        "allowance_basis": allowance_basis,
         "allocation_rule": _first_value(
             lease.get("allocation_rule"), capacity.get("allocation_rule"),
         ),
+        "command_limit_enforced": bool(
+            _first_value(
+                lease.get("command_limit_enforced"),
+                capacity.get("command_limit_enforced"),
+                command_limit is not None,
+            )
+        ),
+        "command_limit_bytes": _first_value(
+            command_limit,
+        ),
         "enforced_command_limit_bytes": _first_value(
-            lease.get("enforced_command_limit_bytes"), capacity.get("allowance_bytes"),
+            command_limit,
         ),
         "control_overhead_bytes": _first_value(
             lease.get("control_overhead_bytes"), capacity.get("control_overhead_bytes"),
         ),
         "capacity_bytes": _first_value(
             lease.get("capacity_bytes"), capacity.get("capacity_bytes"),
+        ),
+        "learned_allowance_bytes": _first_value(
+            lease.get("learned_allowance_bytes"),
+            capacity.get("learned_allowance_bytes"),
+        ),
+        "live_backed_allowance_bytes": _first_value(
+            lease.get("live_backed_allowance_bytes"),
+            capacity.get("live_backed_allowance_bytes"),
+        ),
+        "learned_allowance_live_backed": _first_value(
+            lease.get("learned_allowance_live_backed"),
+            capacity.get("learned_allowance_live_backed"),
+        ),
+        "predicted_rss_bytes": _first_value(
+            lease.get("predicted_rss_bytes"), capacity.get("predicted_rss_bytes"),
         ),
         "policy_command_ceiling_bytes": _first_value(
             lease.get("policy_command_ceiling_bytes"), policy.get("max_command_bytes"),
@@ -265,6 +309,12 @@ def _guard_receipt(payload: Any) -> dict[str, Any] | None:
     fields = (
         "status", "reason", "command_started", "command_exit_code",
         "helper_exit_code", "max_command_bytes", "min_available_bytes",
+        "command_limit_enforced", "command_limit_bytes",
+        "enforced_command_limit_bytes", "allowance_bytes", "capacity_bytes",
+        "control_overhead_bytes", "allowance_basis", "allocation_rule",
+        "remaining_backed_capacity_bytes", "strict_margin_bytes",
+        "learned_allowance_bytes", "live_backed_allowance_bytes",
+        "learned_allowance_live_backed", "predicted_rss_bytes",
         "host_total_bytes", "initial_host_available_bytes", "min_host_available_bytes",
         "peak_command_bytes", "trigger_value_bytes", "memory_metric", "sample_count",
         "sample_interval_ms", "cleanup_complete", "process_tree_drained",
@@ -276,15 +326,15 @@ def _guard_receipt(payload: Any) -> dict[str, Any] | None:
 def _memory_limit_receipt(record: dict[str, Any], *, admission: Any = None,
                           guard: Any = None, release: Any = None) -> dict[str, Any]:
     limit = prepared_memory_limit_mib(record)
-    if limit is None:
-        raise ValueError("memory-limit receipt requires an explicit prepared limit")
     receipt: dict[str, Any] = {
         "schema": 1,
         "resource": "host-process-tree-rss",
         "metric": "sampled-process-tree-rss-v1",
         "requested_mib": limit,
-        "requested_bytes": limit * 1024 * 1024,
-        "provenance": "submit-explicit",
+        "requested_bytes": limit * 1024 * 1024 if limit is not None else None,
+        "provenance": (
+            "submit-explicit" if limit is not None else "admission-live-headroom"
+        ),
     }
     admitted = _admission_receipt(admission)
     outcome = _guard_receipt(guard)
@@ -295,6 +345,21 @@ def _memory_limit_receipt(record: dict[str, Any], *, admission: Any = None,
     released = _admission_receipt(release)
     if released is not None:
         receipt["release"] = released
+    for name in (
+        "command_limit_enforced", "command_limit_bytes",
+        "enforced_command_limit_bytes", "allowance_bytes", "capacity_bytes",
+        "control_overhead_bytes", "allowance_basis", "allocation_rule",
+        "remaining_backed_capacity_bytes", "strict_margin_bytes",
+        "learned_allowance_bytes", "live_backed_allowance_bytes",
+        "learned_allowance_live_backed", "predicted_rss_bytes",
+    ):
+        value = _first_value(
+            (outcome or {}).get(name),
+            (admitted or {}).get(name),
+            (released or {}).get(name),
+        )
+        if value is not None:
+            receipt[name] = value
     return receipt
 
 
@@ -303,16 +368,26 @@ def durable_attempt_record(task: FleetTask, result: dict[str, Any],
     """Return one token-free completed-attempt record for durable queue status."""
     target_operation = result.get("target_operation")
     has_target_operation = isinstance(target_operation, dict)
-    if prepared_memory_limit_mib(task.prepared) is None and not has_target_operation:
+    explicit_limit = prepared_memory_limit_mib(task.prepared)
+    has_memory_evidence = any(
+        isinstance(result.get(name), dict)
+        for name in ("memory_limit", "memory_guard", "_memory_admission")
+    )
+    if explicit_limit is None and not has_target_operation and not has_memory_evidence:
         return worker_record
     record: dict[str, Any] = {
         "schema": 1,
         "kind": "fleet-attempt-receipt",
     }
-    if prepared_memory_limit_mib(task.prepared) is not None:
+    if explicit_limit is not None or has_memory_evidence:
         receipt = result.get("memory_limit")
         if not isinstance(receipt, dict):
-            receipt = _memory_limit_receipt(task.prepared, guard=result.get("memory_guard"))
+            receipt = _memory_limit_receipt(
+                task.prepared,
+                admission=result.get("_memory_admission"),
+                guard=result.get("memory_guard"),
+                release=result.get("memory_reservation_release"),
+            )
         record["memory_limit"] = receipt
     if has_target_operation:
         record["target_operation"] = target_operation
@@ -347,7 +422,7 @@ def target_finalization_disposition(result: dict[str, Any]) -> str | None:
 
 def _choose_device(task: FleetTask, features: Any, config: RemrunConfig, fcfg: dict,
                    costs: dict, *, active_batches: dict[str, int] | None = None
-                   ) -> tuple[str | None, dict[str, str]]:
+                   ) -> tuple[str | None, dict[str, str], dict[str, Any] | None]:
     candidates = [task.force_device] if task.force_device else adapters.candidate_devices(task)
     snapshots = {}
     active_batches = active_batches or {}
@@ -365,8 +440,8 @@ def _choose_device(task: FleetTask, features: Any, config: RemrunConfig, fcfg: d
         [task], [features], snapshots, costs, fcfg, safety_fraction(config),
     )
     if not result.batches:
-        return None, result.skipped
-    return result.batches[0].device, result.skipped
+        return None, result.skipped, None
+    return result.batches[0].device, result.skipped, result.batches[0].explanation
 
 
 def _group_contract_error(tasks: list[FleetTask],
@@ -433,7 +508,7 @@ def run_group(tasks: list[FleetTask], config: RemrunConfig, *,
             active = queue.active_batches_by_device()
         finally:
             queue.close()
-    device_name, skipped = _choose_device(
+    device_name, skipped, placement_explanation = _choose_device(
         placement_task, adapters.extract_features(placement_task), config, fcfg, costs,
         active_batches=active,
     )
@@ -443,6 +518,7 @@ def run_group(tasks: list[FleetTask], config: RemrunConfig, *,
         return _run_group_leased(
             device_name, tasks, config, state_root=state_root,
             cleanup=cleanup, lease_seconds=lease_seconds,
+            placement_explanation=placement_explanation,
         )
 
     def live_launch_gate() -> bool:
@@ -461,10 +537,14 @@ def run_group(tasks: list[FleetTask], config: RemrunConfig, *,
 
         The shared helper refuses to delete without authorization, which is right
         for queue-managed execution, where a targeted cancellation can commit
-        between a decision and the delete. This path has no queue owner, no lease
-        and no cancellation transaction, so nothing can win that race and there is
-        no marker to consult. Granting explicitly keeps the helper's default
-        fail-closed for managed callers rather than weakening it for everyone.
+        between a decision and the delete. This path opens no controller queue
+        row: no owner token, no controller lease, and no persisted target
+        operation for targeted cancellation to address, so no cancellation
+        transaction can race it and there is no marker to consult. The target
+        itself still holds a reservation and heartbeat during staging -- that is
+        a different thing, and not the arbiter this gate exists for. Granting
+        explicitly keeps the helper's default fail-closed for managed callers
+        rather than weakening it for everyone.
         """
         return True
 
@@ -485,7 +565,8 @@ def _run_one_leased(device_name: str, task: FleetTask, config: RemrunConfig, *,
 
 def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
                       state_root: Path, cleanup: bool,
-                      lease_seconds: int) -> dict[str, Any]:
+                      lease_seconds: int,
+                      placement_explanation: dict[str, Any] | None = None) -> dict[str, Any]:
     task = tasks[0]
     pool = adapters.pool_for(task, device_name)
     db_path = state_root / "fleet" / "fleet.db"
@@ -541,6 +622,7 @@ def _run_group_leased(device_name: str, tasks: list[FleetTask], config: RemrunCo
             lease_until=iso_plus_seconds(now, lease_seconds), pool=pool,
             task_name=task.task_name, engine=adapters.engine_for(task, device_name),
             bucket=adapters.option_bucket(task), now=now,
+            placement_explanation=placement_explanation,
             target_protocol_version=(
                 1 if _target_acceptance_supported(config.devices[device_name]) else None
             ),
@@ -800,6 +882,16 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
         return {"ok": False, "error": f"unknown device {device_name!r}"}
     if not tasks:
         return {"ok": False, "device": device_name, "error": "empty batch"}
+    device = config.devices[device_name]
+    for task in tasks:
+        route_status, route_reason = adapters.route_eligibility(
+            task, device_name, device_enabled=getattr(device, "enabled", None),
+        )
+        if route_status != "eligible":
+            return {
+                "ok": False, "device": device_name,
+                "error": f"route is ineligible: {route_reason}",
+            }
     error = _group_contract_error(tasks)
     if error:
         return {"ok": False, "device": device_name, "error": error}
@@ -835,7 +927,11 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
             "error": "lost batch ownership during output return",
         }
     admission = result.pop("_memory_admission", None)
-    if prepared_memory_limit_mib(head.prepared) is not None:
+    if (
+        prepared_memory_limit_mib(head.prepared) is not None
+        or isinstance(result.get("memory_guard"), dict)
+        or isinstance(admission, dict)
+    ):
         result["memory_limit"] = _memory_limit_receipt(
             head.prepared, admission=admission, guard=result.get("memory_guard"),
             release=result.get("memory_reservation_release"),

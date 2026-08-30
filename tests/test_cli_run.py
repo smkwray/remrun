@@ -172,6 +172,7 @@ def env(tmp_path: Path, monkeypatch):
         'os = "posix"\n'
         f'project_root = "{posix(remote_base)}"\n'
         f'state_root = "{posix(state_root)}"\n'
+        f'venv_root = "{posix(tmp_path / "venvs")}"\n'
         f'cache_root = "{posix(tmp_path / "cache")}"\n'
     )
 
@@ -185,8 +186,40 @@ def env(tmp_path: Path, monkeypatch):
         "proj": proj,
         "remote_proj": remote_base / "proj1",
         "state": state_root,
+        "venv_root": tmp_path / "venvs",
         "remrun_root": remrun_root,
     }
+
+
+def configure_managed_bootstrap(env: dict, *, observable_entrypoint: bool = False) -> Path:
+    """Declare a minimal idempotent external environment for CLI courts."""
+    (env["proj"] / "uv.lock").write_text("lock-v1", encoding="utf-8")
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True, exist_ok=True)
+    if observable_entrypoint:
+        step = (
+            "import os,sys; from pathlib import Path; "
+            "v=Path(sys.argv[1]); b=v/'bin'; b.mkdir(parents=True,exist_ok=True); "
+            "p=b/'python'; p.write_text('#!/bin/sh\\nexport REMRUN_TEST_ENTRYPOINT=\"$0\"\\nexec ' "
+            "+ repr(sys.executable) + ' \"$@\"\\n'); os.chmod(p,0o755)"
+        )
+    else:
+        step = (
+            "import sys; from pathlib import Path; "
+            "v=Path(sys.argv[1]); b=v/'bin'; b.mkdir(parents=True,exist_ok=True); "
+            "p=b/'python'; p.exists() or p.symlink_to(sys.executable)"
+        )
+    (cfgdir / "remrun.toml").write_text(
+        "[run]\n"
+        "use_venv = true\n"
+        "venv_layout = \"external\"\n"
+        "[run.bootstrap]\n"
+        "schema = 1\n"
+        'lock_inputs = ["uv.lock"]\n'
+        f"argv = [\"{{python}}\", \"-c\", {json.dumps(step)}, \"{{venv}}\"]\n",
+        encoding="utf-8",
+    )
+    return env["venv_root"] / "proj1"
 
 
 def test_run_happy_path_pulls_output(env, capsys):
@@ -201,6 +234,315 @@ def test_run_happy_path_pulls_output(env, capsys):
     err = capsys.readouterr().err
     assert "preflight_progress completed=0 total=1 pulls=0 pushes=1" in err
     assert "preflight_progress completed=1 total=1 pulls=0 pushes=1" in err
+
+
+def test_explicit_only_device_allows_named_plan_and_run(env, capsys):
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text(encoding="utf-8").replace(
+            "enabled = true",
+            "enabled = false\nallow_explicit_run = true",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    code = main([
+        "plan", "LOCAL_SIM", "--json", "--",
+        "python", "-c", "raise SystemExit(0)",
+    ])
+    assert code == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["target"]["name"] == "LOCAL_SIM"
+
+    code = main([
+        "run", "LOCAL_SIM", "--",
+        "python", "-c", "open('explicit.txt','w').write('ok')",
+    ])
+    assert code == EXIT_OK
+    assert (env["proj"] / "explicit.txt").read_text(encoding="utf-8") == "ok"
+
+    assert main([
+        "plan", "--auto", "--json", "--",
+        "python", "-c", "raise SystemExit(0)",
+    ]) == EXIT_INTERNAL
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no enabled devices" in captured.err.lower()
+
+
+def test_bench_refuses_explicit_only_target_before_any_leg(env, monkeypatch, capsys):
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text(encoding="utf-8").replace(
+            "enabled = true",
+            "enabled = false\nallow_explicit_run = true",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "remrun.cli.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail("local bench leg ran"),
+    )
+    monkeypatch.setattr(
+        "remrun.cli.cmd_run",
+        lambda *_args, **_kwargs: pytest.fail("remote bench leg ran"),
+    )
+
+    assert main([
+        "bench", "LOCAL_SIM", "--no-local", "--",
+        "python", "-c", "print(1)",
+    ]) == EXIT_INTERNAL
+    assert "bench requires enabled target device(s): LOCAL_SIM" in capsys.readouterr().err
+
+
+def test_default_bench_skips_explicit_only_scheduler_target(
+    env, monkeypatch, capsys,
+):
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text(encoding="utf-8").replace(
+            "enabled = true",
+            "enabled = false\nallow_explicit_run = true",
+            1,
+        )
+        + "\n[devices.ENABLED_SIM]\n"
+        + "enabled = true\n"
+        + 'role = "simulation"\n'
+        + 'kind = "local-sim"\n'
+        + 'os = "posix"\n'
+        + f'project_root = "{posix(env["remote_proj"].parent / "enabled")}"\n'
+        + f'state_root = "{posix(env["state"] / "enabled")}"\n'
+        + f'cache_root = "{posix(env["state"] / "enabled-cache")}"\n',
+        encoding="utf-8",
+    )
+    scheduler = env["remrun_root"] / "config" / "defaults.toml"
+    scheduler.write_text(
+        scheduler.read_text(encoding="utf-8")
+        + '\n[scheduler]\nprimary = "LOCAL_SIM"\nfallback = ["ENABLED_SIM"]\n',
+        encoding="utf-8",
+    )
+    called: list[str] = []
+
+    def record_target(args, _reporter):  # noqa: ANN001, ANN202
+        called.append(args.target)
+        return EXIT_OK
+
+    monkeypatch.setattr("remrun.cli.cmd_run", record_target)
+
+    assert main([
+        "bench", "--no-local", "--", "python", "-c", "print(1)",
+    ]) == EXIT_OK
+    assert called == ["ENABLED_SIM"]
+    assert "LOCAL_SIM" not in capsys.readouterr().err
+
+
+def test_declared_bootstrap_runs_before_user_once_and_is_reported_ready(env, capsys):
+    (env["proj"] / "uv.lock").write_text("lock-v1", encoding="utf-8")
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    step = (
+        "import sys; from pathlib import Path; "
+        "v=Path(sys.argv[1]); (v/'bin').mkdir(parents=True,exist_ok=True); "
+        "entry=v/'bin'/'python'; entry.exists() or entry.symlink_to(sys.executable); "
+        "p=Path('bootstrap-count'); "
+        "p.write_text(str(int(p.read_text())+1 if p.exists() else 1))"
+    )
+    (cfgdir / "remrun.toml").write_text(
+        "[run]\n"
+        "use_venv = true\n"
+        "venv_layout = \"external\"\n"
+        "[run.bootstrap]\n"
+        "schema = 1\n"
+        'lock_inputs = ["uv.lock"]\n'
+        f"steps = [[\"{{python}}\", \"-c\", {json.dumps(step)}, \"{{venv}}\"]]\n",
+        encoding="utf-8",
+    )
+    user = [
+        "python", "-c",
+        "from pathlib import Path; Path('bootstrap-observed').write_text(Path('bootstrap-count').read_text())",
+    ]
+    assert main(["run", "LOCAL_SIM", "--", *user]) == EXIT_OK
+    assert (env["proj"] / "bootstrap-observed").read_text() == "1"
+    assert (env["remote_proj"] / "bootstrap-count").read_text() == "1"
+
+    # The target receipt makes the second run a no-op for bootstrap while the
+    # ordinary user command still runs.
+    assert main(["run", "LOCAL_SIM", "--", *user]) == EXIT_OK
+    assert (env["remote_proj"] / "bootstrap-count").read_text() == "1"
+    receipts = list((env["state"] / "bootstrap").glob("*.json"))
+    assert len(receipts) == 1
+    err = capsys.readouterr().err
+    assert "bootstrap" in err
+
+    code = main(["plan", "LOCAL_SIM", "--probe", "--json", "--", *user])
+    assert code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["bootstrap"]["status"] == "ready"
+
+
+def test_bootstrap_with_no_lock_inputs_defers_managed_command_validation(env):
+    """A setup-only declaration can create the managed entrypoint first."""
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    step = (
+        "import sys; from pathlib import Path; "
+        "v=Path(sys.argv[1]); (v/'bin').mkdir(parents=True,exist_ok=True); "
+        "entry=v/'bin'/'python'; entry.exists() or entry.symlink_to(sys.executable)"
+    )
+    (cfgdir / "remrun.toml").write_text(
+        "[run]\n"
+        "use_venv = true\n"
+        "venv_layout = \"external\"\n"
+        "[run.bootstrap]\n"
+        "schema = 1\n"
+        "lock_inputs = []\n"
+        f"argv = [\"{{python}}\", \"-c\", {json.dumps(step)}, \"{{venv}}\"]\n",
+        encoding="utf-8",
+    )
+
+    assert main([
+        "run", "LOCAL_SIM", "--", "python", "-c",
+        "from pathlib import Path; Path('empty-lock-inputs').write_text('ok')",
+    ]) == EXIT_OK
+    assert (env["proj"] / "empty-lock-inputs").read_text(encoding="utf-8") == "ok"
+
+
+def test_run_never_reuses_environment_resolving_outside_venv_root(env, capsys):
+    managed = configure_managed_bootstrap(env)
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "pass"]) == EXIT_OK
+    capsys.readouterr()
+    command = [
+        "python", "-c",
+        "from pathlib import Path; Path('must-not-run-after-escape').write_text('ran')",
+    ]
+    escaped = env["proj"].parents[2] / "escaped-managed-environment"
+    managed.rename(escaped)
+    managed.symlink_to(escaped, target_is_directory=True)
+
+    assert main(["run", "LOCAL_SIM", "--", *command]) == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "must-not-run-after-escape").exists()
+    assert "outside its configured root" in capsys.readouterr().err
+
+
+def test_nonexecutable_managed_entrypoint_never_falls_through(env, capsys):
+    managed = configure_managed_bootstrap(env)
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "pass"]) == EXIT_OK
+    capsys.readouterr()
+    command = [
+        "python", "-c",
+        "from pathlib import Path; Path('must-not-run-after-nonexec').write_text('ran')",
+    ]
+    interpreter = managed / "bin" / "python"
+    interpreter.unlink()
+    interpreter.write_text("not executable", encoding="utf-8")
+    interpreter.chmod(0o644)
+    assert main(["run", "LOCAL_SIM", "--", *command]) == EXIT_INFRA
+    assert not (env["remote_proj"] / "must-not-run-after-nonexec").exists()
+    assert "not executable" in capsys.readouterr().err
+
+
+def test_managed_command_dispatches_absolute_environment_entrypoint(env, capsys):
+    managed = configure_managed_bootstrap(env, observable_entrypoint=True)
+    observed = "managed-executable-path"
+    command = [
+        "python", "-c",
+        f"import os,pathlib; pathlib.Path({observed!r}).write_text(os.environ['REMRUN_TEST_ENTRYPOINT'])",
+    ]
+    assert main(["run", "LOCAL_SIM", "--", *command]) == EXIT_OK
+    capsys.readouterr()
+    observed_path = (env["proj"] / observed).read_text(encoding="utf-8")
+    assert observed_path == str(managed / "bin" / "python")
+    assert Path(observed_path).is_absolute()
+
+
+def test_removed_managed_entrypoint_fails_without_path_fallback(env, monkeypatch, capsys):
+    configure_managed_bootstrap(env)
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "pass"]) == EXIT_OK
+    capsys.readouterr()
+    command = [
+        "python", "-c",
+        "from pathlib import Path; Path('must-not-run-after-removal').write_text('ran')",
+    ]
+    original_resolve = LocalSimTransport.resolve_managed_executable
+
+    def resolve_then_remove(self, bindir, requested, **kwargs):
+        resolved = original_resolve(
+            self, bindir, requested, **kwargs
+        )
+        Path(resolved).unlink()
+        return resolved
+
+    monkeypatch.setattr(
+        LocalSimTransport,
+        "resolve_managed_executable",
+        resolve_then_remove,
+    )
+    assert main(["run", "LOCAL_SIM", "--", *command]) == EXIT_INFRA
+    assert not (env["remote_proj"] / "must-not-run-after-removal").exists()
+    assert "command not found" in capsys.readouterr().err
+    summaries = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (env["state"] / "runs").glob("*/summary.json")
+    ]
+    rejected = [
+        item for item in summaries
+        if "command not found" in str(item.get("error") or "")
+    ]
+    assert len(rejected) == 1
+    summary = rejected[0]
+    assert summary["completion_state"] == "not_started"
+    assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+
+
+def test_declared_bootstrap_preserves_memory_guard_boundary(env):
+    configure_memory_guard(env, max_command_mib=256, min_available_mib=16)
+    (env["proj"] / "uv.lock").write_text("lock-v1", encoding="utf-8")
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    step = (
+        "import sys; from pathlib import Path; v=Path(sys.argv[1]); "
+        "(v/'bin').mkdir(parents=True,exist_ok=True); entry=v/'bin'/'python'; "
+        "entry.exists() or entry.symlink_to(sys.executable); Path('booted').write_text('yes')"
+    )
+    (cfgdir / "remrun.toml").write_text(
+        "[run]\n"
+        "use_venv = true\n"
+        "venv_layout = \"external\"\n"
+        "[run.bootstrap]\n"
+        "schema = 1\n"
+        'lock_inputs = ["uv.lock"]\n'
+        f"argv = [\"{{python}}\", \"-c\", {json.dumps(step)}, \"{{venv}}\"]\n",
+        encoding="utf-8",
+    )
+    command = [
+        "python", "-c", "from pathlib import Path; assert Path('booted').read_text() == 'yes'",
+    ]
+    assert main(["run", "LOCAL_SIM", "--", *command]) == EXIT_OK
+    summary_path = next((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["bootstrap"]["status"] == "bootstrapped"
+    assert summary["memory_admission"] is not None
+
+
+def test_unsupported_bootstrap_stops_before_preflight_mutation(env):
+    (env["proj"] / "input.txt").write_text("must not push", encoding="utf-8")
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "remrun.toml").write_text(
+        "[run.bootstrap]\n"
+        "schema = 1\n"
+        'lock_inputs = ["missing.lock"]\n'
+        'argv = ["python", "-c", "print(1)"]\n',
+        encoding="utf-8",
+    )
+    code = main([
+        "run", "LOCAL_SIM", "--", "python", "-c",
+        "open('must-not-run.txt','w').write('ran')",
+    ])
+    assert code == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "input.txt").exists()
+    assert not (env["remote_proj"] / "must-not-run.txt").exists()
 
 
 def test_run_passes_through_nonzero_exit(env):
@@ -2029,13 +2371,13 @@ def test_guarded_ordinary_run_preserves_real_exit_with_no_telemetry(env):
     assert summary["memory_guard"]["command_started"] is True
 
 
-def test_no_telemetry_cannot_disable_guard_threshold_termination(env, capsys):
+def test_no_telemetry_allows_unprofiled_command_above_allowance(env, capsys):
     configure_memory_guard(env, max_command_mib=160)
     program = (
         "import time;"
         "x=bytearray(160*1024*1024);"
         "[x.__setitem__(i,1) for i in range(0,len(x),4096)];"
-        "time.sleep(10)"
+        "time.sleep(0.5)"
     )
 
     code = main(
@@ -2050,38 +2392,23 @@ def test_no_telemetry_cannot_disable_guard_threshold_termination(env, capsys):
         ]
     )
 
-    assert code == EXIT_GUARD
+    assert code == EXIT_OK
     summaries = list((env["state"] / "runs").glob("*/summary.json"))
     assert len(summaries) == 1
     summary = json.loads(summaries[0].read_text(encoding="utf-8"))
-    assert summary["exit_code"] == EXIT_GUARD
-    assert summary["command_exit_code"] is None
+    assert summary["exit_code"] == EXIT_OK
+    assert summary["command_exit_code"] == EXIT_OK
     assert summary["telemetry"] is None
-    assert summary["memory_guard"]["status"] == "terminated"
-    assert summary["memory_guard"]["reason"] == "command_memory_limit"
-    assert summary["memory_guard"]["cleanup_complete"] is True
-    assert summary["memory_limit_guidance"] == {
-        "allowance_basis": "unprofiled_available_backed",
-        "allocation_rule": "unprofiled_open_slot_fair_share_v1",
-        "fair_share_limit_mib": 160,
-        "observed_peak_lower_bound_bytes": summary["memory_guard"][
-            "peak_command_bytes"
-        ],
-        "policy_command_ceiling_bytes": 160 * 1024**2,
-        "partial_effects_may_exist": True,
-        "profile_recorded": False,
-        "retry_hint": (
-            "inspect the workload, then intentionally rerun with "
-            "--memory-limit-mib N if a larger hard limit is justified"
-        ),
-    }
-    assert load_profiles(env["state"]) == {}
+    assert summary["memory_guard"]["status"] == "ok"
+    assert summary["memory_guard"]["command_limit_enforced"] is False
+    assert summary["memory_guard"]["max_command_bytes"] is None
+    assert summary["memory_guard"]["enforced_command_limit_bytes"] is None
+    assert summary["memory_limit_guidance"] is None
+    assert load_profiles(env["state"])
     assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
     events = capsys.readouterr().err
-    assert "memory_guard status=terminated" in events
-    assert "memory_limit_guidance" in events
-    assert "profile_recorded=false" in events
-    assert "--memory-limit-mib N" in events
+    assert "memory_guard status=ok" in events
+    assert "memory_limit_guidance" not in events
 
 
 def test_guard_prelaunch_refusal_is_distinct_and_user_code_never_runs(
@@ -2311,9 +2638,6 @@ def test_final_summary_uses_transport_authenticated_renewed_reservation(
             original,
             allowance_bytes=renewed_allowance,
             capacity_bytes=renewed_allowance + original.control_overhead_bytes,
-            per_open_slot_capacity_bytes=(
-                renewed_allowance + original.control_overhead_bytes
-            ),
         )
         Path(cwd, "renewed-summary.txt").write_text("ok", encoding="utf-8")
         guard = {
@@ -2360,7 +2684,7 @@ def test_final_summary_uses_transport_authenticated_renewed_reservation(
     assert summary["memory_admission"]["allowance_bytes"] == renewed_allowance
 
 
-def test_memory_limit_guidance_uses_transport_authenticated_renewed_reservation(
+def test_unprofiled_guard_receipt_uses_transport_authenticated_renewed_reservation(
     env, monkeypatch
 ):
     configure_memory_guard(env, max_command_mib=512)
@@ -2374,19 +2698,19 @@ def test_memory_limit_guidance_uses_transport_authenticated_renewed_reservation(
             original,
             allowance_bytes=renewed_allowance,
             capacity_bytes=renewed_allowance + original.control_overhead_bytes,
-            per_open_slot_capacity_bytes=(
-                renewed_allowance + original.control_overhead_bytes
-            ),
         )
         guard = {
             "schema": 1,
             "status": "terminated",
-            "reason": "command_memory_limit",
+            "reason": "host_memory_reserve",
             "detail": "test",
             "command_started": True,
             "command_exit_code": None,
             "helper_exit_code": 125,
-            "max_command_bytes": renewed.allowance_bytes,
+            "max_command_bytes": None,
+            "command_limit_enforced": False,
+            "command_limit_bytes": None,
+            "enforced_command_limit_bytes": None,
             "min_available_bytes": renewed.min_available_bytes,
             "peak_command_bytes": observed_peak,
             "min_host_available_bytes": renewed.min_available_bytes + 1,
@@ -2419,19 +2743,9 @@ def test_memory_limit_guidance_uses_transport_authenticated_renewed_reservation(
     summary_path = next((env["state"] / "runs").glob("*/summary.json"))
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["memory_admission"]["allowance_bytes"] == renewed_allowance
-    assert summary["memory_limit_guidance"] == {
-        "allowance_basis": "unprofiled_available_backed",
-        "allocation_rule": "unprofiled_open_slot_fair_share_v1",
-        "fair_share_limit_mib": 192,
-        "observed_peak_lower_bound_bytes": observed_peak,
-        "policy_command_ceiling_bytes": 512 * 1024**2,
-        "partial_effects_may_exist": True,
-        "profile_recorded": False,
-        "retry_hint": (
-            "inspect the workload, then intentionally rerun with "
-            "--memory-limit-mib N if a larger hard limit is justified"
-        ),
-    }
+    assert summary["memory_guard"]["command_limit_enforced"] is False
+    assert summary["memory_guard"]["max_command_bytes"] is None
+    assert summary["memory_limit_guidance"] is None
 
 
 def test_auto_memory_limit_skips_unguarded_target_before_mutation(two_device_env):
@@ -2476,14 +2790,14 @@ def test_auto_memory_limit_skips_unguarded_target_before_mutation(two_device_env
     assert refused["memory_admission"]["reason"] == "guard_not_configured"
 
 
-def test_selected_workload_is_guarded_even_with_no_telemetry(env):
+def test_selected_workload_allows_unprofiled_command_above_allowance(env):
     configure_workload(env, require_receipt=False)
     configure_memory_guard(env, max_command_mib=160)
     program = (
         "import time;"
         "x=bytearray(160*1024*1024);"
         "[x.__setitem__(i,1) for i in range(0,len(x),4096)];"
-        "time.sleep(10)"
+        "time.sleep(0.5)"
     )
 
     code = main(
@@ -2500,13 +2814,15 @@ def test_selected_workload_is_guarded_even_with_no_telemetry(env):
         ]
     )
 
-    assert code == EXIT_GUARD
+    assert code == EXIT_OK
     summary_path = next((env["state"] / "runs").glob("*/summary.json"))
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["workload"]["name"] == "demo.work"
     assert summary["telemetry"] is None
-    assert summary["memory_guard"]["status"] == "terminated"
-    assert summary["memory_guard"]["reason"] == "command_memory_limit"
+    assert summary["memory_guard"]["status"] == "ok"
+    assert summary["memory_guard"]["command_limit_enforced"] is False
+    assert summary["memory_guard"]["max_command_bytes"] is None
+    assert summary["memory_guard"]["enforced_command_limit_bytes"] is None
 
 
 def _enable_relative_guards_for_two_sim_devices(env: dict) -> None:

@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import re
-from pathlib import Path
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 
 PUBLIC_INCLUDE_GLOBS = [
@@ -87,11 +89,27 @@ DEFAULT_PRIVATE_PATTERN_FILE = Path("config/private_release_patterns.txt")
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(path, pat) for pat in patterns)
+    for pattern in patterns:
+        if fnmatch.fnmatch(path, pattern):
+            return True
+        # pathlib.Path.glob("tests/**/*") includes a file immediately under
+        # tests/, while fnmatch requires another slash. Git-tree paths must use
+        # the same release-surface semantics as the checkout scan.
+        if pattern.endswith("**/*") and path.startswith(pattern.removesuffix("**/*")):
+            return True
+    return False
 
 
 def _is_text_candidate(path: Path) -> bool:
     return path.suffix.lower() in TEXT_SUFFIXES
+
+
+def _is_public_path(relative: str) -> bool:
+    return (
+        _matches_any(relative, PUBLIC_INCLUDE_GLOBS)
+        and not _matches_any(relative, PUBLIC_EXCLUDE_GLOBS)
+        and PurePosixPath(relative).suffix.lower() in TEXT_SUFFIXES
+    )
 
 
 def iter_public_files(root: Path) -> list[Path]:
@@ -104,6 +122,21 @@ def iter_public_files(root: Path) -> list[Path]:
             if not _matches_any(rel, PUBLIC_EXCLUDE_GLOBS):
                 files.add(path)
     return sorted(files)
+
+
+@dataclass(frozen=True)
+class HistoryHit:
+    """One unique private-pattern match in a successor Git blob."""
+
+    commit: str
+    path: str
+    line: int
+    pattern: str
+    text: str
+
+
+class HistoryScanError(RuntimeError):
+    """The requested Git range could not be authenticated or read."""
 
 
 class MissingPatternFile(RuntimeError):
@@ -158,6 +191,146 @@ def scan(root: Path, *, pattern_file: Path | None = None,
     return hits
 
 
+def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            check=check,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            detail = (exc.stderr or exc.stdout or b"").decode("utf-8", "replace").strip()
+        raise HistoryScanError(detail or f"git {' '.join(args)} failed") from exc
+
+
+def _read_git_blobs(root: Path, blob_ids: set[str]) -> dict[str, str | None]:
+    """Read a set of Git blobs through one batch process."""
+    if not blob_ids:
+        return {}
+    ordered = sorted(blob_ids)
+    request = ("\n".join(ordered) + "\n").encode("ascii")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "--batch"],
+            input=request,
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            detail = (exc.stderr or exc.stdout or b"").decode("utf-8", "replace").strip()
+        raise HistoryScanError(detail or "git cat-file --batch failed") from exc
+
+    output = result.stdout
+    offset = 0
+    blobs: dict[str, str | None] = {}
+    for requested in ordered:
+        header_end = output.find(b"\n", offset)
+        if header_end < 0:
+            raise HistoryScanError("git cat-file --batch returned a truncated header")
+        header = output[offset:header_end].decode("ascii", "replace")
+        offset = header_end + 1
+        fields = header.split()
+        if len(fields) != 3 or fields[0] != requested or fields[1] != "blob":
+            raise HistoryScanError(f"unexpected git cat-file response: {header}")
+        try:
+            size = int(fields[2])
+        except ValueError as exc:
+            raise HistoryScanError(f"invalid git blob size: {header}") from exc
+        raw = output[offset:offset + size]
+        offset += size
+        if len(raw) != size or output[offset:offset + 1] != b"\n":
+            raise HistoryScanError(f"truncated git blob response for {requested}")
+        offset += 1
+        try:
+            blobs[requested] = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            blobs[requested] = None
+    if offset != len(output):
+        raise HistoryScanError("git cat-file --batch returned trailing data")
+    return blobs
+
+
+def scan_history(
+    root: Path,
+    *,
+    base: str,
+    head: str = "HEAD",
+    pattern_file: Path | None = None,
+    generic_only: bool = False,
+) -> list[HistoryHit]:
+    """Scan public-surface blobs in every commit reachable through ``base..head``.
+
+    A clean candidate checkout is insufficient for publication: an intermediate
+    tree remains downloadable whenever its commit is reachable from the branch.
+    The public baseline is already published, so only successor commits are read.
+    """
+    root = root.resolve()
+    ancestry = _git(root, "merge-base", "--is-ancestor", base, head, check=False)
+    if ancestry.returncode != 0:
+        detail = ancestry.stderr.decode("utf-8", "replace").strip()
+        raise HistoryScanError(
+            detail or f"history base {base!r} is not an ancestor of {head!r}"
+        )
+    commits = [
+        value for value in
+        _git(root, "rev-list", "--reverse", f"{base}..{head}").stdout
+        .decode("ascii", "strict").splitlines()
+        if value
+    ]
+    patterns = [
+        *GENERIC_PRIVATE_PATTERNS,
+        *_load_private_patterns(root, pattern_file, generic_only=generic_only),
+    ]
+    compiled = [(label, re.compile(label, re.IGNORECASE)) for label in patterns]
+    tree_entries: list[tuple[str, str, str]] = []
+    blob_ids: set[str] = set()
+    for commit in commits:
+        listing = _git(root, "ls-tree", "-r", "-z", commit).stdout
+        for record in listing.split(b"\0"):
+            if not record:
+                continue
+            try:
+                metadata, raw_path = record.split(b"\t", 1)
+                _mode, kind, blob = metadata.decode("ascii").split()
+                relative = raw_path.decode("utf-8")
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise HistoryScanError(f"malformed git tree record in {commit}") from exc
+            if kind == "blob" and _is_public_path(relative):
+                tree_entries.append((commit, relative, blob))
+                blob_ids.add(blob)
+
+    blob_cache = _read_git_blobs(root, blob_ids)
+    blob_matches: dict[str, list[tuple[int, str, str]]] = {}
+    for blob, text in blob_cache.items():
+        matches: list[tuple[int, str, str]] = []
+        if text is not None:
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                for label, regex in compiled:
+                    if regex.search(line):
+                        matches.append((lineno, label, line.strip()))
+        blob_matches[blob] = matches
+
+    seen: set[tuple[str, str, int, str]] = set()
+    hits: list[HistoryHit] = []
+    for commit, relative, blob in tree_entries:
+        for lineno, label, line in blob_matches[blob]:
+            key = (blob, relative, lineno, label)
+            if key not in seen:
+                seen.add(key)
+                hits.append(HistoryHit(
+                    commit=commit,
+                    path=relative,
+                    line=lineno,
+                    pattern=label,
+                    text=line,
+                ))
+    return hits
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -168,6 +341,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--generic-only", action="store_true",
                         help="proceed without the deployment-specific denylist (weaker scan; "
                              "not sufficient for a release)")
+    parser.add_argument("--history-base",
+                        help="also scan every public blob in commits BASE..history-head")
+    parser.add_argument("--history-head", default="HEAD",
+                        help="candidate ref for --history-base (default: HEAD)")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     files = iter_public_files(root)
@@ -176,7 +353,17 @@ def main(argv: list[str] | None = None) -> int:
             print(path.relative_to(root).as_posix())
     try:
         hits = scan(root, pattern_file=args.patterns, generic_only=args.generic_only)
-    except MissingPatternFile as exc:
+        history_hits = (
+            scan_history(
+                root,
+                base=args.history_base,
+                head=args.history_head,
+                pattern_file=args.patterns,
+                generic_only=args.generic_only,
+            )
+            if args.history_base else []
+        )
+    except (MissingPatternFile, HistoryScanError) as exc:
         print(f"public release check FAILED: {exc}")
         return 2
     if hits:
@@ -184,8 +371,16 @@ def main(argv: list[str] | None = None) -> int:
             rel = path.relative_to(root).as_posix()
             print(f"{rel}:{lineno}: {pattern}: {line}")
         return 1
+    if history_hits:
+        for hit in history_hits:
+            print(
+                f"{hit.commit}:{hit.path}:{hit.line}: "
+                f"{hit.pattern}: {hit.text}"
+            )
+        return 1
     scope = "generic patterns only" if args.generic_only else "generic + deployment patterns"
-    print(f"public release check ok ({len(files)} files, {scope})")
+    history = f", history {args.history_base}..{args.history_head}" if args.history_base else ""
+    print(f"public release check ok ({len(files)} files, {scope}{history})")
     return 0
 
 

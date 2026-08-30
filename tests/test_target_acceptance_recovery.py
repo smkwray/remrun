@@ -746,7 +746,7 @@ def test_unleased_execution_still_cleans_target_evidence(
     # Placement probes the real device; force it so the test exercises the
     # unleased execution path rather than device selection.
     monkeypatch.setattr(
-        fleet_executor, "_choose_device", lambda *_args, **_kwargs: ("TARGET", {}),
+        fleet_executor, "_choose_device", lambda *_args, **_kwargs: ("TARGET", {}, None),
     )
     result = fleet_executor.run_group(
         [task], config, state_root=tmp_path / "controller-state", use_lease=False,

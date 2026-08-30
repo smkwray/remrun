@@ -8,7 +8,7 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 _SCHEMA = 3
 _KEYS = frozenset({"schema", "command_limit_fraction", "host_reserve_fraction"})
-_REQUIRED_KEYS = frozenset({"schema", "command_limit_fraction"})
+_REQUIRED_KEYS = frozenset({"schema"})
 _ADMISSION_SCHEMA = 2
 PREDICTION_HEADROOM_FACTOR = 1.25
 RESERVATION_TTL_SECONDS = 30 * 60
@@ -16,6 +16,7 @@ _ALLOWANCE_BASES = frozenset(
     {
         "explicit_command_limit",
         "learned_profile_plus_25_percent",
+        "learned_profile_live_headroom",
         "unprofiled_available_backed",
     }
 )
@@ -29,16 +30,15 @@ class MemoryGuardConfigError(ValueError):
 class MemoryGuard:
     """Validated relative memory policy for one guarded POSIX target."""
 
-    command_limit_fraction: float
+    command_limit_fraction: float | None
     host_reserve_fraction: float | None
     max_jobs: int
     schema: int = _SCHEMA
 
     def as_dict(self) -> dict[str, int | float]:
-        result: dict[str, int | float] = {
-            "schema": self.schema,
-            "command_limit_fraction": self.command_limit_fraction,
-        }
+        result: dict[str, int | float] = {"schema": self.schema}
+        if self.command_limit_fraction is not None:
+            result["command_limit_fraction"] = self.command_limit_fraction
         if self.host_reserve_fraction is not None:
             result["host_reserve_fraction"] = self.host_reserve_fraction
         return result
@@ -59,12 +59,33 @@ class MemoryReservation:
     host_total_bytes: int
     safe_concurrency: int
     expires_at: float
+    # Admission allowance and command enforcement are intentionally separate.
+    # Learned and unprofiled allowances reserve capacity but do not impose an
+    # RSS kill ceiling; only an explicit owner limit populates this field.
+    command_limit_bytes: int | None = None
     allowance_basis: str | None = None
     allocation_rule: str | None = None
     remaining_backed_capacity_bytes: int | None = None
-    open_slots_at_sizing: int | None = None
-    per_open_slot_capacity_bytes: int | None = None
     strict_margin_bytes: int | None = None
+    learned_allowance_bytes: int | None = None
+    live_backed_allowance_bytes: int | None = None
+    learned_allowance_live_backed: bool | None = None
+    predicted_rss_bytes: int | float | None = None
+
+    @property
+    def effective_command_limit_bytes(self) -> int | None:
+        """Return the execution ceiling, if this is an explicit-limit lease.
+
+        The basis fallback keeps older in-process transport doubles and older
+        target receipts readable. New admission responses carry
+        ``command_limit_bytes`` explicitly, while non-explicit bases always
+        remain unlimited at the process-tree layer.
+        """
+        if self.allowance_basis != "explicit_command_limit":
+            return None
+        if self.command_limit_bytes is not None:
+            return self.command_limit_bytes
+        return self.allowance_bytes
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "MemoryReservation":
@@ -107,15 +128,60 @@ class MemoryReservation:
                 raise ValueError(f"memory admission lease.{name} is invalid")
             return value
 
+        learned_allowance_bytes = optional_nonnegative_int("learned_allowance_bytes")
+        live_backed_allowance_bytes = optional_nonnegative_int(
+            "live_backed_allowance_bytes"
+        )
+        learned_allowance_live_backed = lease.get("learned_allowance_live_backed")
+        if learned_allowance_live_backed is not None and not isinstance(
+            learned_allowance_live_backed, bool
+        ):
+            raise ValueError(
+                "memory admission lease.learned_allowance_live_backed is invalid"
+            )
+        predicted_rss_bytes = lease.get("predicted_rss_bytes")
+        if predicted_rss_bytes is not None:
+            if (
+                isinstance(predicted_rss_bytes, bool)
+                or not isinstance(predicted_rss_bytes, (int, float))
+                or not math.isfinite(float(predicted_rss_bytes))
+                or predicted_rss_bytes <= 0
+            ):
+                raise ValueError("memory admission lease.predicted_rss_bytes is invalid")
+
         allocation_rule = lease.get("allocation_rule")
         if allocation_rule is not None and allocation_rule != (
-            "unprofiled_open_slot_fair_share_v1"
+            "unprofiled_live_headroom_v1"
         ):
             raise ValueError("memory admission allocation_rule is invalid")
         allowance_bytes = positive_int("allowance_bytes")
         control_overhead_bytes = positive_int("control_overhead_bytes")
         capacity_bytes = positive_int("capacity_bytes")
         max_command_bytes = positive_int("max_command_bytes")
+        command_limit_bytes = lease.get("command_limit_bytes")
+        if command_limit_bytes is not None:
+            if (
+                isinstance(command_limit_bytes, bool)
+                or not isinstance(command_limit_bytes, int)
+                or command_limit_bytes <= 0
+                or command_limit_bytes % MIB != 0
+            ):
+                raise ValueError("memory admission lease.command_limit_bytes is invalid")
+            if command_limit_bytes > max_command_bytes:
+                raise ValueError(
+                    "memory admission command limit exceeds the policy ceiling"
+                )
+        if allowance_basis == "explicit_command_limit" and command_limit_bytes is None:
+            # Accept the pre-repair explicit wire shape while normalizing it to
+            # the owner-limit meaning.
+            command_limit_bytes = allowance_bytes
+        elif (
+            allowance_basis != "explicit_command_limit"
+            and command_limit_bytes is not None
+        ):
+            raise ValueError(
+                "memory admission command limit requires explicit_command_limit basis"
+            )
         min_available_bytes = positive_int("min_available_bytes")
         host_total_bytes = positive_int("host_total_bytes")
         if capacity_bytes != allowance_bytes + control_overhead_bytes:
@@ -136,16 +202,17 @@ class MemoryReservation:
             host_total_bytes=host_total_bytes,
             safe_concurrency=positive_int("safe_concurrency"),
             expires_at=float(expires_at),
+            command_limit_bytes=command_limit_bytes,
             allowance_basis=allowance_basis,
             allocation_rule=allocation_rule,
             remaining_backed_capacity_bytes=optional_nonnegative_int(
                 "remaining_backed_capacity_bytes"
             ),
-            open_slots_at_sizing=optional_nonnegative_int("open_slots_at_sizing"),
-            per_open_slot_capacity_bytes=optional_nonnegative_int(
-                "per_open_slot_capacity_bytes"
-            ),
             strict_margin_bytes=optional_nonnegative_int("strict_margin_bytes"),
+            learned_allowance_bytes=learned_allowance_bytes,
+            live_backed_allowance_bytes=live_backed_allowance_bytes,
+            learned_allowance_live_backed=learned_allowance_live_backed,
+            predicted_rss_bytes=predicted_rss_bytes,
         )
 
     def as_dict(self, *, include_token: bool = False) -> dict[str, object]:
@@ -153,6 +220,8 @@ class MemoryReservation:
             "lease_id": self.lease_id,
             "state_root": self.state_root,
             "allowance_bytes": self.allowance_bytes,
+            "command_limit_enforced": self.effective_command_limit_bytes is not None,
+            "enforced_command_limit_bytes": self.effective_command_limit_bytes,
             "control_overhead_bytes": self.control_overhead_bytes,
             "capacity_bytes": self.capacity_bytes,
             "max_command_bytes": self.max_command_bytes,
@@ -166,12 +235,16 @@ class MemoryReservation:
             data["lease_token"] = self.lease_token
         if self.allowance_basis is not None:
             data["allowance_basis"] = self.allowance_basis
+        if self.effective_command_limit_bytes is not None:
+            data["command_limit_bytes"] = self.effective_command_limit_bytes
         for name in (
             "allocation_rule",
             "remaining_backed_capacity_bytes",
-            "open_slots_at_sizing",
-            "per_open_slot_capacity_bytes",
             "strict_margin_bytes",
+            "learned_allowance_bytes",
+            "live_backed_allowance_bytes",
+            "learned_allowance_live_backed",
+            "predicted_rss_bytes",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -297,15 +370,21 @@ def parse_memory_guard(
             f"device {device_name!r} memory_guard schema 3 requires a POSIX transport"
         )
 
-    command_fraction = _fraction(
-        raw["command_limit_fraction"], "command_limit_fraction", device_name
+    command_fraction = (
+        _fraction(raw["command_limit_fraction"], "command_limit_fraction", device_name)
+        if "command_limit_fraction" in raw
+        else None
     )
     reserve_fraction = (
         _fraction(raw["host_reserve_fraction"], "host_reserve_fraction", device_name)
         if "host_reserve_fraction" in raw
         else None
     )
-    if reserve_fraction is not None and command_fraction + reserve_fraction > 1.0:
+    if (
+        reserve_fraction is not None
+        and command_fraction is not None
+        and command_fraction + reserve_fraction > 1.0
+    ):
         raise MemoryGuardConfigError(
             f"device {device_name!r} memory guard command limit plus host reserve exceeds RAM"
         )

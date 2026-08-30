@@ -107,7 +107,7 @@ def test_novel_name_submits_claims_executes_closes_and_validates(
         queue.close()
 
     snapshot = DeviceSnapshot(
-        name="LOCAL_SIM", reachable=True, max_jobs=1,
+        name="LOCAL_SIM", reachable=True, enabled=True, max_jobs=1,
         engine_status={"zot-engine": "present"},
     )
     plan = placement.plan_jobs(
@@ -130,6 +130,15 @@ def test_novel_name_submits_claims_executes_closes_and_validates(
         assert row["state"] == "done"
         batch = queue.get_batch(row["batch_id"])
         assert batch["state"] == "done"
+        assert row["placement_explanation"] == batch["placement_explanation"]
+        assert batch["placement_explanation"]["selected"] == {
+            "device": "LOCAL_SIM",
+            "selection_basis": "sole_qualified",
+            "reason": "batched",
+            "estimated_finish_s": None,
+            "estimate_reason": "uncalibrated",
+            "quantities": {},
+        }
     finally:
         queue.close()
     assert [path.read_text() for path in output_root.glob("*.zout")] == ["ok"]

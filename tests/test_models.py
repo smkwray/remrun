@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from remrun.config import load_config
 from remrun.models import Device, ProjectContext, RunPlan, WorkloadSpec
 
 
@@ -46,6 +49,27 @@ def test_device_preserves_resource_policy_for_opt_in_validation() -> None:
     assert _device(resource_policy=raw_policy).resource_policy is raw_policy
     assert _device(resource_policy="malformed").resource_policy == "malformed"
     assert _device().resource_policy is None
+
+
+def test_device_explicit_run_flag_defaults_false_and_is_closed_boolean() -> None:
+    assert _device().allow_explicit_run is False
+    assert _device(allow_explicit_run=True).allow_explicit_run is True
+
+    with pytest.raises(ValueError, match="allow_explicit_run must be a boolean"):
+        _device(allow_explicit_run="true")
+
+
+def test_load_config_rejects_non_boolean_explicit_run_flag(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "defaults.toml").write_text("", encoding="utf-8")
+    (config_dir / "devices.toml").write_text(
+        "[devices.BOX]\nallow_explicit_run = 1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="allow_explicit_run must be a boolean"):
+        load_config(tmp_path)
 
 
 def test_run_plan_legacy_serialization_is_exactly_unchanged_without_workload() -> None:

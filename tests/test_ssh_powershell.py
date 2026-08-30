@@ -90,6 +90,47 @@ def nested_job_script(outer_script: str) -> tuple[str, str]:
     return match.group(1), base64.b64decode(match.group(2)).decode("utf-16-le")
 
 
+def test_managed_windows_resolver_constructs_python_probe_and_validates_output(
+    monkeypatch,
+):
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    seen: dict[str, object] = {}
+
+    def respond(address, script, **kwargs):  # noqa: ANN001, ANN003
+        seen.update(address=address, script=script, kwargs=kwargs)
+        return cp(0, b"C:\\venvs\\project\\Scripts\\python.exe\r\n")
+
+    monkeypatch.setattr(t, "_ps_remote", respond)
+    resolved = t.resolve_managed_executable(
+        r"C:\venvs\project\Scripts",
+        "python",
+        managed_root=r"C:\venvs\project",
+        configured_root=r"C:\venvs",
+    )
+    assert resolved == r"C:\venvs\project\Scripts\python.exe"
+    assert seen["address"] == "winbox"
+    assert seen["kwargs"] == {"timeout": 30.0}
+    script = seen["script"]
+    assert isinstance(script, str)
+    assert "-S" in script
+    assert "managed Windows commands must resolve to an .exe entry" in script
+    assert r"C:\venvs\project\Scripts" in script
+
+    monkeypatch.setattr(
+        t,
+        "_ps_remote",
+        lambda *_args, **_kwargs: cp(0, b"relative\\python.exe\r\n"),
+    )
+    with pytest.raises(TransportError, match="invalid managed executable path"):
+        t.resolve_managed_executable(
+            r"C:\venvs\project\Scripts",
+            "python",
+            managed_root=r"C:\venvs\project",
+            configured_root=r"C:\venvs",
+        )
+
+
 # --- helpers ------------------------------------------------------------------
 
 def test_ps_squote_escapes_quotes():

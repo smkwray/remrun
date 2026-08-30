@@ -19,8 +19,10 @@ GIB = 1024**3
 TOTAL = 64 * GIB
 
 
-def _running_lease(lease_id: str, *, capacity: int) -> dict[str, object]:
-    return {
+def _running_lease(
+    lease_id: str, *, capacity: int, allowance_basis: str | None = None
+) -> dict[str, object]:
+    lease = {
         "lease_id": lease_id,
         "token_hash": "0" * 64,
         "allowance_bytes": capacity,
@@ -33,6 +35,9 @@ def _running_lease(lease_id: str, *, capacity: int) -> dict[str, object]:
         "root_identity": "100:r",
         "pgid": 100,
     }
+    if allowance_basis is not None:
+        lease["allowance_basis"] = allowance_basis
+    return lease
 
 
 def _private(lease_id: str, value: int, *, rss: int | None = None):
@@ -53,7 +58,9 @@ def test_capacity_transaction_rejects_growth_between_host_and_private_reads(monk
     monkeypatch.setattr(telemetry, "_host_memory", lambda: next(hosts))
     monkeypatch.setattr(telemetry, "_lease_private_snapshot", lambda _leases: next(private))
 
-    _total, result = telemetry._capacity_transaction(leases, reserve_bytes=16 * GIB)
+    _total, result = telemetry._capacity_transaction(
+        leases, reserve_bytes=16 * GIB, sizing_lease_id=lease_id
+    )
 
     assert result["available_samples_bytes"] == [40 * GIB, 24 * GIB, 24 * GIB]
     assert result["private_bytes_by_lease"][lease_id] == 0
@@ -75,7 +82,9 @@ def test_capacity_transaction_rejects_shrink_between_private_and_host_reads(monk
     monkeypatch.setattr(telemetry, "_host_memory", lambda: next(hosts))
     monkeypatch.setattr(telemetry, "_lease_private_snapshot", lambda _leases: next(private))
 
-    _total, result = telemetry._capacity_transaction(leases, reserve_bytes=16 * GIB)
+    _total, result = telemetry._capacity_transaction(
+        leases, reserve_bytes=16 * GIB, sizing_lease_id=lease_id
+    )
 
     assert result["available_floor_bytes"] == 24 * GIB
     assert result["private_bytes_by_lease"][lease_id] == 0
@@ -102,10 +111,56 @@ def test_capacity_transaction_credits_stable_private_pages_once_and_keeps_safe_j
     _total, result = telemetry._capacity_transaction(leases, reserve_bytes=16 * GIB)
 
     assert result["current_guarded_private_bytes"] == 16 * GIB
-    assert result["future_headroom_bytes"] == 16 * GIB
-    assert result["required_available_bytes"] == 32 * GIB
+    assert result["future_headroom_bytes"] == 0
+    assert result["required_available_bytes"] == 16 * GIB
     assert result["safe"] is True
     assert result["attribution"] == "private_resident_additive_two_snapshot_minimum"
+
+
+def test_inferred_capacity_overrun_uses_actual_private_bytes_for_concurrency(
+    monkeypatch,
+):
+    lease_id = "g" * 32
+    leases = [_running_lease(lease_id, capacity=10 * GIB)]
+    snapshot = {lease_id: {100: ("100:r", 20 * GIB, MIB)}}
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 48 * GIB))
+    monkeypatch.setattr(
+        telemetry, "_lease_private_snapshot", lambda _leases: snapshot
+    )
+
+    _total, result = telemetry._capacity_transaction(leases, reserve_bytes=16 * GIB)
+
+    assert result["current_guarded_private_bytes"] == 20 * GIB
+    assert result["future_headroom_bytes"] == 0
+    assert result["required_available_bytes"] == 16 * GIB
+    assert result["inferred_capacity_overrun"] is True
+    assert result["inferred_capacity_overrun_bytes_by_lease"][lease_id] == 10 * GIB
+    assert result["capacity_violation"] is False
+    assert result["safe"] is True
+
+
+def test_explicit_capacity_overrun_remains_a_fail_closed_violation(monkeypatch):
+    lease_id = "h" * 32
+    leases = [
+        _running_lease(
+            lease_id,
+            capacity=10 * GIB,
+            allowance_basis="explicit_command_limit",
+        )
+    ]
+    snapshot = {lease_id: {100: ("100:r", 20 * GIB, MIB)}}
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 48 * GIB))
+    monkeypatch.setattr(
+        telemetry, "_lease_private_snapshot", lambda _leases: snapshot
+    )
+
+    _total, result = telemetry._capacity_transaction(leases, reserve_bytes=16 * GIB)
+
+    assert result["current_guarded_private_bytes"] == 20 * GIB
+    assert result["future_headroom_bytes"] == 0
+    assert result["capacity_violation"] is True
+    assert result["inferred_capacity_overrun"] is False
+    assert result["safe"] is False
 
 
 def test_capacity_transaction_never_credits_one_process_identity_to_two_leases(
@@ -128,9 +183,9 @@ def test_capacity_transaction_never_credits_one_process_identity_to_two_leases(
 
     assert result["current_guarded_private_bytes"] == 8 * GIB
     assert sorted(result["private_bytes_by_lease"].values()) == [0, 8 * GIB]
-    assert result["future_headroom_bytes"] == 24 * GIB
-    assert result["required_available_bytes"] == 40 * GIB
-    assert result["safe"] is False
+    assert result["future_headroom_bytes"] == 0
+    assert result["required_available_bytes"] == 16 * GIB
+    assert result["safe"] is True
 
 
 _WORKER = r"""

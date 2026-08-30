@@ -49,8 +49,19 @@ def _task(tmp_path, *, forced: str | None = None):  # noqa: ANN001
     return as_fleet_task(record, spec)
 
 
+def _task_for_devices(tmp_path, devices: list[str]):  # noqa: ANN001
+    definition = _definition()
+    adapter = definition["adapters"]["A"]
+    definition["adapters"] = {name: deepcopy(adapter) for name in devices}
+    spec = resolve_task_spec(
+        "nonsensical-work", definition, devices=set(devices), repo_root=tmp_path,
+    )
+    record = prepare_task_job(spec, repo_root=tmp_path, text="hello")
+    return as_fleet_task(record, spec)
+
+
 def _snap(name: str, status: str = "present", **kwargs) -> DeviceSnapshot:
-    values = {"reachable": True, "max_jobs": 2, "pool_free": {"gpu": 1},
+    values = {"reachable": True, "enabled": True, "max_jobs": 2, "pool_free": {"gpu": 1},
               "engine_status": {"engine-v1": status}, "ram_free_mb": 32000.0}
     values.update(kwargs)
     return DeviceSnapshot(name=name, **values)
@@ -70,6 +81,48 @@ def _cfg() -> dict:
     return {"transfer_mbps": 200.0, "ssh_setup_s": 0.0,
             "per_file_overhead_s": 0.0, "min_hysteresis_s": 1.0,
             "pools": {"gpu": 1}}
+
+
+def _gpu_task(tmp_path):  # noqa: ANN001
+    definition = _definition()
+    for adapter in definition["adapters"].values():
+        adapter["memory_kind"] = "gpu"
+    spec = resolve_task_spec(
+        "opaque-work", definition, devices={"A", "B"}, repo_root=tmp_path,
+    )
+    return as_fleet_task(
+        prepare_task_job(spec, repo_root=tmp_path, text="hello"), spec,
+    )
+
+
+def test_unified_gpu_work_is_charged_once_against_host_memory(tmp_path) -> None:
+    task = _gpu_task(tmp_path)
+    profiles = _profiles(task, A=2.0)
+    profile = profiles[prepared_profile_key(task, "A")]
+    profile["peak_rss_mb"] = 4000.0
+    profile["peak_vram_mb"] = 9000.0
+    snapshot = _snap(
+        "A", gpu_memory_topology="unified", ram_free_mb=10000.0,
+        vram_free_mb=None, vram_total_mb=None,
+    )
+
+    profile["peak_vram_mb"] = 9500.0
+    assert placement.fits(task, "A", snapshot, profiles, 0.9, _cfg()) == (
+        False, "insufficient unified memory (~9500MB > 90% of free)",
+    )
+    leftover_vram = _snap(
+        "A", gpu_memory_topology="unified", ram_free_mb=10000.0,
+        vram_free_mb=None, vram_total_mb=12000.0,
+    )
+    assert placement.fits(task, "A", leftover_vram, profiles, 0.9, _cfg()) == (
+        False, "insufficient unified memory (~9500MB > 90% of free)",
+    )
+    profile["peak_vram_mb"] = 9000.0
+    assert placement.fits(task, "A", snapshot, profiles, 0.9, _cfg()) == (True, "ok")
+    unknown = _snap("A", gpu_memory_topology="unknown")
+    assert placement.fits(task, "A", unknown, profiles, 0.9, _cfg()) == (
+        False, "GPU memory topology unknown",
+    )
 
 
 @pytest.mark.parametrize(
@@ -166,6 +219,82 @@ def test_observed_profiles_choose_faster_device_and_include_backlog(tmp_path) ->
         device_backlog={"A": 20.0},
     )
     assert second.batches[0].device == "B"
+
+
+def test_explanation_distinguishes_ineligible_from_eligible_loser_with_deciding_quantity(
+    tmp_path,
+) -> None:
+    task = _task_for_devices(tmp_path, ["A", "B", "C"])
+    result = placement.plan_jobs(
+        [task], [prepared_features(task.prepared)],
+        {"A": _snap("A"), "B": _snap("B"), "C": _snap("C", "absent")},
+        _profiles(task, A=2.0, B=8.0, C=1.0), _cfg(),
+        device_backlog={"A": 1.0, "B": 4.0, "C": 0.0},
+    )
+
+    explanation = result.batches[0].explanation
+    assert explanation["schema"] == 1
+    assert explanation["selected"]["device"] == "A"
+    assert explanation["selected"]["selection_basis"] == "estimated"
+    alternatives = {item["device"]: item for item in explanation["alternatives"]}
+    assert alternatives["B"]["status"] == "eligible_not_selected"
+    assert alternatives["B"]["reason"] == "higher_estimated_finish"
+    assert alternatives["B"]["quantities"]["effective_finish_s"] \
+        > explanation["selected"]["quantities"]["effective_finish_s"]
+    assert alternatives["C"]["status"] == "ineligible"
+    assert alternatives["C"]["reason"] == "fit_rejected"
+    assert "not installed" in alternatives["C"]["detail"]
+
+
+def test_cold_start_explanation_uses_observed_order_not_fabricated_comparison(tmp_path) -> None:
+    task = _task(tmp_path)
+    result = placement.plan_jobs(
+        [task], [prepared_features(task.prepared)],
+        {"A": _snap("A"), "B": _snap("B")}, {}, _cfg(),
+    )
+
+    explanation = result.batches[0].explanation
+    assert explanation["selected"]["selection_basis"] == "cold_start"
+    assert explanation["selected"]["estimated_finish_s"] is None
+    loser = explanation["alternatives"][0]
+    assert loser["status"] == "eligible_not_selected"
+    assert loser["reason"] == "cold_start_order"
+    assert set(loser["quantities"]) == {"active_jobs", "duration_observations"}
+
+
+def test_equal_estimates_are_reported_as_a_tie_break_not_a_speed_difference(tmp_path) -> None:
+    task = _task(tmp_path)
+    result = placement.plan_jobs(
+        [task], [prepared_features(task.prepared)],
+        {"A": _snap("A"), "B": _snap("B")}, _profiles(task, A=2.0, B=2.0), _cfg(),
+    )
+
+    alternative = result.batches[0].explanation["alternatives"][0]
+    assert alternative["reason"] == "estimated_tie_break"
+    assert alternative["quantities"]["effective_finish_s"] \
+        == result.batches[0].explanation["selected"]["quantities"]["effective_finish_s"]
+
+
+def test_placement_explanation_retains_a_bounded_number_of_alternatives(tmp_path) -> None:
+    devices = [f"D{index:02d}" for index in range(40)]
+    task = _task_for_devices(tmp_path, devices)
+    snapshots = {device: _snap(device) for device in devices}
+    profiles = _profiles(task, **{
+        device: float(index + 1) for index, device in enumerate(devices)
+    })
+
+    result = placement.plan_jobs(
+        [task], [prepared_features(task.prepared)], snapshots, profiles, _cfg(),
+    )
+    explanation = result.batches[0].explanation
+
+    assert len(explanation["alternatives"]) == placement.MAX_PLACEMENT_ALTERNATIVES
+    assert explanation["retention"] == {
+        "alternative_limit": placement.MAX_PLACEMENT_ALTERNATIVES,
+        "total_alternatives": 39,
+        "retained_alternatives": placement.MAX_PLACEMENT_ALTERNATIVES,
+        "omitted": {"eligible_not_selected": 7},
+    }
 
 
 def test_max_jobs_and_pool_slots_are_enforced(tmp_path) -> None:

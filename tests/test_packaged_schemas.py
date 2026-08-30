@@ -17,6 +17,7 @@ SCHEMA_NAMES = (
     "error.v1.schema.json",
     "target-resource-policy.v1.schema.json",
     "target-resource-receipt.v1.schema.json",
+    "request-stdin.v1.schema.json",
 )
 
 
@@ -63,6 +64,14 @@ def test_protocol_schemas_pin_and_accept_the_golden_documents() -> None:
     assert capabilities["properties"]["protocol"]["properties"]["minor"]["type"] == "integer"
     assert error["properties"]["schema"]["const"] == "remrun.error"
     assert error["properties"]["version"]["const"] == 1
+
+
+def test_stdin_request_schema_is_closed_and_versioned() -> None:
+    request = _packaged_schema("request-stdin.v1.schema.json")
+    assert request["properties"]["schema"]["const"] == "remrun.fleet.request-stdin"
+    assert request["properties"]["version"]["const"] == 1
+    assert request["additionalProperties"] is False
+    assert request["properties"]["payload"]["additionalProperties"] is False
 
 
 def test_schema_contract_pins_receipt_values_and_unified_no_vram_offer() -> None:

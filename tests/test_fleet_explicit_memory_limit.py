@@ -80,7 +80,8 @@ def _compatible_definition(tmp_path: Path) -> dict:
 
 
 class GuardedTransport:
-    def __init__(self, root: Path, *, terminate: bool = False) -> None:
+    def __init__(self, root: Path, *, terminate: bool = False,
+                 allow_unprofiled: bool = False) -> None:
         self.root = root
         self.memory_guard = SimpleNamespace(
             command_limit_fraction=0.5, host_reserve_fraction=None,
@@ -89,6 +90,7 @@ class GuardedTransport:
         self.release_calls: list[tuple[MemoryReservation, bool]] = []
         self.exec_calls = 0
         self.terminate = terminate
+        self.allow_unprofiled = allow_unprofiled
 
     @staticmethod
     def native_join(*parts: str) -> str:
@@ -122,8 +124,12 @@ class GuardedTransport:
             "predicted_rss_mb": predicted_rss_mb,
             "explicit_limit_mib": explicit_limit_mib,
         })
-        assert explicit_limit_mib is not None
-        allowance = explicit_limit_mib * MIB
+        if not self.allow_unprofiled:
+            assert explicit_limit_mib is not None
+        allowance = (
+            explicit_limit_mib * MIB
+            if explicit_limit_mib is not None else 8 * 1024 * MIB
+        )
         overhead = 64 * MIB
         ceiling = 12 * 1024 * MIB
         reserve = 4 * 1024 * MIB
@@ -134,7 +140,13 @@ class GuardedTransport:
             control_overhead_bytes=overhead, capacity_bytes=allowance + overhead,
             max_command_bytes=ceiling, min_available_bytes=reserve,
             host_total_bytes=total, safe_concurrency=2, expires_at=4102444800.0,
-            allowance_basis="explicit_command_limit",
+            allowance_basis=(
+                "explicit_command_limit"
+                if explicit_limit_mib is not None else "unprofiled_available_backed"
+            ),
+            command_limit_bytes=(
+                allowance if explicit_limit_mib is not None else None
+            ),
         )
         payload = {
             "schema": 2, "status": "admitted", "reason": "reserved",
@@ -144,8 +156,7 @@ class GuardedTransport:
                        "host_total_bytes": total, "safe_concurrency": 2},
             "lease": {
                 **reservation.as_dict(include_token=True),
-                "enforced_command_limit_bytes": allowance,
-                "allowance_basis": "explicit_command_limit",
+                "allowance_basis": reservation.allowance_basis,
                 "host_reserve_bytes": reserve,
             },
         }
@@ -166,16 +177,25 @@ class GuardedTransport:
     def exec(self, _command, **kwargs) -> ExecResult:  # noqa: ANN001
         self.exec_calls += 1
         reservation = kwargs["memory_reservation"]
+        command_limit = reservation.effective_command_limit_bytes
+        termination_reason = (
+            "command_memory_limit"
+            if command_limit is not None
+            else "host_memory_reserve"
+        )
         peak = reservation.allowance_bytes + MIB if self.terminate else 6 * 1024 * MIB
         guard = {
             "schema": 1,
             "status": "terminated" if self.terminate else "ok",
-            "reason": "command_memory_limit" if self.terminate else "completed",
+            "reason": termination_reason if self.terminate else "completed",
             "detail": "/private/guard/detail",
             "command_started": True,
             "command_exit_code": 125 if self.terminate else 0,
             "helper_exit_code": 125 if self.terminate else 0,
-            "max_command_bytes": reservation.allowance_bytes,
+            "max_command_bytes": command_limit,
+            "command_limit_enforced": command_limit is not None,
+            "command_limit_bytes": command_limit,
+            "enforced_command_limit_bytes": command_limit,
             "min_available_bytes": reservation.min_available_bytes,
             "host_total_bytes": reservation.host_total_bytes,
             "initial_host_available_bytes": 20 * 1024 * MIB,
@@ -279,7 +299,7 @@ def test_hard_limit_preserves_unestimated_cold_start_without_inventing_eta(
     )
     snapshots = {
         name: DeviceSnapshot(
-            name=name, reachable=True, max_jobs=2, pool_free={},
+            name=name, reachable=True, enabled=True, max_jobs=2, pool_free={},
             engine_status={"generic": "present"}, ram_free_mb=32000.0,
         )
         for name in ("A", "B")
@@ -360,6 +380,48 @@ def test_executor_forwards_exact_limit_without_turning_it_into_prediction(
     assert "private-lease" not in durable and "/private/" not in durable
     assert "must-never-persist" not in durable
     assert prepared_memory_limit_mib(record) == 8192
+
+
+def test_memory_receipt_retains_clipped_learned_capacity_and_basis() -> None:
+    allowance = 6_098 * MIB
+    admission = {
+        "schema": 2,
+        "status": "admitted",
+        "reason": "reserved",
+        "active_leases": 1,
+        "policy": {
+            "max_command_bytes": 48 * 1024 * MIB,
+            "min_available_bytes": 16 * 1024 * MIB,
+            "host_total_bytes": 64 * 1024 * MIB,
+        },
+        "capacity": {
+            "allowance_basis": "learned_profile_live_headroom",
+            "allowance_bytes": allowance,
+            "capacity_bytes": allowance + 45 * MIB,
+            "command_limit_enforced": False,
+            "command_limit_bytes": None,
+            "enforced_command_limit_bytes": None,
+            "control_overhead_bytes": 45 * MIB,
+            "learned_allowance_bytes": 6_816 * MIB,
+            "live_backed_allowance_bytes": allowance,
+            "learned_allowance_live_backed": False,
+            "predicted_rss_bytes": int(5452.5 * MIB),
+        },
+    }
+
+    receipt = executor._memory_limit_receipt({"schema": 1}, admission=admission)
+
+    assert receipt["provenance"] == "admission-live-headroom"
+    assert receipt["admission"]["allowance_bytes"] == allowance
+    assert receipt["admission"]["capacity_bytes"] == allowance + 45 * MIB
+    assert receipt["admission"]["allowance_basis"] == (
+        "learned_profile_live_headroom"
+    )
+    assert receipt["admission"]["learned_allowance_bytes"] == 6_816 * MIB
+    assert receipt["admission"]["live_backed_allowance_bytes"] == allowance
+    assert receipt["admission"]["learned_allowance_live_backed"] is False
+    assert receipt["admission"]["predicted_rss_bytes"] == int(5452.5 * MIB)
+    assert receipt["admission"]["enforced_command_limit_bytes"] is None
 
 
 def test_explicit_limit_fails_closed_on_target_without_guard(tmp_path: Path) -> None:
@@ -591,3 +653,46 @@ def test_durable_dispatcher_path_persists_poststart_limit_receipt_without_retry(
     assert receipt["memory_limit"]["outcome"]["reason"] == "command_memory_limit"
     assert "private-lease" not in row["last_result"]
     assert "must-never-persist" not in row["last_result"]
+
+
+def test_durable_queue_persists_poststart_guard_receipt_without_submit_limit(
+        tmp_path: Path, monkeypatch) -> None:
+    """A target policy guard is durable evidence even for an unprofiled job."""
+    monkeypatch.setattr(queue_mod, "_wal_reset_safe", lambda _version: True)
+    _record, task = _raw_task()
+    transport = GuardedTransport(
+        tmp_path / "target", terminate=True, allow_unprofiled=True,
+    )
+    monkeypatch.setattr(executor, "make_transport", lambda _device: transport)
+    state_root = tmp_path / "state"
+
+    result = executor._run_group_leased(
+        "LOCAL_SIM", [task], _config(tmp_path), state_root=state_root,
+        cleanup=True, lease_seconds=60,
+    )
+
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        rows = queue.list(state="completion_unknown")
+        assert len(rows) == 1
+        row = rows[0]
+    finally:
+        queue.close()
+    assert result["no_retry"] is True
+    assert row is not None
+    receipt = json.loads(row["last_result"])
+    memory = receipt["memory_limit"]
+    assert memory["requested_mib"] is None
+    assert memory["provenance"] == "admission-live-headroom"
+    assert memory["admission"]["command_limit_enforced"] is False
+    assert memory["admission"]["enforced_command_limit_bytes"] is None
+    assert memory["admission"]["policy_command_ceiling_bytes"] == 12 * 1024 * MIB
+    assert memory["admission"]["host_reserve_bytes"] == 4 * 1024 * MIB
+    assert memory["admission"]["host_total_bytes"] == 32 * 1024 * MIB
+    assert memory["outcome"]["command_started"] is True
+    assert memory["outcome"]["peak_command_bytes"] == 8 * 1024 * MIB + MIB
+    assert memory["outcome"]["reason"] == "host_memory_reserve"
+    assert memory["outcome"]["trigger_value_bytes"] == 8 * 1024 * MIB + MIB
+    assert "private-lease" not in row["last_result"]
+    assert "must-never-persist" not in row["last_result"]
+    assert "/private/" not in row["last_result"]

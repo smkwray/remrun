@@ -101,6 +101,19 @@ def test_intrinsic_command_plan_produces_route_without_adapter(tmp_path, monkeyp
         "device": "LOCAL_SIM", "estimate_reason": "uncalibrated",
         "estimated_finish_s": None, "jobs": [0], "reason": "forced",
         "selection_basis": "forced",
+        "placement_explanation": {
+            "schema": 1,
+            "selected": {
+                "device": "LOCAL_SIM", "estimate_reason": "uncalibrated",
+                "estimated_finish_s": None, "quantities": {}, "reason": "forced",
+                "selection_basis": "forced",
+            },
+            "alternatives": [],
+            "retention": {
+                "alternative_limit": 32, "total_alternatives": 0,
+                "retained_alternatives": 0, "omitted": {},
+            },
+        },
     }]
     assert planned["skipped"] == {}
 

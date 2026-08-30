@@ -52,6 +52,9 @@ max_jobs = 1
 
 [devices.macbox]
 enabled = false
+# Optional ordinary-run override: explicit `remrun plan/run macbox` only;
+# this never enables automatic or fleet placement.
+# allow_explicit_run = true
 kind = "ssh-posix"
 os = "macos"
 address_candidates = ["macbox.local"]

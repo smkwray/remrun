@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
-from scripts.public_release_check import iter_public_files, scan
+from scripts.public_release_check import iter_public_files, scan, scan_history
+
+
+def _git(root, *args):  # noqa: ANN001, ANN202
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def test_uv_lock_is_scanned(tmp_path):
@@ -55,3 +66,32 @@ def test_private_network_literals_are_rejected(tmp_path, address):
 
     hits = scan(tmp_path, pattern_file=patterns)
     assert [(path, line) for path, line, _pattern, _text in hits] == [(readme, 1)]
+
+
+def test_history_scan_rejects_private_blob_removed_from_clean_tip(tmp_path):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "smkwray")
+    _git(tmp_path, "config", "user.email", "45633267+smkwray@users.noreply.github.com")
+    patterns = tmp_path / "patterns.txt"
+    patterns.write_text("PRIVATE_DEPLOYMENT_LABEL\n")
+    readme = tmp_path / "README.md"
+    readme.write_text("public\n")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-qm", "baseline")
+    baseline = _git(tmp_path, "rev-parse", "HEAD")
+
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    private_file = tests / "test_private.py"
+    private_file.write_text("PRIVATE_DEPLOYMENT_LABEL\n")
+    _git(tmp_path, "add", "tests/test_private.py")
+    _git(tmp_path, "commit", "-qm", "private intermediate")
+    private_commit = _git(tmp_path, "rev-parse", "HEAD")
+    private_file.unlink()
+    _git(tmp_path, "commit", "-qam", "clean tip")
+
+    assert scan(tmp_path, pattern_file=patterns) == []
+    hits = scan_history(tmp_path, base=baseline, pattern_file=patterns)
+    assert [(hit.commit, hit.path, hit.line, hit.pattern) for hit in hits] == [
+        (private_commit, "tests/test_private.py", 1, "PRIVATE_DEPLOYMENT_LABEL")
+    ]

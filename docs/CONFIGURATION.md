@@ -53,6 +53,11 @@ corroborate that exact local host. Ambiguous, unresolved, or contradictory ident
 the configured transport. Every controller-capable device may carry the marker in synced
 configuration; omitting the marker also fails closed to the transport path.
 
+`enabled = false` excludes a device from automatic ordinary placement and all fleet routing.
+An optional `allow_explicit_run = true` permits only an explicitly named ordinary `plan`/`run`
+target; it does not change fleet route eligibility or read-only resource visibility. The field is
+closed boolean and defaults to `false`.
+
 Agents may later add:
 
 ```toml
@@ -71,11 +76,14 @@ max_jobs = 2
 
 [devices.macbox.memory_guard]
 schema = 3
+# Optional: omit for a ceiling derived from physical RAM minus host reserve.
 command_limit_fraction = 0.3125
 ```
 
-The command fraction must be finite, greater than zero, and below one. Unknown
-keys are rejected. By default, the host reserve is 25% of physical RAM, bounded
+When present, the command fraction must be finite, greater than zero, and below
+one. Omitting it removes the independent fraction cap; the effective ceiling is
+physical RAM minus the host reserve, rounded down to MiB. Unknown keys are
+rejected. By default, the host reserve is 25% of physical RAM, bounded
 to 4--16 GiB and rounded upward to MiB. An explicit
 `host_reserve_fraction` remains available; when present, both fractions must sum
 to no more than one. Schema 3 is an intentional compatibility break: prior
@@ -83,28 +91,33 @@ schemas are rejected rather than silently reinterpreted. Windows targets are
 explicitly rejected while the same schema-3 semantics are
 unproved there. Physical RAM is sampled on the target under the
 admission-ledger lock. The per-command ceiling is rounded downward to MiB.
-`max_jobs` independently caps
-guarded leases. Policy maxima do not reserve capacity for jobs that did not ask
-for it. Concurrency has two independent gates:
-
-```text
-active guarded leases < max_jobs
-the exact live ledger transaction fits each requested allowance
-```
+`max_jobs` independently caps guarded leases. Policy maxima do not reserve
+capacity for jobs that did not ask for it. Existing learned and unprofiled
+allowances also do not reserve future growth or veto another inferred command.
+Each new inferred candidate is sized against measured host availability, the
+host reserve, control overhead, and any explicit owner-limit commitments; its
+own candidate allowance must fit that transaction before it starts.
 
 For a command without a learned RSS profile, remrun derives an
-**unprofiled live-capacity allowance** by dividing the remaining safely backed
-capacity among the guarded `max_jobs` slots that are still open. The share includes
-measured control-process overhead and preserves a one-MiB strict-comparison margin.
-It is capped at the per-command ceiling and must leave at least 1 MiB for the user
-process tree. A missing profile therefore neither commits every open slot's capacity
-to the first command nor assumes the command is small. The granted allowance is the
-run's hard process-tree limit. A command that reaches it is terminated; that capped
-failure is a lower bound, not a completed peak, and does not create a learned profile.
-With a positive learned profile, remrun instead reserves the observed process-tree
-RSS high-water mark plus 25% headroom, rounded upward to MiB, and refuses rather
-than clipping when that evidence-based allowance exceeds the command ceiling.
-Admission receipts label the allowance basis and byte counts.
+**unprofiled live-headroom allowance** from all remaining safely backed capacity
+above the host reserve. The allowance includes measured control-process overhead,
+preserves a one-MiB strict-comparison margin, and is capped at the effective
+per-command ceiling. A missing profile therefore never makes the command wait for
+an invented profile or receive an artificial concurrency share. The granted allowance is admission sizing and receipt evidence only; it is
+neither a later concurrency veto nor an RSS kill ceiling. Runtime
+host-reserve enforcement remains active and fail-closed. An allowance-only command may
+therefore exceed its admission allowance while the host reserve remains healthy.
+With a positive learned profile, remrun first uses the observed process-tree
+RSS high-water mark plus 25% headroom, rounded upward to MiB, when that allowance
+is backed by current live headroom. If the estimate is larger than the
+currently backed amount, remrun clips the admission commitment to the exact
+live-backed allowance and records the learned estimate and clipping basis; it
+does not refuse the command merely because the estimate is large. Learned and
+unprofiled allowances do not become runtime RSS limits. Admission and guard
+receipts carry `command_limit_enforced=false` and a null
+`enforced_command_limit_bytes` for those bases; the host-reserve guard remains
+the runtime safety boundary. An explicit owner limit carries `true` and its
+exact byte ceiling.
 
 A caller may instead request an explicit positive whole-MiB hard limit with
 `remrun run DEVICE --memory-limit-mib N -- <argv...>`. That allowance is recorded as
@@ -173,7 +186,7 @@ process group is alive.
 
 After helper staging and all other prelaunch mutation, the controller renews the
 lease while holding the same target-local lock. Every reserved unprofiled lease is
-re-sized against the current open-slot share and may only shrink; learned and explicit
+re-sized against current live headroom and may only shrink; learned and explicit
 allowances remain exact and refuse instead of being clipped.
 The helper then starts only a
 closed-gate control process and claims the same lease under that lock. Reserve,

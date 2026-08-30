@@ -709,10 +709,10 @@ def test_repoless_broader_roots_preserve_leaf_for_status_and_pull(
 ):
     local_sync_root = tmp_path / "local"
     local_run_root = local_sync_root / "proj"
-    local = local_run_root / "hearken"
+    local = local_run_root / "fixture-project"
     remote_sync_root = tmp_path / "remote"
     remote_run_root = remote_sync_root / "proj"
-    remote = remote_run_root / "hearken"
+    remote = remote_run_root / "fixture-project"
     local.mkdir(parents=True)
     remote.mkdir(parents=True)
     monkeypatch.setenv("REMRUN_STATE_ROOT", str(tmp_path / "state"))

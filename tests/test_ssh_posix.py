@@ -1075,12 +1075,30 @@ def test_ssh_posix_reserve_renew_and_guard_args_preserve_lease_capacity(
     assert decoded["capacity_bytes"] == reservation.capacity_bytes
 
 
+def test_ssh_posix_omitted_command_fraction_is_not_sent_as_null(monkeypatch):
+    t = SSHPosixTransport(
+        device(memory_guard={"schema": 3, "host_reserve_fraction": 0.25})
+    )
+    t._remote_home = "/srv/remrun-test-home"
+    requests: list[dict[str, object]] = []
+
+    def invoke(request):
+        requests.append(dict(request))
+        return _ssh_admitted_payload(request)
+
+    monkeypatch.setattr(t, "_invoke_memory_admission", invoke)
+    result = t.reserve_memory_guard()
+
+    assert result.admitted
+    assert "command_limit_fraction" not in requests[0]
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="_posix_telemetry imports fcntl, which does not exist on Windows; the "
            "module under test is POSIX-only rather than merely unexercised here",
 )
-def test_ssh_posix_fair_share_helper_uses_new_filename_and_existing_ledger():
+def test_ssh_posix_live_headroom_helper_uses_new_filename_and_existing_ledger():
     from remrun import _posix_telemetry as telemetry
 
     t = SSHPosixTransport(
@@ -1141,7 +1159,7 @@ def test_ssh_posix_accepts_only_downward_unprofiled_renewal(monkeypatch):
         "/state/helper.py", t.memory_guard, resized, "c" * 32,
         detailed=False, telemetry=False,
     )
-    assert args[args.index("--guard-max-bytes") + 1] == str(1024**3)
+    assert "--guard-max-bytes" not in args
 
     learned = MemoryReservation(
         **{
@@ -1152,6 +1170,153 @@ def test_ssh_posix_accepts_only_downward_unprofiled_renewal(monkeypatch):
     rejected = t.renew_memory_guard(learned)
     assert not rejected.admitted
     assert rejected.reason == "admission_mismatch"
+
+
+def test_ssh_posix_accepts_downward_learned_renewal_projection(monkeypatch):
+    t = SSHPosixTransport(
+        device(
+            max_jobs=3,
+            memory_guard={
+                "schema": 3,
+                "command_limit_fraction": 0.25,
+                "host_reserve_fraction": 0.25,
+            },
+        )
+    )
+    t._remote_home = "/srv/remrun-test-home"
+
+    def invoke(request):
+        payload = _ssh_admitted_payload(request)
+        lease = payload["lease"]
+        lease.update(
+            {
+                "allowance_basis": "learned_profile_live_headroom",
+                "remaining_backed_capacity_bytes": 8 * 1024**3,
+                "live_backed_allowance_bytes": 8 * 1024**3,
+                "learned_allowance_bytes": 8 * 1024**3,
+                "learned_allowance_live_backed": True,
+            }
+        )
+        if request["op"] == "renew":
+            lease.update(
+                {
+                    "allowance_bytes": 1024**3,
+                    "capacity_bytes": 1024**3 + 256 * 1024**2,
+                    "remaining_backed_capacity_bytes": 4 * 1024**3,
+                    "live_backed_allowance_bytes": 1024**3,
+                    "learned_allowance_live_backed": False,
+                }
+            )
+        return payload
+
+    monkeypatch.setattr(t, "_invoke_memory_admission", invoke)
+    reserved = t.reserve_memory_guard(predicted_rss_mb=128)
+    assert reserved.admitted
+    original = reserved.reservation
+    assert original is not None
+
+    renewed = t.renew_memory_guard(original)
+
+    assert renewed.admitted
+    resized = renewed.reservation
+    assert resized is not None
+    assert resized.allowance_bytes == 1024**3
+    assert resized.live_backed_allowance_bytes == 1024**3
+    assert resized.learned_allowance_live_backed is False
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("remaining_backed_capacity_bytes", 32 * 1024**3),
+        ("live_backed_allowance_bytes", 32 * 1024**3),
+        ("learned_allowance_live_backed", True),
+    ],
+)
+def test_ssh_posix_rejects_increased_renewal_projection(monkeypatch, field, value):
+    t = SSHPosixTransport(
+        device(
+            max_jobs=3,
+            memory_guard={
+                "schema": 3,
+                "command_limit_fraction": 0.25,
+                "host_reserve_fraction": 0.25,
+            },
+        )
+    )
+    t._remote_home = "/srv/remrun-test-home"
+
+    def invoke(request):
+        payload = _ssh_admitted_payload(request)
+        lease = payload["lease"]
+        lease.update(
+            {
+                "allowance_basis": "learned_profile_live_headroom",
+                "remaining_backed_capacity_bytes": 8 * 1024**3,
+                "live_backed_allowance_bytes": 8 * 1024**3,
+                "learned_allowance_bytes": 8 * 1024**3,
+                "learned_allowance_live_backed": False,
+            }
+        )
+        if request["op"] == "renew":
+            lease[field] = value
+        return payload
+
+    monkeypatch.setattr(t, "_invoke_memory_admission", invoke)
+    reserved = t.reserve_memory_guard(predicted_rss_mb=128)
+    assert reserved.admitted
+    original = reserved.reservation
+    assert original is not None
+
+    renewed = t.renew_memory_guard(original)
+
+    assert not renewed.admitted
+    assert renewed.reason == "admission_mismatch"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["remaining_backed_capacity_bytes", "live_backed_allowance_bytes"],
+)
+def test_ssh_posix_rejects_erased_renewal_projection(monkeypatch, field):
+    t = SSHPosixTransport(
+        device(
+            max_jobs=3,
+            memory_guard={
+                "schema": 3,
+                "command_limit_fraction": 0.25,
+                "host_reserve_fraction": 0.25,
+            },
+        )
+    )
+    t._remote_home = "/srv/remrun-test-home"
+
+    def invoke(request):
+        payload = _ssh_admitted_payload(request)
+        lease = payload["lease"]
+        lease.update(
+            {
+                "allowance_basis": "learned_profile_live_headroom",
+                "remaining_backed_capacity_bytes": 8 * 1024**3,
+                "live_backed_allowance_bytes": 8 * 1024**3,
+                "learned_allowance_bytes": 8 * 1024**3,
+                "learned_allowance_live_backed": False,
+            }
+        )
+        if request["op"] == "renew":
+            lease[field] = None
+        return payload
+
+    monkeypatch.setattr(t, "_invoke_memory_admission", invoke)
+    reserved = t.reserve_memory_guard(predicted_rss_mb=128)
+    assert reserved.admitted
+    original = reserved.reservation
+    assert original is not None
+
+    renewed = t.renew_memory_guard(original)
+
+    assert not renewed.admitted
+    assert renewed.reason == "admission_mismatch"
 
 
 def test_ssh_posix_reservation_refusal_is_structured(monkeypatch):

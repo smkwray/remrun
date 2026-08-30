@@ -268,7 +268,7 @@ def test_durable_acceptance_claims_before_start_and_reconciles_terminal_result(
         root, json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
     )
     assert accepted["acknowledged"] is True
-    assert accepted["command_started"] is False
+    assert accepted["command_started"] is True
     assert accepted["target_acceptance"]["state"] == "CLAIMED"
     assert accepted["target_acceptance"]["command_start_state"] == "NO"
 

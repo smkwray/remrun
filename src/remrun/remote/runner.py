@@ -556,10 +556,23 @@ def _is_directory_link(path: str) -> bool:
     return getattr(item, "st_reparse_tag", None) == mount_point_tag
 
 
-def build_manifest(root: str, excludes, hash_below_bytes: int, always_hash: bool = False) -> dict:
+def build_manifest(
+    root: str,
+    excludes,
+    hash_below_bytes: int,
+    always_hash: bool = False,
+    include_paths=(),
+) -> dict:
     files: dict = {}
     if not os.path.isdir(root):
         return files
+    forced = frozenset(path.strip("/") for path in include_paths if path)
+
+    def forced_or_descendant(rel: str) -> bool:
+        return rel in forced or any(path.startswith(rel + "/") for path in forced)
+
+    def excluded(rel: str) -> bool:
+        return should_exclude(rel, excludes) and not forced_or_descendant(rel)
 
     def walk_error(error):
         raise RunnerError(f"manifest walk failed: {error}")
@@ -571,7 +584,7 @@ def build_manifest(root: str, excludes, hash_below_bytes: int, always_hash: bool
         kept_dirs = []
         for name in dirnames:
             rel = f"{rel_dir}/{name}" if rel_dir else name
-            if should_exclude(rel, excludes):
+            if excluded(rel):
                 continue
             try:
                 if _is_directory_link(os.path.join(dirpath, name)):
@@ -583,7 +596,7 @@ def build_manifest(root: str, excludes, hash_below_bytes: int, always_hash: bool
         for name in filenames:
             full = os.path.join(dirpath, name)
             rel = f"{rel_dir}/{name}" if rel_dir else name
-            if should_exclude(rel, excludes) or os.path.islink(full):
+            if excluded(rel) or os.path.islink(full):
                 continue
             try:
                 item = os.stat(full)
@@ -2364,7 +2377,6 @@ def _resource_owner_start_state(
     current = str(row["command_start_state"])
     allowed = (
         (current == "NO" and state == "MAYBE")
-        or (current == "MAYBE" and state == "YES")
         or (current == "MAYBE" and state == "NO" and explicit_no_start)
         or current == state
     )
@@ -3819,6 +3831,7 @@ def legacy_main(argv) -> int:
         files = build_manifest(
             request["root"], request.get("exclude", []),
             int(request.get("hash_below_bytes", 0)), bool(request.get("always_hash", False)),
+            request.get("include_paths", []),
         )
         sys.stdout.write(json.dumps({"version": 1, "files": files}))
         return 0

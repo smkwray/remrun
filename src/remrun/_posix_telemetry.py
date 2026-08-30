@@ -42,8 +42,16 @@ GIB = 1024 * MIB
 PREDICTION_HEADROOM_FACTOR = 1.25
 CONTROL_OVERHEAD_HEADROOM_FACTOR = 2.0
 DEFAULT_RESERVATION_TTL_S = 30 * 60
+MEMORY_PROFILE_METRIC = "private_resident_sum_sampled_v1"
+
+
+class _PrivateSampleStale(Exception):
+    """One process changed identity while an additive sample was being read."""
+
+
 _ADMISSION_SCHEMA = 2
 _LEDGER_SCHEMA = 2
+_UNPROFILED_ALLOCATION_RULE = "unprofiled_live_headroom_v1"
 _DARWIN_HOST_PORT: int | None = None
 _DARWIN_TOTAL_MEMORY: int | None = None
 _DARWIN_LIBSYSTEM = None
@@ -408,6 +416,36 @@ def _private_resident_bytes(pid: int) -> int:
     raise RuntimeError("additive private-resident accounting unavailable")
 
 
+def _private_resident_sum(tree: list[ProcessRow]) -> int:
+    """Read one identity-checked additive private-resident tree sample.
+
+    A profile sample is valid only when every process in the observed tree can
+    be attributed with the same identity before and after its physical memory
+    read. A process that exits or changes identity makes this *sample* stale;
+    callers discard the whole sample rather than either crediting a partial sum
+    or invalidating otherwise complete evidence from the cleanly drained run.
+    Stable-identity read failures remain hard sampling failures.
+    """
+    total = 0
+    for row in tree:
+        if _identity_for_pid(row.pid) != row.identity:
+            raise _PrivateSampleStale("process identity changed before private memory read")
+        try:
+            value = _private_resident_bytes(row.pid)
+        except (FileNotFoundError, ProcessLookupError) as exc:
+            if _identity_for_pid(row.pid) != row.identity:
+                raise _PrivateSampleStale(
+                    "process exited during private memory read"
+                ) from exc
+            raise
+        if value < 0:
+            raise RuntimeError("private resident accounting returned a negative value")
+        if _identity_for_pid(row.pid) != row.identity:
+            raise _PrivateSampleStale("process identity changed after private memory read")
+        total += value
+    return total
+
+
 def _known_tree(
     rows: dict[int, ProcessRow],
     root_pid: int,
@@ -605,9 +643,15 @@ def _strict_fraction(value: object, name: str) -> float:
 def _policy_from_request(request: dict[str, object], host_total: int) -> dict[str, object]:
     if host_total <= 0:
         raise ValueError("physical RAM must be positive")
-    command_fraction = _strict_fraction(
-        request.get("command_limit_fraction"), "command_limit_fraction"
-    )
+    if "command_limit_fraction" in request:
+        command_fraction = _strict_fraction(
+            request["command_limit_fraction"], "command_limit_fraction"
+        )
+    else:
+        command_fraction = None
+    allocation_rule = request.get("allocation_rule", _UNPROFILED_ALLOCATION_RULE)
+    if allocation_rule != _UNPROFILED_ALLOCATION_RULE:
+        raise ValueError("memory admission allocation_rule is unsupported")
     reserve_value = request.get("host_reserve_fraction")
     if reserve_value is None:
         reserve_fraction = None
@@ -621,12 +665,16 @@ def _policy_from_request(request: dict[str, object], host_total: int) -> dict[st
         )
         reserve_basis = "explicit_fraction"
         reserve_bytes = _ceil_mib(host_total * reserve_fraction)
-        if command_fraction + reserve_fraction > 1.0:
+        if command_fraction is not None and command_fraction + reserve_fraction > 1.0:
             raise ValueError("command limit plus host reserve exceeds physical RAM")
     max_jobs = request.get("max_jobs")
     if isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs <= 0:
         raise ValueError("max_jobs must be a positive integer")
-    max_command_bytes = _floor_mib(host_total * command_fraction)
+    max_command_bytes = (
+        _floor_mib(host_total * command_fraction)
+        if command_fraction is not None
+        else _floor_nonnegative_mib(host_total - reserve_bytes)
+    )
     if reserve_bytes + max_command_bytes > host_total:
         raise ValueError("rounded command limit plus reserve exceeds physical RAM")
     # The policy ceiling is a per-command upper bound, not a commitment made by
@@ -642,6 +690,7 @@ def _policy_from_request(request: dict[str, object], host_total: int) -> dict[st
     return {
         "schema": 3,
         "command_limit_fraction": command_fraction,
+        "allocation_rule": allocation_rule,
         "host_reserve_fraction": reserve_fraction,
         "host_reserve_basis": reserve_basis,
         "max_jobs": max_jobs,
@@ -660,6 +709,7 @@ def _policy_signature(policy: dict[str, object]) -> tuple[object, ...]:
     return (
         policy.get("schema"),
         policy.get("command_limit_fraction"),
+        policy.get("allocation_rule"),
         policy.get("host_reserve_fraction"),
         policy.get("host_reserve_basis"),
         policy.get("max_jobs"),
@@ -928,7 +978,8 @@ def _validated_host_memory() -> tuple[int, int]:
 
 
 def _capacity_transaction(
-    leases: list[dict[str, object]], *, reserve_bytes: int
+    leases: list[dict[str, object]], *, reserve_bytes: int,
+    sizing_lease_id: str | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Conservatively bracket host availability and additive guarded memory.
 
@@ -961,6 +1012,7 @@ def _capacity_transaction(
     private_by_lease: dict[str, int] = {}
     observed_private_peak_by_lease: dict[str, int] = {}
     observed_rss_peak_by_lease: dict[str, int] = {}
+    inferred_capacity_overrun_bytes_by_lease: dict[str, int] = {}
     capacity_violation = False
     credited_processes: set[tuple[int, str]] = set()
     for lease in leases:
@@ -991,8 +1043,29 @@ def _capacity_transaction(
         private_by_lease[lease_name] = credited
         current_private += credited
         if credited > capacity:
-            capacity_violation = True
-        future_headroom += max(0, capacity - credited)
+            overrun = credited - capacity
+            if lease.get("allowance_basis") == "explicit_command_limit":
+                # An explicit owner limit is a hard command boundary. Keep
+                # its historical fail-closed capacity violation semantics.
+                capacity_violation = True
+            else:
+                # Learned/unprofiled allowances are placement commitments, not
+                # kill ceilings. Once an inferred job exceeds its estimate,
+                # record its actual private footprint but do not count that
+                # already-consumed memory as future growth. Host availability
+                # already excludes the current private footprint; adding it to
+                # required_available would double-count the overrun.
+                inferred_capacity_overrun_bytes_by_lease[lease_name] = overrun
+        elif (
+            lease.get("allowance_basis") == "explicit_command_limit"
+            or lease_name == sizing_lease_id
+        ):
+            # Explicit owner limits remain durable capacity commitments. An
+            # inferred allowance is considered only while this transaction is
+            # sizing that lease itself; once admitted, it is placement/receipt
+            # evidence rather than a veto on later inferred work. Host available
+            # memory already accounts for the running lease's current footprint.
+            future_headroom += max(0, capacity - credited)
         observed_rss_peak_by_lease[lease_name] = observed_rss_peak
 
     required_available = reserve_bytes + future_headroom
@@ -1007,43 +1080,79 @@ def _capacity_transaction(
         "private_bytes_by_lease": private_by_lease,
         "observed_private_peak_by_lease": observed_private_peak_by_lease,
         "observed_rss_peak_by_lease": observed_rss_peak_by_lease,
+        "inferred_capacity_overrun_bytes_by_lease": (
+            inferred_capacity_overrun_bytes_by_lease
+        ),
+        "inferred_capacity_overrun": bool(inferred_capacity_overrun_bytes_by_lease),
         "capacity_violation": capacity_violation,
         "attribution": "private_resident_additive_two_snapshot_minimum",
     }
     return host_total, capacity
 
 
-def _unprofiled_open_slot_allowance(
+def _live_backed_allowance(
+    capacity: dict[str, object],
+    *,
+    candidate_lease_id: str,
+    candidate_capacity_bytes: int,
+    policy: dict[str, object],
+    control_overhead_bytes: int,
+) -> tuple[int, int]:
+    """Return the candidate allowance backed by this transaction's samples.
+
+    ``required_available_bytes`` includes the candidate's future headroom.
+    Remove that candidate commitment before calculating the amount that the
+    current host sample can back.  Existing private usage is already reflected
+    in host ``available``; only future growth is removed here, so an inferred
+    overrun cannot be double-counted.
+    """
+    private_by_lease = capacity.get("private_bytes_by_lease")
+    credited = 0
+    if isinstance(private_by_lease, dict):
+        value = private_by_lease.get(candidate_lease_id, 0)
+        if isinstance(value, int) and not isinstance(value, bool):
+            credited = max(0, value)
+    candidate_future = max(0, candidate_capacity_bytes - credited)
+    required_without_candidate = max(
+        0,
+        int(capacity["required_available_bytes"]) - candidate_future,
+    )
+    remaining_backed = max(
+        0,
+        int(capacity["available_floor_bytes"])
+        - required_without_candidate
+        - MIB,
+    )
+    allowance = min(
+        int(policy["max_command_bytes"]),
+        _floor_nonnegative_mib(remaining_backed - control_overhead_bytes),
+    )
+    return allowance, remaining_backed
+
+
+def _unprofiled_live_headroom_allowance(
     leases: list[dict[str, object]],
     *,
     policy: dict[str, object],
     control_overhead_bytes: int,
 ) -> tuple[int, dict[str, object], int]:
-    """Size one unknown lease from capacity fairly assigned to open slots."""
+    """Size one unknown lease from all currently live-backed headroom."""
     host_total, capacity = _capacity_transaction(
         leases, reserve_bytes=int(policy["min_available_bytes"])
     )
-    open_slots = int(policy["safe_concurrency"]) - len(leases)
     remaining_backed = max(
         0,
         int(capacity["available_floor_bytes"])
         - int(capacity["required_available_bytes"])
         - MIB,
     )
-    per_open_slot = (
-        _floor_nonnegative_mib(remaining_backed / open_slots)
-        if open_slots > 0
-        else 0
-    )
     allowance = min(
         int(policy["max_command_bytes"]),
-        max(0, per_open_slot - control_overhead_bytes),
+        _floor_nonnegative_mib(remaining_backed - control_overhead_bytes),
     )
     details = {
-        "allocation_rule": "unprofiled_open_slot_fair_share_v1",
+        "allocation_rule": _UNPROFILED_ALLOCATION_RULE,
         "remaining_backed_capacity_bytes": remaining_backed,
-        "open_slots_at_sizing": open_slots,
-        "per_open_slot_capacity_bytes": per_open_slot,
         "policy_command_ceiling_bytes": int(policy["max_command_bytes"]),
         "strict_margin_bytes": MIB,
     }
@@ -1083,10 +1192,15 @@ def _admission_result(
             "lease_token": lease_token,
             "state_root": state_root,
             "allowance_bytes": lease["allowance_bytes"],
-            "enforced_command_limit_bytes": lease["allowance_bytes"],
+            "command_limit_enforced": lease.get("command_limit_bytes") is not None,
+            "command_limit_bytes": lease.get("command_limit_bytes"),
+            "enforced_command_limit_bytes": lease.get("command_limit_bytes"),
             "allowance_basis": lease.get("allowance_basis"),
             "control_overhead_bytes": lease["control_overhead_bytes"],
             "capacity_bytes": lease["capacity_bytes"],
+            "allocation_rule": lease.get(
+                "allocation_rule", policy.get("allocation_rule") if policy else None
+            ),
             "max_command_bytes": policy["max_command_bytes"] if policy else None,
             "policy_command_ceiling_bytes": policy["max_command_bytes"] if policy else None,
             "min_available_bytes": policy["min_available_bytes"] if policy else None,
@@ -1100,9 +1214,12 @@ def _admission_result(
         for name in (
             "allocation_rule",
             "remaining_backed_capacity_bytes",
-            "open_slots_at_sizing",
-            "per_open_slot_capacity_bytes",
             "strict_margin_bytes",
+            "prediction_fallback_reason",
+            "learned_allowance_bytes",
+            "live_backed_allowance_bytes",
+            "learned_allowance_live_backed",
+            "predicted_rss_bytes",
         ):
             if name in lease:
                 payload["lease"][name] = lease[name]
@@ -1170,6 +1287,55 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
         predicted = request.get("predicted_rss_bytes")
         explicit_limit = request.get("explicit_limit_bytes")
         allowance_details: dict[str, object] = {}
+        learned_allowance: int | None = None
+
+        def use_unprofiled_allowance(reason: str | None) -> dict[str, object]:
+            nonlocal allowance, allowance_basis, predicted_value
+            nonlocal explicit_limit_value, allowance_details
+            fallback_allowance, base_capacity, base_total = (
+                _unprofiled_live_headroom_allowance(
+                    leases,
+                    policy=policy,
+                    control_overhead_bytes=control_overhead,
+                )
+            )
+            if base_total != host_total:
+                raise RuntimeError(
+                    "physical-memory total changed while sizing unprofiled work"
+                )
+            allowance = fallback_allowance
+            allowance_basis = "unprofiled_available_backed"
+            predicted_value = None
+            explicit_limit_value = None
+            allowance_details = {
+                "minimum_unprofiled_allowance_bytes": MIN_UNPROFILED_ALLOWANCE_BYTES,
+                "allocation_rule": base_capacity["allocation_rule"],
+                "remaining_backed_capacity_bytes": base_capacity[
+                    "remaining_backed_capacity_bytes"
+                ],
+                "policy_command_ceiling_bytes": base_capacity[
+                    "policy_command_ceiling_bytes"
+                ],
+                "strict_margin_bytes": base_capacity["strict_margin_bytes"],
+            }
+            if reason is not None:
+                allowance_details["prediction_fallback_reason"] = reason
+            base_capacity.update(
+                {
+                    "allowance_basis": allowance_basis,
+                    "allowance_bytes": max(0, allowance),
+                    "capacity_bytes": max(0, allowance) + control_overhead,
+                    "command_limit_enforced": False,
+                    "command_limit_bytes": None,
+                    "enforced_command_limit_bytes": None,
+                    "control_overhead_bytes": control_overhead,
+                    "predicted_rss_bytes": None,
+                    "explicit_limit_bytes": None,
+                    **allowance_details,
+                }
+            )
+            return base_capacity
+
         if predicted is not None and explicit_limit is not None:
             raise ValueError(
                 "predicted_rss_bytes and explicit_limit_bytes are mutually exclusive"
@@ -1193,53 +1359,14 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                     stale_reaped=stale_reaped,
                 )
         elif predicted is None:
-            # A hard per-command ceiling is not evidence that an unknown command
+            # A policy per-command ceiling is not evidence that an unknown command
             # will consume that much memory. Size its first guarded run from
-            # capacity that is live and safe now. This allowance is the run's hard
-            # process-tree limit. Only an attributable successful run may later use
-            # the measured peak as profile input; a capped failure remains a lower bound.
-            allowance, base_capacity, base_total = _unprofiled_open_slot_allowance(
-                leases,
-                policy=policy,
-                control_overhead_bytes=control_overhead,
-            )
-            if base_total != host_total:
-                raise RuntimeError(
-                    "physical-memory total changed while sizing unprofiled work"
-                )
-            minimum_unprofiled_allowance = min(
-                MIN_UNPROFILED_ALLOWANCE_BYTES,
-                int(policy["max_command_bytes"]),
-            )
-            allowance_basis = "unprofiled_available_backed"
-            predicted_value = None
-            explicit_limit_value = None
-            allowance_details = {
-                "minimum_unprofiled_allowance_bytes": minimum_unprofiled_allowance,
-                "allocation_rule": base_capacity["allocation_rule"],
-                "remaining_backed_capacity_bytes": base_capacity[
-                    "remaining_backed_capacity_bytes"
-                ],
-                "open_slots_at_sizing": base_capacity["open_slots_at_sizing"],
-                "per_open_slot_capacity_bytes": base_capacity[
-                    "per_open_slot_capacity_bytes"
-                ],
-                "policy_command_ceiling_bytes": base_capacity[
-                    "policy_command_ceiling_bytes"
-                ],
-                "strict_margin_bytes": base_capacity["strict_margin_bytes"],
-            }
-            base_capacity.update(
-                {
-                    "allowance_basis": allowance_basis,
-                    "allowance_bytes": max(0, allowance),
-                    "control_overhead_bytes": control_overhead,
-                    "predicted_rss_bytes": None,
-                    "explicit_limit_bytes": None,
-                    **allowance_details,
-                }
-            )
-            if not base_capacity["safe"] or allowance < minimum_unprofiled_allowance:
+            # capacity that is live and safe now. This allowance reserves admission
+            # capacity only; the host reserve is the runtime safety boundary. Only
+            # an attributable successful run may later use the measured peak as
+            # profile input.
+            base_capacity = use_unprofiled_allowance(None)
+            if not base_capacity["safe"] or allowance < MIN_UNPROFILED_ALLOWANCE_BYTES:
                 return _admission_result(
                     "refused",
                     "insufficient_live_memory",
@@ -1255,20 +1382,20 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
             predicted_value = float(predicted)
             if not math.isfinite(predicted_value) or predicted_value <= 0:
                 raise ValueError("predicted_rss_bytes must be positive")
-            allowance = _ceil_mib(predicted_value * PREDICTION_HEADROOM_FACTOR)
+            learned_allowance = _ceil_mib(
+                predicted_value * PREDICTION_HEADROOM_FACTOR
+            )
+            allowance = min(learned_allowance, int(policy["max_command_bytes"]))
             allowance_basis = "learned_profile_plus_25_percent"
             explicit_limit_value = None
-            if allowance > int(policy["max_command_bytes"]):
-                return _admission_result(
-                    "refused",
-                    "prediction_exceeds_command_limit",
-                    "predicted RSS plus 25% headroom exceeds the per-command limit",
-                    policy=policy,
-                    active_leases=len(leases),
-                    stale_reaped=stale_reaped,
-                )
         capacity_bytes = allowance + control_overhead
-        if capacity_bytes + int(policy["min_available_bytes"]) > host_total:
+        # Only an explicit owner limit is allowed to fail before the atomic
+        # live-memory transaction. Learned/unprofiled estimates are not a
+        # pre-start veto, even when their requested commitment is oversized.
+        if (
+            explicit_limit is not None
+            and capacity_bytes + int(policy["min_available_bytes"]) > host_total
+        ):
             return _admission_result(
                 "refused",
                 "control_overhead_exceeds_capacity",
@@ -1283,6 +1410,12 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
             "token_hash": token_hash,
             "allowance_bytes": allowance,
             "allowance_basis": allowance_basis,
+            # Only a caller-supplied owner limit is an execution ceiling. The
+            # learned/unprofiled allowance remains an admission commitment.
+            "command_limit_bytes": (
+                allowance if allowance_basis == "explicit_command_limit" else None
+            ),
+            "allocation_rule": policy["allocation_rule"],
             "control_overhead_bytes": control_overhead,
             "capacity_bytes": capacity_bytes,
             "state": "reserved",
@@ -1292,12 +1425,24 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
         }
         candidate_leases = [*leases, lease]
         transaction_total, capacity = _capacity_transaction(
-            candidate_leases, reserve_bytes=int(policy["min_available_bytes"])
+            candidate_leases,
+            reserve_bytes=int(policy["min_available_bytes"]),
+            sizing_lease_id=lease_id,
         )
         capacity.update(
             {
                 "allowance_basis": allowance_basis,
                 "allowance_bytes": allowance,
+                "capacity_bytes": capacity_bytes,
+                "command_limit_enforced": (
+                    allowance_basis == "explicit_command_limit"
+                ),
+                "command_limit_bytes": (
+                    allowance if allowance_basis == "explicit_command_limit" else None
+                ),
+                "enforced_command_limit_bytes": (
+                    allowance if allowance_basis == "explicit_command_limit" else None
+                ),
                 "control_overhead_bytes": control_overhead,
                 "predicted_rss_bytes": predicted_value,
                 "explicit_limit_bytes": explicit_limit_value,
@@ -1306,6 +1451,83 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
         )
         if transaction_total != host_total:
             raise RuntimeError("physical-memory total changed while deriving admission policy")
+        if predicted is not None and explicit_limit is None:
+            live_allowance, remaining_backed = _live_backed_allowance(
+                capacity,
+                candidate_lease_id=lease_id,
+                candidate_capacity_bytes=capacity_bytes,
+                policy=policy,
+                control_overhead_bytes=control_overhead,
+            )
+            allowance_details.update(
+                {
+                    "learned_allowance_bytes": learned_allowance,
+                    "live_backed_allowance_bytes": live_allowance,
+                    "learned_allowance_live_backed": allowance <= live_allowance,
+                    "predicted_rss_bytes": predicted_value,
+                    "allocation_rule": _UNPROFILED_ALLOCATION_RULE,
+                    "remaining_backed_capacity_bytes": remaining_backed,
+                    "policy_command_ceiling_bytes": int(policy["max_command_bytes"]),
+                    "strict_margin_bytes": MIB,
+                }
+            )
+            capacity.update(allowance_details)
+            lease.update(allowance_details)
+            if not capacity["safe"]:
+                # The candidate is reserved-only, so its future commitment can
+                # be removed from this transaction to derive the exact amount
+                # currently backed above the reserve. Clip inferred work to
+                # that amount; only the host-reserve guard can terminate it
+                # after launch.
+                if (
+                    not capacity["capacity_violation"]
+                    and live_allowance >= MIN_UNPROFILED_ALLOWANCE_BYTES
+                    and live_allowance < allowance
+                ):
+                    lower_capacity = live_allowance + control_overhead
+                    capacity_delta = capacity_bytes - lower_capacity
+                    allowance = live_allowance
+                    allowance_basis = "learned_profile_live_headroom"
+                    allowance_details.update(
+                        {
+                            "learned_allowance_bytes": learned_allowance,
+                            "live_backed_allowance_bytes": live_allowance,
+                            "learned_allowance_live_backed": False,
+                            "learned_allowance_clip_reason": (
+                                "insufficient_live_headroom"
+                            ),
+                        }
+                    )
+                    capacity.update(
+                        {
+                            "safe": True,
+                            "future_headroom_bytes": int(
+                                capacity["future_headroom_bytes"]
+                            )
+                            - capacity_delta,
+                            "required_available_bytes": int(
+                                capacity["required_available_bytes"]
+                            )
+                            - capacity_delta,
+                            "allowance_basis": allowance_basis,
+                            "allowance_bytes": allowance,
+                            "capacity_bytes": lower_capacity,
+                            "command_limit_enforced": False,
+                            "command_limit_bytes": None,
+                            "enforced_command_limit_bytes": None,
+                            **allowance_details,
+                        }
+                    )
+                    capacity_bytes = lower_capacity
+                    lease.update(
+                        {
+                            "allowance_bytes": allowance,
+                            "allowance_basis": allowance_basis,
+                            "capacity_bytes": capacity_bytes,
+                            "command_limit_bytes": None,
+                            **allowance_details,
+                        }
+                    )
         if not capacity["safe"]:
             if stale_reaped:
                 _write_ledger(
@@ -1321,9 +1543,9 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 "insufficient_live_memory",
                 (
                     "unprofiled live allowance cannot preserve host reserve"
-                    if predicted is None and explicit_limit is None
+                    if allowance_basis == "unprofiled_available_backed"
                     else "explicit command limit cannot preserve host reserve"
-                    if explicit_limit is not None
+                    if allowance_basis == "explicit_command_limit"
                     else "learned allowance cannot preserve host reserve"
                 ),
                 policy=policy,
@@ -1340,9 +1562,9 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
             "reserved",
             (
                 "unprofiled live-capacity allowance reserved before mutation"
-                if predicted is None and explicit_limit is None
+                if allowance_basis == "unprofiled_available_backed"
                 else "explicit command limit reserved before mutation"
-                if explicit_limit is not None
+                if allowance_basis == "explicit_command_limit"
                 else "learned allowance reserved before mutation"
             ),
             policy=policy,
@@ -1358,10 +1580,18 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
 def _reservation_matches_request(
     lease: dict[str, object], request: dict[str, object]
 ) -> bool:
-    return all(
+    matches_capacity = all(
         lease.get(name) == request.get(name)
         for name in ("allowance_bytes", "control_overhead_bytes", "capacity_bytes")
     )
+    if not matches_capacity:
+        return False
+    # The field was added after the original schema-2 lease shape. When absent,
+    # derive the old explicit meaning from its basis; a present null is the
+    # authenticated unlimited form for learned/unprofiled work.
+    if "command_limit_bytes" not in request:
+        return True
+    return lease.get("command_limit_bytes") == request.get("command_limit_bytes")
 
 
 def _renew_memory_lease(request: dict[str, object]) -> dict[str, object]:
@@ -1425,9 +1655,13 @@ def _renew_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 stale_reaped=stale_reaped,
             )
         resized = False
-        if lease.get("allowance_basis") == "unprofiled_available_backed":
+        if lease.get("allowance_basis") in {
+            "unprofiled_available_backed",
+            "learned_profile_plus_25_percent",
+            "learned_profile_live_headroom",
+        }:
             other_leases = [*leases[:index], *leases[index + 1 :]]
-            recalculated, sizing, sizing_total = _unprofiled_open_slot_allowance(
+            recalculated, sizing, sizing_total = _unprofiled_live_headroom_allowance(
                 other_leases,
                 policy=policy,
                 control_overhead_bytes=int(lease["control_overhead_bytes"]),
@@ -1436,45 +1670,138 @@ def _renew_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 raise RuntimeError(
                     "physical-memory total changed while resizing reservation"
                 )
-            minimum = min(
-                MIN_UNPROFILED_ALLOWANCE_BYTES,
-                int(policy["max_command_bytes"]),
-            )
+            minimum = MIN_UNPROFILED_ALLOWANCE_BYTES
             renewed_allowance = min(int(lease["allowance_bytes"]), recalculated)
             candidate = dict(lease)
+            original_basis = str(lease["allowance_basis"])
+            renewed_basis = original_basis
+            if (
+                original_basis == "learned_profile_plus_25_percent"
+                and renewed_allowance < int(lease["allowance_bytes"])
+            ):
+                renewed_basis = "learned_profile_live_headroom"
+            remaining_backed = sizing["remaining_backed_capacity_bytes"]
+            previous_remaining_backed = lease.get(
+                "remaining_backed_capacity_bytes"
+            )
+            if isinstance(previous_remaining_backed, int) and not isinstance(
+                previous_remaining_backed, bool
+            ):
+                remaining_backed = min(remaining_backed, previous_remaining_backed)
             candidate.update(
                 {
                     "allowance_bytes": renewed_allowance,
-                    "capacity_bytes": renewed_allowance
-                    + int(lease["control_overhead_bytes"]),
+                    "capacity_bytes": (
+                        renewed_allowance + int(lease["control_overhead_bytes"])
+                    ),
+                    "allowance_basis": renewed_basis,
                     "minimum_unprofiled_allowance_bytes": minimum,
                     "allocation_rule": sizing["allocation_rule"],
-                    "remaining_backed_capacity_bytes": sizing[
-                        "remaining_backed_capacity_bytes"
-                    ],
-                    "open_slots_at_sizing": sizing["open_slots_at_sizing"],
-                    "per_open_slot_capacity_bytes": sizing[
-                        "per_open_slot_capacity_bytes"
-                    ],
+                    "remaining_backed_capacity_bytes": remaining_backed,
                     "policy_command_ceiling_bytes": sizing[
                         "policy_command_ceiling_bytes"
                     ],
                     "strict_margin_bytes": sizing["strict_margin_bytes"],
                 }
             )
+            if original_basis.startswith("learned_profile"):
+                current_live_backed = recalculated
+                previous_live_backed = lease.get("live_backed_allowance_bytes")
+                if isinstance(previous_live_backed, int) and not isinstance(
+                    previous_live_backed, bool
+                ):
+                    # Renewal may refresh the live bracket, but an authenticated
+                    # reservation never gains a less conservative projection.
+                    current_live_backed = min(current_live_backed, previous_live_backed)
+                candidate["live_backed_allowance_bytes"] = current_live_backed
+                candidate["learned_allowance_live_backed"] = (
+                    renewed_basis == "learned_profile_plus_25_percent"
+                    and renewed_allowance <= current_live_backed
+                )
+                if lease.get("learned_allowance_live_backed") is False:
+                    candidate["learned_allowance_live_backed"] = False
+            else:
+                for name in (
+                    "learned_allowance_bytes",
+                    "live_backed_allowance_bytes",
+                    "learned_allowance_live_backed",
+                ):
+                    candidate.pop(name, None)
             candidate_leases = list(leases)
             candidate_leases[index] = candidate
             transaction_total, capacity = _capacity_transaction(
-                candidate_leases, reserve_bytes=int(policy["min_available_bytes"])
+                candidate_leases,
+                reserve_bytes=int(policy["min_available_bytes"]),
+                sizing_lease_id=str(candidate["lease_id"]),
             )
+            if not capacity["safe"]:
+                candidate_capacity = int(candidate["capacity_bytes"])
+                live_allowance, remaining_backed = _live_backed_allowance(
+                    capacity,
+                    candidate_lease_id=str(candidate["lease_id"]),
+                    candidate_capacity_bytes=candidate_capacity,
+                    policy=policy,
+                    control_overhead_bytes=int(lease["control_overhead_bytes"]),
+                )
+                if (
+                    not capacity["capacity_violation"]
+                    and live_allowance >= minimum
+                    and live_allowance < renewed_allowance
+                ):
+                    lower_capacity = live_allowance + int(
+                        lease["control_overhead_bytes"]
+                    )
+                    capacity_delta = candidate_capacity - lower_capacity
+                    renewed_allowance = live_allowance
+                    if original_basis.startswith("learned_profile"):
+                        renewed_basis = "learned_profile_live_headroom"
+                    candidate.update(
+                        {
+                            "allowance_bytes": renewed_allowance,
+                            "capacity_bytes": lower_capacity,
+                            "allowance_basis": renewed_basis,
+                            "remaining_backed_capacity_bytes": min(
+                                remaining_backed,
+                                previous_remaining_backed
+                            )
+                            if isinstance(previous_remaining_backed, int)
+                            and not isinstance(previous_remaining_backed, bool)
+                            else remaining_backed,
+                        }
+                    )
+                    if original_basis.startswith("learned_profile"):
+                        effective_live_backed = live_allowance
+                        if isinstance(previous_live_backed, int) and not isinstance(
+                            previous_live_backed, bool
+                        ):
+                            effective_live_backed = min(
+                                effective_live_backed, previous_live_backed
+                            )
+                        candidate.update(
+                            {
+                                "learned_allowance_live_backed": False,
+                                "live_backed_allowance_bytes": effective_live_backed,
+                            }
+                        )
+                    capacity.update(
+                        {
+                            "safe": True,
+                            "future_headroom_bytes": int(
+                                capacity["future_headroom_bytes"]
+                            )
+                            - capacity_delta,
+                            "required_available_bytes": int(
+                                capacity["required_available_bytes"]
+                            )
+                            - capacity_delta,
+                        }
+                    )
             capacity.update(
                 {
                     key: candidate[key]
                     for key in (
                         "allocation_rule",
                         "remaining_backed_capacity_bytes",
-                        "open_slots_at_sizing",
-                        "per_open_slot_capacity_bytes",
                         "policy_command_ceiling_bytes",
                         "strict_margin_bytes",
                     )
@@ -1482,11 +1809,24 @@ def _renew_memory_lease(request: dict[str, object]) -> dict[str, object]:
             )
             capacity.update(
                 {
-                    "allowance_basis": "unprofiled_available_backed",
+                    "allowance_basis": renewed_basis,
                     "allowance_bytes": renewed_allowance,
+                    "command_limit_enforced": False,
+                    "command_limit_bytes": None,
+                    "enforced_command_limit_bytes": None,
                     "previous_allowance_bytes": int(lease["allowance_bytes"]),
                     "control_overhead_bytes": int(lease["control_overhead_bytes"]),
                     "minimum_unprofiled_allowance_bytes": minimum,
+                    "learned_allowance_bytes": candidate.get(
+                        "learned_allowance_bytes"
+                    ),
+                    "live_backed_allowance_bytes": candidate.get(
+                        "live_backed_allowance_bytes"
+                    ),
+                    "learned_allowance_live_backed": candidate.get(
+                        "learned_allowance_live_backed"
+                    ),
+                    "predicted_rss_bytes": candidate.get("predicted_rss_bytes"),
                 }
             )
             if renewed_allowance < minimum or not sizing["safe"]:
@@ -1717,10 +2057,77 @@ def _claim_memory_lease(
         candidate_leases = list(leases)
         candidate_leases[index] = running
         transaction_total, capacity = _capacity_transaction(
-            candidate_leases, reserve_bytes=int(policy["min_available_bytes"])
+            candidate_leases,
+            reserve_bytes=int(policy["min_available_bytes"]),
+            sizing_lease_id=lease_id,
         )
         if transaction_total != host_total:
             raise RuntimeError("physical-memory total changed while claiming reservation")
+        allowance_basis = str(original.get("allowance_basis") or "")
+        if not capacity["safe"] and allowance_basis in {
+            "learned_profile_plus_25_percent",
+            "learned_profile_live_headroom",
+            "unprofiled_available_backed",
+        }:
+            candidate_capacity = int(running["capacity_bytes"])
+            live_allowance, remaining_backed = _live_backed_allowance(
+                capacity,
+                candidate_lease_id=lease_id,
+                candidate_capacity_bytes=candidate_capacity,
+                policy=policy,
+                control_overhead_bytes=int(running["control_overhead_bytes"]),
+            )
+            if (
+                not capacity["capacity_violation"]
+                and live_allowance >= MIN_UNPROFILED_ALLOWANCE_BYTES
+                and live_allowance < int(running["allowance_bytes"])
+            ):
+                lower_capacity = live_allowance + int(running["control_overhead_bytes"])
+                capacity_delta = candidate_capacity - lower_capacity
+                clipped_basis = (
+                    "learned_profile_live_headroom"
+                    if allowance_basis.startswith("learned_profile")
+                    else allowance_basis
+                )
+                running.update(
+                    {
+                        "allowance_bytes": live_allowance,
+                        "allowance_basis": clipped_basis,
+                        "capacity_bytes": lower_capacity,
+                        "remaining_backed_capacity_bytes": remaining_backed,
+                    }
+                )
+                if allowance_basis.startswith("learned_profile"):
+                    running.update(
+                        {
+                            "live_backed_allowance_bytes": live_allowance,
+                            "learned_allowance_live_backed": False,
+                        }
+                    )
+                capacity.update(
+                    {
+                        "safe": True,
+                        "future_headroom_bytes": int(
+                            capacity["future_headroom_bytes"]
+                        )
+                        - capacity_delta,
+                        "required_available_bytes": int(
+                            capacity["required_available_bytes"]
+                        )
+                        - capacity_delta,
+                        "allowance_basis": clipped_basis,
+                        "allowance_bytes": live_allowance,
+                        "capacity_bytes": lower_capacity,
+                        "remaining_backed_capacity_bytes": remaining_backed,
+                    }
+                )
+                if allowance_basis.startswith("learned_profile"):
+                    capacity.update(
+                        {
+                            "live_backed_allowance_bytes": live_allowance,
+                            "learned_allowance_live_backed": False,
+                        }
+                    )
         observed_control = int(
             capacity.get("observed_rss_peak_by_lease", {}).get(lease_id, 0)
         )
@@ -1874,6 +2281,10 @@ class Samples:
         self.observed_process_samples = 0
         self.process_table_errors = 0
         self.peak_rss_bytes: int | None = None
+        self.peak_private_resident_bytes: int | None = None
+        self.private_sample_count = 0
+        self.private_sampling_complete = True
+        self.private_sampling_errors: list[str] = []
         self.errors: list[str] = []
         self._host_cpu_prior: tuple[int, int] | None = None
         self._host_busy: list[float] = []
@@ -1904,6 +2315,7 @@ class Samples:
                 self.observed_process_samples += 1
                 rss = sum(row.rss_bytes for row in tree)
                 self.peak_rss_bytes = max(self.peak_rss_bytes or 0, rss)
+                self.record_private_tree(tree)
         except Exception as exc:
             self.process_table_errors += 1
             self.errors.append(f"process table: {type(exc).__name__}")
@@ -1917,6 +2329,24 @@ class Samples:
                 self._sample_gpu()
                 self._next_gpu_at = now + GPU_SAMPLE_INTERVAL_S
         return active
+
+    def record_private_tree(self, tree: list[ProcessRow]) -> None:
+        if not tree:
+            return
+        try:
+            private_bytes = _private_resident_sum(tree)
+        except _PrivateSampleStale:
+            return
+        except Exception as exc:
+            self.private_sampling_complete = False
+            self.private_sampling_errors.append(
+                f"private memory: {type(exc).__name__}"
+            )
+            return
+        self.private_sample_count += 1
+        self.peak_private_resident_bytes = max(
+            self.peak_private_resident_bytes or 0, private_bytes
+        )
 
     def _sample_host_pressure(self) -> None:
         try:
@@ -2050,6 +2480,37 @@ def _shell_exit_code(returncode: int) -> int:
     return returncode
 
 
+def _memory_profile_payload(
+    *,
+    peak_bytes: int | None,
+    sample_count: int,
+    sampling_complete: bool,
+    process_tree_drained: bool,
+    forced_cleanup: bool,
+) -> dict[str, object]:
+    """Describe the versioned, admission-safe memory profile evidence."""
+    sampled = sampling_complete and peak_bytes is not None and peak_bytes > 0
+    trusted = sampled and process_tree_drained and not forced_cleanup
+    if not sampled:
+        coverage = "sampler_failed"
+    elif forced_cleanup:
+        coverage = "forced_cleanup"
+    elif not process_tree_drained:
+        coverage = "tree_not_drained"
+    elif sample_count < 2:
+        coverage = "short_lived_sampled"
+    else:
+        coverage = "known_tree_drained"
+    return {
+        "metric": MEMORY_PROFILE_METRIC if trusted else None,
+        "algorithm_version": 1,
+        "peak_bytes": peak_bytes if trusted else None,
+        "sample_count": sample_count,
+        "coverage": coverage,
+        "shared_page_semantics": "excluded",
+    }
+
+
 def _unknown_payload(reason: str, *, wall_sec: float | None = None) -> dict[str, object]:
     return {
         "schema": 1,
@@ -2080,6 +2541,13 @@ def _unknown_payload(reason: str, *, wall_sec: float | None = None) -> dict[str,
                 "status": "unavailable",
             },
         },
+        "memory_profile": _memory_profile_payload(
+            peak_bytes=None,
+            sample_count=0,
+            sampling_complete=False,
+            process_tree_drained=False,
+            forced_cleanup=False,
+        ),
         "gpu": {
             "scope": "whole_device",
             "kind": "unknown",
@@ -2205,6 +2673,13 @@ def _detailed_run(argv: list[str]) -> tuple[int, dict[str, object]]:
                 "shared_page_semantics": "may_double_count",
                 "whole_device": samples.host_memory_payload(),
             },
+            "memory_profile": _memory_profile_payload(
+                peak_bytes=samples.peak_private_resident_bytes,
+                sample_count=samples.private_sample_count,
+                sampling_complete=samples.private_sampling_complete,
+                process_tree_drained=drained,
+                forced_cleanup=False,
+            ),
             "gpu": samples.gpu_payload(),
             # Deprecated compatibility aliases. POSIX now reports the sampled
             # concurrent RSS sum rather than largest-child ru_maxrss.
@@ -2451,7 +2926,7 @@ def _guard_base(
     command_started: bool,
     command_exit_code: int | None,
     helper_exit_code: int,
-    max_command_bytes: int,
+    max_command_bytes: int | None,
     min_available_bytes: int,
     host_total_bytes: int | None = None,
     initial_host_available_bytes: int | None = None,
@@ -2471,6 +2946,8 @@ def _guard_base(
         "command_exit_code": command_exit_code,
         "helper_exit_code": helper_exit_code,
         "max_command_bytes": max_command_bytes,
+        "command_limit_enforced": max_command_bytes is not None,
+        "enforced_command_limit_bytes": max_command_bytes,
         "min_available_bytes": min_available_bytes,
         "host_total_bytes": host_total_bytes,
         "initial_host_available_bytes": initial_host_available_bytes,
@@ -2604,6 +3081,7 @@ def _record_detailed_guard_sample(
         samples.observed_process_samples += 1
         rss = sum(row.rss_bytes for row in tree)
         samples.peak_rss_bytes = max(samples.peak_rss_bytes or 0, rss)
+        samples.record_private_tree(tree)
     samples.host_total_bytes = host_total
     samples.min_available_bytes = min(
         samples.min_available_bytes
@@ -2642,6 +3120,9 @@ def _guard_telemetry_payload(
     process_tree_drained: bool,
     forced_cleanup: bool,
     samples: Samples | None,
+    profile_peak_bytes: int | None = None,
+    profile_sample_count: int = 0,
+    profile_sampling_complete: bool = False,
 ) -> dict[str, object]:
     cpu_sec = (
         float(usage.ru_utime) + float(usage.ru_stime)
@@ -2656,6 +3137,13 @@ def _guard_telemetry_payload(
     if not detailed:
         return {
             "peak_rss_mb": round(peak_bytes / MIB, 1) if peak_bytes is not None else None,
+            "memory_profile": _memory_profile_payload(
+                peak_bytes=profile_peak_bytes,
+                sample_count=profile_sample_count,
+                sampling_complete=profile_sampling_complete,
+                process_tree_drained=process_tree_drained,
+                forced_cleanup=forced_cleanup,
+            ),
             "avg_cpu_pct": round(avg_cpu, 1) if avg_cpu is not None else None,
             "cpu_sec": round(cpu_sec, 3) if cpu_sec is not None else None,
             "wall_sec": round(wall_sec, 3),
@@ -2723,6 +3211,25 @@ def _guard_telemetry_payload(
                 "status": "measured" if min_host_available is not None else "unavailable",
             },
         },
+        "memory_profile": _memory_profile_payload(
+            peak_bytes=(
+                samples.peak_private_resident_bytes
+                if samples is not None
+                else profile_peak_bytes
+            ),
+            sample_count=(
+                samples.private_sample_count
+                if samples is not None
+                else profile_sample_count
+            ),
+            sampling_complete=(
+                samples.private_sampling_complete
+                if samples is not None
+                else profile_sampling_complete
+            ),
+            process_tree_drained=process_tree_drained,
+            forced_cleanup=forced_cleanup,
+        ),
         "gpu": gpu,
         "peak_rss_mb": round(peak_bytes / MIB, 1) if peak_bytes is not None else None,
         "avg_cpu_pct": round(avg_cpu, 1) if avg_cpu is not None else None,
@@ -2808,7 +3315,7 @@ def _quarantine_or_hold_guard_lease(
 def _guarded_run(
     argv: list[str],
     *,
-    max_command_bytes: int,
+    max_command_bytes: int | None,
     min_available_bytes: int,
     token: str,
     detailed: bool,
@@ -2818,23 +3325,69 @@ def _guarded_run(
     helper_exit = 125
     initial_available: int | None = None
     host_total: int | None = None
+    guard_result_fields: dict[str, object] = {}
+
+    def emit_guard_result(payload: dict[str, object]) -> None:
+        _emit_guard_result(token, {**payload, **guard_result_fields})
+
     try:
         if not re.fullmatch(r"[0-9a-f]{32}", token):
             raise ValueError("guard token must be 32 lowercase hexadecimal characters")
-        if max_command_bytes <= 0 or min_available_bytes <= 0:
+        if (
+            max_command_bytes is not None
+            and (max_command_bytes <= 0 or max_command_bytes % MIB != 0)
+        ) or min_available_bytes <= 0:
             raise ValueError("guard thresholds must be positive")
         if lease_request is None:
             raise ValueError("guarded launch requires a target-local reservation")
         _validated_admission_request({**lease_request, "op": "renew"})
-        if lease_request.get("allowance_bytes") != max_command_bytes:
-            raise ValueError("guard allowance does not match the reservation")
+        allowance = lease_request.get("allowance_bytes")
+        if allowance is None or isinstance(allowance, bool) or not isinstance(allowance, int):
+            raise ValueError("guard allowance is missing or invalid")
+        requested_command_limit = lease_request.get("command_limit_bytes")
+        if requested_command_limit is None and (
+            lease_request.get("allowance_basis") == "explicit_command_limit"
+        ):
+            # Older controller leases did not carry the explicit field, but
+            # their basis still proves that allowance is the requested limit.
+            requested_command_limit = allowance
+        if requested_command_limit != max_command_bytes:
+            raise ValueError("guard command limit does not match the reservation")
+        guard_result_fields.update(
+            {
+                "command_limit_enforced": max_command_bytes is not None,
+                "command_limit_bytes": max_command_bytes,
+                "enforced_command_limit_bytes": max_command_bytes,
+                "allowance_bytes": lease_request.get("allowance_bytes"),
+                "control_overhead_bytes": lease_request.get(
+                    "control_overhead_bytes"
+                ),
+                "capacity_bytes": lease_request.get("capacity_bytes"),
+                "allowance_basis": lease_request.get("allowance_basis"),
+                "allocation_rule": lease_request.get("allocation_rule"),
+                "remaining_backed_capacity_bytes": lease_request.get(
+                    "remaining_backed_capacity_bytes"
+                ),
+                "strict_margin_bytes": lease_request.get("strict_margin_bytes"),
+                "learned_allowance_bytes": lease_request.get(
+                    "learned_allowance_bytes"
+                ),
+                "live_backed_allowance_bytes": lease_request.get(
+                    "live_backed_allowance_bytes"
+                ),
+                "learned_allowance_live_backed": lease_request.get(
+                    "learned_allowance_live_backed"
+                ),
+                "predicted_rss_bytes": lease_request.get("predicted_rss_bytes"),
+            }
+        )
         rows = _processes()
         if os.getpid() not in rows:
             raise RuntimeError("guard process is absent from the process table")
         host_total, initial_available = _host_memory()
         if host_total <= 0 or not 0 <= initial_available <= host_total:
             raise RuntimeError("invalid initial host-memory counters")
-        if max_command_bytes + min_available_bytes > host_total:
+        if max_command_bytes is not None and max_command_bytes + min_available_bytes > host_total:
             payload = _guard_base(
                 status="refused",
                 reason="thresholds_exceed_host",
@@ -2849,7 +3402,7 @@ def _guarded_run(
                 min_host_available_bytes=initial_available,
             )
             _best_effort_release_guard_lease(lease_request, reserved_only=True)
-            _emit_guard_result(token, payload)
+            emit_guard_result(payload)
             return helper_exit
         if initial_available <= min_available_bytes:
             payload = _guard_base(
@@ -2866,7 +3419,7 @@ def _guarded_run(
                 min_host_available_bytes=initial_available,
             )
             _best_effort_release_guard_lease(lease_request, reserved_only=True)
-            _emit_guard_result(token, payload)
+            emit_guard_result(payload)
             return helper_exit
     except Exception as exc:
         payload = _guard_base(
@@ -2883,12 +3436,15 @@ def _guarded_run(
             min_host_available_bytes=initial_available,
         )
         _best_effort_release_guard_lease(lease_request, reserved_only=True)
-        _emit_guard_result(token, payload)
+        emit_guard_result(payload)
         return helper_exit
 
     child: subprocess.Popen | None = None
     known: dict[int, str] = {}
     peak_bytes: int | None = None
+    profile_peak_bytes: int | None = None
+    profile_sample_count = 0
+    profile_sampling_complete = True
     min_host_available = initial_available
     sample_count = 0
     usage: resource.struct_rusage | None = None
@@ -2901,6 +3457,18 @@ def _guarded_run(
     gate_release_attempted = False
     exec_confirmed = False
     lease_claimed = False
+
+    def record_profile_tree(tree: list[ProcessRow]) -> None:
+        nonlocal profile_peak_bytes, profile_sample_count, profile_sampling_complete
+        if not tree:
+            return
+        try:
+            private_bytes = _private_resident_sum(tree)
+        except Exception:
+            profile_sampling_complete = False
+            return
+        profile_sample_count += 1
+        profile_peak_bytes = max(profile_peak_bytes or 0, private_bytes)
 
     def interrupted(signum, _frame):  # noqa: ANN001
         raise _GuardInterrupted(f"signal {signum}")
@@ -2941,6 +3509,65 @@ def _guarded_run(
             root_identity=root_identity,
             pgid=child.pid,
         )
+        claimed_lease = claim.get("lease")
+        if isinstance(claimed_lease, dict):
+            # Claim-time live sampling may clip an inferred lease after the
+            # controller's reservation bracket. Carry that authenticated shape
+            # into renewal/release cleanup so it cannot look stale or mismatched.
+            lease_request = {
+                **lease_request,
+                **{
+                    name: claimed_lease[name]
+                    for name in (
+                        "allowance_bytes",
+                        "control_overhead_bytes",
+                        "capacity_bytes",
+                        "allowance_basis",
+                        "allocation_rule",
+                        "command_limit_bytes",
+                        "remaining_backed_capacity_bytes",
+                        "strict_margin_bytes",
+                        "learned_allowance_bytes",
+                        "live_backed_allowance_bytes",
+                        "learned_allowance_live_backed",
+                        "predicted_rss_bytes",
+                    )
+                    if name in claimed_lease
+                },
+            }
+            guard_result_fields.update(
+                {
+                    "command_limit_enforced": claimed_lease.get(
+                        "command_limit_bytes"
+                    )
+                    is not None,
+                    "command_limit_bytes": claimed_lease.get("command_limit_bytes"),
+                    "enforced_command_limit_bytes": claimed_lease.get(
+                        "command_limit_bytes"
+                    ),
+                    "allowance_bytes": claimed_lease.get("allowance_bytes"),
+                    "control_overhead_bytes": claimed_lease.get(
+                        "control_overhead_bytes"
+                    ),
+                    "capacity_bytes": claimed_lease.get("capacity_bytes"),
+                    "allowance_basis": claimed_lease.get("allowance_basis"),
+                    "allocation_rule": claimed_lease.get("allocation_rule"),
+                    "remaining_backed_capacity_bytes": claimed_lease.get(
+                        "remaining_backed_capacity_bytes"
+                    ),
+                    "strict_margin_bytes": claimed_lease.get("strict_margin_bytes"),
+                    "learned_allowance_bytes": claimed_lease.get(
+                        "learned_allowance_bytes"
+                    ),
+                    "live_backed_allowance_bytes": claimed_lease.get(
+                        "live_backed_allowance_bytes"
+                    ),
+                    "learned_allowance_live_backed": claimed_lease.get(
+                        "learned_allowance_live_backed"
+                    ),
+                    "predicted_rss_bytes": claimed_lease.get("predicted_rss_bytes"),
+                }
+            )
         if claim.get("status") != "admitted":
             try:
                 os.close(gate_write)
@@ -2965,7 +3592,7 @@ def _guarded_run(
                 cleanup_complete=cleanup,
             )
             payload["memory_admission"] = claim
-            _emit_guard_result(token, payload)
+            emit_guard_result(payload)
             return helper_exit
         lease_claimed = True
         # READY means all fail-safe machinery and the target-local claim exist.
@@ -3001,7 +3628,7 @@ def _guarded_run(
                 process_tree_drained=cleanup,
                 cleanup_complete=cleanup,
             )
-            _emit_guard_result(token, payload)
+            emit_guard_result(payload)
             return helper_exit
         if user_pid is not None:
             user_identity = _identity_for_pid(user_pid)
@@ -3025,6 +3652,8 @@ def _guarded_run(
                     user_tree = [row for row in tree if row.pid != child.pid]
                     rss = sum(row.rss_bytes for row in user_tree)
                     peak_bytes = max(peak_bytes or 0, rss)
+                    if samples is None:
+                        record_profile_tree(user_tree)
                     sample_count += 1
                     current_total, available = _host_memory()
                     if (
@@ -3047,7 +3676,7 @@ def _guarded_run(
                             host_available=available,
                             now=now,
                         )
-                    if rss >= max_command_bytes:
+                    if max_command_bytes is not None and rss >= max_command_bytes:
                         guard_status = "terminated"
                         guard_reason = "command_memory_limit"
                         guard_detail = "sampled command-tree RSS reached the hard ceiling"
@@ -3120,10 +3749,13 @@ def _guarded_run(
                         process_tree_drained=cleanup,
                         forced_cleanup=True,
                         samples=samples,
+                        profile_peak_bytes=profile_peak_bytes,
+                        profile_sample_count=profile_sample_count,
+                        profile_sampling_complete=profile_sampling_complete,
                     )
                 )
             finalize_claimed_lease(cleanup)
-            _emit_guard_result(token, payload)
+            emit_guard_result(payload)
             return helper_exit
 
         direct_wall = max(0.0, time.monotonic() - started)
@@ -3141,6 +3773,8 @@ def _guarded_run(
                 user_tree = [row for row in tree if row.pid != child.pid]
                 rss = sum(row.rss_bytes for row in user_tree)
                 peak_bytes = max(peak_bytes or 0, rss)
+                if samples is None:
+                    record_profile_tree(user_tree)
                 sample_count += 1
                 active = len(user_tree)
                 current_total, available = _host_memory()
@@ -3164,7 +3798,7 @@ def _guarded_run(
                         host_available=available,
                         now=time.monotonic(),
                     )
-                if rss >= max_command_bytes:
+                if max_command_bytes is not None and rss >= max_command_bytes:
                     guard_status = "terminated"
                     guard_reason = "command_memory_limit"
                     guard_detail = "sampled descendant RSS reached the hard ceiling"
@@ -3242,10 +3876,13 @@ def _guarded_run(
                         process_tree_drained=cleanup,
                         forced_cleanup=forced_cleanup,
                         samples=samples,
+                        profile_peak_bytes=profile_peak_bytes,
+                        profile_sample_count=profile_sample_count,
+                        profile_sampling_complete=profile_sampling_complete,
                     )
                 )
             finalize_claimed_lease(cleanup)
-            _emit_guard_result(token, payload)
+            emit_guard_result(payload)
             return helper_exit
 
         assert direct_rc is not None
@@ -3263,6 +3900,9 @@ def _guarded_run(
                     process_tree_drained=drained,
                     forced_cleanup=forced_cleanup,
                     samples=samples,
+                    profile_peak_bytes=profile_peak_bytes,
+                    profile_sample_count=profile_sample_count,
+                    profile_sampling_complete=profile_sampling_complete,
                 )
             )
         payload = _guard_base(
@@ -3284,7 +3924,7 @@ def _guarded_run(
             cleanup_complete=cleanup,
         )
         finalize_claimed_lease(cleanup)
-        _emit_guard_result(token, payload)
+        emit_guard_result(payload)
         return command_exit
 
     except BaseException as exc:
@@ -3342,7 +3982,7 @@ def _guarded_run(
             process_tree_drained=cleanup if child is not None else None,
             cleanup_complete=cleanup if child is not None else None,
         )
-        _emit_guard_result(token, payload)
+        emit_guard_result(payload)
         return helper_exit
     finally:
         for fd in (gate_write, exec_status_fd):
@@ -3380,7 +4020,8 @@ def main() -> int:
     except ValueError:
         sys.stderr.write(
             "usage: python _posix_telemetry.py [--detailed] "
-            "[--guard-max-bytes N --guard-min-available-bytes N --guard-token TOKEN] "
+            "[--guard-max-bytes N] --guard-min-available-bytes N "
+            "--guard-token TOKEN --guard-lease-b64 VALUE "
             "-- <command> [args...]\n"
         )
         return 2
@@ -3447,7 +4088,8 @@ def main() -> int:
     if guard_requested:
         token = option_value("--guard-token") or ""
         try:
-            max_bytes = int(option_value("--guard-max-bytes") or "")
+            max_value = option_value("--guard-max-bytes")
+            max_bytes = int(max_value) if max_value is not None else None
             reserve_bytes = int(option_value("--guard-min-available-bytes") or "")
             lease_raw = base64.urlsafe_b64decode(
                 (option_value("--guard-lease-b64") or "").encode("ascii")

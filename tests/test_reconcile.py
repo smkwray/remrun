@@ -78,6 +78,98 @@ def test_first_run_pushes_local_only(tmp_path: Path):
     assert (Path(remote_root) / "sub" / "b.txt").read_text() == "world"
 
 
+def test_preflight_force_includes_declared_lock_input_over_global_exclude(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "uv.lock").write_text("pinned", encoding="utf-8")
+    (local / "other.lock").write_text("not declared", encoding="utf-8")
+
+    result = preflight_reconcile(
+        transport=t,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["*.lock"],
+        hash_below_bytes=1_000_000,
+        prev_local=None,
+        prev_remote=None,
+        backup_root=backup,
+        include_paths=("uv.lock",),
+    )
+
+    assert result.pushed == ["uv.lock"]
+    assert (Path(remote_root) / "uv.lock").read_text(encoding="utf-8") == "pinned"
+    assert not (Path(remote_root) / "other.lock").exists()
+    assert "uv.lock" in result.local_manifest
+    assert "uv.lock" in result.remote_manifest
+
+
+def test_bootstrap_input_target_edit_cannot_overwrite_controller(tmp_path: Path):
+    local, remote_root, transport, backup = setup(tmp_path)
+    (local / "uv.lock").write_text("controller", encoding="utf-8")
+    first = preflight_reconcile(
+        transport=transport,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["*.lock"],
+        hash_below_bytes=1_000_000,
+        prev_local=None,
+        prev_remote=None,
+        backup_root=backup,
+        include_paths=("uv.lock",),
+    )
+    (Path(remote_root) / "uv.lock").write_text("target-tampered", encoding="utf-8")
+
+    result = preflight_reconcile(
+        transport=transport,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["*.lock"],
+        hash_below_bytes=1_000_000,
+        prev_local=first.local_manifest,
+        prev_remote=first.remote_manifest,
+        backup_root=backup,
+        include_paths=("uv.lock",),
+    )
+
+    assert result.has_conflicts
+    assert result.conflicts[0].state == "bootstrap-input-diverged"
+    assert (local / "uv.lock").read_text(encoding="utf-8") == "controller"
+    assert (Path(remote_root) / "uv.lock").read_text(encoding="utf-8") == "target-tampered"
+
+
+def test_bootstrap_input_missing_on_target_is_repaired_from_controller(tmp_path: Path):
+    local, remote_root, transport, backup = setup(tmp_path)
+    (local / "uv.lock").write_text("controller", encoding="utf-8")
+    first = preflight_reconcile(
+        transport=transport,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["*.lock"],
+        hash_below_bytes=1_000_000,
+        prev_local=None,
+        prev_remote=None,
+        backup_root=backup,
+        include_paths=("uv.lock",),
+    )
+    (Path(remote_root) / "uv.lock").unlink()
+
+    result = preflight_reconcile(
+        transport=transport,
+        local_root=local,
+        remote_root=remote_root,
+        excludes=["*.lock"],
+        hash_below_bytes=1_000_000,
+        prev_local=first.local_manifest,
+        prev_remote=first.remote_manifest,
+        backup_root=backup,
+        include_paths=("uv.lock",),
+    )
+
+    assert not result.has_conflicts
+    assert result.pushed == ["uv.lock"]
+    assert (local / "uv.lock").read_text(encoding="utf-8") == "controller"
+    assert (Path(remote_root) / "uv.lock").read_text(encoding="utf-8") == "controller"
+
+
 def test_remote_only_pulled(tmp_path: Path):
     local, remote_root, t, backup = setup(tmp_path)
     Path(remote_root).mkdir(parents=True)

@@ -326,7 +326,10 @@ def build_resource_envelope(
 
     gpus = list(snapshot.gpus)
     gpu_kind = snapshot.gpu_kind
-    if not gpus and gpu_kind != "unified" and device.vram_gb > 0:
+    # Only a resolved discrete/auto snapshot may use configured VRAM as an
+    # explicit static fallback. Unknown topology must not become a fabricated
+    # separate card, and unified declarations never expose VRAM.
+    if not gpus and gpu_kind in {"auto", "discrete"} and device.vram_gb > 0:
         configured_vram = int(device.vram_gb * 1024**3)
         gpus = [
             GPUResourceSnapshot(

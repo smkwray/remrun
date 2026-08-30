@@ -40,6 +40,10 @@ _CANDIDATE_LOCAL_CONFLICT_STATES = frozenset({
     # A missing remote root is broken state on this candidate only; another candidate may
     # have a healthy checkout. The symmetric local-vanished state is intentionally absent.
     "remote-vanished",
+    # Bootstrap inputs are controller-authoritative. A target-side divergence is
+    # candidate-local and can safely fall through to another device because the
+    # refusal happens before either tree is mutated.
+    "bootstrap-input-diverged",
 })
 
 
@@ -131,13 +135,45 @@ def _fresh_local_entry(path: Path, *, hash_if_size: int | None) -> FileEntry | N
 
 
 def _build_local_manifest(
-    root: Path, excludes: list[str], *, hash_below_bytes: int | None
+    root: Path,
+    excludes: list[str],
+    *,
+    hash_below_bytes: int | None,
+    include_paths: list[str] | tuple[str, ...] = (),
 ) -> Manifest:
     """Map trustworthy-snapshot failures onto the run transfer-error seam."""
     try:
-        return build_manifest(root, excludes, hash_below_bytes=hash_below_bytes)
+        return build_manifest(
+            root,
+            excludes,
+            hash_below_bytes=hash_below_bytes,
+            include_paths=include_paths,
+        )
     except ManifestError as exc:
         raise TransportError(str(exc)) from exc
+
+
+def _remote_manifest(
+    transport: BaseTransport,
+    remote_root: str,
+    excludes: list[str],
+    hash_below_bytes: int,
+    include_paths: list[str] | tuple[str, ...],
+) -> Manifest:
+    """Fetch a remote manifest, preserving compatibility with test transports.
+
+    The keyword is only needed for a declared bootstrap input.  Legacy/custom
+    transports that implement the original manifest signature remain valid for
+    ordinary runs, while production backends all support the exact inclusion.
+    """
+    if include_paths:
+        return transport.manifest(
+            remote_root,
+            excludes,
+            hash_below_bytes,
+            include_paths=include_paths,
+        )
+    return transport.manifest(remote_root, excludes, hash_below_bytes)
 
 
 def _already_converged(local_path: Path, remote_entry: FileEntry | None) -> bool:
@@ -257,6 +293,7 @@ def preflight_reconcile(
     backup_below_bytes: int = 0,
     progress: Callable[[int, int, dict[str, int]], None] | None = None,
     is_fallback: bool = False,
+    include_paths: list[str] | tuple[str, ...] = (),
 ) -> ReconcileResult:
     """Reconcile the active run surface before running the command (Mode 1/safe).
 
@@ -269,9 +306,14 @@ def preflight_reconcile(
     result = ReconcileResult()
 
     local_manifest = _build_local_manifest(
-        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+        local_root,
+        excludes,
+        hash_below_bytes=hash_below_bytes or None,
+        include_paths=include_paths,
     )
-    remote_manifest = transport.manifest(remote_root, excludes, hash_below_bytes)
+    remote_manifest = _remote_manifest(
+        transport, remote_root, excludes, hash_below_bytes, include_paths
+    )
 
     # Vanished-root guard. If a side comes back *entirely empty* while its previous
     # baseline had files, that is either a legitimate "user deleted everything" or a
@@ -325,6 +367,46 @@ def preflight_reconcile(
         result.converged_conflicts.extend(item.path for item in plan.conflicts())
         plan = replace(plan, paths=[item for item in plan.paths
                                     if item.action != ABORT_CONFLICT])
+
+    # Exact bootstrap inputs are included so a fresh target receives them even
+    # when a global pattern (notably ``*.lock``) excludes them. Inclusion must
+    # not make those controller identity bytes bidirectional: a target edit may
+    # never overwrite/delete the controller copy. A missing target is repaired
+    # by pushing the authoritative local file; any other reverse/destructive
+    # direction is refused before ensure_remote_dir or a file write.
+    authoritative = frozenset(include_paths)
+    if authoritative:
+        normalized: list[ClassifiedPath] = []
+        authority_conflicts: list[ClassifiedPath] = []
+        for item in plan.paths:
+            if item.path not in authoritative:
+                normalized.append(item)
+                continue
+            local_entry = local_manifest.get(item.path)
+            remote_entry = remote_manifest.get(item.path)
+            if local_entry is not None and remote_entry is None:
+                normalized.append(ClassifiedPath(
+                    item.path,
+                    "bootstrap-input-remote-missing",
+                    PUSH,
+                    "declared bootstrap input is controller-authoritative",
+                ))
+            elif item.action in {PULL, DELETE_LOCAL, DELETE_REMOTE}:
+                authority_conflicts.append(ClassifiedPath(
+                    item.path,
+                    "bootstrap-input-diverged",
+                    ABORT_CONFLICT,
+                    "target divergence cannot mutate a controller-authoritative "
+                    "bootstrap input",
+                ))
+            else:
+                normalized.append(item)
+        if authority_conflicts:
+            result.conflicts = authority_conflicts
+            result.local_manifest = local_manifest
+            result.remote_manifest = remote_manifest
+            return result
+        plan = replace(plan, paths=normalized)
 
     # PREFLIGHT candidate-shopping must not mutate the controller. Scope, precisely:
     # this covers preflight reconciliation on a FALLBACK attempt only. It is deliberately
@@ -436,9 +518,14 @@ def preflight_reconcile(
 
     # Rebuild converged manifests to use as pre-run baselines.
     result.local_manifest = _build_local_manifest(
-        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+        local_root,
+        excludes,
+        hash_below_bytes=hash_below_bytes or None,
+        include_paths=include_paths,
     )
-    result.remote_manifest = transport.manifest(remote_root, excludes, hash_below_bytes)
+    result.remote_manifest = _remote_manifest(
+        transport, remote_root, excludes, hash_below_bytes, include_paths
+    )
     return result
 
 
@@ -455,6 +542,7 @@ def postrun_pullback(
     conflict_remote_root: Path,
     backup_below_bytes: int = 0,
     write_scope_paths: list[str] | tuple[str, ...] | None = None,
+    include_paths: list[str] | tuple[str, ...] = (),
 ) -> PullbackResult:
     """Pull command-caused remote changes back to local project paths.
 
@@ -466,10 +554,15 @@ def postrun_pullback(
     """
     result = PullbackResult()
 
-    post_remote = transport.manifest(remote_root, excludes, hash_below_bytes)
+    post_remote = _remote_manifest(
+        transport, remote_root, excludes, hash_below_bytes, include_paths
+    )
     changed, deleted = diff_remote_changes(pre_remote_manifest, post_remote)
     cur_local = _build_local_manifest(
-        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+        local_root,
+        excludes,
+        hash_below_bytes=hash_below_bytes or None,
+        include_paths=include_paths,
     )
     # Baseline advancement is path-attributed, not a whole-tree snapshot. An
     # unrelated local writer may create, edit, or delete a path while the remote
@@ -601,7 +694,10 @@ def postrun_pullback(
 
     result.post_remote_manifest = post_remote
     result.local_manifest_after = _build_local_manifest(
-        local_root, excludes, hash_below_bytes=hash_below_bytes or None
+        local_root,
+        excludes,
+        hash_below_bytes=hash_below_bytes or None,
+        include_paths=include_paths,
     )
     if not result.conflicts:
         result.next_baseline = NextBaseline(

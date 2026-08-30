@@ -64,15 +64,13 @@ def _race(state_root: Path, command_fraction: float) -> list[tuple[str, str]]:
     return results
 
 
-def test_cross_controller_ledger_atomically_refuses_unsafe_double_admission(
+def test_cross_controller_learned_admission_clips_instead_of_vetoing(
     tmp_path: Path,
 ):
     results = _race(tmp_path / "unsafe", 0.40)
 
-    assert sorted(status for status, _reason in results) == ["admitted", "refused"]
-    assert next(reason for status, reason in results if status == "refused") == (
-        "insufficient_live_memory"
-    )
+    assert [status for status, _reason in results].count("admitted") == 2
+    assert all(reason == "reserved" for _status, reason in results)
 
 
 def test_cross_controller_ledger_keeps_safe_jobs_concurrent(tmp_path: Path):
@@ -111,7 +109,7 @@ def _reserve_unprofiled_worker(state_root: str, barrier, queue) -> None:
     )
 
 
-def test_cross_controller_unknowns_receive_complementary_open_slot_shares(
+def test_cross_controller_unknowns_both_admit_without_inferred_veto(
     tmp_path: Path,
 ):
     context = multiprocessing.get_context("spawn")
@@ -132,7 +130,5 @@ def test_cross_controller_unknowns_receive_complementary_open_slot_shares(
         assert process.exitcode == 0
 
     assert [status for status, _reason, _allowance in results].count("admitted") == 2
-    assert sorted(allowance for _status, _reason, allowance in results) == [
-        4991 * MIB,
-        4992 * MIB,
-    ]
+    assert all(reason == "reserved" for _status, reason, _allowance in results)
+    assert all(allowance == 10111 * MIB for _status, _reason, allowance in results)

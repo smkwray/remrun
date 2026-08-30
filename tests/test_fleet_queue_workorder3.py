@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import sqlite3
 import threading
+from types import SimpleNamespace
 
 import pytest
 
-from remrun.fleet import queue as queue_mod
+from remrun.fleet import cli, placement, queue as queue_mod
+from remrun.fleet.models import PlacedBatch, PlacementResult
 from remrun.fleet.prepared import prepare_raw_command
 from remrun.fleet.queue import FleetQueue, QueueMigrationError
+from remrun.output import Reporter
 
 
 _FAR = "2099-01-01T00:00:00Z"
@@ -178,6 +182,127 @@ def test_two_concurrent_same_pool_claimants_have_one_winner(tmp_path) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         winners = list(pool.map(claim, range(2)))
     assert sum(bool(winner) for winner in winners) == 1
+
+
+def _placement_explanation() -> dict:
+    return {
+        "schema": 1,
+        "selected": {
+            "device": "DEVICE",
+            "selection_basis": "estimated",
+            "reason": "batched",
+            "estimated_finish_s": 3.0,
+            "estimate_reason": None,
+            "quantities": {
+                "backlog_s": 1.0,
+                "effective_finish_s": 4.0,
+            },
+        },
+        "alternatives": [{
+            "device": "OTHER",
+            "status": "eligible_not_selected",
+            "reason": "higher_estimated_finish",
+            "quantities": {
+                "estimated_finish_s": 8.0,
+                "backlog_s": 0.0,
+                "effective_finish_s": 8.0,
+            },
+        }],
+        "retention": {
+            "alternative_limit": 32,
+            "total_alternatives": 1,
+            "retained_alternatives": 1,
+            "omitted": {},
+        },
+    }
+
+
+def test_claim_persists_placement_explanation_across_queue_processes(tmp_path) -> None:
+    db = tmp_path / "fleet.db"
+    queue = FleetQueue(db)
+    job_id = _enqueue(queue, "explained")
+    assert queue.claim_many(
+        [job_id], "DEVICE", batch_id="explained-batch", lease_until=_FAR,
+        pool=None, now=_NOW, placement_explanation=_placement_explanation(),
+    )
+    queue.close()
+
+    reopened = FleetQueue(db)
+    try:
+        assert reopened.get(job_id)["placement_explanation"] == _placement_explanation()
+        assert reopened.get_batch("explained-batch")["placement_explanation"] \
+            == _placement_explanation()
+    finally:
+        reopened.close()
+
+
+def test_claim_persists_byte_bounded_multibyte_placement_detail(
+    tmp_path,
+) -> None:
+    result = placement.add_ineligible_alternatives(
+        PlacementResult(
+            batches=[PlacedBatch(
+                device="DEVICE",
+                job_indices=[0],
+                estimated_finish_s=3.0,
+                reason="batched",
+                explanation=_placement_explanation(),
+            )],
+            makespan_s=3.0,
+        ),
+        {
+            f"OTHER-{index:02d}": ("fit_rejected", "\U0001f642" * 512)
+            for index in range(32)
+        },
+    )
+    explanation = result.batches[0].explanation
+    assert len(json.dumps(explanation).encode("utf-8")) > 32 * 1024
+    assert all(
+        len(alternative["detail"].encode("utf-8")) <= 512
+        for alternative in explanation["alternatives"]
+        if alternative["status"] == "ineligible"
+    )
+
+    queue = FleetQueue(tmp_path / "fleet.db")
+    try:
+        job_id = _enqueue(queue, "unicode-placement-detail")
+        assert queue.claim_many(
+            [job_id], "DEVICE", batch_id="unicode-placement-batch",
+            lease_until=_FAR, pool=None, now=_NOW,
+            placement_explanation=explanation,
+        )
+        durable = queue.get_batch("unicode-placement-batch")["placement_explanation"]
+    finally:
+        queue.close()
+
+    assert len(json.dumps(durable, ensure_ascii=False).encode("utf-8")) <= 32 * 1024
+    assert all(
+        len(alternative["detail"].encode("utf-8")) <= 512
+        for alternative in durable["alternatives"]
+        if alternative["status"] == "ineligible"
+    )
+
+
+def test_status_json_surfaces_durable_placement_explanation(
+    tmp_path, monkeypatch, capsys,
+) -> None:
+    state_root = tmp_path / "state"
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    job_id = _enqueue(queue, "status-explained")
+    assert queue.claim_many(
+        [job_id], "DEVICE", batch_id="status-batch", lease_until=_FAR,
+        pool=None, now=_NOW, placement_explanation=_placement_explanation(),
+    )
+    queue.close()
+    monkeypatch.setattr(cli, "default_state_root", lambda: state_root)
+
+    args = SimpleNamespace(
+        submission_id=None, request_id=None, job_id=[job_id],
+        refresh_target=False, json=True,
+    )
+    assert cli.cmd_status(args, Reporter()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["jobs"][0]["placement_explanation"] == _placement_explanation()
 
 
 def _claimed(queue: FleetQueue, key: str, *, lease_until: str = _FAR) -> tuple[str, str]:

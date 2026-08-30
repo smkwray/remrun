@@ -28,11 +28,16 @@ winbox = Windows runner, fallback
 Current behavior:
 
 ```text
-if explicit target: use it
+if an ordinary plan/run names a target: use it when enabled or allow_explicit_run=true
 if --auto: probe and rank enabled candidates using placement, reachability, and load
+if bench: use enabled targets only, whether named or selected from scheduler order
 if a candidate has a candidate-local conflict before running: try the next candidate
 for later candidates: refuse any plan that would pull or delete on the controller
 ```
+
+`allow_explicit_run` is deliberately narrow. It lets an operator address a paused
+device for an ordinary `plan` or `run` while keeping that device out of automatic
+placement, fleet dispatch and reclamation, and benchmark execution.
 
 An unreachable candidate performs no preflight and therefore does not consume the
 first-attempt reconciliation semantics. Global controller-tree conflicts such as

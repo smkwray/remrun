@@ -15,6 +15,7 @@ from ..resource_probe import GPUResourceSnapshot, ResourceSnapshot, probe_target
 from ..transport import BaseTransport, TransportError, make_transport
 from . import local_resources
 from .models import DeviceSnapshot
+from .resources import apply_gpu_memory_topology
 
 _RESOURCE_PROBE_TIMEOUT_SEC = 20.0
 _CAPABILITY_PROBE_PROGRAM = r"""
@@ -231,6 +232,14 @@ def _build_local_snapshot(
     adapter_specs: list[dict],
 ) -> DeviceSnapshot:
     view = local_resources.local_view(name=device.name, timeout=_RESOURCE_PROBE_TIMEOUT_SEC)
+    apply_gpu_memory_topology(view, device)
+    topology = view.gpu_memory_topology
+    if topology == "unified":
+        # A local report may have raw GPU counters, but unified memory never
+        # exposes those counters as a separate placement capacity.
+        vram_free = None
+    else:
+        vram_free = view.vram_free_mb
     engines = (
         _local_capability_engines(adapter_specs)
         if probe_capability
@@ -239,12 +248,15 @@ def _build_local_snapshot(
     return DeviceSnapshot(
         name=device.name,
         reachable=view.reachable,
+        enabled=device.enabled,
         cpu_busy_pct=view.cpu_busy_pct,
         ram_free_mb=view.ram_free_mb,
         ram_total_mb=(device.ram_gb * 1024.0 if device.ram_gb else view.ram_total_mb),
-        vram_free_mb=view.vram_free_mb,
+        vram_free_mb=vram_free,
         vram_total_mb=(view.vram_total_mb if view.vram_total_mb is not None
-                       else (device.vram_gb * 1024.0 if device.vram_gb else None)),
+                       else (device.vram_gb * 1024.0 if device.vram_gb else None))
+        if topology != "unified" else None,
+        gpu_memory_topology=topology,
         active_jobs=active_jobs,
         max_jobs=device.max_jobs,
         pool_free=_pool_free(fleet_cfg, pool_used),
@@ -272,9 +284,11 @@ def build_snapshot(device: Device, transport: BaseTransport | None, fleet_cfg: d
         transport = transport or _fixed_probe_transport(device)
         pr = transport.probe()
     except (TransportError, Exception):  # noqa: BLE001
-        return DeviceSnapshot(name=device.name, reachable=False, detail="probe raised")
+        return DeviceSnapshot(name=device.name, reachable=False, enabled=device.enabled,
+                              detail="probe raised")
     if not pr.reachable:
-        return DeviceSnapshot(name=device.name, reachable=False, detail=pr.detail)
+        return DeviceSnapshot(name=device.name, reachable=False, enabled=device.enabled,
+                              detail=pr.detail)
 
     try:
         resources = probe_target_resources(
@@ -314,14 +328,23 @@ def build_snapshot(device: Device, transport: BaseTransport | None, fleet_cfg: d
     engines = (_capability_engines(transport, specs, device=device) if probe_capability else
                {spec["engine"]: "unknown" for spec in specs})
 
+    normalized_topology = resources.gpu_memory_topology if resources is not None else "unknown"
+    # Hand-built snapshots from older callers carry the resolved kind but no
+    # topology field; retain their established discrete/unified behavior while
+    # keeping an explicitly unknown result fail-closed.
+    if normalized_topology == "auto" and resources is not None:
+        normalized_topology = resources.gpu_kind
     return DeviceSnapshot(
-        name=device.name, reachable=True, cpu_busy_pct=cpu,
+        name=device.name, reachable=True, enabled=device.enabled, cpu_busy_pct=cpu,
         ram_free_mb=ram_free,
         ram_total_mb=(device.ram_gb * 1024.0 if device.ram_gb else measured_ram_total),
         vram_free_mb=vram_free,
         vram_total_mb=(vram_total if vram_total is not None
-                       else (device.vram_gb * 1024.0 if device.vram_gb else None)),
+                       else (device.vram_gb * 1024.0
+                             if device.vram_gb and normalized_topology == "discrete" else None)),
+        gpu_memory_topology=normalized_topology,
         active_jobs=active_jobs, max_jobs=device.max_jobs,
         pool_free=_pool_free(fleet_cfg, pool_used),
-        engine_status=engines, detail=pr.detail,
+        engine_status=engines,
+        detail="; ".join(filter(None, (pr.detail, resources.detail if resources else ""))),
     )

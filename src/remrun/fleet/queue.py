@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..state import iso_plus_seconds, utc_now_iso
+from .models import MAX_PLACEMENT_EXPLANATION_BYTES, validate_placement_explanation
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id           TEXT PRIMARY KEY,
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at   TEXT NOT NULL, updated_at TEXT NOT NULL,
     lease_until  TEXT NOT NULL, heartbeat_at TEXT,
     estimated_finish_s REAL,                      -- NULL means duration is honestly unknown
+    placement_json TEXT,                          -- bounded schema-1 decision explanation
     target_protocol_version INTEGER,
     target_operation_id TEXT,
     target_request_sha256 TEXT,
@@ -65,6 +67,8 @@ CREATE TABLE IF NOT EXISTS batches (
     target_durable_cleaned_at TEXT,
     target_finalized_at TEXT,
     target_finalization_disposition TEXT,
+    target_release_authorized_at TEXT,
+    target_release_effects_acknowledged_at TEXT,
     error        TEXT
 );
 -- One row per held resource slot. UNIQUE(device,pool) makes a configured pool a
@@ -130,6 +134,18 @@ CREATE TABLE IF NOT EXISTS submission_plans (
     created_at              TEXT NOT NULL,
     consumed_submission_id  TEXT
 );
+-- A saved plan that reached the live definition fence and was refused.  This
+-- is deliberately separate from submissions: the caller must be able to
+-- recover a terminal refusal without manufacturing a fake submission row.
+CREATE TABLE IF NOT EXISTS submission_refusals (
+    refusal_id       TEXT PRIMARY KEY NOT NULL,
+    plan_id          TEXT NOT NULL,
+    request_id       TEXT UNIQUE,
+    fingerprint      TEXT NOT NULL,
+    reason_code      TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_submission_refusals_plan ON submission_refusals(plan_id);
 -- Raw execution observations are authoritative and are committed atomically
 -- with the queue's terminal transition. Derived profile caches are rebuildable.
 CREATE TABLE IF NOT EXISTS fleet_profile_observations (
@@ -144,6 +160,7 @@ CREATE TABLE IF NOT EXISTS fleet_profile_observations (
     worker_elapsed_s     REAL,
     peak_rss_mb          REAL,
     peak_vram_mb         REAL,
+    memory_metric        TEXT,
     accepted_duration    INTEGER NOT NULL,
     reject_reason        TEXT,
     result_digest        TEXT,
@@ -154,6 +171,7 @@ _SCHEMA_OBJECTS = {
     "jobs", "ix_jobs_state", "ix_jobs_batch", "batches", "resource_leases",
     "cooldowns", "prepared_specs", "prepared_output_reservations", "submissions",
     "submission_jobs", "ix_submission_jobs_job", "submission_plans",
+    "submission_refusals", "ix_submission_refusals_plan",
     "fleet_profile_observations",
 }
 
@@ -192,8 +210,13 @@ _TARGET_COLUMNS = (
     "target_resume_token", "target_reserved_at", "target_accepted_at",
     "target_cleanup_state", "target_cleanup_at", "target_stage_cleaned_at",
     "target_durable_cleaned_at", "target_finalized_at",
-    "target_finalization_disposition",
+    "target_finalization_disposition", "target_release_authorized_at",
+    "target_release_effects_acknowledged_at",
 )
+
+_SUBMISSION_REFUSAL_SCHEMA = "remrun.fleet.submission-refusal"
+_SUBMISSION_REFUSAL_VERSION = 1
+_TASK_SPEC_DRIFT = "task_spec_drift"
 
 
 class QueueConfigurationError(RuntimeError):
@@ -202,6 +225,44 @@ class QueueConfigurationError(RuntimeError):
 
 class QueueMigrationError(RuntimeError):
     """Existing queue state needs an explicit owner-directed repair."""
+
+
+class TaskSpecDriftRefusal(ValueError):
+    """A saved-plan identity was durably refused because its task spec drifted.
+
+    The document is the closed protocol returned by both submit and exact
+    request-status lookup.  It intentionally contains no task definition,
+    payload, or live spec value.
+    """
+
+    def __init__(self, document: dict[str, Any]) -> None:
+        self.document = dict(document)
+        super().__init__("saved plan refused: task_spec_drift")
+
+
+def _encode_placement_explanation(value: dict[str, Any] | None, device: str) -> str | None:
+    if value is None:
+        return None
+    validate_placement_explanation(value, device)
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+    if len(encoded.encode("utf-8")) > MAX_PLACEMENT_EXPLANATION_BYTES:
+        raise ValueError("placement explanation exceeds the durable byte limit")
+    return encoded
+
+
+def _decode_placement_explanation(value: Any, device: str | None = None) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_PLACEMENT_EXPLANATION_BYTES:
+        raise QueueMigrationError("durable placement explanation is malformed or oversized")
+    try:
+        explanation = json.loads(value)
+        validate_placement_explanation(explanation, device)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise QueueMigrationError("durable placement explanation is malformed") from exc
+    return explanation
 
 
 def _wal_reset_safe(version: tuple[int, ...]) -> bool:
@@ -266,6 +327,7 @@ class FleetQueue:
             self._migrate()
             self._migrate_nullable_batch_estimates()
             self._migrate_prepared_output_reservations()
+            self._migrate_profile_observations()
             self._verify_submission_control_schema()
         except BaseException:
             self.db.close()
@@ -293,13 +355,16 @@ class FleetQueue:
                         "last_result"}
         current_batches = {"batch_id", "owner_token", "state", "device", "task_name",
                            "engine", "bucket", "created_at", "updated_at", "lease_until",
-                           "heartbeat_at", "estimated_finish_s", "target_protocol_version",
+                           "heartbeat_at", "estimated_finish_s", "placement_json",
+                           "target_protocol_version",
                            "target_operation_id",
                            "target_request_sha256", "target_resume_token",
                            "target_reserved_at", "target_accepted_at",
                            "target_cleanup_state", "target_cleanup_at",
                            "target_stage_cleaned_at", "target_durable_cleaned_at",
                            "target_finalized_at", "target_finalization_disposition",
+                           "target_release_authorized_at",
+                           "target_release_effects_acknowledged_at",
                            "error"}
         index_row = self.db.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
@@ -322,6 +387,8 @@ class FleetQueue:
                 if "estimated_finish_s" not in have_batches:
                     self.db.execute(
                         "ALTER TABLE batches ADD COLUMN estimated_finish_s REAL")
+                if "placement_json" not in have_batches:
+                    self.db.execute("ALTER TABLE batches ADD COLUMN placement_json TEXT")
                 if "target_protocol_version" not in have_batches:
                     self.db.execute(
                         "ALTER TABLE batches ADD COLUMN target_protocol_version INTEGER"
@@ -338,6 +405,8 @@ class FleetQueue:
                     "target_durable_cleaned_at",
                     "target_finalized_at",
                     "target_finalization_disposition",
+                    "target_release_authorized_at",
+                    "target_release_effects_acknowledged_at",
                 ):
                     if column not in have_batches:
                         self.db.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
@@ -510,6 +579,7 @@ class FleetQueue:
                     lease_until TEXT NOT NULL,
                     heartbeat_at TEXT,
                     estimated_finish_s REAL,
+                    placement_json TEXT,
                     target_protocol_version INTEGER,
                     target_operation_id TEXT,
                     target_request_sha256 TEXT,
@@ -522,17 +592,22 @@ class FleetQueue:
                     target_durable_cleaned_at TEXT,
                     target_finalized_at TEXT,
                     target_finalization_disposition TEXT,
+                    target_release_authorized_at TEXT,
+                    target_release_effects_acknowledged_at TEXT,
                     error TEXT
                 )
             """)
             names = (
                 "batch_id,owner_token,state,device,task_name,engine,bucket,created_at,"
                 "updated_at,lease_until,heartbeat_at,estimated_finish_s,"
+                "placement_json,"
                 "target_protocol_version,"
                 "target_operation_id,target_request_sha256,target_resume_token,"
                 "target_reserved_at,target_accepted_at,target_cleanup_state,"
                 "target_cleanup_at,target_stage_cleaned_at,target_durable_cleaned_at,"
-                "target_finalized_at,target_finalization_disposition,error"
+                "target_finalized_at,target_finalization_disposition,"
+                "target_release_authorized_at,"
+                "target_release_effects_acknowledged_at,error"
             )
             self.db.execute(
                 f"INSERT INTO batches_nullable ({names}) SELECT {names} FROM batches"
@@ -572,6 +647,22 @@ class FleetQueue:
                             "VALUES(?,?,?)", (stem, prepared["work_id"], utc_now_iso()),
                         )
 
+    def _migrate_profile_observations(self) -> None:
+        """Add optional resource-metric provenance without rewriting raw history.
+
+        Old rows remain valid duration evidence but have a NULL metric marker;
+        the profile reader consequently excludes their memory values until a
+        producer emits the versioned, shared-page-safe metric.
+        """
+        columns = {row["name"] for row in self.db.execute(
+            "PRAGMA table_info(fleet_profile_observations)"
+        )}
+        if "memory_metric" not in columns:
+            with self._immediate():
+                self.db.execute(
+                    "ALTER TABLE fleet_profile_observations ADD COLUMN memory_metric TEXT"
+                )
+
     def _verify_submission_control_schema(self) -> None:
         """Fail closed unless identity tables enforce the exact durable-key contract."""
         expected_columns = {
@@ -595,6 +686,14 @@ class FleetQueue:
                 ("created_at", "TEXT", 1, None, 0),
                 ("consumed_submission_id", "TEXT", 0, None, 0),
             ),
+            "submission_refusals": (
+                ("refusal_id", "TEXT", 1, None, 1),
+                ("plan_id", "TEXT", 1, None, 0),
+                ("request_id", "TEXT", 0, None, 0),
+                ("fingerprint", "TEXT", 1, None, 0),
+                ("reason_code", "TEXT", 1, None, 0),
+                ("created_at", "TEXT", 1, None, 0),
+            ),
         }
         for table, expected in expected_columns.items():
             actual = tuple(
@@ -615,6 +714,7 @@ class FleetQueue:
             "submissions": {("submission_id",), ("request_id",), ("plan_id",)},
             "submission_jobs": {("submission_id", "item_index")},
             "submission_plans": {("plan_id",)},
+            "submission_refusals": {("refusal_id",), ("request_id",)},
         }
         for table, required in required_unique.items():
             unique_columns: set[tuple[str, ...]] = set()
@@ -659,6 +759,171 @@ class FleetQueue:
 
     def close(self) -> None:
         self.db.close()
+
+    @staticmethod
+    def _submission_fingerprint(
+        prepared_records: list[dict[str, Any]],
+        *,
+        spec_id: str,
+        priority: int,
+        idempotency_keys: list[str | None],
+    ) -> str:
+        """Content identity used by both accepted submissions and refusals."""
+        from .task_contract import sha256_id
+
+        kind = prepared_records[0]["kind"]
+        resolved_keys = [
+            ((prepared["prepared_id"] if requested_key is None else requested_key)
+             if kind == "task" else ("" if requested_key is None else requested_key))
+            for prepared, requested_key in zip(prepared_records, idempotency_keys)
+        ]
+        return sha256_id({
+            "schema": 1,
+            "spec_id": spec_id,
+            "prepared_ids": [record["prepared_id"] for record in prepared_records],
+            "priority": priority,
+            "idempotency_keys": resolved_keys,
+        })
+
+    @staticmethod
+    def _refusal_key(plan_id: str, request_id: str | None, fingerprint: str) -> str:
+        from .task_contract import sha256_id
+
+        return sha256_id({
+            "schema": _SUBMISSION_REFUSAL_VERSION,
+            "plan_id": plan_id,
+            "request_id": request_id,
+            "fingerprint": fingerprint,
+        })
+
+    @staticmethod
+    def _refusal_document(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        """Return the closed refusal wire document, never the frozen task bytes."""
+        if row["reason_code"] != _TASK_SPEC_DRIFT:
+            raise QueueMigrationError("durable submission refusal has an unknown reason")
+        return {
+            "schema": _SUBMISSION_REFUSAL_SCHEMA,
+            "version": _SUBMISSION_REFUSAL_VERSION,
+            "status": "refused",
+            "reason": _TASK_SPEC_DRIFT,
+            "plan_id": row["plan_id"],
+            "request_id": row["request_id"],
+            "fingerprint": row["fingerprint"],
+        }
+
+    def _find_submission_refusal(
+        self, *, plan_id: str, request_id: str | None, fingerprint: str,
+    ) -> dict[str, Any] | None:
+        refusal_id = self._refusal_key(plan_id, request_id, fingerprint)
+        row = self.db.execute(
+            "SELECT * FROM submission_refusals WHERE refusal_id=?", (refusal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (row["plan_id"], row["request_id"], row["fingerprint"]) != (
+            plan_id, request_id, fingerprint
+        ):
+            raise QueueMigrationError("durable submission refusal identity disagrees")
+        return self._refusal_document(row)
+
+    def _find_submission_refusal_by_request(
+        self, *, plan_id: str | None, request_id: str, fingerprint: str,
+    ) -> dict[str, Any] | None:
+        """Find a refusal by its caller request and fence identity rebinding."""
+        row = self.db.execute(
+            "SELECT * FROM submission_refusals WHERE request_id=?", (request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (row["plan_id"], row["request_id"], row["fingerprint"]) != (
+            plan_id, request_id, fingerprint
+        ):
+            raise QueueMigrationError(
+                "request identity already names a different durable refusal"
+            )
+        if row["refusal_id"] != self._refusal_key(plan_id, request_id, fingerprint):
+            raise QueueMigrationError("durable submission refusal identity disagrees")
+        return self._refusal_document(row)
+
+    def _record_submission_refusal(
+        self, *, plan_id: str, request_id: str | None, fingerprint: str,
+        now: str,
+    ) -> dict[str, Any]:
+        refusal_id = self._refusal_key(plan_id, request_id, fingerprint)
+        row = self.db.execute(
+            "SELECT * FROM submission_refusals WHERE refusal_id=?", (refusal_id,),
+        ).fetchone()
+        if row is None:
+            if request_id is not None:
+                request_row = self.db.execute(
+                    "SELECT * FROM submission_refusals WHERE request_id=?", (request_id,),
+                ).fetchone()
+                if request_row is not None:
+                    if (request_row["plan_id"], request_row["request_id"],
+                            request_row["fingerprint"]) == (plan_id, request_id, fingerprint):
+                        return self._refusal_document(request_row)
+                    raise QueueMigrationError(
+                        "request identity already names a different durable refusal"
+                    )
+            try:
+                self.db.execute(
+                    "INSERT INTO submission_refusals "
+                    "(refusal_id,plan_id,request_id,fingerprint,reason_code,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (refusal_id, plan_id, request_id, fingerprint, _TASK_SPEC_DRIFT, now),
+                )
+            except sqlite3.IntegrityError:
+                # Another controller may have committed the same request identity while this
+                # transaction was waiting. Re-read it below; a different row is a hard conflict.
+                row = self.db.execute(
+                    "SELECT * FROM submission_refusals WHERE refusal_id=?", (refusal_id,),
+                ).fetchone()
+                if row is None:
+                    if request_id is not None:
+                        request_row = self.db.execute(
+                            "SELECT * FROM submission_refusals WHERE request_id=?",
+                            (request_id,),
+                        ).fetchone()
+                        if request_row is not None:
+                            if (request_row["plan_id"], request_row["request_id"],
+                                    request_row["fingerprint"]) == (
+                                        plan_id, request_id, fingerprint):
+                                row = request_row
+                            else:
+                                raise QueueMigrationError(
+                                    "request identity already names a different durable refusal"
+                                )
+                    if row is None:
+                        raise
+        if row is None:
+            row = self.db.execute(
+                "SELECT * FROM submission_refusals WHERE refusal_id=?", (refusal_id,),
+            ).fetchone()
+        if row is None or (row["plan_id"], row["request_id"], row["fingerprint"]) != (
+            plan_id, request_id, fingerprint
+        ):
+            raise QueueMigrationError("durable submission refusal identity disagrees")
+        return self._refusal_document(row)
+
+    def get_submission_refusal(
+        self, *, plan_id: str | None = None, request_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read one terminal refusal by an exact saved-plan or request identity."""
+        selected = [(field, value) for field, value in (
+            ("plan_id", plan_id), ("request_id", request_id)
+        ) if value is not None]
+        if len(selected) != 1:
+            raise ValueError("refusal lookup requires exactly one plan or request identity")
+        field, value = selected[0]
+        rows = self.db.execute(
+            f"SELECT * FROM submission_refusals WHERE {field}=? ORDER BY refusal_id",
+            (value,),
+        ).fetchall()
+        if len(rows) > 1:
+            raise QueueMigrationError(
+                f"durable refusal lookup by {field} is ambiguous"
+            )
+        return self._refusal_document(rows[0]) if rows else None
 
     # --- enqueue ----------------------------------------------------------
     def enqueue_prepared(self, prepared: dict[str, Any], *, spec: dict[str, Any] | None,
@@ -763,14 +1028,14 @@ class FleetQueue:
              if kind == "task" else ("" if requested_key is None else requested_key))
             for prepared, requested_key in zip(prepared_records, idempotency_keys)
         ]
-        fingerprint = sha256_id({
-            "schema": 1,
-            "spec_id": spec_id,
-            "prepared_ids": [record["prepared_id"] for record in prepared_records],
-            "priority": priority,
-            "idempotency_keys": resolved_keys,
-        })
+        fingerprint = self._submission_fingerprint(
+            prepared_records,
+            spec_id=spec_id,
+            priority=priority,
+            idempotency_keys=idempotency_keys,
+        )
         result: list[str] = []
+        durable_refusal: dict[str, Any] | None = None
         with self._immediate():
             existing = None
             if plan_id is not None:
@@ -781,7 +1046,16 @@ class FleetQueue:
                 existing = self.db.execute(
                     "SELECT * FROM submissions WHERE request_id=?", (request_id,),
                 ).fetchone()
+            if request_id is not None:
+                durable_refusal = self._find_submission_refusal_by_request(
+                    plan_id=plan_id, request_id=request_id, fingerprint=fingerprint,
+                )
             if existing is not None:
+                if durable_refusal is not None:
+                    raise QueueMigrationError(
+                        "request identity exists as both accepted submission and "
+                        "durable refusal"
+                    )
                 if plan_id is not None and existing["plan_id"] != plan_id:
                     raise ValueError(
                         "request and plan identities do not name the same submission"
@@ -795,91 +1069,110 @@ class FleetQueue:
                         "request or plan identity already names a different prepared submission"
                     )
                 return self._submission_receipt(existing, replayed=True)
-            if kind == "task":
+            if durable_refusal is None and plan_id is not None:
+                durable_refusal = self._find_submission_refusal(
+                    plan_id=plan_id, request_id=request_id, fingerprint=fingerprint,
+                )
+                if durable_refusal is not None:
+                    # The refusal is terminal and idempotent. Do not consult mutable config or
+                    # create any queue rows when the exact identity is replayed.
+                    pass
+            if durable_refusal is None and kind == "task":
                 live_id = current_spec_id()
                 if live_id != spec_id:
-                    raise ValueError("task definition changed before atomic enqueue; no job was enqueued")
-            existing_spec = self.db.execute(
-                "SELECT canonical_json FROM prepared_specs WHERE spec_id=?", (spec_id,),
-            ).fetchone()
-            if existing_spec and existing_spec["canonical_json"] != spec_blob:
-                raise QueueMigrationError(
-                    f"prepared spec {spec_id} exists with different canonical bytes")
-            if not existing_spec:
-                self.db.execute(
-                    "INSERT INTO prepared_specs(spec_id,schema,canonical_json,created_at) "
-                    "VALUES(?,?,?,?)", (spec_id, 1, spec_blob, now))
-            for prepared, key, jid in zip(prepared_records, resolved_keys, allocated):
-                prepared_id = prepared["prepared_id"]
-                for reservation in prepared["output"]["reservations"]:
-                    stem = reservation["stem"]
-                    owner = self.db.execute(
-                        "SELECT work_id FROM prepared_output_reservations WHERE stem=?",
-                        (stem,),
-                    ).fetchone()
-                    if owner is not None and owner["work_id"] != prepared["work_id"]:
+                    if plan_id is None:
                         raise ValueError(
-                            f"output reservation collision for {stem!r} with different work")
-                    if owner is None:
-                        self.db.execute(
-                            "INSERT INTO prepared_output_reservations(stem,work_id,created_at) "
-                            "VALUES(?,?,?)", (stem, prepared["work_id"], now),
+                            "task definition changed before atomic enqueue; no job was enqueued"
                         )
-                if key:
-                    row = self.db.execute(
-                        "SELECT job_id, prepared_id FROM jobs WHERE idempotency_key=? "
-                        f"AND state NOT IN ({_FINAL_Q})", (key, *_FINAL),
-                    ).fetchone()
-                    if row:
-                        if row["prepared_id"] != prepared_id:
-                            raise ValueError(
-                                "idempotency_key collision with different prepared work")
-                        result.append(row["job_id"])
-                        continue
-                label = prepared["task"]["name"] if kind == "task" else "__command__"
-                try:
-                    self.db.execute(
-                        "INSERT INTO jobs (job_id,task_name,prepared_json,force_device,priority,"
-                        "idempotency_key,state,created_at,updated_at,prepared_id,spec_id) "
-                        "VALUES(?,?,?,?,?,?, 'queued',?,?,?,?)",
-                        (jid, label, canonical_json(prepared),
-                         prepared["routing"]["force_device"], priority, key,
-                         now, now, prepared_id, spec_id),
+                    durable_refusal = self._record_submission_refusal(
+                        plan_id=plan_id, request_id=request_id,
+                        fingerprint=fingerprint, now=now,
                     )
-                except sqlite3.IntegrityError:
-                    if not key:
-                        raise
-                    row = self.db.execute(
-                        "SELECT job_id, prepared_id FROM jobs WHERE idempotency_key=? "
-                        f"AND state NOT IN ({_FINAL_Q})", (key, *_FINAL),
-                    ).fetchone()
-                    if row is None or row["prepared_id"] != prepared_id:
-                        raise
-                    jid = row["job_id"]
-                result.append(jid)
-            self.db.execute(
-                "INSERT INTO submissions(submission_id,request_id,plan_id,fingerprint,created_at) "
-                "VALUES(?,?,?,?,?)",
-                (submission_id, request_id, plan_id, fingerprint, now),
-            )
-            for index, (jid, prepared) in enumerate(zip(result, prepared_records)):
+            if durable_refusal is None:
+                existing_spec = self.db.execute(
+                    "SELECT canonical_json FROM prepared_specs WHERE spec_id=?", (spec_id,),
+                ).fetchone()
+                if existing_spec and existing_spec["canonical_json"] != spec_blob:
+                    raise QueueMigrationError(
+                        f"prepared spec {spec_id} exists with different canonical bytes")
+                if not existing_spec:
+                    self.db.execute(
+                        "INSERT INTO prepared_specs(spec_id,schema,canonical_json,created_at) "
+                        "VALUES(?,?,?,?)", (spec_id, 1, spec_blob, now))
+                for prepared, key, jid in zip(prepared_records, resolved_keys, allocated):
+                    prepared_id = prepared["prepared_id"]
+                    for reservation in prepared["output"]["reservations"]:
+                        stem = reservation["stem"]
+                        owner = self.db.execute(
+                            "SELECT work_id FROM prepared_output_reservations WHERE stem=?",
+                            (stem,),
+                        ).fetchone()
+                        if owner is not None and owner["work_id"] != prepared["work_id"]:
+                            raise ValueError(
+                                f"output reservation collision for {stem!r} with different work")
+                        if owner is None:
+                            self.db.execute(
+                                "INSERT INTO prepared_output_reservations(stem,work_id,created_at) "
+                                "VALUES(?,?,?)", (stem, prepared["work_id"], now),
+                            )
+                    if key:
+                        row = self.db.execute(
+                            "SELECT job_id, prepared_id FROM jobs WHERE idempotency_key=? "
+                            f"AND state NOT IN ({_FINAL_Q})", (key, *_FINAL),
+                        ).fetchone()
+                        if row:
+                            if row["prepared_id"] != prepared_id:
+                                raise ValueError(
+                                    "idempotency_key collision with different prepared work")
+                            result.append(row["job_id"])
+                            continue
+                    label = prepared["task"]["name"] if kind == "task" else "__command__"
+                    try:
+                        self.db.execute(
+                            "INSERT INTO jobs (job_id,task_name,prepared_json,force_device,priority,"
+                            "idempotency_key,state,created_at,updated_at,prepared_id,spec_id) "
+                            "VALUES(?,?,?,?,?,?, 'queued',?,?,?,?)",
+                            (jid, label, canonical_json(prepared),
+                             prepared["routing"]["force_device"], priority, key,
+                             now, now, prepared_id, spec_id),
+                        )
+                    except sqlite3.IntegrityError:
+                        if not key:
+                            raise
+                        row = self.db.execute(
+                            "SELECT job_id, prepared_id FROM jobs WHERE idempotency_key=? "
+                            f"AND state NOT IN ({_FINAL_Q})", (key, *_FINAL),
+                        ).fetchone()
+                        if row is None or row["prepared_id"] != prepared_id:
+                            raise
+                        jid = row["job_id"]
+                    result.append(jid)
                 self.db.execute(
-                    "INSERT INTO submission_jobs(submission_id,item_index,job_id,prepared_id) "
-                    "VALUES(?,?,?,?)",
-                    (submission_id, index, jid, prepared["prepared_id"]),
+                    "INSERT INTO submissions(submission_id,request_id,plan_id,fingerprint,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (submission_id, request_id, plan_id, fingerprint, now),
                 )
-            if plan_id is not None:
-                cur = self.db.execute(
-                    "UPDATE submission_plans SET consumed_submission_id=? "
-                    "WHERE plan_id=? AND consumed_submission_id IS NULL",
-                    (submission_id, plan_id),
-                )
-                if cur.rowcount != 1:
-                    raise ValueError("saved plan is missing or already consumed inconsistently")
-            row = self.db.execute(
-                "SELECT * FROM submissions WHERE submission_id=?", (submission_id,),
-            ).fetchone()
-            return self._submission_receipt(row, replayed=False)
+                for index, (jid, prepared) in enumerate(zip(result, prepared_records)):
+                    self.db.execute(
+                        "INSERT INTO submission_jobs(submission_id,item_index,job_id,prepared_id) "
+                        "VALUES(?,?,?,?)",
+                        (submission_id, index, jid, prepared["prepared_id"]),
+                    )
+                if plan_id is not None:
+                    cur = self.db.execute(
+                        "UPDATE submission_plans SET consumed_submission_id=? "
+                        "WHERE plan_id=? AND consumed_submission_id IS NULL",
+                        (submission_id, plan_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise ValueError("saved plan is missing or already consumed inconsistently")
+                row = self.db.execute(
+                    "SELECT * FROM submissions WHERE submission_id=?", (submission_id,),
+                ).fetchone()
+                return self._submission_receipt(row, replayed=False)
+        if durable_refusal is not None:
+            raise TaskSpecDriftRefusal(durable_refusal)
+        raise AssertionError("submission transaction produced neither receipt nor refusal")
 
     def _submission_receipt(self, row: sqlite3.Row, *, replayed: bool) -> dict[str, Any]:
         jobs = self.db.execute(
@@ -924,6 +1217,12 @@ class FleetQueue:
         row = self.db.execute(
             f"SELECT * FROM submissions WHERE {field}=?", (value,),
         ).fetchone()
+        if field == "request_id" and row is not None and self.db.execute(
+            "SELECT 1 FROM submission_refusals WHERE request_id=?", (value,),
+        ).fetchone() is not None:
+            raise QueueMigrationError(
+                "request identity exists as both accepted submission and durable refusal"
+            )
         return self._submission_receipt(row, replayed=True) if row is not None else None
 
     def jobs_for_submission(self, submission_id: str) -> list[dict[str, Any]]:
@@ -950,7 +1249,7 @@ class FleetQueue:
                 )
             if item.get("prepared_id") is None:
                 item["prepared_id"] = item["submitted_prepared_id"]
-            out.append(item)
+            out.append(self._with_placement_explanation(item))
         return out
 
     def save_submission_plan(self, *, spec: dict[str, Any],
@@ -1121,16 +1420,30 @@ class FleetQueue:
         return spec
 
     # --- read -------------------------------------------------------------
+    def _with_placement_explanation(self, record: dict[str, Any]) -> dict[str, Any]:
+        batch_id = record.get("batch_id")
+        if not batch_id:
+            return record
+        batch = self.db.execute(
+            "SELECT device,placement_json FROM batches WHERE batch_id=?", (batch_id,),
+        ).fetchone()
+        if batch is None or batch["placement_json"] is None:
+            return record
+        record["placement_explanation"] = _decode_placement_explanation(
+            batch["placement_json"], batch["device"],
+        )
+        return record
+
     def get(self, job_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-        return dict(row) if row else None
+        return self._with_placement_explanation(dict(row)) if row else None
 
     def jobs_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
         """Return the retained job rows attached to one worker invocation."""
         rows = self.db.execute(
             "SELECT * FROM jobs WHERE batch_id=? ORDER BY created_at,job_id", (batch_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._with_placement_explanation(dict(row)) for row in rows]
 
     def list(self, state: str | None = None,
              job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
@@ -1151,7 +1464,7 @@ class FleetQueue:
             "SELECT * FROM jobs" + where + " ORDER BY priority DESC, created_at",
             tuple(values),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._with_placement_explanation(dict(r)) for r in rows]
 
     def counts(self, job_ids: list[str] | tuple[str, ...] | set[str] | None = None,
                ) -> dict[str, int]:
@@ -1244,6 +1557,7 @@ class FleetQueue:
     def claim_many(self, job_ids: list[str], device: str, *, batch_id: str,
                    lease_until: str, pool: str | None = "gpu", task_name: str = "",
                    engine: str = "", bucket: str = "", estimated_finish_s: float | None = 0.0,
+                   placement_explanation: dict[str, Any] | None = None,
                    target_protocol_version: int | None = None,
                    now: str | None = None,
                    current_spec_ids: dict[str, str | None] |
@@ -1257,6 +1571,7 @@ class FleetQueue:
         or any job is no longer ``queued``.
         """
         now = now or utc_now_iso()
+        placement_json = _encode_placement_explanation(placement_explanation, device)
         if not job_ids or lease_until <= now:   # never grant an already-expired lease
             return None
         owner_token = uuid.uuid4().hex
@@ -1345,12 +1660,12 @@ class FleetQueue:
                         return None
                 self.db.execute(
                     "INSERT INTO batches (batch_id,owner_token,state,device,task_name,engine,bucket,"
-                    "created_at,updated_at,lease_until,heartbeat_at,estimated_finish_s,"
-                    "target_protocol_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "created_at,updated_at,lease_until,heartbeat_at,estimated_finish_s,placement_json,"
+                    "target_protocol_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (batch_id, owner_token, "leased", device, task_name, engine, bucket, now, now,
                      lease_until, now,
                      None if estimated_finish_s is None else float(estimated_finish_s),
-                     target_protocol_version))
+                     placement_json, target_protocol_version))
                 if pool:
                     self.db.execute(
                         "INSERT INTO resource_leases (device,pool,batch_id,lease_until) "
@@ -1843,7 +2158,9 @@ class FleetQueue:
             "observed_units", "controller_elapsed_s", "worker_elapsed_s", "peak_rss_mb",
             "peak_vram_mb", "accepted_duration", "reject_reason", "result_digest",
         }
-        if not isinstance(observation, dict) or set(observation) != expected:
+        if not isinstance(observation, dict) or set(observation) not in (
+            expected, expected | {"memory_metric"}
+        ):
             raise ValueError("profile observation has unknown or missing fields")
         device = observation["device"]
         if not isinstance(device, str) or not device:
@@ -1859,6 +2176,11 @@ class FleetQueue:
             )
         }
         digest = observation["result_digest"]
+        memory_metric = observation.get("memory_metric")
+        if memory_metric is not None and (
+            not isinstance(memory_metric, str) or not memory_metric
+        ):
+            raise ValueError("profile observation memory_metric must be a non-empty string or null")
         is_digest = lambda value: (  # noqa: E731
             isinstance(value, str) and len(value) == 71 and value.startswith("sha256:")
             and all(char in "0123456789abcdef" for char in value[7:])
@@ -1883,8 +2205,8 @@ class FleetQueue:
         self.db.execute(
             "INSERT INTO fleet_profile_observations ("
             "batch_id,profile_key,family_id,device,adapter_id,prepared_units,observed_units,"
-            "controller_elapsed_s,worker_elapsed_s,peak_rss_mb,peak_vram_mb,accepted_duration,"
-            "reject_reason,result_digest,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "controller_elapsed_s,worker_elapsed_s,peak_rss_mb,peak_vram_mb,memory_metric,"
+            "accepted_duration,reject_reason,result_digest,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 batch_id,
                 observation["profile_key"],
@@ -1897,6 +2219,7 @@ class FleetQueue:
                 values["worker_elapsed_s"],
                 values["peak_rss_mb"],
                 values["peak_vram_mb"],
+                memory_metric,
                 1 if accepted else 0,
                 observation["reject_reason"],
                 observation["result_digest"],
@@ -2161,6 +2484,11 @@ class FleetQueue:
             return None
         result = dict(row)
         result.pop("target_resume_token", None)
+        placement_json = result.pop("placement_json", None)
+        if placement_json is not None:
+            result["placement_explanation"] = _decode_placement_explanation(
+                placement_json, result["device"],
+            )
         return result
 
     def record_target_reservation(
@@ -2423,6 +2751,7 @@ class FleetQueue:
         stage_cleaned: bool = False,
         durable_cleaned: bool = False,
         replayable: bool = False,
+        owner_release: bool = False,
         now: str,
     ) -> bool:
         """CAS-record one cleanup proof for an expired or terminal target row.
@@ -2440,7 +2769,8 @@ class FleetQueue:
             row = self.db.execute(
                 "SELECT target_protocol_version,target_operation_id,target_request_sha256,"
                 "target_cleanup_state,target_cleanup_at,target_stage_cleaned_at,"
-                "target_durable_cleaned_at,target_finalized_at,target_finalization_disposition "
+                "target_durable_cleaned_at,target_finalized_at,target_finalization_disposition,"
+                "target_release_authorized_at "
                 "FROM batches WHERE batch_id=?",
                 (batch_id,),
             ).fetchone()
@@ -2453,7 +2783,11 @@ class FleetQueue:
                     and current_state != cleanup_state:
                 return False
             disposition = row["target_finalization_disposition"]
-            if disposition in {FINALIZATION_MALFORMED, FINALIZATION_FENCED}:
+            if disposition == FINALIZATION_MALFORMED:
+                return False
+            if disposition == FINALIZATION_FENCED and (
+                not owner_release or row["target_release_authorized_at"] is None
+            ):
                 return False
             if replayable:
                 disposition = FINALIZATION_REPLAYABLE
@@ -2485,11 +2819,20 @@ class FleetQueue:
         operation_id: str,
         request_sha256: str,
         cleanup_state: str,
+        owner_release: bool = False,
         now: str,
     ) -> bool:
         """Persist complete cleanup proof under the expired-lease recovery fence."""
         if cleanup_state not in {"RELEASED", "CANCELLED", "EXPIRED", "REBOOTED"}:
             return False
+        release_fence = (
+            "AND target_release_authorized_at IS NOT NULL "
+            "AND target_finalization_disposition=?"
+            if owner_release else "AND lease_until<?"
+        )
+        release_values: tuple[str, ...] = (
+            (FINALIZATION_FENCED,) if owner_release else (now,)
+        )
         with self._immediate():
             cur = self.db.execute(
                 "UPDATE batches SET target_cleanup_state=?,target_cleanup_at="
@@ -2498,14 +2841,107 @@ class FleetQueue:
                 "COALESCE(target_durable_cleaned_at,?),target_finalized_at="
                 "COALESCE(target_finalized_at,?),target_finalization_disposition=?,"
                 "updated_at=? WHERE batch_id=? AND target_protocol_version=1 "
-                "AND lease_until<? AND target_operation_id=? AND target_request_sha256=? "
+                f"{release_fence} AND target_operation_id=? AND target_request_sha256=? "
                 "AND (target_cleanup_state IS NULL OR target_cleanup_state=?)",
                 (
                     cleanup_state, now, now, now, now, FINALIZATION_FINALIZED, now,
-                    batch_id, now, operation_id, request_sha256, cleanup_state,
+                    batch_id, *release_values, operation_id, request_sha256, cleanup_state,
                 ),
             )
             return cur.rowcount == 1
+
+    def target_release_operation(
+        self, operation_id: str, request_sha256: str,
+    ) -> dict[str, Any] | None:
+        """Return one exact owner-release row, including its private resume token."""
+        if not operation_id or not self._valid_target_digest(request_sha256):
+            return None
+        rows = self.db.execute(
+            "SELECT batch_id,state,device,target_protocol_version,target_operation_id,"
+            "target_request_sha256,target_resume_token,target_reserved_at,"
+            "target_accepted_at,target_cleanup_state,target_stage_cleaned_at,"
+            "target_durable_cleaned_at,target_finalized_at,"
+            "target_finalization_disposition,target_release_authorized_at,"
+            "target_release_effects_acknowledged_at FROM batches "
+            "WHERE target_operation_id=? AND target_request_sha256=?",
+            (operation_id, request_sha256),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise QueueMigrationError(
+                f"target operation {operation_id!r} is not unique in the batch ledger"
+            )
+        return dict(rows[0])
+
+    def _authorize_target_release(
+        self,
+        operation_id: str,
+        request_sha256: str,
+        *,
+        acknowledge_effects: bool,
+        now: str | None = None,
+    ) -> bool:
+        """Record exact owner authority without changing job or cleanup state."""
+        if not operation_id or not self._valid_target_digest(request_sha256):
+            return False
+        now = now or utc_now_iso()
+        with self._immediate():
+            rows = self.db.execute(
+                "SELECT batch_id,state,target_protocol_version,target_finalized_at,"
+                "target_finalization_disposition,target_release_authorized_at,"
+                "target_release_effects_acknowledged_at FROM batches "
+                "WHERE target_operation_id=? AND target_request_sha256=?",
+                (operation_id, request_sha256),
+            ).fetchall()
+            if len(rows) != 1:
+                return False
+            row = rows[0]
+            if (
+                row["state"] != "failed"
+                or row["target_protocol_version"] != 1
+                or row["target_finalized_at"] is not None
+                or row["target_finalization_disposition"] != FINALIZATION_FENCED
+            ):
+                return False
+            job_states = {
+                str(job["state"])
+                for job in self.db.execute(
+                    "SELECT state FROM jobs WHERE batch_id=?", (row["batch_id"],),
+                )
+            }
+            if not job_states or not job_states <= {"cancelled", "completion_unknown"}:
+                return False
+            cur = self.db.execute(
+                "UPDATE batches SET target_release_authorized_at="
+                "COALESCE(target_release_authorized_at,?),"
+                "target_release_effects_acknowledged_at=CASE WHEN ? THEN "
+                "COALESCE(target_release_effects_acknowledged_at,?) "
+                "ELSE target_release_effects_acknowledged_at END,updated_at=? "
+                "WHERE batch_id=? AND target_operation_id=? AND target_request_sha256=? "
+                "AND target_finalized_at IS NULL AND target_finalization_disposition=?",
+                (
+                    now, acknowledge_effects, now, now, row["batch_id"], operation_id,
+                    request_sha256, FINALIZATION_FENCED,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def authorize_target_release_no_start(
+        self, operation_id: str, request_sha256: str, *, now: str | None = None,
+    ) -> bool:
+        """Record release authority after exact target truth proves no command start."""
+        return self._authorize_target_release(
+            operation_id, request_sha256, acknowledge_effects=False, now=now,
+        )
+
+    def acknowledge_target_release_effects(
+        self, operation_id: str, request_sha256: str, *, now: str | None = None,
+    ) -> bool:
+        """Distinct owner act accepting that the cancelled operation may have effects."""
+        return self._authorize_target_release(
+            operation_id, request_sha256, acknowledge_effects=True, now=now,
+        )
 
     def target_operation(
         self, batch_id: str, *, include_token: bool = False

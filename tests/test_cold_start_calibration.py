@@ -170,6 +170,7 @@ def _fixture_capability_snapshot(device, *_args, **kwargs) -> DeviceSnapshot:  #
     return DeviceSnapshot(
         name=device.name,
         reachable=True,
+        enabled=True,
         active_jobs=int(kwargs.get("active_jobs", 0)),
         max_jobs=int(getattr(device, "max_jobs", 1)),
         engine_status={"engine-v1": "present"},
@@ -180,6 +181,7 @@ def _snap(name: str, *, active_jobs: int = 0) -> DeviceSnapshot:
     return DeviceSnapshot(
         name=name,
         reachable=True,
+        enabled=True,
         active_jobs=active_jobs,
         max_jobs=2,
         pool_free={"gpu": 1},
@@ -609,7 +611,9 @@ def test_plan_json_and_human_output_surface_null_eta_reason(
     monkeypatch.setattr(cli, "load_costs", lambda *_args: {})
     monkeypatch.setattr(
         cli.probes, "build_snapshot",
-        lambda *_args, **_kwargs: DeviceSnapshot(name="A", reachable=True),
+        lambda *_args, **_kwargs: DeviceSnapshot(
+            name="A", reachable=True, enabled=True,
+        ),
     )
     monkeypatch.setattr(cli.placement, "plan_jobs", lambda *_args, **_kwargs: planned)
 

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO, Callable, Iterable
 
+from ._durable_runner import MAX_TOKEN_CHARS
 from .frame import decode_file_frame, encode_file_frame
 from .job_observation import JobObservation, observation_warning
 from .manifest import Manifest, build_manifest, sha256_file
@@ -564,6 +565,80 @@ if busy is not None and 0.0 <= busy <= 100.0:
     print(round(busy, 1))
 """.strip()
 
+# Resolve one managed entrypoint on the target before dispatch.  This is kept
+# stdlib-only because SSH targets may not have Remrun installed.  The returned
+# entry path is absolute; callers therefore cannot fall back to a different
+# executable through PATH if the managed entrypoint disappears.  A normal POSIX
+# venv may link that entry to an OS-installed interpreter, so only the entry's
+# managed directory and its canonical ancestors are confined.
+_RESOLVE_MANAGED_EXECUTABLE_PROG = r"""
+import os
+import sys
+
+def fail(detail):
+    print(detail, file=sys.stderr)
+    raise SystemExit(44)
+
+bindir_arg, requested, root_arg, configured_arg = sys.argv[1:5]
+if not requested or requested != os.path.basename(requested) or "\x00" in requested:
+    fail("managed command must be a single executable name")
+if os.name == "nt":
+    suffix = os.path.splitext(requested)[1].lower()
+    if suffix not in ("", ".exe"):
+        fail("managed Windows commands must resolve to an .exe entry")
+    names = [requested if suffix == ".exe" else requested + ".exe"]
+else:
+    names = [requested]
+if not os.path.isabs(bindir_arg):
+    fail("managed executable directory must be absolute")
+if root_arg and not os.path.isabs(root_arg):
+    fail("managed environment root must be absolute")
+if configured_arg and not os.path.isabs(configured_arg):
+    fail("configured environment root must be absolute")
+bindir_entry = os.path.abspath(bindir_arg)
+bindir = os.path.realpath(bindir_entry)
+root = os.path.realpath(os.path.abspath(root_arg)) if root_arg else None
+configured = os.path.realpath(os.path.abspath(configured_arg)) if configured_arg else None
+if (root is None) != (configured is None):
+    fail("managed environment and configured roots must be supplied together")
+try:
+    environment_under_root = (
+        root is not None and configured is not None
+        and root != configured
+        and os.path.commonpath((root, configured)) == configured
+    )
+except ValueError:
+    environment_under_root = False
+if root is not None and not environment_under_root:
+    fail("managed environment escapes its configured root")
+try:
+    bindir_inside_root = root is None or os.path.commonpath((bindir, root)) == root
+except ValueError:
+    bindir_inside_root = False
+if not bindir_inside_root:
+    fail("managed executable directory escapes its managed environment")
+for name in names:
+    entry = os.path.abspath(os.path.join(bindir_entry, name))
+    candidate = os.path.realpath(entry)
+    try:
+        # The selected entry itself must remain below the managed directory;
+        # its regular-file symlink target may be an OS-installed interpreter,
+        # as with a standard Python venv.
+        inside_bindir = os.path.commonpath((entry, bindir_entry)) == bindir_entry
+        inside_root = root is None or os.path.commonpath((bindir, root)) == root
+    except ValueError:
+        inside_bindir = inside_root = False
+    if not inside_bindir or not inside_root or not os.path.isfile(candidate):
+        continue
+    if os.name == "nt" and not entry.lower().endswith(".exe"):
+        continue
+    if os.name != "nt" and not os.access(candidate, os.X_OK):
+        continue
+    print(entry)
+    raise SystemExit(0)
+fail("managed environment executable is missing or not executable")
+""".strip()
+
 _TELEMETRY_MARKER = "\n__REMRUN_TELEMETRY__ "
 _MEMORY_ADMISSION_MARKER = "__REMRUN_MEMORY_ADMISSION__ "
 _GUARD_HELPER_EXIT = 125
@@ -652,19 +727,44 @@ def _lease_request(guard: MemoryGuard, reservation: MemoryReservation) -> dict[s
         "allowance_bytes": reservation.allowance_bytes,
         "control_overhead_bytes": reservation.control_overhead_bytes,
         "capacity_bytes": reservation.capacity_bytes,
-        "command_limit_fraction": guard.command_limit_fraction,
         "max_jobs": guard.max_jobs,
         "reservation_ttl_seconds": RESERVATION_TTL_SECONDS,
     }
+    if guard.command_limit_fraction is not None:
+        request["command_limit_fraction"] = guard.command_limit_fraction
     if guard.host_reserve_fraction is not None:
         request["host_reserve_fraction"] = guard.host_reserve_fraction
+    command_limit = reservation.effective_command_limit_bytes
+    if command_limit is not None:
+        request["command_limit_bytes"] = command_limit
+    for name in (
+        "allowance_basis",
+        "allocation_rule",
+        "remaining_backed_capacity_bytes",
+        "strict_margin_bytes",
+        "learned_allowance_bytes",
+        "live_backed_allowance_bytes",
+        "learned_allowance_live_backed",
+        "predicted_rss_bytes",
+    ):
+        value = getattr(reservation, name)
+        if value is not None:
+            request[name] = value
     return request
 
 
 def _renewed_reservation_matches(
     original: MemoryReservation, renewed: MemoryReservation
 ) -> bool:
-    """Accept only an authenticated downward resize of an unprofiled lease."""
+    """Accept only an authenticated downward resize of an inferred lease."""
+    basis_compatible = (
+        renewed.allowance_basis == original.allowance_basis
+        or (
+            original.allowance_basis == "learned_profile_plus_25_percent"
+            and renewed.allowance_basis == "learned_profile_live_headroom"
+        )
+    )
+    basis_changed = renewed.allowance_basis != original.allowance_basis
     if (
         renewed.lease_id != original.lease_id
         or renewed.lease_token != original.lease_token
@@ -674,9 +774,21 @@ def _renewed_reservation_matches(
         or renewed.min_available_bytes != original.min_available_bytes
         or renewed.host_total_bytes != original.host_total_bytes
         or renewed.safe_concurrency != original.safe_concurrency
-        or renewed.allowance_basis != original.allowance_basis
+        or not basis_compatible
+        or renewed.allocation_rule != original.allocation_rule
+        or renewed.command_limit_bytes != original.command_limit_bytes
+        or renewed.strict_margin_bytes != original.strict_margin_bytes
+        or renewed.learned_allowance_bytes != original.learned_allowance_bytes
+        or renewed.predicted_rss_bytes != original.predicted_rss_bytes
         or renewed.capacity_bytes
         != renewed.allowance_bytes + renewed.control_overhead_bytes
+    ):
+        return False
+    if basis_changed and not (
+        original.allowance_basis == "learned_profile_plus_25_percent"
+        and renewed.allowance_basis == "learned_profile_live_headroom"
+        and renewed.allowance_bytes < original.allowance_bytes
+        and renewed.capacity_bytes < original.capacity_bytes
     ):
         return False
     if (
@@ -685,10 +797,145 @@ def _renewed_reservation_matches(
     ):
         return True
     return (
-        original.allowance_basis == "unprofiled_available_backed"
+        original.allowance_basis
+        in {
+            "unprofiled_available_backed",
+            "learned_profile_plus_25_percent",
+            "learned_profile_live_headroom",
+        }
         and renewed.allowance_bytes < original.allowance_bytes
         and renewed.capacity_bytes < original.capacity_bytes
     )
+
+
+def _claim_projection_metadata_is_nonincreasing(
+    original: MemoryReservation, effective: MemoryReservation
+) -> bool:
+    """Accept claim metadata only when it is equal or more conservative."""
+
+    def optional_int(before: int | None, after: int | None) -> bool:
+        if before is None:
+            return after is None
+        return after is not None and after <= before
+
+    before_flag = original.learned_allowance_live_backed
+    after_flag = effective.learned_allowance_live_backed
+    flag_nonincreasing = (
+        after_flag is None
+        if before_flag is None
+        else isinstance(after_flag, bool) and not (before_flag is False and after_flag)
+    )
+    return (
+        optional_int(
+            original.remaining_backed_capacity_bytes,
+            effective.remaining_backed_capacity_bytes,
+        )
+        and optional_int(
+            original.live_backed_allowance_bytes,
+            effective.live_backed_allowance_bytes,
+        )
+        and flag_nonincreasing
+    )
+
+
+def _effective_guard_reservation(
+    guard_result: dict[str, Any], original: MemoryReservation
+) -> MemoryReservation:
+    """Validate the helper's claim-time effective allowance as a downward resize."""
+    required = {
+        "allowance_bytes",
+        "control_overhead_bytes",
+        "capacity_bytes",
+        "allowance_basis",
+        "allocation_rule",
+        "command_limit_bytes",
+        "remaining_backed_capacity_bytes",
+        "strict_margin_bytes",
+        "learned_allowance_bytes",
+        "live_backed_allowance_bytes",
+        "learned_allowance_live_backed",
+        "predicted_rss_bytes",
+    }
+    missing = sorted(required.difference(guard_result))
+    if missing:
+        raise GuardFinalizationError(
+            "target memory guard omitted claim-effective reservation fields: "
+            + ", ".join(missing),
+            command_started=_guard_command_start_evidence(guard_result),
+            memory_guard=guard_result,
+        )
+    raw = original.as_dict(include_token=True)
+    for name in (
+        "allowance_bytes",
+        "control_overhead_bytes",
+        "capacity_bytes",
+        "allowance_basis",
+        "allocation_rule",
+        "remaining_backed_capacity_bytes",
+        "strict_margin_bytes",
+        "learned_allowance_bytes",
+        "live_backed_allowance_bytes",
+        "learned_allowance_live_backed",
+        "predicted_rss_bytes",
+    ):
+        if name in guard_result:
+            value = guard_result.get(name)
+            if value is None:
+                raw.pop(name, None)
+            else:
+                raw[name] = value
+    value = guard_result.get("command_limit_bytes")
+    if value is None:
+        raw.pop("command_limit_bytes", None)
+    else:
+        raw["command_limit_bytes"] = value
+    try:
+        effective = MemoryReservation.from_payload({"lease": raw})
+    except (TypeError, ValueError) as exc:
+        raise GuardFinalizationError(
+            "target memory guard returned a malformed effective reservation",
+            command_started=_guard_command_start_evidence(guard_result),
+            memory_guard=guard_result,
+        ) from exc
+    if (
+        not _renewed_reservation_matches(original, effective)
+        or not _claim_projection_metadata_is_nonincreasing(original, effective)
+    ):
+        raise GuardFinalizationError(
+            "target memory guard effective reservation is not an authenticated downward resize",
+            command_started=_guard_command_start_evidence(guard_result),
+            memory_guard=guard_result,
+        )
+    learned_fields = (
+        effective.learned_allowance_bytes,
+        effective.live_backed_allowance_bytes,
+        effective.learned_allowance_live_backed,
+    )
+    if isinstance(effective.allowance_basis, str) and effective.allowance_basis.startswith(
+        "learned_profile"
+    ):
+        learned, live_backed, live_backed_flag = learned_fields
+        if (
+            learned is None
+            or live_backed is None
+            or not isinstance(live_backed_flag, bool)
+            or learned < effective.allowance_bytes
+            or live_backed < effective.allowance_bytes
+            or live_backed_flag
+            != (min(learned, effective.max_command_bytes) <= live_backed)
+        ):
+            raise GuardFinalizationError(
+                "target memory guard returned inconsistent learned allowance metadata",
+                command_started=_guard_command_start_evidence(guard_result),
+                memory_guard=guard_result,
+            )
+    elif any(value is not None for value in learned_fields):
+        raise GuardFinalizationError(
+            "target memory guard returned learned metadata for a non-learned allowance",
+            command_started=_guard_command_start_evidence(guard_result),
+            memory_guard=guard_result,
+        )
+    return effective
 
 
 def _controller_guard_refusal(
@@ -697,7 +944,7 @@ def _controller_guard_refusal(
     detail: str,
     reservation: MemoryReservation | None = None,
 ) -> dict:
-    return {
+    payload = {
         "schema": 1,
         "status": "refused",
         "reason": reason,
@@ -705,15 +952,27 @@ def _controller_guard_refusal(
         "command_started": False,
         "command_exit_code": None,
         "helper_exit_code": _GUARD_HELPER_EXIT,
-        "max_command_bytes": reservation.allowance_bytes if reservation else None,
+        "max_command_bytes": (
+            reservation.effective_command_limit_bytes if reservation else None
+        ),
         "min_available_bytes": reservation.min_available_bytes if reservation else None,
-        "command_limit_fraction": guard.command_limit_fraction,
         "host_reserve_fraction": guard.host_reserve_fraction,
         "peak_command_bytes": None,
         "min_host_available_bytes": None,
         "sample_count": 0,
         "platform": "controller",
     }
+    if guard.command_limit_fraction is not None:
+        payload["command_limit_fraction"] = guard.command_limit_fraction
+    if reservation is not None:
+        payload.update(
+            command_limit_enforced=reservation.effective_command_limit_bytes is not None,
+            command_limit_bytes=reservation.effective_command_limit_bytes,
+            enforced_command_limit_bytes=reservation.effective_command_limit_bytes,
+            allowance_basis=reservation.allowance_basis,
+            allocation_rule=reservation.allocation_rule,
+        )
+    return payload
 
 
 def _admission_exec_refusal(
@@ -743,17 +1002,18 @@ def _guarded_helper_args(
     detailed: bool,
     telemetry: bool,
 ) -> list[str]:
-    args = [
-        helper,
-        "--guard-max-bytes",
-        str(reservation.allowance_bytes),
+    args = [helper]
+    command_limit = reservation.effective_command_limit_bytes
+    if command_limit is not None:
+        args.extend(["--guard-max-bytes", str(command_limit)])
+    args.extend([
         "--guard-min-available-bytes",
         str(reservation.min_available_bytes),
         "--guard-token",
         token,
         "--guard-lease-b64",
         _encode_memory_admission_request(_lease_request(guard, reservation)),
-    ]
+    ])
     if detailed:
         args.append("--detailed")
     elif telemetry:
@@ -800,15 +1060,33 @@ def _finalize_guarded_result(
                 "could not be established; command completion is unknown"
             )
         raise GuardFinalizationError(detail, command_started=None)
+    effective_reservation = _effective_guard_reservation(guard_result, reservation)
     if (
-        guard_result.get("max_command_bytes") != reservation.allowance_bytes
-        or guard_result.get("min_available_bytes") != reservation.min_available_bytes
+        guard_result.get("max_command_bytes")
+        != effective_reservation.effective_command_limit_bytes
+        or guard_result.get("min_available_bytes")
+        != effective_reservation.min_available_bytes
     ):
         raise GuardFinalizationError(
             f"{platform_name} memory guard result thresholds do not match the reservation",
             command_started=_guard_command_start_evidence(guard_result),
             memory_guard=guard_result,
         )
+    guard_result = {
+        **guard_result,
+        "command_limit_enforced": (
+            effective_reservation.effective_command_limit_bytes is not None
+        ),
+        "command_limit_bytes": effective_reservation.effective_command_limit_bytes,
+        "enforced_command_limit_bytes": (
+            effective_reservation.effective_command_limit_bytes
+        ),
+        "allowance_bytes": effective_reservation.allowance_bytes,
+        "control_overhead_bytes": effective_reservation.control_overhead_bytes,
+        "capacity_bytes": effective_reservation.capacity_bytes,
+        "allowance_basis": effective_reservation.allowance_basis,
+        "allocation_rule": effective_reservation.allocation_rule,
+    }
     status = guard_result["status"]
     if status == "ok":
         command_code = guard_result.get("command_exit_code")
@@ -825,7 +1103,12 @@ def _finalize_guarded_result(
                 memory_guard=guard_result,
             )
         return ExecResult(
-            command_code, stdout, stderr, telemetry, guard_result, reservation
+            command_code,
+            stdout,
+            stderr,
+            telemetry,
+            guard_result,
+            effective_reservation,
         )
     if helper_exit_code != _GUARD_HELPER_EXIT:
         raise GuardFinalizationError(
@@ -838,7 +1121,12 @@ def _finalize_guarded_result(
     # CLI maps them to its distinct guard exit instead of exposing helper 125 as
     # the user's command code.
     return ExecResult(
-        _GUARD_HELPER_EXIT, stdout, stderr, telemetry, guard_result, reservation
+        _GUARD_HELPER_EXIT,
+        stdout,
+        stderr,
+        telemetry,
+        guard_result,
+        effective_reservation,
     )
 
 
@@ -994,6 +1282,21 @@ class DurableStateError(TransportError):
     """Authenticated target durable state is missing, corrupt, or ambiguous."""
 
 
+def _durable_resume_token_arg(
+    operation: str, resume_token: object,
+) -> str | None:
+    """Return one argparse-safe token item, rejecting malformed credentials locally."""
+    if operation == "launch" and resume_token is None:
+        return None
+    if (
+        not isinstance(resume_token, str)
+        or not resume_token
+        or len(resume_token) > MAX_TOKEN_CHARS
+    ):
+        raise TransportError("resume token is invalid")
+    return f"--resume-token={resume_token}"
+
+
 class BaseTransport:
     """Abstract backend contract.
 
@@ -1036,6 +1339,25 @@ class BaseTransport:
         """
         del env, path_prepend
         self.validate_command(command)
+
+    def resolve_managed_executable(
+        self,
+        bindir: str,
+        requested: str,
+        *,
+        managed_root: str | None = None,
+        configured_root: str | None = None,
+    ) -> str:
+        """Resolve a managed bare command to a target-local absolute path.
+
+        Managed environments need stronger semantics than PATH precedence.  A
+        backend must prove that the selected file is usable and remains inside
+        the configured environment before returning it for dispatch.
+        """
+        del bindir, requested, managed_root, configured_root
+        raise TransportError(
+            f"managed executable resolution is unsupported by {type(self).__name__}"
+        )
 
     def command_start_requires_confirmation(self) -> bool:
         """Whether dispatch alone cannot prove that the user command started."""
@@ -1089,10 +1411,13 @@ class BaseTransport:
                 "lease_token": uuid.uuid4().hex,
                 "predicted_rss_bytes": predicted_bytes,
                 "explicit_limit_bytes": explicit_limit_bytes,
-                "command_limit_fraction": self.memory_guard.command_limit_fraction,
                 "max_jobs": self.memory_guard.max_jobs,
                 "reservation_ttl_seconds": RESERVATION_TTL_SECONDS,
             }
+            if self.memory_guard.command_limit_fraction is not None:
+                request["command_limit_fraction"] = (
+                    self.memory_guard.command_limit_fraction
+                )
             if self.memory_guard.host_reserve_fraction is not None:
                 request["host_reserve_fraction"] = (
                     self.memory_guard.host_reserve_fraction
@@ -1139,7 +1464,12 @@ class BaseTransport:
         if result.admitted:
             renewed = result.reservation
             assert renewed is not None
-            if not _renewed_reservation_matches(reservation, renewed):
+            if (
+                not _renewed_reservation_matches(reservation, renewed)
+                or not _claim_projection_metadata_is_nonincreasing(
+                    reservation, renewed
+                )
+            ):
                 return MemoryAdmissionResult.refused(
                     "admission_mismatch", "target renewed a different reservation"
                 )
@@ -1212,6 +1542,29 @@ class BaseTransport:
         ExecResult is authoritative either way.
         """
         raise NotImplementedError
+
+    def exec_control(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+    ) -> ExecResult:
+        """Run a controller-owned, non-workload helper without a memory lease.
+
+        Control probes such as bootstrap readiness must not compete with or
+        consume the workload admission lease.  Backends retain their normal
+        shell/path construction, but deliberately bypass memory guarding.
+        """
+        return self.exec(
+            command,
+            cwd,
+            env=env,
+            timeout=timeout,
+            path_prepend=path_prepend,
+        )
 
     def exec_with_memory_limit(
         self,
@@ -1427,6 +1780,8 @@ class BaseTransport:
         remote_root: str,
         exclude_patterns: Iterable[str],
         hash_below_bytes: int = 0,
+        *,
+        include_paths: Iterable[str] = (),
     ) -> Manifest:
         raise NotImplementedError
 
@@ -1678,11 +2033,49 @@ class LocalSimTransport(BaseTransport):
                     platform_name="local",
                 )
             return ExecResult(code, stdout, stderr, telem)
-        except FileNotFoundError as exc:
-            raise TransportError(f"command not found: {command[0]}: {exc}") from exc
+        except OSError as exc:
+            # subprocess could not create a child, so this is a conclusive
+            # pre-start refusal rather than an unknown remote outcome.  This
+            # matters for an absolute managed entrypoint removed after
+            # resolution: never turn that race into a completion hazard.
+            raise CommandNotStartedError(
+                f"command not found: {command[0]}: {exc}"
+            ) from exc
         finally:
             if self.memory_guard is not None and reservation is not None:
                 self.release_memory_guard(reservation, reserved_only=True)
+
+    def exec_control(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+    ) -> ExecResult:
+        """Run a local target-control helper without reserving workload memory."""
+        merged_env = None
+        if env or path_prepend:
+            merged_env = {**os.environ, **(env or {})}
+            if path_prepend:
+                expanded = [str(Path(p).expanduser()) for p in path_prepend]
+                existing = merged_env.get("PATH", "")
+                merged_env["PATH"] = os.pathsep.join([*expanded, existing]) if existing else os.pathsep.join(expanded)
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=cwd,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=merged_env,
+                timeout=timeout,
+                creationflags=_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TransportError(f"control helper failed: {exc}") from exc
+        return ExecResult(proc.returncode, proc.stdout, proc.stderr)
 
     def ensure_remote_dir(self, remote_path: str) -> None:
         Path(remote_path).mkdir(parents=True, exist_ok=True)
@@ -1810,16 +2203,83 @@ class LocalSimTransport(BaseTransport):
     def remote_path_exists(self, remote_path: str) -> bool:
         return Path(remote_path).exists()
 
+    def resolve_managed_executable(
+        self,
+        bindir: str,
+        requested: str,
+        *,
+        managed_root: str | None = None,
+        configured_root: str | None = None,
+    ) -> str:
+        """Resolve a managed entrypoint with the local target's path rules."""
+        if not requested or requested != Path(requested).name or "\x00" in requested:
+            raise TransportError("managed command must be a single executable name")
+        if self.device.is_windows:
+            suffix = PureWindowsPath(requested).suffix.lower()
+            if suffix not in {"", ".exe"}:
+                raise TransportError(
+                    "managed Windows commands must resolve to an .exe entry"
+                )
+            names = [requested if suffix == ".exe" else requested + ".exe"]
+        else:
+            names = [requested]
+        bindir_path = Path(bindir).expanduser()
+        bindir_entry = Path(os.path.abspath(os.fspath(bindir_path)))
+        bindir_c = bindir_path.resolve(strict=False)
+        root_c = Path(managed_root).expanduser().resolve(strict=False) if managed_root else None
+        configured_c = (
+            Path(configured_root).expanduser().resolve(strict=False)
+            if configured_root else None
+        )
+        if (root_c is None) != (configured_c is None):
+            raise TransportError("managed environment and configured roots are required")
+        if root_c is not None and configured_c is not None:
+            try:
+                if root_c == configured_c or not root_c.is_relative_to(configured_c):
+                    raise TransportError(
+                        "managed environment escapes its configured root"
+                    )
+                if not bindir_c.is_relative_to(root_c):
+                    raise TransportError(
+                        "managed executable directory escapes its managed environment"
+                    )
+            except ValueError as exc:
+                raise TransportError(
+                    "managed executable directory escapes its managed environment"
+                ) from exc
+        for name in names:
+            entry = bindir_entry / name
+            candidate = entry.resolve(strict=False)
+            try:
+                # Keep the selected entry path local to the managed directory;
+                # its file symlink may point to an OS-installed interpreter,
+                # as with a standard Python venv.
+                inside_bindir = entry.is_relative_to(bindir_entry)
+                inside_root = root_c is None or bindir_c.is_relative_to(root_c)
+            except ValueError:
+                inside_bindir = inside_root = False
+            if not inside_bindir or not inside_root or not candidate.is_file():
+                continue
+            if not self.device.is_windows and not os.access(candidate, os.X_OK):
+                continue
+            return str(entry)
+        raise TransportError(
+            f"managed environment executable is missing or not executable: {requested!r}"
+        )
+
     def manifest(
         self,
         remote_root: str,
         exclude_patterns: Iterable[str],
         hash_below_bytes: int = 0,
+        *,
+        include_paths: Iterable[str] = (),
     ) -> Manifest:
         return build_manifest(
             Path(remote_root),
             exclude_patterns,
             hash_below_bytes=hash_below_bytes or None,
+            include_paths=include_paths,
         )
 
     def hash_file(self, remote_path: str) -> str:
@@ -3077,6 +3537,7 @@ class SSHPosixTransport(_SSHCommon):
         resume_token: str | None = None, include_logs: bool = False,
         input_bytes: bytes | None = None, timeout: float = 60.0,
     ) -> dict[str, object]:
+        resume_token_arg = _durable_resume_token_arg(operation, resume_token)
         address = self._address_or_resolve()
         root, helper = self._ensure_durable_runner()
         argv = [
@@ -3084,9 +3545,11 @@ class SSHPosixTransport(_SSHCommon):
             "--state-root", root,
         ]
         if run_id is not None:
-            argv.extend(["--run-id", run_id])
-        if resume_token is not None:
-            argv.extend(["--resume-token", resume_token])
+            # Bound like the token: argv construction must not depend on a value
+            # generated elsewhere never starting with '-'.
+            argv.append(f"--run-id={run_id}")
+        if resume_token_arg is not None:
+            argv.append(resume_token_arg)
         if include_logs:
             argv.append("--include-logs")
         proc = self._remote(address, shlex.join(argv), input_bytes=input_bytes, timeout=timeout)
@@ -3277,6 +3740,36 @@ class SSHPosixTransport(_SSHCommon):
             telemetry=telemetry, on_stdout=on_stdout,
             telemetry_request=telemetry_request, memory_reservation=memory_reservation,
         )
+
+    def exec_control(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+    ) -> ExecResult:
+        """Run a target-control helper without touching the memory ledger."""
+        address = self._address_or_resolve()
+        parts: list[str] = []
+        for key, value in (env or {}).items():
+            parts.append(f"export {key}={shlex.quote(self._expand_remote(str(value)))}")
+        if path_prepend:
+            joined = ":".join(shlex.quote(self._expand_remote(p)) for p in path_prepend)
+            parts.append(f'export PATH={joined}:"$PATH"')
+        parts.append(f"cd {shlex.quote(self._expand_remote(cwd))} && {shlex.join(command)}")
+        shell_flag = "-lc" if self.device.login_shell else "-c"
+        proc = self._remote(
+            address,
+            f"{self.device.shell} {shell_flag} {shlex.quote('; '.join(parts))}",
+            timeout=timeout,
+        )
+        stdout = proc.stdout.decode("utf-8", "replace")
+        stderr = proc.stderr.decode("utf-8", "replace")
+        if proc.returncode == 255:
+            raise TransportError(f"ssh connection failed (exit 255): {stderr.strip()}")
+        return ExecResult(proc.returncode, stdout, stderr)
 
     def _exec_posix(
         self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
@@ -3633,6 +4126,36 @@ class SSHPosixTransport(_SSHCommon):
         proc = self._remote(address, f"test -e {shlex.quote(p)} && echo __REMRUN_EXISTS__")
         return proc.returncode == 0 and b"__REMRUN_EXISTS__" in proc.stdout
 
+    def resolve_managed_executable(
+        self,
+        bindir: str,
+        requested: str,
+        *,
+        managed_root: str | None = None,
+        configured_root: str | None = None,
+    ) -> str:
+        address = self._address_or_resolve()
+        argv = [
+            self.device.remote_python or "python3",
+            "-S",
+            "-c",
+            _RESOLVE_MANAGED_EXECUTABLE_PROG,
+            self._expand_remote(bindir),
+            requested,
+            self._expand_remote(managed_root) if managed_root else "",
+            self._expand_remote(configured_root) if configured_root else "",
+        ]
+        proc = self._remote(address, shlex.join(argv), timeout=30.0)
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            raise TransportError(
+                detail or f"managed environment executable is missing or not executable: {requested!r}"
+            )
+        resolved = proc.stdout.decode("utf-8", "replace").strip()
+        if not resolved or "\n" in resolved or not posixpath.isabs(resolved):
+            raise TransportError("target returned an invalid managed executable path")
+        return resolved
+
     def remote_temp_dir(self, prefix: str = "remrun-fleet") -> str:
         address = self._address_or_resolve()
         path = f"/tmp/{prefix}-{uuid.uuid4().hex[:8]}"
@@ -3651,13 +4174,16 @@ class SSHPosixTransport(_SSHCommon):
                 f"remote tree deletion failed: {proc.stderr.decode('utf-8', 'replace')}"
             )
 
-    def manifest(self, remote_root, exclude_patterns, hash_below_bytes=0) -> Manifest:  # noqa: ANN001
+    def manifest(
+        self, remote_root, exclude_patterns, hash_below_bytes=0, *, include_paths=()
+    ) -> Manifest:  # noqa: ANN001
         address = self._address_or_resolve()
         request = base64.b64encode(json.dumps({
             "op": "manifest",
             "root": remote_root,
             "exclude": list(exclude_patterns),
             "hash_below_bytes": int(hash_below_bytes),
+            "include_paths": list(include_paths),
         }).encode("utf-8")).decode("ascii")
         # Pipe runner source to the remote python via stdin; pass the request as
         # a bare (base64, shell-safe) argv to python's "-" program.
@@ -4035,6 +4561,7 @@ class SSHPowerShellTransport(_SSHCommon):
         resume_token: str | None = None, include_logs: bool = False,
         input_bytes: bytes | None = None, timeout: float = 60.0,
     ) -> dict[str, object]:
+        resume_token_arg = _durable_resume_token_arg(operation, resume_token)
         address = self._address_or_resolve()
         root, helper = self._ensure_durable_runner()
         argv = [
@@ -4042,9 +4569,11 @@ class SSHPowerShellTransport(_SSHCommon):
             "--state-root", root,
         ]
         if run_id is not None:
-            argv.extend(["--run-id", run_id])
-        if resume_token is not None:
-            argv.extend(["--resume-token", resume_token])
+            # Bound like the token: argv construction must not depend on a value
+            # generated elsewhere never starting with '-'.
+            argv.append(f"--run-id={run_id}")
+        if resume_token_arg is not None:
+            argv.append(resume_token_arg)
         if include_logs:
             argv.append("--include-logs")
         tokens = " ".join(_ps_squote(token) for token in argv)
@@ -4235,6 +4764,36 @@ class SSHPowerShellTransport(_SSHCommon):
         return [*self._ssh_base(address), remote]
 
     # --- execution --------------------------------------------------------
+    def exec_control(
+        self,
+        command: list[str],
+        cwd: str,
+        *,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        path_prepend: list[str] | None = None,
+    ) -> ExecResult:
+        """Run a target-control helper without touching the memory ledger."""
+        address = self._address_or_resolve()
+        lines = [
+            "$ErrorActionPreference = 'Stop'",
+            "$PSNativeCommandUseErrorActionPreference = $false",
+        ]
+        for key, value in (env or {}).items():
+            lines.append(f"$env:{key} = {_ps_squote(self._expand_remote(str(value)))}")
+        if path_prepend:
+            joined = ";".join(self._expand_remote(p) for p in path_prepend) + ";"
+            lines.append(f"$env:PATH = {_ps_squote(joined)} + $env:PATH")
+        lines.append(f"Set-Location -LiteralPath {_ps_squote(self._expand_remote(cwd))}")
+        lines.append("& " + " ".join(_ps_squote(token) for token in command))
+        lines.append("exit $LASTEXITCODE")
+        proc = self._ps_remote(address, "\n".join(lines), timeout=timeout)
+        stdout = proc.stdout.decode("utf-8", "replace")
+        stderr = proc.stderr.decode("utf-8", "replace")
+        if proc.returncode == 255:
+            raise TransportError(f"ssh connection failed (exit 255): {stderr.strip()}")
+        return ExecResult(proc.returncode, stdout, stderr)
+
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001
              telemetry=False, on_stdout=None,
              telemetry_request: TelemetryRequest | None = None,
@@ -4652,6 +5211,41 @@ class SSHPowerShellTransport(_SSHCommon):
         proc = self._ps_remote(address, script)
         return proc.returncode == 0 and b"__REMRUN_EXISTS__" in proc.stdout
 
+    def resolve_managed_executable(
+        self,
+        bindir: str,
+        requested: str,
+        *,
+        managed_root: str | None = None,
+        configured_root: str | None = None,
+    ) -> str:
+        address = self._address_or_resolve()
+        argv = [
+            self.device.remote_python or "python",
+            "-S",
+            "-c",
+            _RESOLVE_MANAGED_EXECUTABLE_PROG,
+            self._expand_remote(bindir),
+            requested,
+            self._expand_remote(managed_root) if managed_root else "",
+            self._expand_remote(configured_root) if configured_root else "",
+        ]
+        command = "& " + " ".join(_ps_squote(token) for token in argv)
+        proc = self._ps_remote(
+            address,
+            "$ErrorActionPreference='Stop'\n" + command + "\nexit $LASTEXITCODE",
+            timeout=30.0,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            raise TransportError(
+                detail or f"managed environment executable is missing or not executable: {requested!r}"
+            )
+        resolved = proc.stdout.decode("utf-8", "replace").strip()
+        if not resolved or "\n" in resolved or not PureWindowsPath(resolved).is_absolute():
+            raise TransportError("target returned an invalid managed executable path")
+        return resolved
+
     def native_join(self, *parts: str) -> str:
         # Preserve the first part (a drive/UNC root) intact; collapse only the
         # separators between parts. (See the base native_join note.)
@@ -4684,13 +5278,16 @@ class SSHPowerShellTransport(_SSHCommon):
                 f"remote tree deletion failed: {proc.stderr.decode('utf-8', 'replace')}"
             )
 
-    def manifest(self, remote_root, exclude_patterns, hash_below_bytes=0) -> Manifest:  # noqa: ANN001
+    def manifest(
+        self, remote_root, exclude_patterns, hash_below_bytes=0, *, include_paths=()
+    ) -> Manifest:  # noqa: ANN001
         address = self._address_or_resolve()
         request = base64.b64encode(json.dumps({
             "op": "manifest",
             "root": remote_root,
             "exclude": list(exclude_patterns),
             "hash_below_bytes": int(hash_below_bytes),
+            "include_paths": list(include_paths),
         }).encode("utf-8")).decode("ascii")
         # Pipe runner source to the remote python via stdin; the base64 request is
         # a bare, shell-safe argv that survives whether the shell is pwsh or cmd.

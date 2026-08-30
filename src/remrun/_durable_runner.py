@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -113,11 +114,52 @@ def _atomic_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
     _fsync_dir(path.parent)
 
 
-def _atomic_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
+@contextmanager
+def _status_file_lock(path: Path):  # noqa: ANN202
+    """Serialize status writers across controller and supervisor processes."""
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_json_unlocked(
+    path: Path, payload: dict[str, Any], mode: int = 0o600,
+) -> None:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(raw) > MAX_STATUS_BYTES and path.name == "status.json":
         raise DurableError("status document exceeds bound")
     _atomic_bytes(path, raw, mode)
+
+
+def _atomic_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
+    if path.name == "status.json":
+        with _status_file_lock(path):
+            _atomic_json_unlocked(path, payload, mode)
+        return
+    _atomic_json_unlocked(path, payload, mode)
 
 
 def _read_json(path: Path, max_bytes: int) -> dict[str, Any]:
@@ -351,6 +393,34 @@ def _validate_status(status: dict[str, Any], spec: dict[str, Any]) -> None:
             raise DurableError("status target acceptance identity mismatch")
 
 
+_TERMINAL_STATUS_STATES = {"complete", "failed"}
+
+
+def _update_status_fields(
+    rdir: Path,
+    spec: dict[str, Any],
+    fields: dict[str, Any],
+    *,
+    expected: dict[str, Any] | None = None,
+    require_nonterminal: bool = False,
+) -> dict[str, Any]:
+    """Conditionally update the latest status while holding the writer lock."""
+    path = rdir / "status.json"
+    with _status_file_lock(path):
+        current = _read_json(path, MAX_STATUS_BYTES)
+        _validate_status(current, spec)
+        if require_nonterminal and current.get("state") in _TERMINAL_STATUS_STATES:
+            return current
+        if expected is not None and any(
+            current.get(key) != value for key, value in expected.items()
+        ):
+            return current
+        refreshed = {**current, **fields, "updated_at": time.time()}
+        _validate_status(refreshed, spec)
+        _atomic_json_unlocked(path, refreshed)
+        return refreshed
+
+
 class _BoundedWriter:
     def __init__(self, path: Path, max_bytes: int) -> None:
         self.path = path
@@ -568,11 +638,12 @@ def _reconcile_target_cleanup(
         return status
     if reconciled == cleanup:
         return status
-    refreshed = dict(status)
-    refreshed["target_cleanup"] = reconciled
-    refreshed["updated_at"] = time.time()
-    _atomic_json(rdir / "status.json", refreshed)
-    return refreshed
+    return _update_status_fields(
+        rdir,
+        spec,
+        {"target_cleanup": reconciled},
+        expected={"target_cleanup": cleanup},
+    )
 
 
 def _supervise(root: Path, run_id: str) -> int:
@@ -610,6 +681,7 @@ def _supervise(root: Path, run_id: str) -> int:
             acknowledged = False
             command_started = False
             claim_token = None
+            claimed = False
             while proc.poll() is None and not ready_path.exists():
                 time.sleep(POLL_SECONDS)
             if ready_path.exists():
@@ -640,9 +712,9 @@ def _supervise(root: Path, run_id: str) -> int:
                     )
                     claim_auth_path.unlink()
                     _fsync_dir(claim_auth_path.parent)
-                    acknowledged = True
+                    claimed = True
                     status.update(
-                        acknowledged=True,
+                        acknowledged=False,
                         command_started=False,
                         acknowledged_at=time.time(),
                         target_acceptance=receipt,
@@ -681,9 +753,11 @@ def _supervise(root: Path, run_id: str) -> int:
                             "exec_confirm",
                             {"user_pid": user_pid, "user_start_id": user_identity},
                         )
+                        acknowledged = True
                         command_started = True
                         status.update(
                             state="running",
+                            acknowledged=True,
                             command_started=True,
                             started_at=time.time(),
                             updated_at=time.time(),
@@ -699,10 +773,11 @@ def _supervise(root: Path, run_id: str) -> int:
                 acknowledged = _ready_valid(ready_path, spec)
                 command_started = acknowledged
             cleanup_receipt = None
-            if acceptance is not None and acknowledged and claim_token is not None:
+            if acceptance is not None and claimed and claim_token is not None:
                 cleanup_receipt = _resource_transition(
                     acceptance, claim_token, "finish", {}
                 )
+                acknowledged = True
             status.update(
                 state="complete",
                 acknowledged=acknowledged,
@@ -740,6 +815,7 @@ def _supervise(root: Path, run_id: str) -> int:
                 claim_token = locals().get("claim_token")
                 if acceptance is not None and isinstance(claim_token, str) \
                         and status.get("target_acceptance") is not None:
+                    status["acknowledged"] = True
                     try:
                         status["target_cleanup"] = _resource_transition(
                             acceptance,
@@ -868,33 +944,53 @@ def _status(root: Path, run_id: str, token: str, include_logs: bool) -> dict[str
     acceptance = spec.get("acceptance")
     if status.get("state") in {"launching", "pending", "running"}:
         if status.get("boot_marker") != _boot_marker() or not _pid_alive(status.get("supervisor_pid")):
-            status = dict(status)
-            status["state"] = "failed"
-            status["error"] = "durable supervisor is absent or target rebooted; restart is forbidden"
-            status["ambiguous"] = True
-            if isinstance(acceptance, dict):
-                try:
-                    cleanup = _resource_transition(acceptance, token, "finish", {})
-                except DurableError:
+            # The supervisor can commit its terminal record and exit after the
+            # snapshot above but before the liveness probe. Its exit orders the
+            # terminal write, so authenticate a fresh snapshot before declaring
+            # the non-terminal record abandoned.
+            rdir, spec, status = _load_authenticated(root, run_id, token)
+            acceptance = spec.get("acceptance")
+            if status.get("state") in {"launching", "pending", "running"}:
+                failure = {
+                    "state": "failed",
+                    "error": (
+                        "durable supervisor is absent or target rebooted; "
+                        "restart is forbidden"
+                    ),
+                    "ambiguous": True,
+                }
+                if isinstance(acceptance, dict):
                     try:
-                        cleanup = _resource_transition(acceptance, token, "status", {})
-                    except DurableError as exc:
-                        cleanup = {
-                            "schema": 1,
-                            "state": "UNKNOWN",
-                            "terminal_reason": f"resource_status_failed:{type(exc).__name__}",
-                        }
-                status["target_cleanup"] = cleanup
-                status["updated_at"] = time.time()
-                _atomic_json(rdir / "status.json", status)
+                        cleanup = _resource_transition(acceptance, token, "finish", {})
+                    except DurableError:
+                        try:
+                            cleanup = _resource_transition(acceptance, token, "status", {})
+                        except DurableError as exc:
+                            cleanup = {
+                                "schema": 1,
+                                "state": "UNKNOWN",
+                                "terminal_reason": f"resource_status_failed:{type(exc).__name__}",
+                            }
+                    failure["target_cleanup"] = cleanup
+                status = _update_status_fields(
+                    rdir,
+                    spec,
+                    failure,
+                    require_nonterminal=True,
+                )
     status = _reconcile_target_cleanup(rdir, spec, status, token)
     cleanup = status.get("target_cleanup")
     certainty = _resource_start_certainty(cleanup)
     if certainty is not NotImplemented and status.get("command_started") is not certainty:
-        status = dict(status)
-        status["command_started"] = certainty
-        status["updated_at"] = time.time()
-        _atomic_json(rdir / "status.json", status)
+        status = _update_status_fields(
+            rdir,
+            spec,
+            {"command_started": certainty},
+            expected={
+                "command_started": status.get("command_started"),
+                "target_cleanup": cleanup,
+            },
+        )
     if include_logs:
         if status.get("state") != "complete":
             raise DurableError("logs are available only for a complete durable run")

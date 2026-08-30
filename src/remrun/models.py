@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .gpu_topology import parse_gpu_memory_topology
+
+if TYPE_CHECKING:
+    from .bootstrap import BootstrapPlan
 
 
 @dataclass(frozen=True)
@@ -16,6 +21,9 @@ class Device:
     project_root: str
     state_root: str
     cache_root: str
+    # Disabled devices remain excluded from automatic and fleet placement. This
+    # opt-in only permits an explicitly named ordinary run/plan target.
+    allow_explicit_run: bool = False
     tags: list[str] = field(default_factory=list)
     max_jobs: int = 1
     notes: str = ""
@@ -47,6 +55,9 @@ class Device:
     eff_cores: int = 0
     ram_gb: float = 0.0
     vram_gb: float = 0.0
+    # Optional device-level declaration for whether GPU memory is separately
+    # allocatable or shared with host RAM. Unset means resolve from telemetry.
+    gpu_memory_topology: str = "auto"
     # Raw versioned resource policy. Validation belongs to the opt-in resource
     # envelope path; preserving the original value ensures missing and malformed
     # policy never become plausible defaults during ordinary configuration load.
@@ -55,6 +66,16 @@ class Device:
     # execution boundary: when present, every command path must initialize it
     # before user code and may not be disabled by a normal CLI flag.
     memory_guard: object | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.allow_explicit_run) is not bool:
+            raise ValueError("allow_explicit_run must be a boolean")
+        topology = parse_gpu_memory_topology(self.gpu_memory_topology)
+        object.__setattr__(self, "gpu_memory_topology", topology)
+        if topology == "unified" and self.vram_gb > 0:
+            raise ValueError(
+                "gpu_memory_topology='unified' cannot declare separate vram_gb"
+            )
 
     @classmethod
     def from_mapping(cls, name: str, data: dict[str, Any]) -> "Device":
@@ -68,6 +89,7 @@ class Device:
             project_root=str(data.get("project_root", "")),
             state_root=str(data.get("state_root", "")),
             cache_root=str(data.get("cache_root", "")),
+            allow_explicit_run=data.get("allow_explicit_run", False),
             tags=list(data.get("tags", [])),
             max_jobs=int(data.get("max_jobs", 1)),
             notes=str(data.get("notes", "")),
@@ -88,6 +110,7 @@ class Device:
             eff_cores=int(data.get("eff_cores", 0) or 0),
             ram_gb=float(data.get("ram_gb", 0) or 0),
             vram_gb=float(data.get("vram_gb", 0) or 0),
+            gpu_memory_topology=parse_gpu_memory_topology(data.get("gpu_memory_topology")),
             resource_policy=data["resource_policy"] if "resource_policy" in data else None,
             memory_guard=data["memory_guard"] if "memory_guard" in data else None,
         )
@@ -164,6 +187,7 @@ class RunPlan:
     # CLI resolves reachability/load). Single element for an explicit target.
     candidates: list[Device] = field(default_factory=list)
     workload: WorkloadSpec | None = None
+    bootstrap: BootstrapPlan | None = None
 
     def as_dict(self) -> dict[str, Any]:
         result = {
@@ -193,4 +217,6 @@ class RunPlan:
         }
         if self.workload is not None:
             result["workload"] = self.workload.as_dict()
+        if self.bootstrap is not None:
+            result["bootstrap"] = self.bootstrap.as_dict()
         return result

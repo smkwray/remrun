@@ -15,6 +15,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import __version__
+from .bootstrap import (
+    BootstrapConfigError,
+    bootstrap_inputs_match,
+    execute_bootstrap,
+    inspect_bootstrap,
+    validate_managed_command,
+)
 from .config import (
     load_config, load_project_config, load_retention, offload_policy, offload_threshold,
     scheduler_config,
@@ -788,6 +795,35 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         if selection:
             plan = replace(plan, target=selection[0][0])
             target_reason = selection[0][3]
+            if plan.bootstrap is not None:
+                try:
+                    bootstrap_transport = selection[0][1]
+                    bootstrap_remote_root = bootstrap_transport.remote_project_path(
+                        plan.project
+                    )
+                    bootstrap_runenv = resolve_run_env(
+                        device=plan.target,
+                        project=plan.project,
+                        project_config=plan.project_config,
+                    )
+                    plan = replace(
+                        plan,
+                        bootstrap=inspect_bootstrap(
+                            bootstrap_transport,
+                            device=plan.target,
+                            project=plan.project,
+                            plan=plan.bootstrap,
+                            remote_root=bootstrap_remote_root,
+                            runenv=bootstrap_runenv,
+                        ),
+                    )
+                except (OSError, TransportError, ValueError) as exc:
+                    plan = replace(
+                        plan,
+                        bootstrap=replace(
+                            plan.bootstrap, status="unsupported", detail=str(exc)
+                        ),
+                    )
         else:
             target_reason = "unreachable"
     if args.json:
@@ -810,6 +846,8 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         if plan.workload is not None:
             reporter.event("workload", **plan.workload.as_dict())
         reporter.event("active_surface", excludes=len(plan.excludes), hash_below_bytes=plan.hash_below_bytes)
+        if plan.bootstrap is not None:
+            reporter.event("bootstrap", **plan.bootstrap.as_dict())
         for entry in (candidates or []):
             reporter.event("candidate_probe", **entry)
         reporter.event("project_config", path=str(plan.project_config_path) if plan.project_config_path else None)
@@ -1617,11 +1655,15 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             return EXIT_INTERNAL
 
         t0 = time.monotonic()
+        reservation_ref: dict[str, MemoryReservation | None] = {"value": reservation}
         try:
             return _run_locked(args, reporter, plan, transport, remote_root, remote_cwd,
                                run_id, rdir, summary_path, started_at, t0, policy,
                                telemetry_default, attempt > 0, attempted_run_ids,
-                               resource_policy, reservation)
+                               resource_policy, reservation,
+                               memory_limit_mib=memory_limit_mib,
+                               predicted_rss_mb=(prediction.get("rss_mb") if prediction else None),
+                               memory_reservation_ref=reservation_ref)
         except _PreflightConflict as exc:
             last_conflict_exit = exc.exit_code
             # A non-retryable conflict (e.g. local-vanished) is global: stop the whole run.
@@ -1665,8 +1707,9 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             raise
         finally:
             lock.release()
-            if reservation is not None:
-                transport.release_memory_guard(reservation, reserved_only=True)
+            current_reservation = reservation_ref["value"]
+            if current_reservation is not None:
+                transport.release_memory_guard(current_reservation, reserved_only=True)
             # Prune even when a run errors out early (preflight/exec/pullback may already have
             # written backups), so repeated failures can't grow the state unbounded.
             try:
@@ -1696,56 +1739,115 @@ def _run_locked(
     attempted_run_ids: set[str],
     resource_policy: ResourcePolicy | None,
     memory_reservation: MemoryReservation | None,
+    memory_limit_mib: int | None = None,
+    predicted_rss_mb: object = None,
+    memory_reservation_ref: dict[str, MemoryReservation | None] | None = None,
 ) -> int:
     local_root = plan.project.local_project_root
     prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
     backup_root = conflict_dir(run_id) / "backup"
 
-    # Validate a backend's declared argv boundary before reconciliation can mutate
-    # either tree and before an UNKNOWN fence can be installed. PowerShell command
-    # discovery depends on the resolved target PATH/environment, while direct
-    # transport APIs still recheck the boundary at their own dispatch seam.
+    if plan.bootstrap is not None and plan.bootstrap.status == "unsupported":
+        detail = plan.bootstrap.detail or "bootstrap declaration is unsupported"
+        reporter.event("bootstrap_failed", status="unsupported", detail=detail)
+        write_json(summary_path, {
+            "run_id": run_id, "project_id": plan.project.project_id,
+            "target": plan.target.name, "command": plan.command,
+            "started_at": started_at, "ended_at": utc_now_iso(),
+            "phase": "bootstrap", "completion_state": "not_started",
+            "command_started": False, "terminal": True, "error": detail,
+            "bootstrap": plan.bootstrap.as_dict(), "plan": plan.as_dict(),
+        })
+        return EXIT_INTERNAL
+
     runenv = resolve_run_env(
         device=plan.target, project=plan.project, project_config=plan.project_config
     )
-    try:
-        transport.validate_command_context(
-            plan.command, env=runenv.env, path_prepend=runenv.path_prepend
-        )
-    except CommandNotStartedError as exc:
-        reporter.event("command_rejected", phase="preflight", message=str(exc))
-        write_json(summary_path, {
-            "run_id": run_id,
-            "project_id": plan.project.project_id,
-            "target": plan.target.name,
-            "command": plan.command,
-            "started_at": started_at,
-            "ended_at": utc_now_iso(),
-            "error": str(exc),
-            "phase": "preflight",
-            "completion_state": "not_started",
-            "command_started": False,
-            "terminal": True,
-            "plan": plan.as_dict(),
-        })
-        return EXIT_INFRA
-    except TransportError as exc:
-        reporter.event("transfer_error", phase="command_validation", message=str(exc))
-        write_json(summary_path, {
-            "run_id": run_id,
-            "project_id": plan.project.project_id,
-            "target": plan.target.name,
-            "command": plan.command,
-            "started_at": started_at,
-            "ended_at": utc_now_iso(),
-            "error": str(exc),
-            "phase": "command_validation",
-            "completion_state": "not_started",
-            "command_started": False,
-            "terminal": True,
-            "plan": plan.as_dict(),
-        })
-        return EXIT_TRANSFER
+    # Keep the owner-requested argv in ``plan`` and summaries, but dispatch a
+    # managed bare entrypoint only after the target has resolved it to its
+    # canonical absolute executable.  This prevents PATH from selecting a
+    # system executable if the managed file is replaced between validation and
+    # launch.
+    dispatch_command = list(plan.command)
+    bootstrap_inputs = (
+        plan.bootstrap.lock_inputs
+        if plan.bootstrap is not None and plan.bootstrap.status == "bootstrap-needed"
+        else ()
+    )
+    bootstrap_result = None
+    # Bootstrap must complete before resolving a managed bare command, even when
+    # a declaration has no lock inputs: otherwise validation can reject the
+    # interpreter before the setup step has had a chance to create it.
+    defer_command_validation = (
+        plan.bootstrap is not None
+        and plan.bootstrap.status == "bootstrap-needed"
+    )
+
+    def validate_user_command() -> int | None:
+        nonlocal dispatch_command
+        try:
+            dispatch_command = validate_managed_command(
+                transport,
+                device=plan.target,
+                runenv=runenv,
+                command=plan.command,
+            )
+            transport.validate_command_context(
+                dispatch_command, env=runenv.env, path_prepend=runenv.path_prepend
+            )
+        except (BootstrapConfigError, CommandNotStartedError) as exc:
+            reporter.event("command_rejected", phase="preflight", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "command": plan.command,
+                "started_at": started_at,
+                "ended_at": utc_now_iso(),
+                "error": str(exc),
+                "phase": "preflight",
+                "completion_state": "not_started",
+                "command_started": False,
+                "terminal": True,
+                "bootstrap": (
+                    bootstrap_result.as_dict()
+                    if bootstrap_result is not None
+                    else None
+                ),
+                "plan": plan.as_dict(),
+            })
+            return EXIT_INFRA
+        except TransportError as exc:
+            reporter.event("transfer_error", phase="command_validation", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "command": plan.command,
+                "started_at": started_at,
+                "ended_at": utc_now_iso(),
+                "error": str(exc),
+                "phase": "command_validation",
+                "completion_state": "not_started",
+                "command_started": False,
+                "terminal": True,
+                "bootstrap": (
+                    bootstrap_result.as_dict()
+                    if bootstrap_result is not None
+                    else None
+                ),
+                "plan": plan.as_dict(),
+            })
+            return EXIT_TRANSFER
+        return None
+
+    # Preserve the ordinary path's pre-mutation rejection boundary.  Only a
+    # declared bootstrap may defer validation, because it can install the
+    # requested entrypoint.
+    if not defer_command_validation:
+        validation_exit = validate_user_command()
+        if validation_exit is not None:
+            return validation_exit
 
     # --- preflight reconcile -------------------------------------------------
     def report_preflight_progress(
@@ -1771,6 +1873,7 @@ def _run_locked(
             backup_below_bytes=policy.backup_below_bytes,
             progress=report_preflight_progress,
             is_fallback=is_fallback,
+            include_paths=bootstrap_inputs,
         )
     except TransportError as exc:
         reporter.event("transfer_error", phase="preflight", message=str(exc))
@@ -1823,6 +1926,165 @@ def _run_locked(
                    skipped_identical=len(pre.skipped_identical),
                    converged_conflicts=len(pre.converged_conflicts), conflicts=0)
 
+    def fail_bootstrap_input_drift(detail: str) -> int:
+        reporter.event("bootstrap_failed", status="input_changed", detail=detail)
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "ended_at": utc_now_iso(),
+            "phase": "bootstrap",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "error": detail,
+            "bootstrap": {
+                "status": "input_changed",
+                "detail": detail,
+            },
+            "plan": plan.as_dict(),
+        })
+        return EXIT_CONFLICT
+
+    if plan.bootstrap is not None and plan.bootstrap.status == "bootstrap-needed":
+        inputs_current, detail = bootstrap_inputs_match(
+            plan.bootstrap, project_root=local_root
+        )
+        if not inputs_current:
+            return fail_bootstrap_input_drift(detail)
+
+    # Bootstrap is deliberately after reconciliation: declared lock inputs are now
+    # present on the target, and no setup command can run against a stale project
+    # surface.  It is also before both ordinary and durable dispatch, so a failed
+    # or uncertain setup can never be mistaken for a user-command attempt.
+    if plan.bootstrap is not None:
+        try:
+            target_bootstrap = inspect_bootstrap(
+                transport,
+                device=plan.target,
+                project=plan.project,
+                plan=plan.bootstrap,
+                remote_root=remote_root,
+                runenv=runenv,
+            )
+        except (OSError, TransportError, ValueError) as exc:
+            target_bootstrap = replace(plan.bootstrap, status="unsupported", detail=str(exc))
+        reporter.event("bootstrap", **target_bootstrap.as_dict())
+        if target_bootstrap.status == "disabled":
+            pass
+        elif target_bootstrap.status == "unsupported":
+            detail = target_bootstrap.detail or "bootstrap declaration is unsupported"
+            write_json(summary_path, {
+                "run_id": run_id, "project_id": plan.project.project_id,
+                "target": plan.target.name, "command": plan.command,
+                "started_at": started_at, "ended_at": utc_now_iso(),
+                "phase": "bootstrap", "completion_state": "not_started",
+                "command_started": False, "terminal": True, "error": detail,
+                "bootstrap": target_bootstrap.as_dict(), "plan": plan.as_dict(),
+            })
+            return EXIT_INTERNAL
+        elif target_bootstrap.status != "ready":
+            used_existing_guard = (
+                memory_reservation is not None
+                and getattr(transport, "memory_guard", None) is not None
+            )
+            try:
+                bootstrap_result = execute_bootstrap(
+                    transport, device=plan.target, project=plan.project,
+                    plan=target_bootstrap, remote_root=remote_root, runenv=runenv,
+                    memory_reservation=memory_reservation if used_existing_guard else None,
+                )
+            except (
+                BootstrapConfigError,
+                OSError,
+                TransportError,
+                ValueError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                bootstrap_result = None
+                detail = f"{type(exc).__name__}: {exc}"
+                reporter.event("bootstrap_failed", detail=detail)
+                write_json(summary_path, {
+                    "run_id": run_id, "project_id": plan.project.project_id,
+                    "target": plan.target.name, "command": plan.command,
+                    "started_at": started_at, "ended_at": utc_now_iso(),
+                    "phase": "bootstrap", "completion_state": "unknown",
+                    "command_started": False, "terminal": True, "error": detail,
+                    "bootstrap": {"status": "unknown", "detail": detail},
+                    "plan": plan.as_dict(),
+                })
+                return EXIT_INFRA
+            # A transport consumes/releases a supplied lease when its bootstrap
+            # helper returns.  Make the holder agree before any pre-dispatch
+            # failure can be finalized by the outer cleanup.
+            if used_existing_guard:
+                memory_reservation = None
+                if memory_reservation_ref is not None:
+                    memory_reservation_ref["value"] = None
+            if bootstrap_result is None or bootstrap_result.status not in {"ready", "bootstrapped"}:
+                detail = (
+                    bootstrap_result.detail if bootstrap_result is not None
+                    else "bootstrap did not return an outcome"
+                )
+                reporter.event(
+                    "bootstrap_failed",
+                    status=bootstrap_result.status if bootstrap_result else "unknown",
+                    detail=detail,
+                )
+                write_json(summary_path, {
+                    "run_id": run_id, "project_id": plan.project.project_id,
+                    "target": plan.target.name, "command": plan.command,
+                    "started_at": started_at, "ended_at": utc_now_iso(),
+                    "phase": "bootstrap", "completion_state": "not_started",
+                    "command_started": False, "terminal": True, "error": detail,
+                    "bootstrap": bootstrap_result.as_dict() if bootstrap_result else None,
+                    "plan": plan.as_dict(),
+                })
+                return EXIT_INFRA
+            if used_existing_guard:
+                if memory_limit_mib is not None:
+                    admission = transport.reserve_memory_guard(
+                        explicit_limit_mib=memory_limit_mib
+                    )
+                else:
+                    admission = transport.reserve_memory_guard(
+                        predicted_rss_mb=predicted_rss_mb
+                    )
+                if not admission.admitted:
+                    detail = "target capacity was unavailable after bootstrap: " + admission.detail
+                    reporter.event("memory_admission", target=plan.target.name,
+                                   status=admission.status, reason=admission.reason,
+                                   detail=detail, phase="post_bootstrap")
+                    write_json(summary_path, {
+                        "run_id": run_id, "project_id": plan.project.project_id,
+                        "target": plan.target.name, "command": plan.command,
+                        "started_at": started_at, "ended_at": utc_now_iso(),
+                        "phase": "memory_admission", "completion_state": "not_started",
+                        "command_started": False, "terminal": True, "error": detail,
+                        "bootstrap": bootstrap_result.as_dict(),
+                        "memory_admission": admission.payload, "plan": plan.as_dict(),
+                    })
+                    return EXIT_GUARD
+                memory_reservation = admission.reservation
+                if memory_reservation_ref is not None:
+                    memory_reservation_ref["value"] = memory_reservation
+        elif target_bootstrap.status == "ready":
+            bootstrap_result = None
+
+    if plan.bootstrap is not None and plan.bootstrap.status == "bootstrap-needed":
+        inputs_current, detail = bootstrap_inputs_match(
+            plan.bootstrap, project_root=local_root
+        )
+        if not inputs_current:
+            return fail_bootstrap_input_drift(detail)
+
+    if defer_command_validation:
+        validation_exit = validate_user_command()
+        if validation_exit is not None:
+            return validation_exit
+
     if getattr(args, "durable", False):
         reporter.event(
             "durable_target_bound",
@@ -1836,6 +2098,7 @@ def _run_locked(
             rdir=rdir, summary_path=summary_path, started_at=started_at, t0=t0,
             policy=policy, telemetry_default=telemetry_default, pre=pre,
             backup_root=backup_root, memory_reservation=memory_reservation,
+            bootstrap_result=bootstrap_result, command=dispatch_command,
         )
 
     # --- execute -------------------------------------------------------------
@@ -1934,17 +2197,17 @@ def _run_locked(
         if not active_job_observation_enabled() or observed_exec is None:
             # Exact-base landing is dormant unless the controller explicitly opts in.
             # Third-party/test doubles continue through their established exec seam.
-            result = transport.exec(plan.command, cwd=remote_cwd, **exec_kwargs)
+            result = transport.exec(dispatch_command, cwd=remote_cwd, **exec_kwargs)
         else:
             observation = JobObservation.for_command(
                 job_id=run_id,
                 project=plan.project.project_id,
                 target=plan.target.name,
                 phase="command",
-                command=plan.command,
+                command=dispatch_command,
             )
             result = observed_exec(
-                plan.command,
+                dispatch_command,
                 cwd=remote_cwd,
                 observation=observation,
                 **exec_kwargs,
@@ -2066,25 +2329,23 @@ def _run_locked(
         and guard_result is not None
         and guard_result.get("reason") == "command_memory_limit"
         and final_memory_reservation is not None
-        and final_memory_reservation.allowance_basis
-        == "unprofiled_available_backed"
+        and final_memory_reservation.effective_command_limit_bytes is not None
     ):
         memory_limit_guidance = {
             "allowance_basis": final_memory_reservation.allowance_basis,
             "allocation_rule": final_memory_reservation.allocation_rule,
-            "fair_share_limit_mib": final_memory_reservation.allowance_bytes // MIB,
+            "enforced_command_limit_bytes": (
+                final_memory_reservation.effective_command_limit_bytes
+            ),
             "observed_peak_lower_bound_bytes": guard_result.get(
                 "peak_command_bytes"
             ),
             "policy_command_ceiling_bytes": (
                 final_memory_reservation.max_command_bytes
             ),
+            "host_reserve_bytes": final_memory_reservation.min_available_bytes,
             "partial_effects_may_exist": True,
             "profile_recorded": False,
-            "retry_hint": (
-                "inspect the workload, then intentionally rerun with "
-                "--memory-limit-mib N if a larger hard limit is justified"
-            ),
         }
         reporter.event("memory_limit_guidance", **memory_limit_guidance)
     command_exit_code = (
@@ -2148,6 +2409,7 @@ def _run_locked(
                 conflict_remote_root=conflict_dir(run_id) / "remote",
                 backup_below_bytes=policy.backup_below_bytes,
                 write_scope_paths=plan.write_scope_paths or None,
+                include_paths=bootstrap_inputs,
             )
         except TransportError as exc:
             reporter.event("transfer_error", phase="pullback", message=str(exc))
@@ -2388,6 +2650,7 @@ def _run_locked(
             else None
         ),
         "memory_limit_guidance": memory_limit_guidance,
+        "bootstrap": bootstrap_result.as_dict() if bootstrap_result is not None else None,
         "peak_rss_mb": result.telemetry.get("peak_rss_mb") if result.telemetry else None,
         "avg_cpu_pct": result.telemetry.get("avg_cpu_pct") if result.telemetry else None,
         "plan": plan.as_dict(),
@@ -2448,10 +2711,22 @@ def cmd_bench(args: argparse.Namespace, reporter: Reporter) -> int:
     command = normalize_cmd(args.cmd)
     if args.targets:
         targets = [t.strip() for t in str(args.targets).split(",") if t.strip()]
+        ineligible = [
+            name for name in targets
+            if name not in config.devices or not config.devices[name].enabled
+        ]
+        if ineligible:
+            raise ValueError(
+                "bench requires enabled target device(s): " + ", ".join(ineligible)
+                + "; allow_explicit_run applies only to ordinary plan/run"
+            )
     else:
         sched = scheduler_config(config)
         ordered = [sched.get("primary"), *list(sched.get("fallback", []))]
-        targets = [str(t) for t in ordered if t and t in config.devices]
+        targets = [
+            str(name) for name in ordered
+            if name and str(name) in config.devices and config.devices[str(name)].enabled
+        ]
         if not targets:
             targets = [name for name, device in config.devices.items() if device.enabled]
     skip_local = bool(getattr(args, "no_local", False))
@@ -2679,6 +2954,25 @@ def _durable_record_path(rdir: Path) -> Path:
     return rdir / "durable.json"
 
 
+def _durable_record_token(record: dict[str, object]) -> str:
+    """Return the saved resume token, refusing to invent one from malformed state.
+
+    ``str(record["resume_token"])`` turns a missing or null credential into the
+    literal ``"None"`` — a non-empty string that satisfies every later validity
+    check and reaches the target looking like a real token.  The target then
+    reports an authentication failure, which reads as "the credential was
+    rejected" rather than "this controller no longer has one".  A record that
+    cannot produce its credential keeps its fence and says why.
+    """
+    token = record.get("resume_token")
+    if not isinstance(token, str) or not token:
+        raise TransportError(
+            "saved durable record has no usable resume token; "
+            "its target state must be resolved by hand"
+        )
+    return token
+
+
 def _validate_durable_identity(
     status: dict[str, object], record: dict[str, object], *, require_complete: bool = False
 ) -> None:
@@ -2776,7 +3070,9 @@ def _finalize_durable_run(
             return code
         raise UnknownCompletionHazardError("completed durable summary has no valid exit code")
 
-    payload = transport.durable_status(run_id, str(record["resume_token"]), include_logs=True)
+    payload = transport.durable_status(
+        run_id, _durable_record_token(record), include_logs=True
+    )
     if not isinstance(payload, dict) or not isinstance(payload.get("status"), dict):
         raise TransportError("durable result payload is malformed")
     status = payload["status"]
@@ -2806,7 +3102,7 @@ def _finalize_durable_run(
             "plan": plan.as_dict(),
         })
         try:
-            transport.durable_cleanup(run_id, str(record["resume_token"]))
+            transport.durable_cleanup(run_id, _durable_record_token(record))
         except TransportError as cleanup_exc:
             reporter.event(
                 "durable_cleanup_deferred", run_id=run_id, message=str(cleanup_exc)
@@ -2835,6 +3131,7 @@ def _finalize_durable_run(
         "command_exit_code": command_exit_code_checkpoint,
         "terminal": False,
         "durable": True,
+        "bootstrap": record.get("bootstrap"),
         "plan": plan.as_dict(),
     })
 
@@ -2886,6 +3183,11 @@ def _finalize_durable_run(
                 conflict_remote_root=conflict_dir(run_id) / "remote",
                 backup_below_bytes=policy.backup_below_bytes,
                 write_scope_paths=plan.write_scope_paths or None,
+                include_paths=(
+                    plan.bootstrap.lock_inputs
+                    if plan.bootstrap is not None and plan.bootstrap.status == "bootstrap-needed"
+                    else ()
+                ),
             )
         except TransportError as exc:
             reporter.event("transfer_error", phase="pullback", message=str(exc))
@@ -2947,6 +3249,7 @@ def _finalize_durable_run(
         "telemetry": result.telemetry,
         "memory_guard": guard_result,
         "durable": True,
+        "bootstrap": record.get("bootstrap"),
         "plan": plan.as_dict(),
     }
     write_json(summary_path, checkpoint)
@@ -2964,7 +3267,7 @@ def _finalize_durable_run(
         durable=True,
     )
     try:
-        transport.durable_cleanup(run_id, str(record["resume_token"]))
+        transport.durable_cleanup(run_id, _durable_record_token(record))
     except TransportError as exc:
         reporter.event("durable_cleanup_deferred", run_id=run_id, message=str(exc))
     else:
@@ -3029,7 +3332,7 @@ def _poll_durable(
             try:
                 if not _running_observation_matches(transport, record):
                     status = transport.durable_status(
-                        run_id, str(record["resume_token"])
+                        run_id, _durable_record_token(record)
                     )
                     _validate_durable_identity(status, record)
                     if status.get("state") != "complete":
@@ -3068,7 +3371,7 @@ def _poll_durable(
         try:
             time.sleep(1.0)
             next_status = transport.durable_status(
-                run_id, str(record["resume_token"])
+                run_id, _durable_record_token(record)
             )
             _validate_durable_identity(next_status, record)
             status = next_status
@@ -3148,11 +3451,14 @@ def _run_durable_locked(
     pre,
     backup_root: Path,
     memory_reservation: MemoryReservation | None,
+    bootstrap_result=None,
+    command: list[str] | None = None,
 ) -> int:
     del t0, pre, backup_root
     runenv = resolve_run_env(
         device=plan.target, project=plan.project, project_config=plan.project_config
     )
+    dispatch_command = list(command if command is not None else plan.command)
     transport.ensure_remote_dir(remote_cwd)
     resume_token = secrets.token_urlsafe(32)
     source_controller = controller_label()
@@ -3161,7 +3467,7 @@ def _run_durable_locked(
         project=plan.project.project_id,
         target=plan.target.name,
         phase="command",
-        command=plan.command,
+        command=dispatch_command,
         source_controller=source_controller,
     )
     record: dict[str, object] = {
@@ -3177,6 +3483,7 @@ def _run_durable_locked(
         "remote_cwd": remote_cwd,
         "no_pullback": bool(args.no_pullback),
         "plan": plan.as_dict(),
+        "bootstrap": bootstrap_result.as_dict() if bootstrap_result is not None else None,
         "execution": None,
     }
     write_json(_durable_record_path(rdir), record)
@@ -3201,7 +3508,7 @@ def _run_durable_locked(
     reporter.event("durable_launch", run_id=run_id, target=plan.target.name)
     try:
         status, execution = transport.launch_durable(
-            plan.command,
+            dispatch_command,
             remote_cwd,
             run_id=run_id,
             resume_token=resume_token,
@@ -3366,7 +3673,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
             if summary.get("durable_cleanup_complete") is not True:
                 try:
                     make_transport(plan.target).durable_cleanup(
-                        args.run_id, str(record["resume_token"])
+                        args.run_id, _durable_record_token(record)
                     )
                 except TransportError as exc:
                     reporter.event(
@@ -3411,7 +3718,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
         )
         try:
             make_transport(plan.target).durable_cleanup(
-                args.run_id, str(record["resume_token"])
+                args.run_id, _durable_record_token(record)
             )
         except TransportError as exc:
             reporter.event(
@@ -3435,7 +3742,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
         adopt_dead_run=True,
     ).acquire()
     try:
-        status = transport.durable_status(args.run_id, str(record["resume_token"]))
+        status = transport.durable_status(args.run_id, _durable_record_token(record))
         _validate_durable_identity(status, record)
         return _poll_durable(
             args=args, reporter=reporter, plan=plan, transport=transport,

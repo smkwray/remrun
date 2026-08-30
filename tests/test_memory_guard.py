@@ -156,6 +156,20 @@ def test_schema_3_defaults_to_automatic_host_reserve():
     }
 
 
+def test_schema_3_allows_omitted_command_ceiling():
+    guard = parse_memory_guard(
+        {"schema": 3},
+        device_name="RUNNER",
+        max_jobs=2,
+        device_kind="ssh-posix",
+        device_os="macos",
+    )
+
+    assert guard is not None
+    assert guard.command_limit_fraction is None
+    assert guard.as_dict() == {"schema": 3}
+
+
 def test_directly_constructed_transport_cannot_bypass_guard_validation(tmp_path: Path):
     device = Device(
         name="RUNNER",

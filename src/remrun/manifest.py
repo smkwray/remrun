@@ -78,6 +78,7 @@ def build_manifest(
     *,
     hash_below_bytes: int | None = None,
     always_hash: bool = False,
+    include_paths: Iterable[str] = (),
 ) -> Manifest:
     """Build a manifest for a local filesystem tree.
 
@@ -88,6 +89,17 @@ def build_manifest(
     as a planning/cache optimization). Default False preserves current behavior.
     """
     root = root.resolve()
+    # A declared bootstrap lock input is an exact, opt-in exception to the
+    # normal excludes (for example the global ``*.lock`` rule).  Keep this
+    # narrow: only the enumerated relative path, and parents needed to reach
+    # it, are retained.  No exclude pattern is changed for any other path.
+    forced = frozenset(path.strip("/") for path in include_paths if path)
+
+    def forced_or_descendant(rel: str) -> bool:
+        return rel in forced or any(path.startswith(rel + "/") for path in forced)
+
+    def excluded(rel: str) -> bool:
+        return should_exclude(rel, exclude_patterns) and not forced_or_descendant(rel)
     manifest: Manifest = {}
     if not root.exists():
         return manifest
@@ -109,7 +121,7 @@ def build_manifest(
         kept_dirs = []
         for dirname in dirnames:
             rel = f"{rel_dir}/{dirname}" if rel_dir else dirname
-            if should_exclude(rel, exclude_patterns):
+            if excluded(rel):
                 continue
             try:
                 if _is_directory_link(current / dirname):
@@ -122,7 +134,7 @@ def build_manifest(
         for filename in filenames:
             path = current / filename
             rel = path.relative_to(root).as_posix()
-            if should_exclude(rel, exclude_patterns):
+            if excluded(rel):
                 continue
             try:
                 # A symlink would manifest content OUTSIDE the tree, and a later pull

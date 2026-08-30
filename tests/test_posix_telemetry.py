@@ -371,6 +371,7 @@ def _guard_request(
     max_command_mib: int = 128,
     min_available_mib: int = 16,
     predicted_rss_bytes: int | None = None,
+    explicit_limit_bytes: int | None = None,
     max_jobs: int = 1,
 ) -> dict[str, object]:
     total, _available = telemetry._host_memory()
@@ -386,6 +387,7 @@ def _guard_request(
         "lease_id": uuid.uuid4().hex,
         "lease_token": uuid.uuid4().hex,
         "predicted_rss_bytes": predicted_rss_bytes,
+        "explicit_limit_bytes": explicit_limit_bytes,
         "command_limit_fraction": command_fraction,
         "host_reserve_fraction": reserve_fraction,
         "max_jobs": max_jobs,
@@ -413,12 +415,30 @@ def _lease_request(payload: dict[str, object], *, op: str = "renew") -> dict[str
     }
 
 
+def _production_lease_request(
+    payload: dict[str, object], *, op: str = "renew"
+) -> dict[str, object]:
+    """Build the post-repair transport lease shape, including limit semantics."""
+    request = _lease_request(payload, op=op)
+    lease = payload["lease"]
+    assert isinstance(lease, dict)
+    request.update(
+        {
+            "allowance_basis": lease.get("allowance_basis"),
+            "allocation_rule": lease.get("allocation_rule"),
+            "command_limit_bytes": lease.get("command_limit_bytes"),
+        }
+    )
+    return request
+
+
 def _reserve_guard(
     state_root: Path,
     *,
     max_command_mib: int = 128,
     min_available_mib: int = 16,
     predicted_rss_bytes: int | None = None,
+    explicit_limit_bytes: int | None = None,
     max_jobs: int = 1,
 ) -> dict[str, object]:
     payload = telemetry._handle_admission_request(
@@ -427,6 +447,7 @@ def _reserve_guard(
             max_command_mib=max_command_mib,
             min_available_mib=min_available_mib,
             predicted_rss_bytes=predicted_rss_bytes,
+            explicit_limit_bytes=explicit_limit_bytes,
             max_jobs=max_jobs,
         )
     )
@@ -435,7 +456,7 @@ def _reserve_guard(
 
 
 def _renew_guard(payload: dict[str, object]) -> dict[str, object]:
-    renewed = telemetry._handle_admission_request(_lease_request(payload))
+    renewed = telemetry._handle_admission_request(_production_lease_request(payload))
     assert renewed["status"] == "admitted", renewed
     return renewed
 
@@ -447,33 +468,355 @@ def _ledger_leases(state_root: Path) -> list[dict[str, object]]:
     return json.loads(ledger.read_text(encoding="utf-8"))["leases"]
 
 
+def test_learned_prediction_over_live_headroom_clips_to_inferred_admission(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    total = 1024 * MIB
+    available = 512 * MIB
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (total, available))
+
+    request = _guard_request(
+        tmp_path,
+        max_command_mib=768,
+        min_available_mib=128,
+        predicted_rss_bytes=512 * MIB,
+    )
+    payload = telemetry._handle_admission_request(request)
+
+    assert payload["status"] == "admitted", payload
+    lease = payload["lease"]
+    assert isinstance(lease, dict)
+    assert lease["allowance_basis"] == "learned_profile_live_headroom"
+    assert lease["command_limit_enforced"] is False
+    assert lease["command_limit_bytes"] is None
+    assert lease["learned_allowance_bytes"] == 640 * MIB
+    assert lease["predicted_rss_bytes"] == 512 * MIB
+    assert lease["live_backed_allowance_bytes"] == lease["allowance_bytes"]
+    assert lease["learned_allowance_live_backed"] is False
+    assert payload["capacity"]["predicted_rss_bytes"] == 512 * MIB
+
+
+def test_versioned_private_profile_payload_is_the_only_admission_profile_metric() -> None:
+    trusted = telemetry._memory_profile_payload(
+        peak_bytes=12 * MIB,
+        sample_count=3,
+        sampling_complete=True,
+        process_tree_drained=True,
+        forced_cleanup=False,
+    )
+    untrusted = telemetry._memory_profile_payload(
+        peak_bytes=12 * MIB,
+        sample_count=3,
+        sampling_complete=False,
+        process_tree_drained=True,
+        forced_cleanup=False,
+    )
+    incomplete = telemetry._memory_profile_payload(
+        peak_bytes=12 * MIB,
+        sample_count=3,
+        sampling_complete=True,
+        process_tree_drained=False,
+        forced_cleanup=False,
+    )
+    forced = telemetry._memory_profile_payload(
+        peak_bytes=12 * MIB,
+        sample_count=3,
+        sampling_complete=True,
+        process_tree_drained=True,
+        forced_cleanup=True,
+    )
+
+    assert trusted["metric"] == telemetry.MEMORY_PROFILE_METRIC
+    assert trusted["shared_page_semantics"] == "excluded"
+    assert untrusted["metric"] is None
+    assert untrusted["peak_bytes"] is None
+    assert incomplete["metric"] is None
+    assert incomplete["coverage"] == "tree_not_drained"
+    assert forced["metric"] is None
+    assert forced["coverage"] == "forced_cleanup"
+
+
+def test_detailed_guard_sample_records_private_profile_and_drops_stale_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production detailed sampler must feed the trusted profile path."""
+    row = telemetry.ProcessRow(
+        pid=123,
+        ppid=1,
+        rss_bytes=7,
+        cpu_sec=0.0,
+        identity="123:start",
+    )
+    private_samples = iter(
+        [
+            64,
+            telemetry._PrivateSampleStale("process exited during private memory read"),
+            128,
+        ]
+    )
+
+    def private_sum(_tree):
+        value = next(private_samples)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(telemetry, "_private_resident_sum", private_sum)
+    samples = telemetry.Samples()
+    samples._next_pressure_at = float("inf")
+    samples._next_gpu_at = float("inf")
+
+    for now in (1.0, 2.0, 3.0):
+        telemetry._record_detailed_guard_sample(
+            samples,
+            [row],
+            host_total=1024,
+            host_available=900,
+            now=now,
+        )
+
+    assert samples.private_sampling_complete is True
+    assert samples.private_sample_count == 2
+    assert samples.peak_private_resident_bytes == 128
+
+
+def test_detailed_private_profile_marks_stable_read_failure_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = telemetry.ProcessRow(
+        pid=123,
+        ppid=1,
+        rss_bytes=7,
+        cpu_sec=0.0,
+        identity="123:start",
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "_private_resident_sum",
+        lambda _tree: (_ for _ in ()).throw(PermissionError()),
+    )
+    samples = telemetry.Samples()
+    samples._next_pressure_at = float("inf")
+    samples._next_gpu_at = float("inf")
+
+    telemetry._record_detailed_guard_sample(
+        samples,
+        [row],
+        host_total=1024,
+        host_available=900,
+        now=1.0,
+    )
+
+    assert samples.private_sampling_complete is False
+    assert samples.private_sample_count == 0
+    assert samples.peak_private_resident_bytes is None
+
+
 def _guarded_helper_argv(
     payload: dict[str, object],
     *,
     token: str,
     command: list[str],
     telemetry_enabled: bool = False,
+    allowance_only: bool = False,
+    production_protocol: bool = True,
 ) -> list[str]:
     lease = payload["lease"]
     assert isinstance(lease, dict)
+    lease_request = (
+        _production_lease_request(payload)
+        if production_protocol
+        else _lease_request(payload)
+    )
     encoded = base64.urlsafe_b64encode(
-        json.dumps(_lease_request(payload), separators=(",", ":")).encode("utf-8")
+        json.dumps(lease_request, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
-    argv = [
-        sys.executable,
-        str(HELPER),
-        "--guard-max-bytes",
-        str(lease["allowance_bytes"]),
+    argv = [sys.executable, str(HELPER)]
+    if not allowance_only and (
+        not production_protocol or lease.get("command_limit_bytes") is not None
+    ):
+        argv.extend(["--guard-max-bytes", str(lease["allowance_bytes"])])
+    argv.extend([
         "--guard-min-available-bytes",
         str(lease["min_available_bytes"]),
         "--guard-token",
         token,
         "--guard-lease-b64",
         encoded,
-    ]
+    ])
     if telemetry_enabled:
         argv.append("--telemetry")
     return [*argv, "--", *command]
+
+
+def _run_allowance_only_guard(
+    payload: dict[str, object],
+    *,
+    tmp_path: Path,
+    production_protocol: bool = True,
+) -> dict[str, object]:
+    token = uuid.uuid4().hex
+    lease = payload["lease"]
+    assert isinstance(lease, dict)
+    allocation_mib = max(48, int(lease["allowance_bytes"]) // MIB + 32)
+    program = (
+        f"import time; x=bytearray({allocation_mib}*1024*1024); "
+        "x[::4096]=b'x'*((len(x)+4095)//4096); time.sleep(0.5)"
+    )
+    result = subprocess.run(
+        _guarded_helper_argv(
+            payload,
+            token=token,
+            command=[sys.executable, "-c", program],
+            allowance_only=True,
+            production_protocol=production_protocol,
+        ),
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return _guard_payload_from_stderr(result.stderr, token)
+
+
+def test_learned_allowance_is_not_a_process_tree_kill_ceiling(tmp_path: Path):
+    state_root = tmp_path / "learned"
+    reserved = _renew_guard(
+        _reserve_guard(state_root, max_command_mib=128, predicted_rss_bytes=4 * MIB)
+    )
+    lease = reserved["lease"]
+    assert isinstance(lease, dict)
+    payload = _run_allowance_only_guard(reserved, tmp_path=tmp_path)
+
+    assert payload["status"] == "ok"
+    assert payload["command_limit_enforced"] is False
+    assert payload["max_command_bytes"] is None
+    assert payload["enforced_command_limit_bytes"] is None
+    assert payload["peak_command_bytes"] > int(lease["allowance_bytes"])
+    assert _ledger_leases(state_root) == []
+
+
+def test_unprofiled_allowance_is_not_a_process_tree_kill_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_host_memory = telemetry._host_memory
+    total, _available = real_host_memory()
+    reserve = 16 * MIB
+    # Constrain only admission sizing. The runtime helper sees the real,
+    # healthy host counters, proving the allowance is not a kill threshold.
+    monkeypatch.setattr(
+        telemetry, "_host_memory", lambda: (total, reserve + 1024 * MIB)
+    )
+    reserved = _reserve_guard(
+        tmp_path / "unprofiled", max_command_mib=128, min_available_mib=16
+    )
+    monkeypatch.setattr(telemetry, "_host_memory", real_host_memory)
+    lease = reserved["lease"]
+    assert isinstance(lease, dict)
+    assert lease["allowance_basis"] == "unprofiled_available_backed"
+    payload = _run_allowance_only_guard(reserved, tmp_path=tmp_path)
+
+    assert payload["status"] == "ok"
+    assert payload["command_limit_enforced"] is False
+    assert payload["max_command_bytes"] is None
+    assert payload["enforced_command_limit_bytes"] is None
+    assert payload["peak_command_bytes"] > int(lease["allowance_bytes"])
+
+
+def test_explicit_limit_above_ceiling_terminates(tmp_path: Path):
+    state_root = tmp_path / "explicit"
+    reserved = _renew_guard(
+        _reserve_guard(
+            state_root,
+            max_command_mib=32,
+            explicit_limit_bytes=32 * MIB,
+        )
+    )
+    token = uuid.uuid4().hex
+    program = (
+        "import time; x=bytearray(64*1024*1024); "
+        "x[::4096]=b'x'*((len(x)+4095)//4096); time.sleep(10)"
+    )
+    result = subprocess.run(
+        _guarded_helper_argv(
+            reserved,
+            token=token,
+            command=[sys.executable, "-c", program],
+            production_protocol=True,
+        ),
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+    payload = _guard_payload_from_stderr(result.stderr, token)
+
+    assert result.returncode == 125
+    assert payload["status"] == "terminated"
+    assert payload["reason"] == "command_memory_limit"
+    assert payload["command_limit_enforced"] is True
+    assert payload["max_command_bytes"] == 32 * MIB
+    assert payload["enforced_command_limit_bytes"] == 32 * MIB
+    assert _ledger_leases(state_root) == []
+
+
+@pytest.mark.parametrize("basis", ["explicit", "learned", "unprofiled"])
+def test_host_reserve_termination_applies_to_every_allowance_basis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, basis: str
+):
+    real_host_memory = telemetry._host_memory
+    total, _available = real_host_memory()
+    state_root = tmp_path / basis
+    if basis == "explicit":
+        reserved = _reserve_guard(
+            state_root, max_command_mib=128, explicit_limit_bytes=128 * MIB
+        )
+    elif basis == "learned":
+        reserved = _reserve_guard(
+            state_root, max_command_mib=128, predicted_rss_bytes=4 * MIB
+        )
+    else:
+        reserve = 16 * MIB
+        monkeypatch.setattr(
+            telemetry, "_host_memory", lambda: (total, reserve + 1024 * MIB)
+        )
+        reserved = _reserve_guard(
+            state_root, max_command_mib=128, min_available_mib=16
+        )
+        monkeypatch.setattr(telemetry, "_host_memory", real_host_memory)
+
+    lease = reserved["lease"]
+    assert isinstance(lease, dict)
+    reserve_bytes = int(lease["min_available_bytes"])
+    # The guard performs one initial read, one claim read, and three reads in
+    # the claim transaction before its first post-launch sample. The sixth
+    # read is the deliberate runtime reserve violation.
+    readings = iter([(total, total)] * 5 + [(total, reserve_bytes)])
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: next(readings))
+    token = uuid.uuid4().hex
+    lease_request = _production_lease_request(reserved)
+    max_command_bytes = (
+        int(lease["command_limit_bytes"])
+        if basis == "explicit"
+        else None
+    )
+    rc = telemetry._guarded_run(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        max_command_bytes=max_command_bytes,
+        min_available_bytes=reserve_bytes,
+        token=token,
+        detailed=False,
+        telemetry=False,
+        lease_request=lease_request,
+    )
+    payload = _guard_payload_from_stderr(capsys.readouterr().err, token)
+
+    assert rc == 125
+    assert payload["status"] == "terminated"
+    assert payload["reason"] == "host_memory_reserve"
+    assert payload["command_limit_enforced"] is (basis == "explicit")
+    assert _ledger_leases(state_root) == []
 
 
 def test_guard_refuses_low_initial_host_memory_before_user_code(
@@ -491,12 +834,12 @@ def test_guard_refuses_low_initial_host_memory_before_user_code(
 
     rc = telemetry._guarded_run(
         [sys.executable, "-c", f"open({str(marker)!r},'w').write('ran')"],
-        max_command_bytes=int(lease["allowance_bytes"]),
+        max_command_bytes=None,
         min_available_bytes=reserve,
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(reserved),
+        lease_request=_production_lease_request(reserved),
     )
 
     payload = _guard_payload_from_stderr(capsys.readouterr().err, token)
@@ -525,12 +868,12 @@ def test_guard_refuses_when_initial_host_memory_read_is_unavailable(
 
     rc = telemetry._guarded_run(
         [sys.executable, "-c", f"open({str(marker)!r},'w').write('ran')"],
-        max_command_bytes=int(lease["allowance_bytes"]),
+        max_command_bytes=None,
         min_available_bytes=int(lease["min_available_bytes"]),
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(reserved),
+        lease_request=_production_lease_request(reserved),
     )
 
     payload = _guard_payload_from_stderr(capsys.readouterr().err, token)
@@ -570,12 +913,12 @@ def test_guard_sampling_failure_after_launch_kills_instead_of_waiting(
                 "time.sleep(10)"
             ),
         ],
-        max_command_bytes=int(lease["allowance_bytes"]),
+        max_command_bytes=None,
         min_available_bytes=int(lease["min_available_bytes"]),
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(reserved),
+        lease_request=_production_lease_request(reserved),
     )
     elapsed = time.monotonic() - started
 
@@ -600,7 +943,7 @@ def test_guard_reports_failed_safe_when_process_tree_drain_is_unverified(
 ):
     state_root = tmp_path / "state"
     reserved = _reserve_guard(
-        state_root, max_command_mib=64, predicted_rss_bytes=MIB
+        state_root, max_command_mib=64, explicit_limit_bytes=2 * MIB
     )
     lease = reserved["lease"]
     assert isinstance(lease, dict)
@@ -614,7 +957,7 @@ def test_guard_reports_failed_safe_when_process_tree_drain_is_unverified(
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(reserved),
+        lease_request=_production_lease_request(reserved),
     )
 
     payload = _guard_payload_from_stderr(capsys.readouterr().err, token)
@@ -646,7 +989,13 @@ def test_guard_reports_failed_safe_when_process_tree_drain_is_unverified(
 
 def test_guard_threshold_terminates_allocating_descendant_and_reports_result(tmp_path):
     state_root = tmp_path / "state"
-    reserved = _renew_guard(_reserve_guard(state_root, max_command_mib=32))
+    reserved = _renew_guard(
+        _reserve_guard(
+            state_root,
+            max_command_mib=32,
+            explicit_limit_bytes=32 * MIB,
+        )
+    )
     token = uuid.uuid4().hex
     pid_file = tmp_path / "grandchild.pid"
     child_code = (

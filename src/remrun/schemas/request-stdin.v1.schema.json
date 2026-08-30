@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/smkwray/remrun/schemas/request-stdin.v1.schema.json",
+  "title": "remrun fleet request stdin version 1",
+  "description": "Bounded controller-to-remrun request document for inline payloads.",
+  "$comment": "The document is limited to 8388608 bytes on the wire; text is limited to 1048576 UTF-8 bytes. The implementation enforces byte limits because JSON Schema maxLength counts characters.",
+  "type": "object",
+  "required": ["schema", "version", "task", "spec_id", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "remrun.fleet.request-stdin"},
+    "version": {"const": 1},
+    "task": {"type": "string", "minLength": 1},
+    "spec_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "payload": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "text"},
+        "value": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

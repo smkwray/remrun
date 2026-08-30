@@ -19,6 +19,50 @@ exclude = [
 ]
 ```
 
+## Opt-in target environment bootstrap
+
+Projects may declare an idempotent, target-local environment setup as argv arrays. The
+declaration is never inferred from a command or lockfile name. Every step is executed
+without a shell, in project-root order, under a target-local lock; `plan` reports
+`bootstrap-needed`, `ready`, or `unsupported` and never installs anything.
+Bootstrap requires `[run] use_venv = true` and an external target environment. Set
+`venv_layout = "external"` and configure each device's absolute (or `~`-relative)
+`venv_root`; a per-device `[run.venv]` override is accepted only when it is strictly
+confined beneath that root. Local/default layouts, unsafe names, relative paths, and
+escaping overrides are rejected before target mutation.
+
+```toml
+[run]
+use_venv = true
+venv_layout = "external"
+
+[run.bootstrap]
+schema = 1
+lock_inputs = ["pyproject.toml", "uv.lock"]
+steps = [
+  ["{python}", "-m", "venv", "{venv}"],
+  ["{venv_python}", "-m", "pip", "install", "uv==0.11.17"],
+  ["{venv_python}", "-m", "uv", "sync", "--active", "--frozen", "--all-extras"],
+]
+```
+
+`argv = [...]` is the one-step shorthand for `steps = [[...]]`. Supported placeholders
+are `{project_root}`, `{python}`, `{venv}`, `{venv_python}`, and `{state_root}`. The
+project must opt into `[run] use_venv = true` before using the virtualenv placeholders.
+`timeout_seconds` is optional and defaults to 1800 seconds (maximum 86400). Unknown
+keys or a schema other than `1` are unsupported.
+The controller fingerprints the canonical declaration, its rendered target paths, and
+the bytes of every `lock_inputs` path. Those exact paths are included in the
+preflight/postrun manifests even when a global exclude (such as `*.lock`) would
+otherwise omit them. A matching receipt is retained under the target's configured
+state root. Readiness additionally requires the external environment directory, its
+expected interpreter, and an environment-local marker authenticated to the same
+fingerprint and paths; deleting any of these makes the next run bootstrap again. A
+failed receipt may be retried, while an uncertain transport outcome is kept fenced by
+the target receipt and lock. Bootstrap still accepts arbitrary argv arrays: Remrun
+does not sandbox their filesystem writes, so a project should make its steps
+idempotent and avoid mutating declared lock inputs.
+
 ## Placement hints
 
 ```toml

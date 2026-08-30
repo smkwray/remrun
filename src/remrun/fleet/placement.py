@@ -8,13 +8,17 @@ one model), so batch size does not multiply RAM/VRAM.
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
+from dataclasses import replace
 
 from .adapters import (
     candidate_devices, engine_for, memory_kind_for, option_bucket,
-    required_capabilities, task_provided_capabilities,
+    required_capabilities, route_eligibility, task_provided_capabilities,
 )
 from .models import (
+    MAX_PLACEMENT_ALTERNATIVES,
     DeviceSnapshot, FleetTask, JobFeatures, PlacedBatch, PlacementResult,
+    truncate_placement_detail,
 )
 from .profiles import (
     duration_observation_count, estimate_unavailable_reason, prepared_profile,
@@ -108,6 +112,11 @@ def fits(task: FleetTask, device: str, snap: DeviceSnapshot, profiles: dict,
     the worker's immediate preflight when ``allow_unknown_capability`` is true.
     """
     fleet_cfg = fleet_cfg or {}
+    route_status, route_reason = route_eligibility(
+        task, device, device_enabled=snap.enabled,
+    )
+    if route_status != "eligible":
+        return False, route_reason
     if not snap.reachable:
         return False, "unreachable"
     if snap.active_jobs >= snap.max_jobs:
@@ -146,8 +155,17 @@ def fits(task: FleetTask, device: str, snap: DeviceSnapshot, profiles: dict,
     # jobs are gated on system RAM, VRAM irrelevant. Unknown probe values never veto.
     rss, vram = predicted_resources(task, device, profiles)
     sf = safety_fraction
-    discrete_gpu = snap.vram_total_mb is not None and snap.vram_total_mb > 0
+    topology = snap.gpu_memory_topology
+    discrete_gpu = (
+        topology == "discrete"
+        or (topology == "auto" and snap.vram_total_mb is not None
+            and snap.vram_total_mb > 0)
+    )
     if memory_kind_for(task, device) == "gpu":
+        if topology == "unknown":
+            return False, "GPU memory topology unknown"
+        if topology == "none":
+            return False, "device has no GPU"
         if discrete_gpu:
             # Two-part GPU memory gate. A configured pool makes a model job
             # exclusive among fleet jobs, but it cannot see external GPU/desktop use.
@@ -400,6 +418,186 @@ def _split_hysteresis(fleet_cfg: dict, *, best_finish: float) -> float:
     return max(min_h, frac * max(best_finish, 0.0))
 
 
+def _placement_explanations(
+    batches: list[PlacedBatch], indices: list[int], tasks: list[FleetTask],
+    features: list[JobFeatures], snapshots: dict[str, DeviceSnapshot], profiles: dict,
+    fleet_cfg: dict, safety_fraction: float,
+    device_backlog: dict[str, float] | None,
+) -> list[PlacedBatch]:
+    """Attach one bounded, structured explanation to every selected batch."""
+    if not batches:
+        return batches
+    task = tasks[indices[0]]
+    backlog = device_backlog or {}
+    fitting, rejected = _fitting_devices(
+        task, snapshots, profiles, safety_fraction, fleet_cfg,
+    )
+    selected_devices = {batch.device for batch in batches}
+    rejected = {
+        device: detail for device, detail in rejected.items()
+        if device not in selected_devices
+    }
+
+    def estimate(ix: list[int], device: str) -> float | None:
+        return estimate_finish(ix, device, tasks, features, profiles, fleet_cfg)
+
+    def comparison_quantities(ix: list[int], device: str) -> dict[str, float | None]:
+        own = estimate(ix, device)
+        queued = backlog.get(device, 0.0)
+        quantities: dict[str, float | None] = {
+            "estimated_finish_s": own,
+            "backlog_s": None if queued is None else float(queued),
+        }
+        quantities["effective_finish_s"] = (
+            None if own is None or queued is None else round(float(queued) + own, 3)
+        )
+        return quantities
+
+    explained: list[PlacedBatch] = []
+    for batch in batches:
+        if batch.selection_basis in {"cold_start", "exploration"}:
+            selected_quantities: dict[str, int] = {
+                "duration_observations": duration_observation_count(
+                    profiles, task, batch.device,
+                ),
+                "active_jobs": snapshots[batch.device].active_jobs,
+            }
+        elif batch.selection_basis == "estimated":
+            selected_quantities = comparison_quantities(batch.job_indices, batch.device)
+        else:
+            selected_quantities = {}
+
+        alternatives: list[dict] = []
+        for device in fitting:
+            if device == batch.device:
+                continue
+            if batch.selection_basis == "cold_start":
+                reason = "cold_start_order"
+                quantities = {
+                    "duration_observations": duration_observation_count(
+                        profiles, task, device,
+                    ),
+                    "active_jobs": snapshots[device].active_jobs,
+                }
+                extra = {}
+            elif batch.selection_basis == "exploration":
+                candidate_estimate = estimate(batch.job_indices, device)
+                reason = (
+                    "calibration_priority" if candidate_estimate is not None
+                    else "exploration_order"
+                )
+                quantities = {
+                    "duration_observations": duration_observation_count(
+                        profiles, task, device,
+                    ),
+                    "active_jobs": snapshots[device].active_jobs,
+                }
+                extra = {}
+            else:
+                quantities = comparison_quantities(batch.job_indices, device)
+                if batch.reason == "split":
+                    reason = "split_assignment"
+                    extra = {}
+                elif quantities["effective_finish_s"] is None:
+                    reason = "estimate_unavailable"
+                    extra = {"estimate_reason": (
+                        "backlog_unknown" if backlog.get(device, 0.0) is None
+                        else estimate_unavailable_reason(
+                            profiles, task, device,
+                            sum(features[index].units() for index in batch.job_indices),
+                        )
+                    )}
+                else:
+                    reason = (
+                        "estimated_tie_break"
+                        if quantities["effective_finish_s"]
+                        == selected_quantities["effective_finish_s"]
+                        else "higher_estimated_finish"
+                    )
+                    extra = {}
+            alternatives.append({
+                "device": device,
+                "status": "eligible_not_selected",
+                "reason": reason,
+                "quantities": quantities,
+                **extra,
+            })
+        for device, detail in rejected.items():
+            alternatives.append({
+                "device": device,
+                "status": "ineligible",
+                "reason": "fit_rejected",
+                "detail": truncate_placement_detail(detail),
+            })
+
+        alternatives.sort(key=lambda item: (
+            item["status"] != "eligible_not_selected", item["device"],
+        ))
+        total = len(alternatives)
+        retained = alternatives[:MAX_PLACEMENT_ALTERNATIVES]
+        omitted: dict[str, int] = {}
+        for item in alternatives[MAX_PLACEMENT_ALTERNATIVES:]:
+            status = item["status"]
+            omitted[status] = omitted.get(status, 0) + 1
+        explanation = {
+            "schema": 1,
+            "selected": {
+                "device": batch.device,
+                "selection_basis": batch.selection_basis,
+                "reason": batch.reason,
+                "estimated_finish_s": batch.estimated_finish_s,
+                "estimate_reason": batch.estimate_reason,
+                "quantities": selected_quantities,
+            },
+            "alternatives": retained,
+            "retention": {
+                "alternative_limit": MAX_PLACEMENT_ALTERNATIVES,
+                "total_alternatives": total,
+                "retained_alternatives": len(retained),
+                "omitted": omitted,
+            },
+        }
+        explained.append(replace(batch, explanation=explanation))
+    return explained
+
+
+def add_ineligible_alternatives(
+    result: PlacementResult, rejected: dict[str, tuple[str, str]],
+) -> PlacementResult:
+    """Add dispatcher-only rejection facts before the batch is durably claimed."""
+    if not result.batches or not rejected:
+        return result
+    batches: list[PlacedBatch] = []
+    for batch in result.batches:
+        explanation = deepcopy(batch.explanation)
+        alternatives = explanation["alternatives"]
+        existing = {batch.device, *(item["device"] for item in alternatives)}
+        added = [
+            {
+                "device": device,
+                "status": "ineligible",
+                "reason": reason,
+                "detail": truncate_placement_detail(detail),
+            }
+            for device, (reason, detail) in rejected.items()
+            if device not in existing
+        ]
+        alternatives.extend(added)
+        alternatives.sort(key=lambda item: (
+            item["status"] != "eligible_not_selected", item["device"],
+        ))
+        displaced = alternatives[MAX_PLACEMENT_ALTERNATIVES:]
+        explanation["alternatives"] = alternatives[:MAX_PLACEMENT_ALTERNATIVES]
+        retention = explanation["retention"]
+        retention["total_alternatives"] += len(added)
+        retention["retained_alternatives"] = len(explanation["alternatives"])
+        for item in displaced:
+            status = item["status"]
+            retention["omitted"][status] = retention["omitted"].get(status, 0) + 1
+        batches.append(replace(batch, explanation=explanation))
+    return replace(result, batches=batches)
+
+
 def plan_jobs(tasks: list[FleetTask], features: list[JobFeatures],
               snapshots: dict[str, DeviceSnapshot], profiles: dict,
               fleet_cfg: dict, safety_fraction: float = 0.90,
@@ -418,6 +616,10 @@ def plan_jobs(tasks: list[FleetTask], features: list[JobFeatures],
     for _key, idx in groups.items():
         b, sk = assign_group(idx, tasks, features, snapshots, profiles, fleet_cfg,
                              safety_fraction, device_backlog)
+        b = _placement_explanations(
+            b, idx, tasks, features, snapshots, profiles, fleet_cfg,
+            safety_fraction, device_backlog,
+        )
         batches.extend(b)
         for d, why in sk.items():
             skipped.setdefault(d, why)

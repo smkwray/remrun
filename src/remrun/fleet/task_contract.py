@@ -26,6 +26,12 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RESERVED_OPTIONS = {"argv", "spec_id", "prepared_id", "work_id"}
 _PLACEHOLDERS = {"{stage}", "{manifest}", "{output_root}"}
 _MAX_MEASURE_TIMEOUT_S = 300.0
+_TASK_ROUTES_SCHEMA = "remrun.fleet.task-routes"
+_INPUT_MODES = {"none", "text", "files", "text-or-files"}
+_ROUTE_STATUSES = {"eligible", "ineligible"}
+_ROUTE_REASONS = {
+    "configured", "disabled", "missing_adapter", "device_unconfigured", "malformed",
+}
 
 
 def canonical_json(value: Any) -> str:
@@ -587,3 +593,161 @@ def resolve_tasks(config: Any) -> dict[str, dict[str, Any]]:
         name: resolve_task_spec(name, raw, devices=config.devices, repo_root=config.repo_root)
         for name, raw in raw_tasks.items()
     }
+
+
+def resolved_route_eligibility(
+    spec: Any,
+    device: str,
+    *,
+    device_exists: bool = True,
+    device_enabled: bool | None = None,
+    requires_adapter: bool = True,
+) -> tuple[str, str]:
+    """Return the closed, static eligibility of one resolved task/device route.
+
+    This is deliberately limited to facts available without a device probe.  The
+    planner layers live reachability, qualification, pool, and resource checks on
+    top of this predicate.  All execution paths use this same static boundary so a
+    disabled or unconfigured route cannot be selected by a caller that bypasses the
+    planner.
+    """
+    if not isinstance(device, str) or not device:
+        return "ineligible", "malformed"
+    if not device_exists:
+        return "ineligible", "device_unconfigured"
+    if type(device_enabled) is not bool:
+        return "ineligible", "malformed"
+    if not device_enabled:
+        return "ineligible", "disabled"
+    if not requires_adapter:
+        return "eligible", "configured"
+    if not isinstance(spec, dict):
+        return "ineligible", "malformed"
+    adapters = spec.get("adapters")
+    if not isinstance(adapters, dict):
+        return "ineligible", "malformed"
+    if device not in adapters:
+        return "ineligible", "missing_adapter"
+    adapter = adapters[device]
+    if not isinstance(adapter, dict):
+        return "ineligible", "malformed"
+    # Full resolved specs are validated by ``resolve_tasks`` and by the route
+    # projection itself.  The shared planner predicate intentionally only needs
+    # the adapter roster boundary here; hand-built test carriers and legacy
+    # internal callers may omit the content-addressed adapter identity.
+    return "eligible", "configured"
+
+
+def validate_task_routes_document(document: Any) -> None:
+    """Validate the closed route projection consumed by submitter UIs."""
+    if not isinstance(document, dict) or set(document) != {"schema", "version", "routes"}:
+        raise TaskContractError("task-routes document has unknown or missing fields")
+    if document["schema"] != _TASK_ROUTES_SCHEMA \
+            or type(document["version"]) is not int or document["version"] != 1:
+        raise TaskContractError("task-routes document schema or version is invalid")
+    routes = document["routes"]
+    if not isinstance(routes, list):
+        raise TaskContractError("task-routes routes must be a list")
+    seen: set[tuple[str, str]] = set()
+    previous: tuple[str, str] | None = None
+    contracts: dict[str, tuple[str, str, tuple[str, ...]]] = {}
+    for index, entry in enumerate(routes):
+        field = f"task-routes.routes[{index}]"
+        expected = {
+            "task", "spec_id", "device", "input_mode", "accepted_option_ids", "eligibility",
+        }
+        if not isinstance(entry, dict) or set(entry) != expected:
+            raise TaskContractError(f"{field} has unknown or missing fields")
+        task = entry["task"]
+        if not isinstance(task, str) or not task or _NAME_RE.fullmatch(task) is None:
+            raise TaskContractError(f"{field}.task must be a non-empty task name")
+        device = entry["device"]
+        if not isinstance(device, str) or _TOKEN_RE.fullmatch(device) is None:
+            raise TaskContractError(f"{field}.device must be a non-empty device name")
+        key = (task, device)
+        if key in seen:
+            raise TaskContractError(f"duplicate task/device route {task!r}/{device!r}")
+        if previous is not None and key <= previous:
+            raise TaskContractError("task-routes routes must be sorted by task and device")
+        previous = key
+        seen.add(key)
+        verify_id(entry["spec_id"], f"{field}.spec_id")
+        input_mode = _enum(entry["input_mode"], _INPUT_MODES, f"{field}.input_mode")
+        option_ids = entry["accepted_option_ids"]
+        if not isinstance(option_ids, list) \
+                or any(not isinstance(option, str) or _OPTION_RE.fullmatch(option) is None
+                       for option in option_ids) \
+                or option_ids != sorted(set(option_ids)):
+            raise TaskContractError(f"{field}.accepted_option_ids must be sorted and unique")
+        eligibility = entry["eligibility"]
+        if not isinstance(eligibility, dict) or set(eligibility) != {"status", "reason"}:
+            raise TaskContractError(f"{field}.eligibility has unknown or missing fields")
+        _enum(eligibility["status"], _ROUTE_STATUSES, f"{field}.eligibility.status")
+        _enum(eligibility["reason"], _ROUTE_REASONS, f"{field}.eligibility.reason")
+        if (eligibility["status"] == "eligible") != (
+            eligibility["reason"] == "configured"
+        ):
+            raise TaskContractError(f"{field}.eligibility status and reason disagree")
+        contract = (entry["spec_id"], input_mode, tuple(option_ids))
+        previous_contract = contracts.setdefault(task, contract)
+        if previous_contract != contract:
+            raise TaskContractError(
+                f"task-routes task {task!r} has inconsistent route contracts"
+            )
+
+
+def task_routes_document(specs: Any, devices: Any) -> dict[str, Any]:
+    """Project resolved task contracts over the configured device roster.
+
+    This document is intentionally static and no-probe: a route marked eligible
+    has a valid adapter on an enabled configured device, while live placement may
+    still reject it for reachability, qualification, capacity, or queue state.
+    """
+    if not isinstance(specs, dict):
+        raise TaskContractError("resolved tasks must be a table")
+    if not isinstance(devices, dict):
+        raise TaskContractError("configured devices must be a table")
+    routes: list[dict[str, Any]] = []
+    for configured_name, spec in specs.items():
+        if not isinstance(configured_name, str) or not configured_name:
+            raise TaskContractError("resolved task names must be non-empty strings")
+        validate_resolved_task_spec(spec)
+        task_name = spec["task_name"]
+        if task_name != configured_name:
+            raise TaskContractError(
+                f"resolved task name {task_name!r} disagrees with configured name "
+                f"{configured_name!r}"
+            )
+        input_spec = spec["definition"].get("input")
+        if not isinstance(input_spec, dict) or "mode" not in input_spec:
+            raise TaskContractError(f"task {task_name!r} is missing its input definition")
+        mode = _enum(input_spec["mode"], _INPUT_MODES, f"task {task_name!r} input.mode")
+        options = spec["definition"].get("options")
+        if not isinstance(options, dict):
+            raise TaskContractError(f"task {task_name!r} options are malformed")
+        option_ids = sorted(options)
+        for device_name, device_config in devices.items():
+            if not isinstance(device_name, str) or not device_name:
+                raise TaskContractError("configured device names must be non-empty strings")
+            enabled = getattr(device_config, "enabled", None)
+            status, reason = resolved_route_eligibility(
+                spec, device_name,
+                device_exists=device_config is not None,
+                device_enabled=enabled,
+            )
+            routes.append({
+                "task": task_name,
+                "spec_id": spec["spec_id"],
+                "device": device_name,
+                "input_mode": mode,
+                "accepted_option_ids": option_ids,
+                "eligibility": {"status": status, "reason": reason},
+            })
+    routes.sort(key=lambda route: (route["task"], route["device"]))
+    document: dict[str, Any] = {
+        "schema": _TASK_ROUTES_SCHEMA,
+        "version": 1,
+        "routes": routes,
+    }
+    validate_task_routes_document(document)
+    return document

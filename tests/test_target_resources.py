@@ -759,6 +759,80 @@ def test_stale_internal_owner_mutation_cannot_touch_newer_allocation(
     client.cancel(newer)
 
 
+def test_start_transition_cannot_promote_maybe_to_yes_without_exec_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = str(tmp_path / "state")
+    monkeypatch.setattr(
+        remote_runner,
+        "filesystem_probe",
+        lambda path: {"local": True, "kind": "test", "path": path},
+    )
+    monkeypatch.setattr(remote_runner, "_strict_boot_id", lambda: "current-boot")
+    monkeypatch.setattr(remote_runner, "_strict_monotonic_ns", lambda: 2)
+    conn, _runner_root, _meta = remote_runner.open_participant_store(state_root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reserved = remote_runner._resource_reserve(
+            conn,
+            {
+                "allocation_id": "start-needs-exec-proof",
+                "operation_id": "operation-start-needs-exec-proof",
+                "request_sha256": hashlib.sha256(b"start-needs-exec-proof").hexdigest(),
+                "resource_keys": [],
+                "expected_policy_generation": 0,
+                "expected_policy_digest": remote_runner.EMPTY_RESOURCE_POLICY_DIGEST,
+            },
+            "current-boot",
+            1,
+        )
+        body = {
+            "allocation_id": "start-needs-exec-proof",
+            "fence": reserved["receipt"]["fence"],
+            "token": reserved["token"],
+            "policy_generation": 0,
+            "policy_digest": remote_runner.EMPTY_RESOURCE_POLICY_DIGEST,
+        }
+        remote_runner._resource_owner_claim(
+            conn,
+            body,
+            {
+                "kind": "posix_pgid_v1",
+                "key": "123",
+                "pid": 123,
+                "start_id": "test-owner",
+                "root_pid": 123,
+                "root_start_id": "test-root",
+            },
+            "current-boot",
+            2,
+        )
+        remote_runner._resource_owner_start_state(
+            conn, body, "current-boot", "MAYBE",
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        remote_runner.RunnerError,
+        match="invalid target owner start transition: MAYBE -> YES",
+    ):
+        remote_runner._resource_owner_mutation(
+            state_root, "start", body, state="YES"
+        )
+
+    conn, _runner_root, _meta = remote_runner.open_participant_store(state_root)
+    try:
+        assert conn.execute(
+            "SELECT command_start_state FROM target_resource_allocations "
+            "WHERE allocation_id='start-needs-exec-proof'"
+        ).fetchone()[0] == "MAYBE"
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     ("operation", "terminal_state", "values"),
     [

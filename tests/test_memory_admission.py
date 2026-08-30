@@ -38,11 +38,11 @@ def _request(
     predicted_rss_bytes: int | None = None,
     explicit_limit_bytes: int | None = None,
     max_jobs: int = 2,
-    command_fraction: float = 0.25,
+    command_fraction: float | None = 0.25,
     reserve_fraction: float | None = 0.25,
     ttl: float = 120.0,
 ) -> dict[str, object]:
-    return {
+    request = {
         "schema": 2,
         "op": op,
         "state_root": str(state_root),
@@ -50,18 +50,20 @@ def _request(
         "lease_token": lease_token or uuid.uuid4().hex,
         "predicted_rss_bytes": predicted_rss_bytes,
         "explicit_limit_bytes": explicit_limit_bytes,
-        "command_limit_fraction": command_fraction,
         "host_reserve_fraction": reserve_fraction,
         "max_jobs": max_jobs,
         "reservation_ttl_seconds": ttl,
     }
+    if command_fraction is not None:
+        request["command_limit_fraction"] = command_fraction
+    return request
 
 
 def _lease_request(reserved: dict[str, object], *, op: str = "renew") -> dict[str, object]:
     lease = reserved["lease"]
     policy = reserved["policy"]
     assert isinstance(lease, dict) and isinstance(policy, dict)
-    return {
+    request = {
         "schema": 2,
         "op": op,
         "state_root": lease["state_root"],
@@ -70,11 +72,42 @@ def _lease_request(reserved: dict[str, object], *, op: str = "renew") -> dict[st
         "allowance_bytes": lease["allowance_bytes"],
         "control_overhead_bytes": lease["control_overhead_bytes"],
         "capacity_bytes": lease["capacity_bytes"],
-        "command_limit_fraction": policy["command_limit_fraction"],
         "host_reserve_fraction": policy["host_reserve_fraction"],
         "max_jobs": policy["max_jobs"],
         "reservation_ttl_seconds": policy["reservation_ttl_seconds"],
     }
+    if policy["command_limit_fraction"] is not None:
+        request["command_limit_fraction"] = policy["command_limit_fraction"]
+    if policy.get("allocation_rule") is not None:
+        request["allocation_rule"] = policy["allocation_rule"]
+    return request
+
+
+def _production_lease_request(
+    reserved: dict[str, object], *, op: str = "renew"
+) -> dict[str, object]:
+    request = _lease_request(reserved, op=op)
+    lease = reserved["lease"]
+    assert isinstance(lease, dict)
+    request.update(
+        {
+            "allowance_basis": lease.get("allowance_basis"),
+            "command_limit_bytes": lease.get("command_limit_bytes"),
+            "remaining_backed_capacity_bytes": lease.get(
+                "remaining_backed_capacity_bytes"
+            ),
+            "strict_margin_bytes": lease.get("strict_margin_bytes"),
+            "learned_allowance_bytes": lease.get("learned_allowance_bytes"),
+            "live_backed_allowance_bytes": lease.get(
+                "live_backed_allowance_bytes"
+            ),
+            "learned_allowance_live_backed": lease.get(
+                "learned_allowance_live_backed"
+            ),
+            "predicted_rss_bytes": lease.get("predicted_rss_bytes"),
+        }
+    )
+    return request
 
 
 def _ledger_leases(state_root: Path) -> list[dict[str, object]]:
@@ -131,6 +164,61 @@ def test_automatic_host_reserve_is_proportional_and_bounded(
     assert policy["host_reserve_bytes"] == reserve_gib * GIB
 
 
+def test_omitted_command_fraction_derives_ceiling_from_host_reserve():
+    policy = telemetry._policy_from_request(
+        {"max_jobs": 2, "reservation_ttl_seconds": 120.0},
+        64 * GIB,
+    )
+
+    assert policy["command_limit_fraction"] is None
+    assert policy["max_command_bytes"] == 48 * GIB
+    assert policy["policy_command_ceiling_bytes"] == 48 * GIB
+
+
+def test_null_command_fraction_is_not_an_alias_for_omission():
+    with pytest.raises(ValueError, match="command_limit_fraction"):
+        telemetry._policy_from_request(
+            {
+                "command_limit_fraction": None,
+                "max_jobs": 2,
+                "reservation_ttl_seconds": 120.0,
+            },
+            64 * GIB,
+        )
+
+
+def test_command_fraction_presence_is_part_of_active_policy_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, AVAILABLE_SAFE))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    state_root = tmp_path / "state"
+
+    omitted = telemetry._handle_admission_request(
+        _request(state_root, command_fraction=None, reserve_fraction=0.25)
+    )
+    assert omitted["status"] == "admitted"
+    present = telemetry._handle_admission_request(
+        _request(state_root, command_fraction=0.25, reserve_fraction=0.25)
+    )
+
+    assert present["status"] == "refused"
+    assert present["reason"] == "policy_mismatch"
+
+
+def test_old_allocation_rule_cannot_mix_with_new_policy(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, AVAILABLE_SAFE))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    state_root = tmp_path / "state"
+    first = telemetry._handle_admission_request(_request(state_root))
+    assert first["status"] == "admitted"
+
+    old = _lease_request(first)
+    old["allocation_rule"] = "unprofiled_open_slot_fair_share_v1"
+    with pytest.raises(ValueError, match="allocation_rule is unsupported"):
+        telemetry._handle_admission_request(old)
+
+
 def test_empty_schema_one_ledger_upgrades_but_active_one_fails_closed(tmp_path: Path):
     ledger = tmp_path / "ledger.json"
     ledger.write_text('{"schema":1,"policy":null,"leases":[]}', encoding="utf-8")
@@ -163,7 +251,7 @@ def test_admission_labels_unprofiled_allowance_separately_from_learned_need(
     assert unknown["capacity"]["allowance_basis"] == (
         "unprofiled_available_backed"
     )
-    assert unknown["capacity"]["allowance_bytes"] == 6655 * MIB
+    assert unknown["capacity"]["allowance_bytes"] == 13823 * MIB
     assert unknown["capacity"]["allowance_bytes"] < 16 * GIB
     assert unknown["capacity"]["predicted_rss_bytes"] is None
 
@@ -180,6 +268,209 @@ def test_admission_labels_unprofiled_allowance_separately_from_learned_need(
     )
     assert learned["capacity"]["allowance_bytes"] == 10 * GIB
     assert learned["capacity"]["predicted_rss_bytes"] == 8 * GIB
+
+
+def test_learned_allowance_clips_to_live_headroom_instead_of_refusing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A learned estimate cannot veto a command while reserve headroom remains."""
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 22 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 45 * MIB)
+
+    result = telemetry._handle_admission_request(
+        _request(
+            tmp_path / "state",
+            predicted_rss_bytes=int(5452.5 * MIB),
+        )
+    )
+
+    assert result["status"] == "admitted"
+    assert result["reason"] == "reserved"
+    assert result["capacity"]["allowance_basis"] == "learned_profile_live_headroom"
+    # 22 GiB available - 16 GiB reserve - 1 MiB strict margin - 45 MiB overhead.
+    assert result["capacity"]["allowance_bytes"] == 6_098 * MIB
+    assert result["capacity"]["capacity_bytes"] == 6_098 * MIB + 45 * MIB
+    assert result["capacity"]["learned_allowance_bytes"] == 6_816 * MIB
+    assert result["capacity"]["live_backed_allowance_bytes"] == 6_098 * MIB
+    assert result["capacity"]["learned_allowance_live_backed"] is False
+    assert result["lease"]["allowance_bytes"] == 6_098 * MIB
+    assert result["lease"]["command_limit_bytes"] is None
+
+
+def test_healthy_host_learned_receipt_preserves_exact_admission_calculation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A healthy 64-GiB/48-GiB host keeps the learned allowance exact."""
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 48 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 45 * MIB)
+
+    result = telemetry._handle_admission_request(
+        _request(
+            tmp_path / "state",
+            predicted_rss_bytes=int(5452.5 * MIB),
+            command_fraction=None,
+            reserve_fraction=None,
+        )
+    )
+
+    assert result["status"] == "admitted"
+    assert result["reason"] == "reserved"
+    capacity = result["capacity"]
+    assert capacity["allowance_basis"] == "learned_profile_plus_25_percent"
+    assert capacity["predicted_rss_bytes"] == int(5452.5 * MIB)
+    assert capacity["learned_allowance_bytes"] == 6_816 * MIB
+    assert capacity["allowance_bytes"] == 6_816 * MIB
+    assert capacity["capacity_bytes"] == 6_816 * MIB + 45 * MIB
+    assert capacity["command_limit_bytes"] is None
+    assert capacity["enforced_command_limit_bytes"] is None
+    assert result["lease"]["allowance_bytes"] == 6_816 * MIB
+    assert result["lease"]["command_limit_bytes"] is None
+
+
+def test_oversized_learned_profile_clips_before_physical_capacity_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An inferred estimate above an omitted policy ceiling still gets a safe start."""
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 48 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 45 * MIB)
+
+    result = telemetry._handle_admission_request(
+        _request(
+            tmp_path / "state",
+            predicted_rss_bytes=60 * GIB,
+            command_fraction=None,
+            reserve_fraction=None,
+        )
+    )
+
+    assert result["status"] == "admitted"
+    assert result["capacity"]["allowance_basis"] == (
+        "learned_profile_live_headroom"
+    )
+    assert result["capacity"]["learned_allowance_bytes"] == 75 * GIB
+    assert result["capacity"]["allowance_bytes"] < 48 * GIB
+    assert result["capacity"]["command_limit_bytes"] is None
+    assert result["capacity"]["enforced_command_limit_bytes"] is None
+
+
+def _inferred_overrun_snapshot(lease_id: str) -> dict[str, dict[int, tuple[str, int, int]]]:
+    return {lease_id: {100: ("100:r", 20 * GIB, MIB)}}
+
+
+@pytest.mark.parametrize("available_gib", [48, 20])
+def test_inferred_overrun_does_not_block_another_inferred_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, available_gib: int
+):
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 60 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    first = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
+    assert first["status"] == "admitted"
+    first_lease = first["lease"]
+    assert isinstance(first_lease, dict)
+
+    monkeypatch.setattr(
+        telemetry, "_host_memory", lambda: (TOTAL, available_gib * GIB)
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "_lease_private_snapshot",
+        lambda _leases: _inferred_overrun_snapshot(str(first_lease["lease_id"])),
+    )
+    second = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
+
+    assert second["status"] == "admitted"
+    assert second["capacity"]["inferred_capacity_overrun"] is True
+    assert second["capacity"]["capacity_violation"] is False
+    if available_gib == 48:
+        assert second["capacity"]["required_available_bytes"] == 26 * GIB + CONTROL
+        assert second["capacity"]["allowance_basis"] == (
+            "learned_profile_plus_25_percent"
+        )
+    else:
+        assert second["capacity"]["required_available_bytes"] == 20 * GIB - MIB
+        assert second["capacity"]["allowance_bytes"] == 3_583 * MIB
+        assert second["capacity"]["allowance_basis"] == (
+            "learned_profile_live_headroom"
+        )
+
+
+@pytest.mark.parametrize("available_gib", [48, 20])
+def test_inferred_overrun_does_not_release_lease_during_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, available_gib: int
+):
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 60 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    first = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
+    assert first["status"] == "admitted"
+    first_lease = first["lease"]
+    assert isinstance(first_lease, dict)
+
+    monkeypatch.setattr(
+        telemetry, "_host_memory", lambda: (TOTAL, available_gib * GIB)
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "_lease_private_snapshot",
+        lambda _leases: _inferred_overrun_snapshot(str(first_lease["lease_id"])),
+    )
+    renewed = telemetry._handle_admission_request(_lease_request(first))
+
+    assert renewed["status"] == "admitted"
+    assert renewed["reason"] == (
+        "renewed" if available_gib == 48 else "renewed_resized"
+    )
+    if available_gib == 20:
+        assert renewed["lease"]["allowance_bytes"] == 3_583 * MIB
+        assert renewed["lease"]["allowance_basis"] == (
+            "learned_profile_live_headroom"
+        )
+    assert renewed["capacity"]["inferred_capacity_overrun"] is True
+    assert renewed["capacity"]["capacity_violation"] is False
+
+
+@pytest.mark.parametrize("available_gib", [48, 20])
+def test_inferred_overrun_does_not_block_helper_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, available_gib: int
+):
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 60 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    first = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
+    assert first["status"] == "admitted"
+    first_lease = first["lease"]
+    assert isinstance(first_lease, dict)
+
+    monkeypatch.setattr(
+        telemetry, "_host_memory", lambda: (TOTAL, available_gib * GIB)
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "_lease_private_snapshot",
+        lambda _leases: _inferred_overrun_snapshot(str(first_lease["lease_id"])),
+    )
+    monkeypatch.setattr(telemetry, "_identity_for_pid", lambda pid: f"{pid}:x")
+    claimed = telemetry._claim_memory_lease(
+        _lease_request(first),
+        helper_pid=123,
+        root_pid=456,
+        root_identity="456:x",
+        pgid=456,
+    )
+
+    assert claimed["status"] == "admitted"
+    assert claimed["reason"] == "claimed"
+    assert claimed["capacity"]["inferred_capacity_overrun"] is True
+    assert claimed["capacity"]["capacity_violation"] is False
 
 
 def test_unprofiled_refusal_requires_actual_live_headroom_exhaustion(
@@ -205,7 +496,7 @@ def test_unprofiled_refusal_requires_actual_live_headroom_exhaustion(
     assert result["capacity"]["allowance_bytes"] < MIB
 
 
-def test_unprofiled_open_slots_share_available_backed_capacity(
+def test_unprofiled_allowance_uses_all_available_backed_capacity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 26 * GIB))
@@ -222,25 +513,61 @@ def test_unprofiled_open_slots_share_available_backed_capacity(
 
     first = telemetry._handle_admission_request(request())
     second = telemetry._handle_admission_request(request())
-    third = telemetry._handle_admission_request(request())
 
     assert first["status"] == "admitted"
     assert second["status"] == "admitted"
-    assert int(first["lease"]["allowance_bytes"]) == 4991 * MIB
-    assert int(second["lease"]["allowance_bytes"]) == 4992 * MIB
+    assert int(first["lease"]["allowance_bytes"]) == 10111 * MIB
+    assert int(first["lease"]["allowance_bytes"]) > 5 * GIB
     assert first["capacity"]["allocation_rule"] == (
-        "unprofiled_open_slot_fair_share_v1"
+        "unprofiled_live_headroom_v1"
     )
     assert first["capacity"]["remaining_backed_capacity_bytes"] == 10239 * MIB
-    assert first["capacity"]["open_slots_at_sizing"] == 2
-    assert first["capacity"]["per_open_slot_capacity_bytes"] == 5119 * MIB
-    assert second["capacity"]["open_slots_at_sizing"] == 1
-    assert second["capacity"]["per_open_slot_capacity_bytes"] == 5120 * MIB
-    assert third["status"] == "refused"
-    assert third["reason"] == "guarded_job_limit"
+    assert "open_slots_at_sizing" not in first["capacity"]
+    assert "per_open_slot_capacity_bytes" not in first["capacity"]
+    assert second["lease"]["allowance_bytes"] == first["lease"]["allowance_bytes"]
+    assert second["lease"]["command_limit_bytes"] is None
 
 
-def test_unprofiled_fair_share_preserves_single_slot_sizing(
+@pytest.mark.parametrize("mode", ["learned", "explicit"])
+def test_unknown_inferred_allowance_does_not_veto_later_small_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 26 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 128 * MIB)
+    state_root = tmp_path / mode
+    unknown = telemetry._handle_admission_request(
+        _request(
+            state_root,
+            command_fraction=0.3125,
+            reserve_fraction=None,
+        )
+    )
+    assert unknown["status"] == "admitted"
+
+    if mode == "learned":
+        later = _request(
+            state_root,
+            predicted_rss_bytes=256 * MIB,
+            command_fraction=0.3125,
+            reserve_fraction=None,
+        )
+    else:
+        later = _request(
+            state_root,
+            explicit_limit_bytes=256 * MIB,
+            command_fraction=0.3125,
+            reserve_fraction=None,
+        )
+    admitted = telemetry._handle_admission_request(later)
+
+    assert admitted["status"] == "admitted"
+    if mode == "learned":
+        assert admitted["lease"]["command_limit_bytes"] is None
+    else:
+        assert admitted["lease"]["command_limit_bytes"] == 256 * MIB
+
+
+def test_unprofiled_allowance_is_independent_of_max_jobs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 26 * GIB))
@@ -257,8 +584,28 @@ def test_unprofiled_fair_share_preserves_single_slot_sizing(
 
     assert result["status"] == "admitted"
     assert result["lease"]["allowance_bytes"] == 10111 * MIB
-    assert result["capacity"]["open_slots_at_sizing"] == 1
-    assert result["capacity"]["per_open_slot_capacity_bytes"] == 10239 * MIB
+    assert result["capacity"]["allocation_rule"] == (
+        "unprofiled_live_headroom_v1"
+    )
+
+
+def test_first_unprofiled_allowance_is_same_for_max_jobs_one_or_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, 26 * GIB))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 128 * MIB)
+
+    first = telemetry._handle_admission_request(
+        _request(tmp_path / "one", max_jobs=1, command_fraction=0.3125,
+                 reserve_fraction=None)
+    )
+    second = telemetry._handle_admission_request(
+        _request(tmp_path / "two", max_jobs=2, command_fraction=0.3125,
+                 reserve_fraction=None)
+    )
+
+    assert first["status"] == second["status"] == "admitted"
+    assert first["lease"]["allowance_bytes"] == second["lease"]["allowance_bytes"]
 
 
 def test_unprofiled_final_renewal_rebalances_before_global_unsafety(
@@ -277,20 +624,20 @@ def test_unprofiled_final_renewal_rebalances_before_global_unsafety(
     )
     first = telemetry._handle_admission_request(request())
     assert first["status"] == "admitted"
-    assert first["lease"]["allowance_bytes"] == 6655 * MIB
-    assert first["lease"]["capacity_bytes"] == 7167 * MIB
+    assert first["lease"]["allowance_bytes"] == 13823 * MIB
+    assert first["lease"]["capacity_bytes"] == 14335 * MIB
 
     available = 24 * GIB
     renewed = telemetry._handle_admission_request(_lease_request(first))
     assert renewed["status"] == "admitted"
     assert renewed["reason"] == "renewed_resized"
-    assert renewed["lease"]["allowance_bytes"] == 3583 * MIB
-    assert renewed["lease"]["capacity_bytes"] == 4095 * MIB
+    assert renewed["lease"]["allowance_bytes"] == 7679 * MIB
+    assert renewed["lease"]["capacity_bytes"] == 8191 * MIB
 
     second = telemetry._handle_admission_request(request())
     assert second["status"] == "admitted"
-    assert second["lease"]["allowance_bytes"] == 3584 * MIB
-    assert second["lease"]["capacity_bytes"] == 4096 * MIB
+    assert second["lease"]["allowance_bytes"] == 7679 * MIB
+    assert second["lease"]["command_limit_bytes"] is None
 
 
 def test_actual_commitments_not_policy_ceiling_control_concurrency(
@@ -319,14 +666,14 @@ def test_actual_commitments_not_policy_ceiling_control_concurrency(
     assert third["reason"] == "guarded_job_limit"
 
 
-def test_falling_live_memory_at_final_renewal_releases_and_later_controller_reclaims(
+def test_falling_live_memory_at_final_renewal_clips_and_releases_for_later_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     # reserve policy+bracket, renewal policy+bracket, later reserve policy+bracket
     readings = iter(
         [(TOTAL, AVAILABLE_SAFE)] * 4
         + [(TOTAL, AVAILABLE_UNSAFE)] * 4
-        + [(TOTAL, AVAILABLE_SAFE)] * 4
+        + [(TOTAL, AVAILABLE_SAFE)] * 8
     )
     monkeypatch.setattr(telemetry, "_host_memory", lambda: next(readings))
     monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
@@ -338,9 +685,15 @@ def test_falling_live_memory_at_final_renewal_releases_and_later_controller_recl
     assert reserved["status"] == "admitted"
 
     renewal = telemetry._handle_admission_request(_lease_request(reserved))
-    assert renewal["status"] == "refused"
-    assert renewal["reason"] == "live_memory_changed"
-    assert renewal["lease_released"] is True
+    assert renewal["status"] == "admitted"
+    assert renewal["reason"] == "renewed_resized"
+    assert renewal["lease"]["allowance_basis"] == "learned_profile_live_headroom"
+    assert renewal["lease"]["allowance_bytes"] == 3_583 * MIB
+
+    released = telemetry._handle_admission_request(
+        _lease_request(renewal, op="release")
+    )
+    assert released["status"] == "released"
     assert _ledger_leases(state_root) == []
 
     later = telemetry._handle_admission_request(
@@ -361,7 +714,10 @@ def test_unprofiled_final_renewal_shrinks_to_current_backed_capacity(
     def host_memory() -> tuple[int, int]:
         nonlocal reads
         reads += 1
-        return (TOTAL, 30 * GIB if reads <= 7 else 29 * GIB)
+        return (
+            TOTAL,
+            30 * GIB if reads <= 7 else 29 * GIB if reads <= 11 else 24 * GIB,
+        )
 
     monkeypatch.setattr(telemetry, "_host_memory", host_memory)
     monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
@@ -369,51 +725,122 @@ def test_unprofiled_final_renewal_shrinks_to_current_backed_capacity(
 
     reserved = telemetry._handle_admission_request(_request(state_root))
     assert reserved["status"] == "admitted"
-    assert reserved["lease"]["allowance_bytes"] == 6655 * MIB
+    assert reserved["lease"]["allowance_bytes"] == 13823 * MIB
 
     renewal = telemetry._handle_admission_request(_lease_request(reserved))
 
     assert renewal["status"] == "admitted"
     assert renewal["reason"] == "renewed_resized"
     assert renewal["lease"]["allowance_basis"] == "unprofiled_available_backed"
-    assert renewal["lease"]["allowance_bytes"] == 6143 * MIB
-    assert renewal["lease"]["capacity_bytes"] == 6143 * MIB + CONTROL
-    assert renewal["capacity"]["previous_allowance_bytes"] == 6655 * MIB
+    assert renewal["lease"]["allowance_bytes"] == 7679 * MIB
+    assert renewal["lease"]["capacity_bytes"] == 7679 * MIB + CONTROL
+    assert renewal["lease"]["remaining_backed_capacity_bytes"] is not None
+    assert renewal["capacity"]["previous_allowance_bytes"] == 13823 * MIB
+    assert reads == 14
     leases = _ledger_leases(state_root)
     assert len(leases) == 1
-    assert leases[0]["allowance_bytes"] == 6143 * MIB
-    assert leases[0]["capacity_bytes"] == 6143 * MIB + CONTROL
+    assert leases[0]["allowance_bytes"] == 7679 * MIB
+    assert leases[0]["capacity_bytes"] == 7679 * MIB + CONTROL
 
     reservation = MemoryReservation.from_payload(renewal)
     token = uuid.uuid4().hex
     rc = telemetry._guarded_run(
         [sys.executable, "-c", "pass"],
-        max_command_bytes=reservation.allowance_bytes,
+        max_command_bytes=None,
         min_available_bytes=reservation.min_available_bytes,
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(renewal),
+        lease_request=_production_lease_request(renewal),
     )
-    result = _guard_result(capsys.readouterr().err, token)
+    captured = capsys.readouterr()
+    result = _guard_result(captured.err, token)
     assert rc == 0
     assert result["status"] == "ok"
-    assert result["max_command_bytes"] == 6143 * MIB
+    assert result["max_command_bytes"] is None
+
+    finalized = _finalize_guarded_result(
+        helper_exit_code=rc,
+        stdout=captured.out,
+        stderr=captured.err,
+        token=token,
+        reservation=reservation,
+        telemetry=None,
+        platform_name="test target",
+    )
+    assert finalized.memory_reservation is not None
+    assert finalized.memory_reservation.allowance_basis == (
+        "unprofiled_available_backed"
+    )
+    assert finalized.memory_reservation.allowance_bytes == 7679 * MIB
+    assert finalized.memory_reservation.remaining_backed_capacity_bytes is not None
+    assert finalized.memory_reservation.live_backed_allowance_bytes is None
+    assert finalized.memory_reservation.learned_allowance_live_backed is None
     assert _ledger_leases(state_root) == []
 
 
-def test_falling_live_memory_at_helper_claim_never_releases_gate_and_reclaims(
+def test_learned_final_renewal_refreshes_live_backed_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ):
-    # reserve (4), renew (4), helper initialization (1), claim (4), later reserve (4)
-    readings = iter(
-        [(TOTAL, AVAILABLE_SAFE)] * 9
-        + [(TOTAL, AVAILABLE_UNSAFE)] * 4
-        + [(TOTAL, AVAILABLE_SAFE)] * 4
+    """A learned renewal must carry its current live-backed projection."""
+    available = AVAILABLE_SAFE
+    monkeypatch.setattr(
+        telemetry, "_host_memory", lambda: (TOTAL, available)
     )
-    monkeypatch.setattr(telemetry, "_host_memory", lambda: next(readings))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
+    state_root = tmp_path / "state"
+
+    reserved = telemetry._handle_admission_request(
+        _request(state_root, predicted_rss_bytes=8 * GIB)
+    )
+    assert reserved["status"] == "admitted"
+    original_live_backed = reserved["lease"]["live_backed_allowance_bytes"]
+
+    available = AVAILABLE_UNSAFE
+    renewed = telemetry._handle_admission_request(_lease_request(reserved))
+    assert renewed["status"] == "admitted"
+    lease = renewed["lease"]
+    assert lease["allowance_basis"] == "learned_profile_live_headroom"
+    assert lease["allowance_bytes"] < reserved["lease"]["allowance_bytes"]
+    assert original_live_backed > lease["allowance_bytes"]
+
+    reservation = MemoryReservation.from_payload(renewed)
+    token = uuid.uuid4().hex
+    rc = telemetry._guarded_run(
+        [sys.executable, "-c", "pass"],
+        max_command_bytes=None,
+        min_available_bytes=reservation.min_available_bytes,
+        token=token,
+        detailed=False,
+        telemetry=False,
+        lease_request=_production_lease_request(renewed),
+    )
+    captured = capsys.readouterr()
+    assert rc == 0
+    finalized = _finalize_guarded_result(
+        helper_exit_code=rc,
+        stdout=captured.out,
+        stderr=captured.err,
+        token=token,
+        reservation=reservation,
+        telemetry=None,
+        platform_name="test target",
+    )
+    assert finalized.memory_reservation is not None
+    assert finalized.memory_reservation.live_backed_allowance_bytes == lease[
+        "live_backed_allowance_bytes"
+    ]
+    assert _ledger_leases(state_root) == []
+
+
+def test_learned_helper_claim_clips_without_rss_killing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, AVAILABLE_SAFE))
     monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: CONTROL)
     state_root = tmp_path / "state"
     sentinel = tmp_path / "argv-started"
@@ -428,34 +855,34 @@ def test_falling_live_memory_at_helper_claim_never_releases_gate_and_reclaims(
     assert isinstance(lease, dict)
     token = uuid.uuid4().hex
 
+    # A controller reservation made at 60 GiB available is larger than the
+    # 20-GiB claim-time headroom, but 20 GiB still safely exceeds the 16-GiB
+    # host reserve. The target must clip the inferred lease and start argv.
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, AVAILABLE_UNSAFE))
+
     rc = telemetry._guarded_run(
         [
             sys.executable,
             "-c",
             f"from pathlib import Path; Path({str(sentinel)!r}).write_text('started')",
         ],
-        max_command_bytes=int(lease["allowance_bytes"]),
+        max_command_bytes=None,
         min_available_bytes=int(lease["min_available_bytes"]),
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(renewed),
+        lease_request=_production_lease_request(renewed),
     )
 
     captured = capsys.readouterr()
     result = _guard_result(captured.err, token)
-    assert rc == 125
-    assert result["status"] == "refused"
-    assert result["reason"] == "live_memory_changed"
-    assert result["command_started"] is False
-    assert result["memory_admission"]["lease_released"] is True
-    assert not sentinel.exists()
+    assert rc == 0
+    assert result["status"] == "ok"
+    assert result["command_started"] is True
+    assert result["max_command_bytes"] is None
+    assert result["command_limit_enforced"] is False
+    assert sentinel.exists()
     assert _ledger_leases(state_root) == []
-
-    later = telemetry._handle_admission_request(
-        _request(state_root, predicted_rss_bytes=8 * GIB)
-    )
-    assert later["status"] == "admitted"
 
 
 def test_gate_release_interruption_is_completion_unknown_never_false(
@@ -477,12 +904,12 @@ def test_gate_release_interruption_is_completion_unknown_never_false(
     monkeypatch.setattr(telemetry, "_after_gate_release", interrupt_after_release)
     rc = telemetry._guarded_run(
         [sys.executable, "-c", "import time; time.sleep(30)"],
-        max_command_bytes=reservation.allowance_bytes,
+        max_command_bytes=None,
         min_available_bytes=reservation.min_available_bytes,
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(reserved),
+        lease_request=_production_lease_request(reserved),
     )
 
     captured = capsys.readouterr()
@@ -551,7 +978,7 @@ def test_cleanup_survivor_quarantines_lease_until_identity_verified_dead(
     state_root = tmp_path / "state"
     request = _request(
         state_root,
-        predicted_rss_bytes=MIB,
+        explicit_limit_bytes=2 * MIB,
         max_jobs=1,
         command_fraction=0.10,
         reserve_fraction=0.05,
@@ -569,7 +996,7 @@ def test_cleanup_survivor_quarantines_lease_until_identity_verified_dead(
         token=token,
         detailed=False,
         telemetry=False,
-        lease_request=_lease_request(reserved),
+        lease_request=_production_lease_request(reserved),
     )
 
     payload = _guard_result(capsys.readouterr().err, token)
@@ -684,8 +1111,13 @@ def test_ledger_ttl_token_policy_max_jobs_and_prediction_headroom(
             reserve_fraction=0.10,
         )
     )
-    assert too_large["status"] == "refused"
-    assert too_large["reason"] == "prediction_exceeds_command_limit"
+    assert too_large["status"] == "admitted"
+    assert too_large["capacity"]["allowance_basis"] == (
+        "learned_profile_plus_25_percent"
+    )
+    assert too_large["lease"]["allowance_bytes"] == 16 * GIB
+    assert too_large["capacity"]["learned_allowance_bytes"] == 17_920 * MIB
+    assert too_large["capacity"]["learned_allowance_live_backed"] is True
 
 
 def test_local_transport_guarded_exit_uses_reserved_lease_end_to_end(tmp_path: Path):
@@ -732,7 +1164,7 @@ def test_local_transport_guarded_exit_uses_reserved_lease_end_to_end(tmp_path: P
     assert result.memory_reservation is not None
     assert result.memory_reservation.lease_id == reservation.lease_id
     assert result.memory_reservation.lease_token == reservation.lease_token
-    assert result.memory_guard["max_command_bytes"] == (
-        result.memory_reservation.allowance_bytes
-    )
+    assert result.memory_guard["max_command_bytes"] is None
+    assert result.memory_guard["command_limit_enforced"] is False
+    assert result.memory_guard["enforced_command_limit_bytes"] is None
     assert _ledger_leases(tmp_path / "state") == []

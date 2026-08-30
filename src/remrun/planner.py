@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .bootstrap import parse_bootstrap
 from .config import (
     RemrunConfig,
     hash_below_bytes,
@@ -30,6 +31,9 @@ def make_run_plan(
     project = detect_project(cwd, config)
     project_config_path = find_project_config(project.local_project_root)
     project_config = load_project_config(project_config_path)
+    bootstrap = parse_bootstrap(
+        project_config, project_root=project.local_project_root
+    )
 
     workload = (
         select_workload(project_config, requested_workload)
@@ -58,4 +62,5 @@ def make_run_plan(
         write_scope=write_scope.name,
         write_scope_paths=list(write_scope.paths),
         workload=workload,
+        bootstrap=bootstrap,
     )

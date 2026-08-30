@@ -19,6 +19,12 @@ from .task_contract import sha256_id
 
 FLEET_PROFILE_FILE = "fleet_profiles.json"
 DEFAULT_MAX_ENTRIES = 256
+# Resource peaks are admission inputs, so their measurement semantics are part
+# of the profile identity.  The former ``peak_rss_mb`` value came from an
+# additive RSS sum that can double-count shared pages and is not evidence for a
+# memory commitment.  Keep old rows readable for duration calibration, but do
+# not let their resource values enter placement or admission.
+RESOURCE_MEMORY_METRIC = "private_resident_sum_sampled_v1"
 
 _COST_FIELDS = ("fixed_load_s", "var_per_unit_s", "peak_rss_mb", "peak_vram_mb")
 
@@ -103,6 +109,27 @@ def profile_observation(tasks: list[FleetTask], device: str, result: dict[str, A
     else:
         reject_reason = "elapsed_invalid"
     telemetry = result.get("telemetry") if isinstance(result.get("telemetry"), dict) else {}
+    memory_profile = (
+        telemetry.get("memory_profile")
+        if isinstance(telemetry.get("memory_profile"), dict)
+        else {}
+    )
+    memory_metric = memory_profile.get("metric")
+    profile_peak_bytes = memory_profile.get("peak_bytes")
+    if (
+        memory_metric != RESOURCE_MEMORY_METRIC
+        or isinstance(profile_peak_bytes, bool)
+        or not isinstance(profile_peak_bytes, (int, float))
+        or not math.isfinite(float(profile_peak_bytes))
+        or float(profile_peak_bytes) <= 0
+    ):
+        # Legacy/malformed resource telemetry remains useful as receipt context,
+        # but cannot seed a future memory admission.  In particular, never fall
+        # back to the compatibility ``peak_rss_mb`` alias here.
+        memory_metric = None
+        profile_peak_mb = None
+    else:
+        profile_peak_mb = round(float(profile_peak_bytes) / (1024 * 1024), 1)
     item_elapsed = [float(row["elapsed_s"]) for row in rows
                     if isinstance(row.get("elapsed_s"), (int, float))
                     and not isinstance(row.get("elapsed_s"), bool)]
@@ -134,8 +161,9 @@ def profile_observation(tasks: list[FleetTask], device: str, result: dict[str, A
         "controller_elapsed_s": float(elapsed) if isinstance(elapsed, (int, float))
         and not isinstance(elapsed, bool) else None,
         "worker_elapsed_s": sum(item_elapsed) if item_elapsed else None,
-        "peak_rss_mb": telemetry.get("peak_rss_mb"),
+        "peak_rss_mb": profile_peak_mb,
         "peak_vram_mb": telemetry.get("peak_vram_mb"),
+        "memory_metric": memory_metric,
         "accepted_duration": accepted,
         "reject_reason": reject_reason,
         "result_digest": result_digest,
@@ -208,10 +236,25 @@ def merge_costs(local: dict, shared: dict, observed: dict | None = None) -> dict
     local = local or {}
     shared = shared or {}
     out: dict[str, dict] = {}
+    def resource_safe(row: dict) -> dict:
+        """Strip only unversioned host-memory peaks before placement."""
+        out = dict(row)
+        if out.get("memory_metric") != RESOURCE_MEMORY_METRIC:
+            out["peak_rss_mb"] = None
+            out["memory_metric"] = None
+        return out
+
     for key in set(shared) | set(local):
         s = shared.get(key) if isinstance(shared.get(key), dict) else {}
         loc = local.get(key) if isinstance(local.get(key), dict) else {}
+        s = resource_safe(s)
+        loc = resource_safe(loc)
         row = {f: (loc.get(f) if loc.get(f) is not None else s.get(f)) for f in _COST_FIELDS}
+        row["memory_metric"] = (
+            loc.get("memory_metric")
+            if loc.get("memory_metric") is not None
+            else s.get("memory_metric")
+        )
         row["n"] = int(loc.get("n", 0))
         row["updated"] = loc.get("updated") or s.get("updated", "")
         out[key] = row
@@ -221,9 +264,23 @@ def merge_costs(local: dict, shared: dict, observed: dict | None = None) -> dict
         prior = out.get(key, {})
         row = dict(prior)
         row.update(raw)
-        for field in ("peak_rss_mb", "peak_vram_mb"):
-            values = [value for value in (prior.get(field), raw.get(field)) if value is not None]
-            row[field] = max(values) if values else None
+        vram_values = [
+            value
+            for value in (prior.get("peak_vram_mb"), raw.get("peak_vram_mb"))
+            if value is not None
+        ]
+        row["peak_vram_mb"] = max(vram_values) if vram_values else None
+        if raw.get("memory_metric") == RESOURCE_MEMORY_METRIC:
+            rss_values = [
+                value
+                for value in (prior.get("peak_rss_mb"), raw.get("peak_rss_mb"))
+                if value is not None
+            ]
+            row["peak_rss_mb"] = max(rss_values) if rss_values else None
+            row["memory_metric"] = RESOURCE_MEMORY_METRIC
+        else:
+            row["peak_rss_mb"] = prior.get("peak_rss_mb")
+            row["memory_metric"] = prior.get("memory_metric")
         out[key] = row
     return out
 
@@ -316,19 +373,30 @@ def load_observation_profiles(db_path: Path) -> dict[str, dict[str, Any]]:
     for key in set(resources) | set(grouped):
         fit = _duration_fit(grouped.get(key, []))
         resource_rows = resources.get(key, [])
-        rss = [float(row["peak_rss_mb"]) for row in resource_rows
+        trusted_resources = [
+            row for row in resource_rows
+            if "memory_metric" in row.keys()
+            and row["memory_metric"] == RESOURCE_MEMORY_METRIC
+        ]
+        rss = [float(row["peak_rss_mb"]) for row in trusted_resources
                if row["peak_rss_mb"] is not None]
         vram = [float(row["peak_vram_mb"]) for row in resource_rows
                 if row["peak_vram_mb"] is not None]
         fit.update({
-            "resource_n": sum(1 for row in resource_rows
-                              if row["peak_rss_mb"] is not None
-                              or row["peak_vram_mb"] is not None),
+            "resource_n": sum(
+                1
+                for row in resource_rows
+                if (
+                    row in trusted_resources and row["peak_rss_mb"] is not None
+                ) or row["peak_vram_mb"] is not None
+            ),
             "peak_rss_mb": max(rss) if rss else None,
             "peak_vram_mb": max(vram) if vram else None,
             "n": len(resource_rows),
             "updated": str(resource_rows[-1]["recorded_at"]) if resource_rows else "",
         })
+        if rss or vram:
+            fit["memory_metric"] = RESOURCE_MEMORY_METRIC
         out[key] = fit
     return out
 

@@ -7,28 +7,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
+import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from ..config import load_config
-from ..output import Reporter
+from ..output import Reporter, emit_json_document
 from ..state import default_state_root
 from ..target_resources import (
     TargetReservation, TargetResourceClient, TargetResourceError, canonical_json,
     policy_digest,
 )
-from . import adapters, executor, placement, probes
+from . import adapters, dispatcher, executor, placement, probes
 from .config import fleet_config, load_costs, safety_fraction
 from .models import FleetTask
-from .queue import FleetQueue
+from .queue import FleetQueue, TaskSpecDriftRefusal
 from .prepared import (
     RAW_COMMAND_SPEC, RAW_COMMAND_SPEC_ID, as_fleet_task, parse_option_assignments,
     pin_prepared_job, prepare_raw_command, prepare_task_jobs,
 )
+from .request_stdin import RequestStdinError, read_request_document
 from .storage import StorageError, bind_device_root, enroll_local_root, load_registry
-from .task_contract import resolve_tasks
+from .task_contract import resolve_tasks, task_routes_document
 from ..transport import (
     TransportError, _posix_cancel_script, _powershell_cancel_script, make_transport,
 )
@@ -36,6 +40,7 @@ from ..transport import (
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_STUCK = 2
+EXIT_DRAIN_STOPPED = 3
 EXIT_INFRA = 4
 EXIT_CANCELLED = 130
 
@@ -43,7 +48,36 @@ EXIT_CANCELLED = 130
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def _configured_payload(args, definition: dict) -> tuple[str | None, list[str]]:  # noqa: ANN001
+def _positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return seconds
+
+
+def _configured_payload(
+    args, definition: dict, *, task_name: str, spec_id: str,
+) -> tuple[str | None, list[str]]:  # noqa: ANN001
+    if getattr(args, "stdin_request", False):
+        if (getattr(args, "text", None) is not None
+                or getattr(args, "input", None)
+                or getattr(args, "clipboard", False)):
+            raise ValueError(
+                "--stdin-request cannot be combined with --text, --input, or --clipboard"
+            )
+        try:
+            request = read_request_document()
+        except RequestStdinError as exc:
+            raise ValueError(str(exc)) from exc
+        if request["task"] != task_name:
+            raise ValueError("request task does not match the configured task argument")
+        if request["spec_id"] != spec_id:
+            raise ValueError("request spec_id does not match the resolved task definition")
+        return request["text"], []
+
     text = getattr(args, "text", None)
     inputs = list(getattr(args, "input", None) or [])
     if getattr(args, "clipboard", False):
@@ -68,7 +102,9 @@ def _prepare_configured(args, config):  # noqa: ANN001
     if spec is None:
         available = ", ".join(sorted(specs)) or "none"
         raise ValueError(f"unknown configured task {args.task_name!r}; available: {available}")
-    text, inputs = _configured_payload(args, spec["definition"])
+    text, inputs = _configured_payload(
+        args, spec["definition"], task_name=spec["task_name"], spec_id=spec["spec_id"],
+    )
     options = parse_option_assignments(spec["definition"], getattr(args, "opt", None))
     records = prepare_task_jobs(
         spec, repo_root=config.repo_root, text=text, inputs=inputs, options=options,
@@ -141,6 +177,18 @@ def cmd_storage(args, reporter: Reporter) -> int:  # noqa: ANN001
     return EXIT_OK
 
 
+def cmd_task_interfaces(args, reporter: Reporter) -> int:  # noqa: ANN001
+    """Expose resolved task/device routes without probing any device."""
+    config = load_config()
+    document = task_routes_document(resolve_tasks(config), config.devices)
+    if args.json:
+        emit_json_document(document)
+    else:
+        for route in document["routes"]:
+            reporter.event("task_route", **route)
+    return EXIT_OK
+
+
 def _candidate_devices(task: FleetTask, config) -> list[str]:
     if task.force_device:
         return [task.force_device]
@@ -207,7 +255,8 @@ def _route_preview(task: FleetTask, config, q: FleetQueue, state_root) -> dict:
             "variant": task.options.get("_variant"), "device_busy": busy,
             "active_on_device": active, "estimated_finish_s": b.estimated_finish_s,
             "selection_basis": b.selection_basis,
-            "estimate_reason": b.estimate_reason}
+            "estimate_reason": b.estimate_reason,
+            "placement_explanation": b.explanation}
 
 
 def _route_preview_multi(tasks: list[FleetTask], config, q: FleetQueue, state_root) -> dict:
@@ -307,7 +356,8 @@ def cmd_plan(args, reporter: Reporter) -> int:
                      "estimated_finish_s": batch.estimated_finish_s,
                      "reason": batch.reason,
                      "selection_basis": batch.selection_basis,
-                     "estimate_reason": batch.estimate_reason}
+                     "estimate_reason": batch.estimate_reason,
+                     "placement_explanation": batch.explanation}
                     for batch in result.batches],
         "makespan_s": result.makespan_s,
         "skipped": result.skipped, "note": result.note,
@@ -370,6 +420,17 @@ def _route_line(task_name: str, route: dict, will_run: bool, queued_total: int) 
     return f"{label} -> {dev} - queued (#{queued_total})"
 
 
+def _emit_submission_refusal(
+    refusal: dict, args, reporter: Reporter,  # noqa: ANN001
+) -> int:
+    """Emit the closed durable refusal without exposing frozen task bytes."""
+    if getattr(args, "json", False):
+        emit_json_document(refusal)
+    else:
+        reporter.event("submission_refused", reason=refusal["reason"])
+    return EXIT_ERROR
+
+
 def cmd_submit(args, reporter: Reporter) -> int:
     if getattr(args, "preview_route", False) and not getattr(args, "json", False):
         raise ValueError("--preview-route requires --json")
@@ -380,6 +441,7 @@ def cmd_submit(args, reporter: Reporter) -> int:
             "require": getattr(args, "require", None) or [],
             "text": getattr(args, "text", None),
             "input": getattr(args, "input", None) or [],
+            "stdin_request": getattr(args, "stdin_request", False),
             "clipboard": getattr(args, "clipboard", False),
             "device": getattr(args, "device", None),
             "engine": getattr(args, "engine", None),
@@ -400,6 +462,7 @@ def cmd_submit(args, reporter: Reporter) -> int:
             )
         state_root = default_state_root()
         q = FleetQueue(state_root / "fleet" / "fleet.db")
+        refusal = None
         try:
             plan = q.get_submission_plan(plan_id)
             if plan is None:
@@ -411,14 +474,20 @@ def cmd_submit(args, reporter: Reporter) -> int:
                 current = resolve_tasks(load_config(config.repo_root)).get(task_name)
                 return current.get("spec_id") if current else None
 
-            receipt = q.enqueue_saved_plan(
-                plan_id,
-                request_id=getattr(args, "request_id", None),
-                current_spec_id=current_spec_id,
-            )
-            queued_total = q.counts().get("queued", 0)
+            try:
+                receipt = q.enqueue_saved_plan(
+                    plan_id,
+                    request_id=getattr(args, "request_id", None),
+                    current_spec_id=current_spec_id,
+                )
+            except TaskSpecDriftRefusal as exc:
+                refusal = exc.document
+            if refusal is None:
+                queued_total = q.counts().get("queued", 0)
         finally:
             q.close()
+        if refusal is not None:
+            return _emit_submission_refusal(refusal, args, reporter)
         payload = {**receipt, "task": task_name, "queued_total": queued_total,
                    "route_preview": False}
         if args.json:
@@ -559,7 +628,8 @@ def cmd_command(args, reporter: Reporter) -> int:
                      "estimated_finish_s": batch.estimated_finish_s,
                      "reason": batch.reason,
                      "selection_basis": batch.selection_basis,
-                     "estimate_reason": batch.estimate_reason}
+                     "estimate_reason": batch.estimate_reason,
+                     "placement_explanation": batch.explanation}
                     for batch in result.batches],
         "skipped": result.skipped,
     }
@@ -592,7 +662,7 @@ def _target_operation_status(
         if config is None or stored["device"] not in config.devices:
             raise TransportError("accepted target is absent from current device configuration")
         status = make_transport(config.devices[stored["device"]]).durable_status(
-            stored["operation_id"], str(token)
+            stored["operation_id"], token
         )
         if status.get("operation_id") != stored["operation_id"] \
                 or status.get("request_sha256") != stored["request_sha256"]:
@@ -715,6 +785,16 @@ def cmd_status(args, reporter: Reporter) -> int:
                 submission_id=submission_id, request_id=request_id,
             )
             if receipt is None:
+                refusal = q.get_submission_refusal(request_id=request_id) \
+                    if request_id is not None else None
+                if refusal is not None:
+                    if args.json:
+                        emit_json_document(refusal)
+                    else:
+                        reporter.event(
+                            "submission_refused", reason=refusal["reason"],
+                        )
+                    return EXIT_OK
                 raise ValueError("submission identity was not found")
             jobs = q.jobs_for_submission(receipt["submission_id"])
             target_ok = True
@@ -807,7 +887,6 @@ def cmd_run(args, reporter: Reporter) -> int:
 
 
 def cmd_dispatch(args, reporter: Reporter) -> int:
-    from . import dispatcher
     config = load_config()
     scope_job_ids = list(getattr(args, "job_id", None) or [])
     submission_id = getattr(args, "submission_id", None)
@@ -846,14 +925,37 @@ def cmd_dispatch(args, reporter: Reporter) -> int:
         else:
             reporter.event("dispatch_tick", **{k: v for k, v in summary.items() if k != "skipped"})
         return EXIT_OK
-    result = dispatcher.run(
-        config, poll_s=args.poll, debounce_s=args.debounce,
-        until_empty=bool(getattr(args, "drain", False) or scope is not None), reporter=reporter,
-        job_ids=scope,
-    )
-    if args.json:
-        print(json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")))
-    else:
+    until_empty = bool(getattr(args, "drain", False) or scope is not None)
+    stop_event = dispatcher.DrainStopEvent() if until_empty else None
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def request_stop(signum, _frame) -> None:  # noqa: ANN001
+        assert stop_event is not None
+        if not stop_event.is_set():
+            stop_event.set()
+            return
+        previous = previous_handlers[signal.Signals(signum)]
+        signal.signal(signum, previous)
+        signal.raise_signal(signum)
+
+    if stop_event is not None and threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+    try:
+        result = dispatcher.run(
+            config, poll_s=args.poll, debounce_s=args.debounce,
+            until_empty=until_empty, reporter=reporter, job_ids=scope,
+            stop_event=stop_event,
+            stop_timeout_s=float(getattr(
+                args, "stop_timeout", dispatcher.DEFAULT_STOP_TIMEOUT_S,
+            )),
+        )
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    emit_json_document(result.to_dict())
+    if not args.json:
         reporter.event("dispatch_final", **result.to_dict())
     return result.exit_code
 
@@ -935,7 +1037,7 @@ def _stop_target_operation(config, operation: dict) -> tuple[str, str | None, st
     request_sha = operation["request_sha256"]
     token = operation["resume_token"]
     try:
-        client = TargetResourceClient.connect(config, device_name)
+        client = TargetResourceClient.connect(config, device_name, install=False)
         observed = client.status_identity(operation_id, token)
         receipt = observed.get("receipt")
         if not isinstance(receipt, dict) \
@@ -1143,6 +1245,56 @@ def cmd_cancel(args, reporter: Reporter) -> int:
         print(f"cancelled: cleared {res['jobs']} job(s), {res['leases']} lease(s); "
               f"stopped workers on {', '.join(ok) if ok else '(none reachable)'}")
     return EXIT_OK if all(stopped.values()) else EXIT_ERROR
+
+
+def cmd_release(args, reporter: Reporter) -> int:
+    """Acknowledge or execute cleanup for one exact fenced target operation."""
+    operation_id = str(args.operation_id)
+    request_sha256 = str(args.request_sha256)
+    q = FleetQueue(default_state_root() / "fleet" / "fleet.db")
+    try:
+        if args.release_action == "acknowledge-effects":
+            operation = q.target_release_operation(operation_id, request_sha256)
+            if operation is None:
+                disposition = "identity_mismatch"
+                error = "exact target operation identity was not found"
+            elif q.acknowledge_target_release_effects(operation_id, request_sha256):
+                disposition = "effects_acknowledged"
+                error = None
+            else:
+                disposition = "not_releasable"
+                error = "operation is not an unfinalized fenced cancellation"
+        else:
+            from . import dispatcher
+
+            disposition, error = dispatcher.release_target_operation(
+                load_config(),
+                q,
+                operation_id,
+                request_sha256,
+                reporter=reporter,
+            )
+    finally:
+        q.close()
+
+    result = {
+        "operation_id": operation_id,
+        "request_sha256": request_sha256,
+        "disposition": disposition,
+    }
+    if error is not None:
+        result["error"] = error
+    payload = {"schema": 1, "operations": [result]}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        suffix = f": {error}" if error is not None else ""
+        print(f"{operation_id}: {disposition}{suffix}")
+    return (
+        EXIT_OK
+        if disposition in {"effects_acknowledged", "released", "already_released"}
+        else EXIT_ERROR
+    )
 
 
 def cmd_resources(args, reporter: Reporter) -> int:
@@ -1440,6 +1592,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="opaque capability token an eligible adapter must "
                              "list in its `provides` (repeatable)")
         sp.add_argument("--text", help="inline text payload")
+        sp.add_argument(
+            "--stdin-request", action="store_true",
+            help="read the closed versioned inline payload document from stdin",
+        )
         sp.add_argument("--input", action="append", help="input file or folder (repeatable)")
         sp.add_argument("--clipboard", action="store_true",
                         help="use the OS clipboard as the payload: a folder path -> its eligible "
@@ -1530,7 +1686,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pd = sub.add_parser("dispatch", help="drain the queue: place + run batched jobs "
                                          "(loops until Ctrl-C; --once for one tick; --drain "
-                                         "to run the queue empty then exit)")
+                                         "to run empty or detach gracefully on SIGINT/SIGTERM)")
     pd.add_argument("--once", action="store_true", help="run a single tick and exit")
     pd.add_argument("--drain", action="store_true",
                     help="loop until the queue is empty (no queued/in-flight jobs), then exit "
@@ -1538,6 +1694,11 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--poll", type=float, default=2.0, help="idle poll interval (s)")
     pd.add_argument("--debounce", type=float, default=5.0,
                     help="seconds to coalesce a burst before launching one worker")
+    pd.add_argument(
+        "--stop-timeout", type=_positive_seconds,
+        default=dispatcher.DEFAULT_STOP_TIMEOUT_S,
+        help="maximum seconds to return after SIGINT/SIGTERM during --drain (default 35)",
+    )
     dispatch_scope = pd.add_mutually_exclusive_group()
     dispatch_scope.add_argument("--job", dest="job_id", action="append",
                                 help="dispatch only this exact queued job (repeatable)")
@@ -1572,6 +1733,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true", help="global sweep: also wipe done/failed job history",
     )
     px.add_argument("--json", action="store_true")
+    prelease = sub.add_parser(
+        "release",
+        help="explicitly authorize or execute cleanup for one exact fenced operation",
+    )
+    release_actions = prelease.add_subparsers(dest="release_action", required=True)
+    for action, help_text in (
+        (
+            "acknowledge-effects",
+            "durably acknowledge that this exact operation may have external effects",
+        ),
+        ("execute", "clean up this exact owner-authorized operation"),
+    ):
+        release_parser = release_actions.add_parser(action, help=help_text)
+        release_parser.add_argument(
+            "--operation", dest="operation_id", required=True,
+            help="exact target operation ID",
+        )
+        release_parser.add_argument(
+            "--request-sha256", required=True,
+            help="exact target request digest",
+        )
+        release_parser.add_argument("--json", action="store_true")
     prs = sub.add_parser("resources", help="live CPU / RAM / GPU / disk for every configured "
                                            "device (hardware, not the job queue)")
     prs.add_argument("--device", action="append",
@@ -1639,6 +1822,11 @@ def build_parser() -> argparse.ArgumentParser:
     psb.add_argument("--json", action="store_true")
     psl = storage_sub.add_parser("list", help="show this controller's verified bindings")
     psl.add_argument("--json", action="store_true")
+    pti = sub.add_parser(
+        "task-interfaces",
+        help="show resolved task/device routes (read-only; no device probe)",
+    )
+    pti.add_argument("--json", action="store_true")
     return p
 
 
@@ -1669,6 +1857,8 @@ def main(argv: list[str]) -> int:
             return cmd_clear(args, reporter)
         if args.fleet_command == "cancel":
             return cmd_cancel(args, reporter)
+        if args.fleet_command == "release":
+            return cmd_release(args, reporter)
         if args.fleet_command == "resources":
             return cmd_resources(args, reporter)
         if args.fleet_command == "jobs":
@@ -1679,6 +1869,8 @@ def main(argv: list[str]) -> int:
             return cmd_mesh(args, reporter)
         if args.fleet_command == "storage":
             return cmd_storage(args, reporter)
+        if args.fleet_command == "task-interfaces":
+            return cmd_task_interfaces(args, reporter)
     except Exception as exc:  # noqa: BLE001 - keep agent-visible error concise
         reporter.event("error", type=type(exc).__name__, message=str(exc))
         return EXIT_ERROR
