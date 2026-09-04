@@ -30,7 +30,8 @@ _TASK_ROUTES_SCHEMA = "remrun.fleet.task-routes"
 _INPUT_MODES = {"none", "text", "files", "text-or-files"}
 _ROUTE_STATUSES = {"eligible", "ineligible"}
 _ROUTE_REASONS = {
-    "configured", "disabled", "missing_adapter", "device_unconfigured", "malformed",
+    "configured", "explicit_only", "disabled", "missing_adapter",
+    "device_unconfigured", "malformed",
 }
 
 
@@ -601,6 +602,8 @@ def resolved_route_eligibility(
     *,
     device_exists: bool = True,
     device_enabled: bool | None = None,
+    device_automatic: bool = True,
+    allow_explicit_only: bool = False,
     requires_adapter: bool = True,
 ) -> tuple[str, str]:
     """Return the closed, static eligibility of one resolved task/device route.
@@ -617,8 +620,12 @@ def resolved_route_eligibility(
         return "ineligible", "device_unconfigured"
     if type(device_enabled) is not bool:
         return "ineligible", "malformed"
+    if type(device_automatic) is not bool or type(allow_explicit_only) is not bool:
+        return "ineligible", "malformed"
     if not device_enabled:
         return "ineligible", "disabled"
+    if not device_automatic and not allow_explicit_only:
+        return "ineligible", "explicit_only"
     if not requires_adapter:
         return "eligible", "configured"
     if not isinstance(spec, dict):
@@ -734,6 +741,7 @@ def task_routes_document(specs: Any, devices: Any) -> dict[str, Any]:
                 spec, device_name,
                 device_exists=device_config is not None,
                 device_enabled=enabled,
+                device_automatic=getattr(device_config, "automatic_placement", True),
             )
             routes.append({
                 "task": task_name,

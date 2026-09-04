@@ -22,12 +22,16 @@ def route_eligibility(
     *,
     device_exists: bool = True,
     device_enabled: bool | None = None,
+    device_automatic: bool = True,
+    allow_explicit_only: bool = False,
 ) -> tuple[str, str]:
     """Return the shared static task/device route eligibility predicate."""
     return resolved_route_eligibility(
         task.resolved_spec, device,
         device_exists=device_exists,
         device_enabled=device_enabled,
+        device_automatic=device_automatic,
+        allow_explicit_only=allow_explicit_only,
         requires_adapter=not bool(task.prepared and task.prepared.get("kind") == "command"),
     )
 

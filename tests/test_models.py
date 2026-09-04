@@ -59,6 +59,14 @@ def test_device_explicit_run_flag_defaults_false_and_is_closed_boolean() -> None
         _device(allow_explicit_run="true")
 
 
+def test_device_automatic_placement_defaults_true_and_is_closed_boolean() -> None:
+    assert _device().automatic_placement is True
+    assert _device(automatic_placement=False).automatic_placement is False
+
+    with pytest.raises(ValueError, match="automatic_placement must be a boolean"):
+        _device(automatic_placement="false")
+
+
 def test_load_config_rejects_non_boolean_explicit_run_flag(tmp_path: Path) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -69,6 +77,19 @@ def test_load_config_rejects_non_boolean_explicit_run_flag(tmp_path: Path) -> No
     )
 
     with pytest.raises(ValueError, match="allow_explicit_run must be a boolean"):
+        load_config(tmp_path)
+
+
+def test_load_config_rejects_non_boolean_automatic_placement(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "defaults.toml").write_text("", encoding="utf-8")
+    (config_dir / "devices.toml").write_text(
+        "[devices.BOX]\nautomatic_placement = 1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="automatic_placement must be a boolean"):
         load_config(tmp_path)
 
 

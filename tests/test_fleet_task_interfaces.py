@@ -279,6 +279,172 @@ def test_route_projection_court_1_covers_static_eligibility_and_options(tmp_path
     assert task_routes_document(resolve_tasks(reversed_config), reversed_config.devices) == document
 
 
+def test_enabled_explicit_only_route_is_visible_but_not_auto_eligible(tmp_path: Path) -> None:
+    raw = _definition("text")
+    raw["adapters"] = {"EXPLICIT_ONLY": raw["adapters"]["BOX"]}
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        devices={"EXPLICIT_ONLY": SimpleNamespace(enabled=True, automatic_placement=False)},
+        fleet_tasks={"generic.task": raw},
+    )
+    spec = resolve_tasks(config)["generic.task"]
+    route = task_routes_document({"generic.task": spec}, config.devices)["routes"][0]
+    assert route["eligibility"] == {"status": "ineligible", "reason": "explicit_only"}
+    assert resolved_route_eligibility(
+        spec, "EXPLICIT_ONLY", device_enabled=True, device_automatic=False,
+    ) == ("ineligible", "explicit_only")
+    assert resolved_route_eligibility(
+        spec, "EXPLICIT_ONLY", device_enabled=True, device_automatic=False,
+        allow_explicit_only=True,
+    ) == ("eligible", "configured")
+
+    task = as_fleet_task(
+        prepare_task_job(spec, repo_root=tmp_path, text="hello", force_device="EXPLICIT_ONLY"), spec,
+    )
+    snapshot = DeviceSnapshot(
+        name="EXPLICIT_ONLY", reachable=True, enabled=True, automatic_placement=False,
+        engine_status={"unit-engine": "present"},
+    )
+    assert placement.fits(task, "EXPLICIT_ONLY", snapshot, {}, 0.9) == (True, "ok")
+
+
+def test_force_other_device_does_not_unlock_explicit_only(tmp_path: Path) -> None:
+    raw = _definition("text")
+    raw["adapters"] = {
+        "BOX": raw["adapters"]["BOX"],
+        "EXPLICIT_ONLY": dict(raw["adapters"]["BOX"]),
+    }
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        devices={
+            "BOX": SimpleNamespace(enabled=True, automatic_placement=True),
+            "EXPLICIT_ONLY": SimpleNamespace(enabled=True, automatic_placement=False),
+        },
+        fleet_tasks={"generic.task": raw},
+    )
+    spec = resolve_tasks(config)["generic.task"]
+    task = as_fleet_task(
+        prepare_task_job(spec, repo_root=tmp_path, text="hello", force_device="BOX"),
+        spec,
+    )
+    snapshot = DeviceSnapshot(
+        name="EXPLICIT_ONLY", reachable=True, enabled=True, automatic_placement=False,
+        engine_status={"unit-engine": "present"},
+    )
+    ok, reason = placement.fits(task, "EXPLICIT_ONLY", snapshot, {}, 0.9)
+    assert ok is False
+    assert reason == "explicit_only"
+
+
+def test_unforced_task_never_reclaims_explicit_only_device(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    raw = _definition("text")
+    raw["adapters"] = {"EXPLICIT_ONLY": raw["adapters"]["BOX"]}
+    config_ns = SimpleNamespace(
+        repo_root=tmp_path,
+        devices={"EXPLICIT_ONLY": SimpleNamespace(enabled=True, automatic_placement=False)},
+        fleet_tasks={"generic.task": raw},
+    )
+    spec = resolve_tasks(config_ns)["generic.task"]
+    task = as_fleet_task(prepare_task_job(spec, repo_root=tmp_path, text="hello"), spec)
+    device = Device.from_mapping("EXPLICIT_ONLY", {
+        "enabled": True,
+        "automatic_placement": False,
+        "kind": "ssh-posix",
+        "os": "posix",
+        "project_root": str(tmp_path),
+        "state_root": str(tmp_path / "state"),
+        "cache_root": str(tmp_path / "cache"),
+        "reclaim": {"command": ["true"]},
+        "ram_gb": 64,
+    })
+    config = SimpleNamespace(devices={"EXPLICIT_ONLY": device})
+    monkeypatch.setattr(
+        dispatcher,
+        "_run_device_reclaim",
+        lambda *_args, **_kwargs: pytest.fail("unforced reclaim ran on explicit-only device"),
+    )
+    monkeypatch.setattr(placement, "predicted_resources", lambda *_a, **_k: (50_000.0, 0.0))
+    monkeypatch.setattr(
+        probes,
+        "build_snapshot",
+        lambda *_a, **_k: DeviceSnapshot(
+            name="EXPLICIT_ONLY", reachable=True, enabled=True,
+            automatic_placement=False, ram_free_mb=1_000.0,
+        ),
+    )
+    dispatcher._reclaim_marginal_devices(
+        config,
+        groups=[{"tasks": [task]}],
+        snap_cache={},
+        lease_used={},
+        active_batches={},
+        fcfg={},
+        profs={},
+        sf=0.9,
+        reporter=SimpleNamespace(event=lambda *_args, **_kwargs: None),
+    )
+
+
+def test_exact_force_may_reclaim_explicit_only_device(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    raw = _definition("text")
+    raw["adapters"] = {"EXPLICIT_ONLY": raw["adapters"]["BOX"]}
+    config_ns = SimpleNamespace(
+        repo_root=tmp_path,
+        devices={"EXPLICIT_ONLY": SimpleNamespace(enabled=True, automatic_placement=False)},
+        fleet_tasks={"generic.task": raw},
+    )
+    spec = resolve_tasks(config_ns)["generic.task"]
+    task = as_fleet_task(
+        prepare_task_job(
+            spec, repo_root=tmp_path, text="hello", force_device="EXPLICIT_ONLY",
+        ),
+        spec,
+    )
+    device = Device.from_mapping("EXPLICIT_ONLY", {
+        "enabled": True,
+        "automatic_placement": False,
+        "kind": "ssh-posix",
+        "os": "posix",
+        "project_root": str(tmp_path),
+        "state_root": str(tmp_path / "state"),
+        "cache_root": str(tmp_path / "cache"),
+        "reclaim": {"command": ["true"]},
+        "ram_gb": 64,
+    })
+    config = SimpleNamespace(devices={"EXPLICIT_ONLY": device})
+    calls = []
+    monkeypatch.setattr(
+        dispatcher,
+        "_run_device_reclaim",
+        lambda *_args, **_kwargs: calls.append(True) or True,
+    )
+    monkeypatch.setattr(placement, "predicted_resources", lambda *_a, **_k: (50_000.0, 0.0))
+    monkeypatch.setattr(
+        probes,
+        "build_snapshot",
+        lambda *_a, **_k: DeviceSnapshot(
+            name="EXPLICIT_ONLY", reachable=True, enabled=True,
+            automatic_placement=False, ram_free_mb=1_000.0,
+        ),
+    )
+    dispatcher._reclaim_marginal_devices(
+        config,
+        groups=[{"tasks": [task]}],
+        snap_cache={},
+        lease_used={},
+        active_batches={},
+        fcfg={},
+        profs={},
+        sf=0.9,
+        reporter=SimpleNamespace(event=lambda *_args, **_kwargs: None),
+    )
+    assert calls == [True]
+
+
 def test_route_projection_court_2_fails_closed_on_stale_resolved_identity(tmp_path: Path) -> None:
     config = _config(tmp_path, {"generic.task": "text"})
     spec = resolve_tasks(config)["generic.task"]

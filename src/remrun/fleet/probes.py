@@ -249,6 +249,7 @@ def _build_local_snapshot(
         name=device.name,
         reachable=view.reachable,
         enabled=device.enabled,
+        automatic_placement=device.automatic_placement,
         cpu_busy_pct=view.cpu_busy_pct,
         ram_free_mb=view.ram_free_mb,
         ram_total_mb=(device.ram_gb * 1024.0 if device.ram_gb else view.ram_total_mb),
@@ -285,9 +286,11 @@ def build_snapshot(device: Device, transport: BaseTransport | None, fleet_cfg: d
         pr = transport.probe()
     except (TransportError, Exception):  # noqa: BLE001
         return DeviceSnapshot(name=device.name, reachable=False, enabled=device.enabled,
+                              automatic_placement=device.automatic_placement,
                               detail="probe raised")
     if not pr.reachable:
         return DeviceSnapshot(name=device.name, reachable=False, enabled=device.enabled,
+                              automatic_placement=device.automatic_placement,
                               detail=pr.detail)
 
     try:
@@ -335,7 +338,8 @@ def build_snapshot(device: Device, transport: BaseTransport | None, fleet_cfg: d
     if normalized_topology == "auto" and resources is not None:
         normalized_topology = resources.gpu_kind
     return DeviceSnapshot(
-        name=device.name, reachable=True, enabled=device.enabled, cpu_busy_pct=cpu,
+        name=device.name, reachable=True, enabled=device.enabled,
+        automatic_placement=device.automatic_placement, cpu_busy_pct=cpu,
         ram_free_mb=ram_free,
         ram_total_mb=(device.ram_gb * 1024.0 if device.ram_gb else measured_ram_total),
         vram_free_mb=vram_free,

@@ -885,7 +885,10 @@ def run_batch(device_name: str, tasks: list[FleetTask], config: RemrunConfig, *,
     device = config.devices[device_name]
     for task in tasks:
         route_status, route_reason = adapters.route_eligibility(
-            task, device_name, device_enabled=getattr(device, "enabled", None),
+            task, device_name,
+            device_enabled=getattr(device, "enabled", None),
+            device_automatic=getattr(device, "automatic_placement", True),
+            allow_explicit_only=(task.force_device == device_name),
         )
         if route_status != "eligible":
             return {

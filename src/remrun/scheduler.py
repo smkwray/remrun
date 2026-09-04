@@ -112,7 +112,10 @@ def order_devices(
 
     # Automatic placement is deliberately narrower than explicit ordinary runs:
     # an explicit-only device must never become an auto candidate.
-    enabled = {name: d for name, d in devices.items() if d.enabled}
+    enabled = {
+        name: d for name, d in devices.items()
+        if d.enabled and getattr(d, "automatic_placement", True)
+    }
 
     sched = scheduler_cfg or {}
     order: list[str] = list(_placement_order(project_config, command or []))

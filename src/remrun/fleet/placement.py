@@ -113,7 +113,10 @@ def fits(task: FleetTask, device: str, snap: DeviceSnapshot, profiles: dict,
     """
     fleet_cfg = fleet_cfg or {}
     route_status, route_reason = route_eligibility(
-        task, device, device_enabled=snap.enabled,
+        task, device,
+        device_enabled=snap.enabled,
+        device_automatic=snap.automatic_placement,
+        allow_explicit_only=(task.force_device == device),
     )
     if route_status != "eligible":
         return False, route_reason

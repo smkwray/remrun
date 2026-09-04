@@ -58,6 +58,10 @@ An optional `allow_explicit_run = true` permits only an explicitly named ordinar
 target; it does not change fleet route eligibility or read-only resource visibility. The field is
 closed boolean and defaults to `false`.
 
+`automatic_placement = false` keeps an enabled device out of automatic fleet placement and
+auto-route candidacy while still allowing an explicitly forced fleet task that names that exact
+device. It is a closed boolean and defaults to `true`. Unforced reclaim and auto placement must
+not treat such a device as an ordinary candidate.
 Agents may later add:
 
 ```toml

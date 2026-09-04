@@ -44,6 +44,18 @@ def test_explicit_only_target_resolves_but_stays_out_of_auto():
     )] == ["WINBOX"]
 
 
+def test_enabled_explicit_only_target_resolves_but_stays_out_of_auto():
+    devices = {
+        "EXPLICIT_ONLY": _dev("EXPLICIT_ONLY", automatic_placement=False),
+        "WINBOX": _dev("WINBOX"),
+    }
+
+    assert [d.name for d in order_devices(devices, "EXPLICIT_ONLY")] == ["EXPLICIT_ONLY"]
+    assert [d.name for d in order_devices(
+        devices, "auto", scheduler_cfg={"primary": "EXPLICIT_ONLY", "fallback": ["WINBOX"]}
+    )] == ["WINBOX"]
+
+
 def test_disabled_target_without_explicit_only_opt_in_stays_rejected():
     with pytest.raises(SchedulingError):
         order_devices({"PAUSED": _dev("PAUSED", enabled=False)}, "PAUSED")

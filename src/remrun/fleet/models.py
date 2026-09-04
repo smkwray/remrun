@@ -238,6 +238,7 @@ class DeviceSnapshot:
     # fact cannot place work, while resource/reporting consumers may still
     # retain the reachable snapshot.
     enabled: bool = False
+    automatic_placement: bool = True
     cpu_busy_pct: float | None = None
     ram_free_mb: float | None = None
     ram_total_mb: float | None = None

@@ -1097,6 +1097,14 @@ def _reclaim_marginal_devices(config: RemrunConfig, groups: list[dict[str, Any]]
         need = 0.0                          # largest predicted host RSS among queued candidate jobs
         for g in groups:
             head = g["tasks"][0]
+            route_status, _route_reason = adapters.route_eligibility(
+                head, name,
+                device_enabled=dev.enabled,
+                device_automatic=getattr(dev, "automatic_placement", True),
+                allow_explicit_only=(head.force_device == name),
+            )
+            if route_status != "eligible":
+                continue
             if name not in _candidate_names(config, head):
                 continue
             rss, _vram = placement.predicted_resources(head, name, profs)
