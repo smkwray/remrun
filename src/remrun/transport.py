@@ -1270,6 +1270,31 @@ class CommandNotStartedError(TransportError):
     """A conclusive ordinary-run refusal before the user's command starts."""
 
 
+class ControlSourceError(TransportError):
+    """Controller-owned PowerShell source delivery or invocation failed.
+
+    ``phase`` is ``delivery`` before the target starts the payload, ``execution``
+    after the started marker, or ``protocol`` when markers/exit disagree.
+    ``started`` is tri-state: ``False`` before the payload began, ``True`` after
+    the started marker, ``None`` when that fact cannot be established.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        phase: str,
+        started: bool | None,
+        exit_code: int | None = None,
+    ) -> None:
+        super().__init__(detail)
+        if phase not in {"delivery", "execution", "protocol"}:
+            raise ValueError(f"unsupported control-source phase: {phase!r}")
+        self.phase = phase
+        self.started = started
+        self.exit_code = exit_code
+
+
 class DurablePrestartError(TransportError):
     """A conclusive target-side refusal before the durable supervisor starts."""
 
@@ -1564,6 +1589,26 @@ class BaseTransport:
             env=env,
             timeout=timeout,
             path_prepend=path_prepend,
+        )
+
+    def exec_control_source(
+        self,
+        source: str,
+        cwd: str,
+        *,
+        timeout: float | None = None,
+        max_source_bytes: int = 262_144,
+    ) -> ExecResult:
+        """Execute bounded controller-owned PowerShell source (transport-specific).
+
+        The base contract fails closed. Only backends that implement a fixed-size
+        launcher plus validated stdin source delivery may override this.
+        """
+        del source, cwd, timeout, max_source_bytes
+        raise ControlSourceError(
+            "control-source delivery is unsupported on this transport",
+            phase="delivery",
+            started=False,
         )
 
     def exec_with_memory_limit(
@@ -3009,6 +3054,149 @@ def _ps_remote_command_fits(shell: str, script: str) -> bool:
     # Windows OpenSSH can execute the remote string through cmd.exe, whose
     # documented command-line limit is lower than CreateProcessW's limit.
     return len(_ps_remote_command(shell, script)) <= _WINDOWS_REMOTE_COMMAND_LINE_LIMIT
+
+
+_PS_CONTROL_SOURCE_MAX_BYTES = 262_144
+_PS_CONTROL_SOURCE_B64_MAX = 349_528  # base64 for 262144 bytes
+_PS_CONTROL_SOURCE_LAUNCHER_LIMIT = 2_048
+_PS_CONTROL_SOURCE_MARKER_PREFIX = "__REMRUN_PS_SOURCE_V1_"
+# Fixed-width 128-bit nonce placeholder; substituted per invocation.
+_PS_CONTROL_SOURCE_BOOTSTRAP_TEMPLATE = (
+    "$ErrorActionPreference='Stop';"
+    "$n='__NONCE__';$p=\"__REMRUN_PS_SOURCE_V1_$n`__\";"
+    "function W($c){[Console]::Error.Write($p+$c+';')};"
+    "function F($c,$x){W $c;exit $x};"
+    "try{$h=[Console]::In.ReadLine();if(!$h){F E 125};"
+    "$a=$h -split ' ',2;"
+    "if($a.Count -ne 2 -or $a[0] -cne 'RRPS1' -or $a[1].Length -ne 64){F E 125};"
+    "$b=([Console]::In.ReadToEnd()).Trim();"
+    f"if($b.Length -gt {_PS_CONTROL_SOURCE_B64_MAX}){{F E 125}};"
+    "try{$r=[Convert]::FromBase64String($b)}catch{F E 125};"
+    "$s=[BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($r))"
+    " -replace '-','';"
+    "if($s -cne $a[1]){F E 125};"
+    "try{$sb=[scriptblock]::Create([Text.Encoding]::UTF8.GetString($r))}"
+    "catch{F E 125};"
+    "W S;try{& $sb;W D;exit 0}catch{W P;exit 126}}catch{F E 125}"
+)
+
+
+def _ps_control_source_bootstrap(nonce: str) -> str:
+    if len(nonce) != 32 or any(c not in "0123456789abcdef" for c in nonce):
+        raise ValueError("control-source nonce must be 32 lowercase hex characters")
+    return _PS_CONTROL_SOURCE_BOOTSTRAP_TEMPLATE.replace("__NONCE__", nonce)
+
+
+def _ps_control_source_remote_command(shell: str, nonce: str) -> str:
+    return _ps_remote_command(shell, _ps_control_source_bootstrap(nonce))
+
+
+def _ps_control_source_frame(source: str, *, max_source_bytes: int = _PS_CONTROL_SOURCE_MAX_BYTES) -> bytes:
+    """Build the RRPS1 stdin frame for controller-owned UTF-8 PowerShell source."""
+    if not isinstance(source, str):
+        raise ControlSourceError(
+            "control-source payload must be text",
+            phase="delivery",
+            started=False,
+        )
+    raw = source.encode("utf-8")
+    if len(raw) > max_source_bytes:
+        raise ControlSourceError(
+            f"control-source payload exceeds {max_source_bytes} bytes",
+            phase="delivery",
+            started=False,
+        )
+    digest = hashlib.sha256(raw).hexdigest().upper()
+    body = base64.b64encode(raw)
+    if len(body) > _PS_CONTROL_SOURCE_B64_MAX:
+        raise ControlSourceError(
+            "control-source base64 body exceeds protocol cap",
+            phase="delivery",
+            started=False,
+        )
+    return f"RRPS1 {digest}\n".encode("ascii") + body
+
+
+def _ps_control_source_markers(nonce: str) -> dict[str, str]:
+    base = f"{_PS_CONTROL_SOURCE_MARKER_PREFIX}{nonce}__"
+    return {
+        "error": base + "E;",
+        "started": base + "S;",
+        "done": base + "D;",
+        "raised": base + "P;",
+    }
+
+
+def _classify_ps_control_source(
+    *,
+    exit_code: int,
+    stderr: str,
+    nonce: str,
+) -> None:
+    """Raise ControlSourceError when markers/exit prove delivery or execution failure."""
+    markers = _ps_control_source_markers(nonce)
+    has_e = markers["error"] in stderr
+    has_s = markers["started"] in stderr
+    has_d = markers["done"] in stderr
+    has_p = markers["raised"] in stderr
+    low = stderr.casefold()
+    if not has_s and (
+        "command line is too long" in low
+        or "the command line is too long" in low
+    ):
+        raise ControlSourceError(
+            "remote command exceeded the host command-line boundary",
+            phase="delivery",
+            started=False,
+            exit_code=exit_code,
+        )
+    if has_e and not has_s:
+        raise ControlSourceError(
+            "control-source frame rejected before payload start",
+            phase="delivery",
+            started=False,
+            exit_code=exit_code if exit_code is not None else 125,
+        )
+    if has_s and (has_p or exit_code == 126 or (not has_d and exit_code != 0)):
+        raise ControlSourceError(
+            "control-source payload raised or ended without completion marker",
+            phase="execution",
+            started=True,
+            exit_code=exit_code,
+        )
+    if has_s and has_d and exit_code == 0:
+        return
+    if has_s and has_d and exit_code != 0:
+        raise ControlSourceError(
+            f"control-source completed markers but remote exit was {exit_code}",
+            phase="protocol",
+            started=True,
+            exit_code=exit_code,
+        )
+    if not has_s:
+        raise ControlSourceError(
+            "control-source started marker missing",
+            phase="delivery",
+            started=False,
+            exit_code=exit_code,
+        )
+    raise ControlSourceError(
+        "control-source marker protocol mismatch",
+        phase="protocol",
+        started=True if has_s else None,
+        exit_code=exit_code,
+    )
+
+
+_PS_CONTROL_SOURCE_LAUNCHER_LEN = len(
+    _ps_control_source_remote_command("pwsh", "0" * 32)
+)
+if _PS_CONTROL_SOURCE_LAUNCHER_LEN > _PS_CONTROL_SOURCE_LAUNCHER_LIMIT:
+    raise RuntimeError(
+        "ssh-powershell control-source launcher exceeds "
+        f"{_PS_CONTROL_SOURCE_LAUNCHER_LIMIT} characters "
+        f"(measured {_PS_CONTROL_SOURCE_LAUNCHER_LEN})"
+    )
 
 
 def _ps_command_argv(
@@ -4792,6 +4980,58 @@ class SSHPowerShellTransport(_SSHCommon):
         stderr = proc.stderr.decode("utf-8", "replace")
         if proc.returncode == 255:
             raise TransportError(f"ssh connection failed (exit 255): {stderr.strip()}")
+        return ExecResult(proc.returncode, stdout, stderr)
+
+    def exec_control_source(
+        self,
+        source: str,
+        cwd: str,
+        *,
+        timeout: float | None = None,
+        max_source_bytes: int = _PS_CONTROL_SOURCE_MAX_BYTES,
+    ) -> ExecResult:
+        """Deliver bounded controller-owned PowerShell source over a fixed launcher.
+
+        The SSH remote command is a constant-size ``pwsh -EncodedCommand`` bootstrap.
+        The payload travels on stdin as an RRPS1 SHA-256 frame and is executed only
+        after the complete frame validates. Public ``exec()`` is unchanged.
+        """
+        if self._ps_exe().lower() == "powershell":
+            raise ControlSourceError(
+                _WINDOWS_POWERSHELL_UNSUPPORTED,
+                phase="delivery",
+                started=False,
+            )
+        address = self._address_or_resolve()
+        remote_cwd = self._expand_remote(cwd)
+        wrapped = (
+            f"Set-Location -LiteralPath {_ps_squote(remote_cwd)}\n{source}"
+        )
+        frame = _ps_control_source_frame(
+            wrapped, max_source_bytes=max_source_bytes
+        )
+        nonce = uuid.uuid4().hex
+        remote = _ps_control_source_remote_command(self._ps_exe(), nonce)
+        if len(remote) > _PS_CONTROL_SOURCE_LAUNCHER_LIMIT:
+            raise ControlSourceError(
+                "control-source launcher exceeds the fixed command-size ceiling",
+                phase="delivery",
+                started=False,
+            )
+        # Launcher is built only from shell + nonce; payload identity stays on stdin.
+        try:
+            proc = self._remote(
+                address, remote, input_bytes=frame, timeout=timeout
+            )
+        except TransportError:
+            raise
+        stdout = proc.stdout.decode("utf-8", "replace")
+        stderr = proc.stderr.decode("utf-8", "replace")
+        if proc.returncode == 255:
+            raise TransportError(f"ssh connection failed (exit 255): {stderr.strip()}")
+        _classify_ps_control_source(
+            exit_code=proc.returncode, stderr=stderr, nonce=nonce
+        )
         return ExecResult(proc.returncode, stdout, stderr)
 
     def exec(self, command, cwd, env=None, timeout=None, path_prepend=None,  # noqa: ANN001

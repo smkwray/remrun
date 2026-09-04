@@ -143,6 +143,8 @@ def _short_detail(detail: str) -> str:
 def _status_cell(view: ResourceView) -> str:
     if not view.reachable:
         return _short_detail(view.detail) or "unreachable"
+    if view.probe_status and view.probe_status not in {"", "healthy"}:
+        return view.probe_status.replace("_", " ")
     bits = []
     if view.is_local:
         bits.append("local")
@@ -272,6 +274,8 @@ def to_dict(view: ResourceView) -> dict:
     return {
         "name": view.name,
         "reachable": view.reachable,
+        "probe_status": view.probe_status,
+        "resource_exit_code": view.resource_exit_code,
         "detail": view.detail,
         "os": view.os,
         "hostname": view.hostname,

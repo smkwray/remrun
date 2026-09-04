@@ -20,7 +20,12 @@ from threading import Lock
 
 from ..models import Device
 from ..gpu_topology import GpuTopologyError, resolve_gpu_memory_topology
-from ..transport import BaseTransport, TransportError, make_transport
+from ..transport import (
+    BaseTransport,
+    ControlSourceError,
+    TransportError,
+    make_transport,
+)
 
 # No console-window flash on Windows when invoked from a GUI trigger; 0 elsewhere.
 _NO_WINDOW_FLAG = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -178,88 +183,198 @@ exit 0
 """
 
 _WINDOWS_SCRIPT = r"""
-$ErrorActionPreference = 'SilentlyContinue'
-Write-Output "HOST=$env:COMPUTERNAME"
-$os = Get-CimInstance Win32_OperatingSystem
-Write-Output "MEMTOTAL_KB=$($os.TotalVisibleMemorySize)"
-$m = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
-Write-Output "RAM_AVAIL_MB=$($m.AvailableMBytes)"
-Write-Output "MEMFREE_KB=$($os.FreePhysicalMemory)"
-$p = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor |
-     Where-Object { $_.Name -eq '_Total' }
-Write-Output "CPU_IDLE=$($p.PercentIdleTime)"
-$s = Get-CimInstance Win32_PerfFormattedData_PerfOS_System
-Write-Output "CPU_QUEUE=$($s.ProcessorQueueLength)"
-$c = @(Get-CimInstance Win32_Processor)
-Write-Output "NCPU=$($c[0].NumberOfLogicalProcessors)"
-Write-Output "CHIP=$($c[0].Name)"
+$ErrorActionPreference = 'Continue'
+$issues = [System.Collections.Generic.List[string]]::new()
+# One mutable holder so ScriptBlock.Create + call-operator child scopes share status.
+$state = [pscustomobject]@{ status = 'ok' }
+$deadline = [DateTime]::UtcNow.AddSeconds(30)
+function Remrun-RemainingMs {
+  return [int][math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+}
+function Remrun-AddIssue([string]$code) {
+  if (-not [string]::IsNullOrWhiteSpace($code) -and -not $issues.Contains($code)) {
+    [void]$issues.Add($code)
+  }
+}
+function Remrun-SetPartial([string]$code) {
+  Remrun-AddIssue $code
+  if ($state.status -eq 'ok') { $state.status = 'partial' }
+}
+function Remrun-SetUnsupported([string]$code) {
+  Remrun-AddIssue $code
+  $state.status = 'unsupported'
+}
+function Remrun-SetTimeout([string]$code) {
+  Remrun-AddIssue $code
+  $state.status = 'timeout'
+}
+$lines = [System.Collections.Generic.List[string]]::new()
+function Remrun-Out([string]$line) { [void]$lines.Add($line) }
+
+try { Remrun-Out ("HOST=$env:COMPUTERNAME") } catch { Remrun-SetPartial 'host_failed' }
+
+try {
+  $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+  if ($null -eq $os -or $null -eq $os.TotalVisibleMemorySize) { Remrun-SetPartial 'memtotal_missing' }
+  else {
+    Remrun-Out ("MEMTOTAL_KB=$($os.TotalVisibleMemorySize)")
+    if ($null -ne $os.FreePhysicalMemory) { Remrun-Out ("MEMFREE_KB=$($os.FreePhysicalMemory)") }
+  }
+} catch { Remrun-SetPartial 'os_cim_failed' }
+
+try {
+  $m = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+  if ($null -eq $m -or $null -eq $m.AvailableMBytes) { Remrun-SetPartial 'ram_avail_missing' }
+  else { Remrun-Out ("RAM_AVAIL_MB=$($m.AvailableMBytes)") }
+} catch { Remrun-SetPartial 'ram_avail_failed' }
+
+try {
+  $p = @(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -ErrorAction Stop |
+         Where-Object { $_.Name -eq '_Total' })
+  if (-not $p -or $null -eq $p[0].PercentIdleTime) { Remrun-SetPartial 'cpu_idle_missing' }
+  else { Remrun-Out ("CPU_IDLE=$($p[0].PercentIdleTime)") }
+} catch { Remrun-SetPartial 'cpu_idle_failed' }
+
+try {
+  $s = Get-CimInstance Win32_PerfFormattedData_PerfOS_System -ErrorAction Stop
+  if ($null -ne $s -and $null -ne $s.ProcessorQueueLength) {
+    Remrun-Out ("CPU_QUEUE=$($s.ProcessorQueueLength)")
+  } else { Remrun-AddIssue 'cpu_queue_unavailable' }
+} catch { Remrun-AddIssue 'cpu_queue_failed' }
+
+try {
+  $c = @(Get-CimInstance Win32_Processor -ErrorAction Stop)
+  if (-not $c -or $null -eq $c[0].NumberOfLogicalProcessors) { Remrun-SetPartial 'ncpu_missing' }
+  else {
+    Remrun-Out ("NCPU=$($c[0].NumberOfLogicalProcessors)")
+    if ($c[0].Name) { Remrun-Out ("CHIP=$($c[0].Name)") } else { Remrun-AddIssue 'chip_unavailable' }
+  }
+} catch { Remrun-SetPartial 'processor_cim_failed' }
+
 # Passive adapter-counter sample on the active IPv4 default-route interface.
-# This is a rough local usage estimate, not an active speed test.
 $networkInterface = ''
-$default = @(Get-NetIPConfiguration |
-    Where-Object { $_.IPv4DefaultGateway -ne $null } |
-    Sort-Object InterfaceMetric |
-    Select-Object -First 1)
-if ($default) { $networkInterface = [string]$default[0].InterfaceAlias }
-if (-not $networkInterface) {
-    $route = @(Get-CimInstance Win32_IP4RouteTable |
+if ((Remrun-RemainingMs) -lt 1200) {
+  Remrun-AddIssue 'network_skipped_deadline'
+  Remrun-Out 'NETWORK_INTERFACE='
+  Remrun-Out 'NETWORK_STATUS=timeout'
+  Remrun-Out 'NETWORK_DETAIL=collection deadline before network sample'
+} else {
+  try {
+    $default = @(Get-NetIPConfiguration -ErrorAction Stop |
+      Where-Object { $_.IPv4DefaultGateway -ne $null } |
+      Sort-Object InterfaceMetric |
+      Select-Object -First 1)
+    if ($default) { $networkInterface = [string]$default[0].InterfaceAlias }
+  } catch { Remrun-AddIssue 'network_route_netip_failed' }
+  if (-not $networkInterface) {
+    try {
+      $route = @(Get-CimInstance Win32_IP4RouteTable -ErrorAction Stop |
         Where-Object { $_.Destination -eq '0.0.0.0' -and $_.Mask -eq '0.0.0.0' } |
         Sort-Object Metric1 |
         Select-Object -First 1)
-    if ($route) {
-        $adapter = Get-CimInstance Win32_NetworkAdapterConfiguration |
-            Where-Object { $_.InterfaceIndex -eq $route[0].InterfaceIndex }
+      if ($route) {
+        $adapter = Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue |
+          Where-Object { $_.InterfaceIndex -eq $route[0].InterfaceIndex }
         if ($adapter) { $networkInterface = [string]$adapter.Description }
-    }
-}
-Write-Output "NETWORK_INTERFACE=$networkInterface"
-function Get-NetworkCounters {
+      }
+    } catch { Remrun-AddIssue 'network_route_cim_failed' }
+  }
+  Remrun-Out ("NETWORK_INTERFACE=$networkInterface")
+  function Get-NetworkCounters {
     if (-not $networkInterface) { return }
-    $stats = @(Get-NetAdapterStatistics -Name $networkInterface)
+    $stats = @(Get-NetAdapterStatistics -Name $networkInterface -ErrorAction SilentlyContinue)
     if ($stats -and $null -ne $stats[0].ReceivedBytes -and $null -ne $stats[0].SentBytes) {
-        Write-Output "$([uint64]$stats[0].ReceivedBytes) $([uint64]$stats[0].SentBytes)"
+      Write-Output "$([uint64]$stats[0].ReceivedBytes) $([uint64]$stats[0].SentBytes)"
     }
-}
-$firstNetwork = @(Get-NetworkCounters)
-Start-Sleep -Milliseconds 1000
-$secondNetwork = @(Get-NetworkCounters)
-if ($firstNetwork.Count -eq 1 -and $secondNetwork.Count -eq 1) {
+  }
+  $firstNetwork = @(Get-NetworkCounters)
+  Start-Sleep -Milliseconds 1000
+  $secondNetwork = @(Get-NetworkCounters)
+  if ($firstNetwork.Count -eq 1 -and $secondNetwork.Count -eq 1) {
     $firstParts = $firstNetwork[0] -split '\s+'
     $secondParts = $secondNetwork[0] -split '\s+'
     try {
-        $rx1 = [uint64]$firstParts[0]; $tx1 = [uint64]$firstParts[1]
-        $rx2 = [uint64]$secondParts[0]; $tx2 = [uint64]$secondParts[1]
-        if ($rx2 -lt $rx1 -or $tx2 -lt $tx1) {
-            Write-Output 'NETWORK_STATUS=counter_reset'
-        } else {
-            $down = [int64][math]::Round(([double]($rx2 - $rx1) * 8) / 1000000, 0, [MidpointRounding]::AwayFromZero)
-            $up = [int64][math]::Round(([double]($tx2 - $tx1) * 8) / 1000000, 0, [MidpointRounding]::AwayFromZero)
-            Write-Output 'NETWORK_STATUS=measured'
-            Write-Output "NETWORK_DOWNLOAD_MBPS=$down"
-            Write-Output "NETWORK_UPLOAD_MBPS=$up"
-        }
+      $rx1 = [uint64]$firstParts[0]; $tx1 = [uint64]$firstParts[1]
+      $rx2 = [uint64]$secondParts[0]; $tx2 = [uint64]$secondParts[1]
+      if ($rx2 -lt $rx1 -or $tx2 -lt $tx1) {
+        Remrun-Out 'NETWORK_STATUS=counter_reset'
+      } else {
+        $down = [int64][math]::Round(([double]($rx2 - $rx1) * 8) / 1000000, 0, [MidpointRounding]::AwayFromZero)
+        $up = [int64][math]::Round(([double]($tx2 - $tx1) * 8) / 1000000, 0, [MidpointRounding]::AwayFromZero)
+        Remrun-Out 'NETWORK_STATUS=measured'
+        Remrun-Out ("NETWORK_DOWNLOAD_MBPS=$down")
+        Remrun-Out ("NETWORK_UPLOAD_MBPS=$up")
+      }
     } catch {
-        Write-Output 'NETWORK_STATUS=malformed'
+      Remrun-Out 'NETWORK_STATUS=malformed'
+      Remrun-AddIssue 'network_malformed'
     }
-} else {
-    Write-Output 'NETWORK_STATUS=unavailable'
-    Write-Output 'NETWORK_DETAIL=interface counters unavailable'
+  } else {
+    Remrun-Out 'NETWORK_STATUS=unavailable'
+    Remrun-Out 'NETWORK_DETAIL=interface counters unavailable'
+    Remrun-AddIssue 'network_counters_unavailable'
+  }
 }
-$g = nvidia-smi --query-gpu=name,utilization.gpu,memory.free,memory.total --format=csv,noheader,nounits
-if ($g) { Write-Output "NVIDIA:$(@($g)[0])" }
-$drive = $env:SystemDrive
-$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'"
-if ($disk) {
+
+try {
+  $waitSec = [math]::Max(1, [math]::Min(8, [math]::Ceiling((Remrun-RemainingMs) / 1000.0)))
+  $job = Start-Job -ScriptBlock {
+    & nvidia-smi --query-gpu=name,utilization.gpu,memory.free,memory.total --format=csv,noheader,nounits 2>$null
+  }
+  if (Wait-Job $job -Timeout $waitSec) {
+    $g = Receive-Job $job
+    if ($g) { Remrun-Out ("NVIDIA:$(@($g)[0])") } else { Remrun-AddIssue 'nvidia_empty' }
+  } else {
+    Stop-Job $job -ErrorAction SilentlyContinue
+    Remrun-AddIssue 'nvidia_timeout'
+  }
+  Remove-Job $job -Force -ErrorAction SilentlyContinue
+} catch { Remrun-AddIssue 'nvidia_unavailable' }
+
+try {
+  $drive = $env:SystemDrive
+  $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction Stop
+  if ($null -eq $disk -or $null -eq $disk.Size -or $null -eq $disk.FreeSpace) {
+    Remrun-SetPartial 'disk_missing'
+  } else {
     $diskPayload = [ordered]@{
-        mount = [string]$disk.DeviceID
-        total_bytes = [string][uint64]$disk.Size
-        available_bytes = [string][uint64]$disk.FreeSpace
-        semantics = 'allocated-used'
-        source = 'Win32_LogicalDisk'
+      mount = [string]$disk.DeviceID
+      total_bytes = [string][uint64]$disk.Size
+      available_bytes = [string][uint64]$disk.FreeSpace
+      semantics = 'allocated-used'
+      source = 'Win32_LogicalDisk'
     } | ConvertTo-Json -Compress
-    Write-Output "DISK_JSON=$diskPayload"
+    Remrun-Out ("DISK_JSON=$diskPayload")
+  }
+} catch { Remrun-SetPartial 'disk_failed' }
+
+$haveHost = ($lines | Where-Object { $_ -like 'HOST=*' } | Measure-Object).Count -gt 0
+$haveNcpu = ($lines | Where-Object { $_ -like 'NCPU=*' } | Measure-Object).Count -gt 0
+$haveCpu = ($lines | Where-Object { $_ -like 'CPU_IDLE=*' } | Measure-Object).Count -gt 0
+$haveRamTotal = ($lines | Where-Object { $_ -like 'MEMTOTAL_KB=*' } | Measure-Object).Count -gt 0
+$haveRamAvail = ($lines | Where-Object { $_ -like 'RAM_AVAIL_MB=*' -or $_ -like 'MEMFREE_KB=*' } | Measure-Object).Count -gt 0
+$haveDisk = ($lines | Where-Object { $_ -like 'DISK_JSON=*' } | Measure-Object).Count -gt 0
+if (-not ($haveHost -and $haveNcpu -and $haveCpu -and $haveRamTotal -and $haveRamAvail -and $haveDisk)) {
+  if ($state.status -ne 'timeout') {
+    if (-not $haveHost -and -not $haveNcpu -and -not $haveCpu -and -not $haveRamTotal) {
+      Remrun-SetUnsupported 'core_cim_absent'
+    } elseif ($state.status -eq 'ok') {
+      $state.status = 'partial'
+      Remrun-AddIssue 'core_incomplete'
+    }
+  }
 }
-exit 0
+if ((Remrun-RemainingMs) -le 0 -and $state.status -eq 'ok') { Remrun-SetTimeout 'deadline_elapsed' }
+
+$meta = [ordered]@{
+  schema = 1
+  status = $state.status
+  issues = @($issues)
+} | ConvertTo-Json -Compress
+Write-Output '__REMRUN_FLEET_RESOURCES_V1_BEGIN__'
+foreach ($line in $lines) { Write-Output $line }
+Write-Output ("PROBE_META_JSON=$meta")
+Write-Output '__REMRUN_FLEET_RESOURCES_V1_END__'
 """
 
 
@@ -339,6 +454,9 @@ class ResourceView:
     primary_disk: PrimaryDiskView = field(default_factory=PrimaryDiskView)
     # Set when this row is the controller running the command.
     is_local: bool = False
+    # reachable = network/auth; probe_status classifies the resource command.
+    probe_status: str = ""
+    resource_exit_code: int | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -628,6 +746,80 @@ def _parse_posix(out: str, view: ResourceView) -> None:
             _parse_nvidia(line[len("NVIDIA:"):], view)
 
 
+_FLEET_RESOURCES_BEGIN = "__REMRUN_FLEET_RESOURCES_V1_BEGIN__"
+_FLEET_RESOURCES_END = "__REMRUN_FLEET_RESOURCES_V1_END__"
+_PROBE_META_STATUSES = frozenset({"ok", "partial", "unsupported", "timeout"})
+
+
+class ResourceFrameError(ValueError):
+    """Windows fleet resource stdout frame is absent, duplicate, or malformed."""
+
+
+def _extract_fleet_resources_frame(out: str) -> tuple[str, dict]:
+    """Return (inner key/value body, probe meta) from one V1 resource frame."""
+    begins = []
+    ends = []
+    for index, line in enumerate(out.splitlines()):
+        stripped = line.strip()
+        if stripped == _FLEET_RESOURCES_BEGIN:
+            begins.append(index)
+        elif stripped == _FLEET_RESOURCES_END:
+            ends.append(index)
+    if len(begins) != 1 or len(ends) != 1 or ends[0] <= begins[0]:
+        raise ResourceFrameError("resource frame markers are absent, duplicate, or unordered")
+    body_lines = [ln.strip() for ln in out.splitlines()[begins[0] + 1:ends[0]]]
+    meta_lines = [ln for ln in body_lines if ln.startswith("PROBE_META_JSON=")]
+    if len(meta_lines) != 1:
+        raise ResourceFrameError("resource frame must contain exactly one PROBE_META_JSON")
+    raw_meta = meta_lines[0].partition("=")[2]
+    try:
+        meta = json.loads(raw_meta)
+    except json.JSONDecodeError as exc:
+        raise ResourceFrameError("PROBE_META_JSON is malformed") from exc
+    if not isinstance(meta, dict):
+        raise ResourceFrameError("PROBE_META_JSON must be an object")
+    schema = meta.get("schema")
+    status = meta.get("status")
+    issues = meta.get("issues", [])
+    if schema != 1 or status not in _PROBE_META_STATUSES:
+        raise ResourceFrameError("PROBE_META_JSON schema/status is invalid")
+    if not isinstance(issues, list) or any(not isinstance(item, str) for item in issues):
+        raise ResourceFrameError("PROBE_META_JSON issues must be a string list")
+    if len(raw_meta) > 16_384 or len(issues) > 64:
+        raise ResourceFrameError("PROBE_META_JSON exceeds bounded size")
+    inner = "\n".join(ln for ln in body_lines if not ln.startswith("PROBE_META_JSON="))
+    return inner, {"schema": 1, "status": status, "issues": list(issues)}
+
+
+def _probe_status_from_detail(detail: str) -> str:
+    """Map pre-auth transport detail to a stable probe_status."""
+    low = (detail or "").casefold()
+    if "auth refused" in low or "permission denied" in low or "ssh key missing" in low:
+        return "auth_failed"
+    if "did not resolve" in low or "no route" in low or "connection refused" in low:
+        return "network_failed"
+    if "timeout" in low or "timed out" in low:
+        return "connect_timeout"
+    if "unsupported" in low or "configuration" in low:
+        return "configuration_error"
+    return "network_failed"
+
+
+def _windows_core_fields_complete(view: ResourceView) -> bool:
+    """Core telemetry required before an ok meta status may become healthy."""
+    disk = view.primary_disk
+    return bool(
+        view.hostname
+        and view.cpu_count
+        and view.cpu_busy_pct is not None
+        and view.ram_total_mb is not None
+        and view.ram_free_mb is not None
+        and disk.status == "ok"
+        and disk.total_bytes is not None
+        and disk.available_bytes is not None
+    )
+
+
 def _parse_windows(out: str, view: ResourceView) -> None:
     kv = _kv(out)
     view.hostname = kv.get("HOST", "")
@@ -789,9 +981,11 @@ def probe_device(device: Device, transport: BaseTransport | None = None,
         transport = transport or make_transport(probe_device_config)
     except Exception as exc:                                  # noqa: BLE001
         view.detail = _friendly_error(str(exc))
+        view.probe_status = "configuration_error"
         return view
 
     probe = None
+    detail = ""
     for attempt in range(retries + 1):
         try:
             probe = transport.probe()
@@ -811,6 +1005,7 @@ def probe_device(device: Device, transport: BaseTransport | None = None,
 
     if probe is None:
         view.detail = _friendly_error(detail)
+        view.probe_status = _probe_status_from_detail(view.detail)
         return view
     if not probe.reachable:
         # `probe()` keeps only the LAST candidate's error (transport.py:877-897
@@ -819,42 +1014,108 @@ def probe_device(device: Device, transport: BaseTransport | None = None,
         # trailing unresolvable alias. Re-walk the candidates to find the most
         # specific reason before believing that.
         view.detail = _diagnose(device, probe.detail)
-        return view
-
-    if device.is_windows:
-        command = ["powershell", "-NoProfile", "-Command", _WINDOWS_SCRIPT]
-        cwd = "C:\\"
-    else:
-        command = [device.shell or "bash", "-lc", _POSIX_SCRIPT]
-        cwd = "/"
-
-    try:
-        result = transport.exec(command, cwd=cwd, telemetry=False, timeout=timeout)
-    except (TransportError, Exception) as exc:                # noqa: BLE001
-        view.detail = _friendly_error(str(exc))
+        view.probe_status = _probe_status_from_detail(view.detail)
         return view
 
     view.reachable = True
+    allow_config_fallback = False
+    try:
+        if device.is_windows:
+            result = transport.exec_control_source(
+                _WINDOWS_SCRIPT, cwd="C:\\", timeout=timeout
+            )
+        else:
+            result = transport.exec(
+                [device.shell or "bash", "-lc", _POSIX_SCRIPT],
+                cwd="/",
+                telemetry=False,
+                timeout=timeout,
+            )
+    except ControlSourceError as exc:
+        view.resource_exit_code = exc.exit_code
+        view.detail = _friendly_error(str(exc))
+        low = str(exc).casefold()
+        if "command-line boundary" in low or "command line is too long" in low:
+            view.probe_status = "command_boundary_failed"
+        elif exc.phase == "delivery":
+            view.probe_status = "delivery_failed"
+        elif exc.phase == "execution":
+            view.probe_status = "execution_failed"
+        else:
+            view.probe_status = "protocol_error"
+        return view
+    except TransportError as exc:
+        view.detail = _friendly_error(str(exc))
+        if _is_timeout(str(exc)):
+            view.probe_status = "resource_timeout"
+        else:
+            view.probe_status = "execution_failed"
+        return view
+    except Exception as exc:                                  # noqa: BLE001
+        view.detail = _friendly_error(str(exc))
+        view.probe_status = "execution_failed"
+        return view
+
+    view.resource_exit_code = result.exit_code
     out = result.stdout or ""
+
     if device.is_windows:
-        _parse_windows(out, view)
+        try:
+            body, meta = _extract_fleet_resources_frame(out)
+        except ResourceFrameError as exc:
+            view.detail = str(exc)
+            view.probe_status = "protocol_error"
+            return view
+        _parse_windows(body, view)
+        meta_status = meta["status"]
+        if meta_status == "ok" and not _windows_core_fields_complete(view):
+            view.probe_status = "protocol_error"
+            view.detail = "ok frame missing mandatory core telemetry"
+            allow_config_fallback = False
+        elif meta_status == "ok":
+            view.probe_status = "healthy"
+            allow_config_fallback = True
+        elif meta_status == "partial":
+            view.probe_status = "partial"
+            allow_config_fallback = True
+            if meta["issues"]:
+                view.detail = "; ".join(meta["issues"][:4])
+        elif meta_status == "unsupported":
+            view.probe_status = "unsupported"
+            allow_config_fallback = True
+            if meta["issues"]:
+                view.detail = "; ".join(meta["issues"][:4])
+        else:
+            view.probe_status = "resource_timeout"
+            allow_config_fallback = False
+            if meta["issues"]:
+                view.detail = "; ".join(meta["issues"][:4])
     else:
+        if result.exit_code != 0:
+            view.probe_status = "execution_failed"
+            view.detail = (result.stderr or result.stdout or f"exit {result.exit_code}")[
+                :160
+            ]
+            return view
         _parse_posix(out, view)
+        view.probe_status = "healthy"
+        allow_config_fallback = True
 
     apply_gpu_memory_topology(view, device)
 
-    # Configured hardware fills only what the probe could not measure, and says
-    # so; a static figure must never masquerade as a live reading.
-    if view.ram_total_mb is None and device.ram_gb:
-        view.ram_total_mb = device.ram_gb * 1024.0
-        view.notes.append("ram_total from config")
-    if (
-        view.vram_total_mb is None
-        and device.vram_gb
-        and view.gpu_memory_topology == "discrete"
-    ):
-        view.vram_total_mb = device.vram_gb * 1024.0
-        view.notes.append("vram_total from config")
+    # Configured hardware fills only what a validated frame could not measure.
+    # Delivery/execution/protocol failures must never become plausible telemetry.
+    if allow_config_fallback:
+        if view.ram_total_mb is None and device.ram_gb:
+            view.ram_total_mb = device.ram_gb * 1024.0
+            view.notes.append("ram_total from config")
+        if (
+            view.vram_total_mb is None
+            and device.vram_gb
+            and view.gpu_memory_topology == "discrete"
+        ):
+            view.vram_total_mb = device.vram_gb * 1024.0
+            view.notes.append("vram_total from config")
     if not view.reachable and not view.detail:
         view.detail = "unreachable"
     return view

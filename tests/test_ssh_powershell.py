@@ -1134,3 +1134,155 @@ def test_memory_guard_schema_three_is_explicitly_unsupported_on_windows():
                 },
             )
         )
+
+
+def test_control_source_launcher_is_size_invariant_and_capped():
+    from remrun.transport import (
+        _PS_CONTROL_SOURCE_LAUNCHER_LIMIT,
+        _PS_CONTROL_SOURCE_MAX_BYTES,
+        _ps_control_source_bootstrap,
+        _ps_control_source_frame,
+        _ps_control_source_remote_command,
+    )
+
+    nonce = "abcdef0123456789abcdef0123456789"
+    tiny = _ps_control_source_remote_command("pwsh", nonce)
+    huge_source = "x" * _PS_CONTROL_SOURCE_MAX_BYTES
+    # Launcher depends only on shell + nonce, never on source size.
+    assert tiny == _ps_control_source_remote_command("pwsh", nonce)
+    assert len(tiny) <= _PS_CONTROL_SOURCE_LAUNCHER_LIMIT
+    assert decoded(tiny) == _ps_control_source_bootstrap(nonce)
+    frame_small = _ps_control_source_frame("a")
+    frame_large = _ps_control_source_frame(huge_source)
+    assert len(frame_small) < len(frame_large)
+    assert b"RRPS1 " in frame_small
+    assert decoded(tiny) == decoded(_ps_control_source_remote_command("pwsh", nonce))
+
+
+def test_control_source_rejects_oversize_locally():
+    from remrun.transport import (
+        ControlSourceError,
+        _PS_CONTROL_SOURCE_MAX_BYTES,
+        _ps_control_source_frame,
+    )
+
+    with pytest.raises(ControlSourceError, match="exceeds"):
+        _ps_control_source_frame("x" * (_PS_CONTROL_SOURCE_MAX_BYTES + 1))
+
+
+def test_exec_control_source_uses_fixed_launcher_and_stdin_frame(monkeypatch):
+    from remrun.transport import (
+        _ps_control_source_bootstrap,
+        _ps_control_source_markers,
+        _PS_CONTROL_SOURCE_LAUNCHER_LIMIT,
+    )
+
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    seen = {}
+
+    def respond(argv, input_bytes=None, timeout=None, on_stdout=None):
+        del timeout, on_stdout
+        remote = argv[-1]
+        seen["remote"] = remote
+        seen["input"] = input_bytes
+        script = decoded(remote)
+        nonce = script.split("$n='", 1)[1].split("'", 1)[0]
+        assert script == _ps_control_source_bootstrap(nonce)
+        markers = _ps_control_source_markers(nonce)
+        return cp(0, b"ok\n", (markers["started"] + markers["done"]).encode())
+
+    rec = Recorder(respond)
+    monkeypatch.setattr(t, "_run", rec)
+    result = t.exec_control_source("Write-Output 'hi'", cwd="C:\\", timeout=45)
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "ok"
+    assert seen["remote"].startswith("pwsh -NoProfile -NonInteractive -EncodedCommand ")
+    assert len(seen["remote"]) <= _PS_CONTROL_SOURCE_LAUNCHER_LIMIT
+    assert seen["input"].startswith(b"RRPS1 ")
+    assert b"Set-Location" in base64.b64decode(seen["input"].split(b"\n", 1)[1])
+
+
+def test_exec_control_source_accepts_short_sources(monkeypatch):
+    from remrun.transport import _ps_control_source_markers
+
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+
+    def respond(argv, input_bytes=None, timeout=None, on_stdout=None):
+        del input_bytes, timeout, on_stdout
+        nonce = decoded(argv[-1]).split("$n='", 1)[1].split("'", 1)[0]
+        markers = _ps_control_source_markers(nonce)
+        return cp(0, b"ok\n", (markers["started"] + markers["done"]).encode())
+
+    monkeypatch.setattr(t, "_run", Recorder(respond))
+    for source in ("a", "A", "W", "x", "1"):
+        result = t.exec_control_source(source, cwd="C:\\")
+        assert result.exit_code == 0
+
+
+def test_exec_control_source_classifies_delivery_and_boundary(monkeypatch):
+    from remrun.transport import ControlSourceError, _ps_control_source_markers
+
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+
+    def too_long(argv, input_bytes=None, timeout=None, on_stdout=None):
+        del argv, input_bytes, timeout, on_stdout
+        return cp(1, b"", b"The command line is too long.\n")
+
+    monkeypatch.setattr(t, "_run", Recorder(too_long))
+    with pytest.raises(ControlSourceError) as excinfo:
+        t.exec_control_source("Write-Output 1", cwd="C:\\")
+    assert excinfo.value.phase == "delivery"
+    assert excinfo.value.started is False
+    assert "command-line boundary" in str(excinfo.value)
+
+    def rejected(argv, input_bytes=None, timeout=None, on_stdout=None):
+        del input_bytes, timeout, on_stdout
+        nonce = decoded(argv[-1]).split("$n='", 1)[1].split("'", 1)[0]
+        markers = _ps_control_source_markers(nonce)
+        return cp(125, b"", markers["error"].encode())
+
+    monkeypatch.setattr(t, "_run", Recorder(rejected))
+    with pytest.raises(ControlSourceError) as excinfo:
+        t.exec_control_source("Write-Output 1", cwd="C:\\")
+    assert excinfo.value.phase == "delivery"
+    assert excinfo.value.started is False
+
+
+def test_exec_control_source_classifies_execution_failure(monkeypatch):
+    from remrun.transport import ControlSourceError, _ps_control_source_markers
+
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+
+    def raised(argv, input_bytes=None, timeout=None, on_stdout=None):
+        del input_bytes, timeout, on_stdout
+        nonce = decoded(argv[-1]).split("$n='", 1)[1].split("'", 1)[0]
+        markers = _ps_control_source_markers(nonce)
+        return cp(126, b"", (markers["started"] + markers["raised"]).encode())
+
+    monkeypatch.setattr(t, "_run", Recorder(raised))
+    with pytest.raises(ControlSourceError) as excinfo:
+        t.exec_control_source("throw 'x'", cwd="C:\\")
+    assert excinfo.value.phase == "execution"
+    assert excinfo.value.started is True
+
+
+def test_legacy_inline_resource_script_exceeds_artificial_2048_boundary():
+    """Document why the fleet probe cannot keep embedding source in -Command."""
+    from remrun.fleet.resources import _WINDOWS_SCRIPT
+    from remrun.transport import _ps_remote_command, _PS_CONTROL_SOURCE_LAUNCHER_LIMIT
+
+    legacy = _ps_remote_command(
+        "pwsh",
+        "Set-Location -LiteralPath 'C:\\'\n" + _WINDOWS_SCRIPT,
+    )
+    modern = _ps_remote_command(
+        "pwsh",
+        # bootstrap size is the modern launcher; compare against same shell.
+        "x",  # placeholder for size comparison only
+    )
+    del modern
+    assert len(legacy) > _PS_CONTROL_SOURCE_LAUNCHER_LIMIT

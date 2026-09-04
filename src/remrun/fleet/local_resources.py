@@ -18,7 +18,9 @@ from .resources import (
     _NO_WINDOW_FLAG,
     _POSIX_SCRIPT,
     _WINDOWS_SCRIPT,
+    ResourceFrameError,
     ResourceView,
+    _extract_fleet_resources_frame,
     _parse_posix,
     _parse_windows,
 )
@@ -55,12 +57,29 @@ def local_view(name: str = "", timeout: float = 20.0) -> ResourceView:
         shell = shutil.which("powershell") or shutil.which("pwsh")
         out = _run([shell, "-NoProfile", "-Command", _WINDOWS_SCRIPT], timeout) if shell else None
         if out:
-            _parse_windows(out, view)
+            try:
+                body, meta = _extract_fleet_resources_frame(out)
+            except ResourceFrameError as exc:
+                view.detail = str(exc)[:160]
+                view.probe_status = "protocol_error"
+                body, meta = None, None
+            if body is not None:
+                _parse_windows(body, view)
+                status = meta.get("status")
+                if status == "ok":
+                    view.probe_status = "healthy"
+                elif status in {"partial", "unsupported"}:
+                    view.probe_status = status
+                elif status == "timeout":
+                    view.probe_status = "resource_timeout"
+                else:
+                    view.probe_status = "protocol_error"
     else:
         shell = shutil.which("bash") or "/bin/sh"
         out = _run([shell, "-lc", _POSIX_SCRIPT], timeout)
         if out:
             _parse_posix(out, view)
+            view.probe_status = "healthy"
 
     if not view.cpu_count:
         view.cpu_count = os.cpu_count()

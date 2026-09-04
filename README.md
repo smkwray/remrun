@@ -204,7 +204,10 @@ RAM, VRAM, and primary-disk usage default to compact percentages; set
 usage uses the system's important-usage capacity so automatically reclaimable space is
 treated as available. On Windows, `LOAD` is ready waiters per core (`q`); on POSIX it is
 one-minute runnable demand per core (`x`), so the two are related congestion signals but
-not numerically identical.
+not numerically identical. Windows resource collection is delivered through a fixed-size
+PowerShell control-source launcher (script bytes on stdin, not on the SSH command line);
+`reachable` remains an auth/network fact and `probe_status` reports delivery, execution,
+timeout, and protocol outcomes so a failed probe cannot look blank-but-healthy.
 
 Per-item submissions may share one compatible device invocation while retaining one
 manifest and result row per prepared job. A post-launch loss of completion evidence becomes
