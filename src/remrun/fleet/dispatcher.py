@@ -1972,7 +1972,8 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
     while any job is queued or in flight; once the queue is empty, stay alive for a bounded idle
     grace so a near-follow-up trigger can join the same lifecycle, then exit. This is still not a
     resident warm pool: no model process is kept alive by remrun, and the grace is capped below
-    five minutes."""
+    five minutes. An immutable job scope has no follow-up membership to admit, so it exits
+    immediately once its own jobs settle."""
     reporter = reporter or Reporter(json_events=False)
     sr = state_root or default_state_root()
     grace_s = 0.0
@@ -2117,7 +2118,8 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         return result, monotonic() if stop_event.is_set() else None
 
     try:
-        grace_s = _bounded_idle_grace_s(config, idle_grace_s) if until_empty else 0.0
+        grace_s = (_bounded_idle_grace_s(config, idle_grace_s)
+                   if until_empty and job_ids is None else 0.0)
         reporter.event("dispatch_loop_start", poll_s=poll_s, debounce_s=debounce_s,
                        drain=until_empty, idle_grace_s=grace_s)
         while max_ticks is None or ticks < max_ticks:

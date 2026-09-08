@@ -341,3 +341,36 @@ def test_dispatch_accepts_positive_stop_timeout() -> None:
 def test_dispatch_default_stop_timeout_covers_queue_busy_timeout() -> None:
     args = cli.build_parser().parse_args(["dispatch", "--drain"])
     assert args.stop_timeout == dispatcher.DEFAULT_STOP_TIMEOUT_S == 35.0
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_immutable_scope_finishes_without_open_queue_idle_grace(tmp_path, monkeypatch, scoped):
+    state_root = tmp_path / "state"
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    job = queue.enqueue_prepared(
+        prepare_raw_command(["python", "-c", "pass"], device="A"),
+        spec=None, idempotency_key="idle-scope",
+    )
+    owner = queue.claim_many([job], "A", batch_id="idle-batch",
+                             lease_until="2099-01-01T00:00:00Z", pool=None)
+    assert owner is not None
+    assert queue.complete_batch("idle-batch", expected_state="leased", owner_token=owner)
+    queue.close()
+    clock = [0.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    def tick(*args, **kwargs):
+        return {"placed": 0, "ran": 0, "ok": 0, "failed": 0, "review": 0, "skipped": {}}
+
+    monkeypatch.setattr(dispatcher, "drain_once", tick)
+    result = dispatcher.run(
+        SimpleNamespace(defaults={}), state_root=state_root, until_empty=True,
+        job_ids=[job] if scoped else None, idle_grace_s=60,
+        sleep=sleep, monotonic=lambda: clock[0],
+    )
+    assert result.status == "drained"
+    assert sum(sleeps) == (0 if scoped else 60)
