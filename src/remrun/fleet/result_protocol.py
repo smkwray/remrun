@@ -54,6 +54,17 @@ def _safe_path(value: Any, field: str) -> str:
     return value
 
 
+def _text_output_stem(expected: Mapping[str, Any]) -> str | None:
+    """Return the prepared binding for a text payload with no file reservation."""
+    if expected.get("payload_mode") != "text":
+        return None
+    try:
+        work_id = _result_id(expected.get("work_id"), "expected work_id")
+    except ResultProtocolError as exc:
+        raise ResultProtocolError("text result output binding is invalid") from exc
+    return "text-" + work_id.removeprefix("sha256:")
+
+
 def _validate_item(item: Any, expected: Mapping[str, Any], completion: Mapping[str, Any]) -> dict:
     if (not isinstance(item, dict) or not _REQUIRED_ITEM_FIELDS.issubset(item)
             or not set(item).issubset(_ITEM_FIELDS)):
@@ -115,15 +126,23 @@ def _validate_item(item: Any, expected: Mapping[str, Any], completion: Mapping[s
     reservations = expected.get("reservations") or []
     allowed_stems = {str(row["stem"]) for row in reservations}
     if outputs and not allowed_stems:
-        raise ResultProtocolError("result output has no prepared reservation")
+        text_stem = _text_output_stem(expected)
+        if text_stem is None:
+            raise ResultProtocolError("result output has no prepared reservation")
+        allowed_stems = {text_stem}
+    text_binding = expected.get("payload_mode") == "text" and not reservations
     for output in outputs:
         name = PurePosixPath(output).name
         if not any(name == stem or name.startswith(stem + ".") for stem in allowed_stems):
+            if text_binding:
+                raise ResultProtocolError("result output does not match text output binding")
             raise ResultProtocolError("result output does not match a prepared reservation stem")
     if companion is not None:
         name = PurePosixPath(companion).name
         if not allowed_stems or not any(
                 name == stem or name.startswith(stem + ".") for stem in allowed_stems):
+            if text_binding:
+                raise ResultProtocolError("result companion does not match text output binding")
             raise ResultProtocolError(
                 "result companion does not match a prepared reservation stem")
     companion_rule = completion["companion"]

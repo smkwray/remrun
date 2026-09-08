@@ -11,6 +11,7 @@ SPEC = "sha256:" + "1" * 64
 ADAPTER = "sha256:" + "2" * 64
 PREPARED = "sha256:" + "3" * 64
 MEASURE = "sha256:" + "4" * 64
+TEXT_WORK = "sha256:" + "5" * 64
 
 
 def _completion() -> dict:
@@ -48,8 +49,72 @@ def _validate(envelope: dict) -> list[dict]:
     )
 
 
+def _validate_text(envelope: dict) -> list[dict]:
+    return validate_result_envelope(
+        envelope, batch_id="batch", spec_id=SPEC, adapter_id=ADAPTER,
+        expected_items=[{"job_id": "job1", "prepared_id": PREPARED,
+                         "index": 0, "cost_unit": "pages",
+                         "cost_status": "exact", "measure_id": MEASURE,
+                         "prepared_value": 4.0, "verify_relative_tolerance": 0.0,
+                         "payload_mode": "text", "work_id": TEXT_WORK,
+                         "reservations": []}],
+        completion=_completion(),
+    )
+
+
 def test_valid_exact_result_is_accepted() -> None:
     assert _validate(_envelope()) == [_item()]
+
+
+def test_text_result_uses_canonical_work_binding_without_file_reservation() -> None:
+    stem = "text-" + TEXT_WORK.removeprefix("sha256:")
+    item = _item()
+    item.update({
+        "outputs": [f"{stem}.result/{stem}.m4a"],
+        "companion": f"{stem}.result/{stem}.receipt.json",
+    })
+    assert _validate_text(_envelope(item))[0]["outputs"] == item["outputs"]
+
+
+def test_text_result_with_foreign_stem_is_rejected_without_reservation() -> None:
+    item = _item()
+    item["outputs"] = ["text-" + "6" * 64 + ".result/text-" + "6" * 64 + ".m4a"]
+    with pytest.raises(ResultProtocolError, match="text output binding"):
+        _validate_text(_envelope(item))
+
+
+def test_text_result_keeps_traversal_guard_without_reservation() -> None:
+    stem = "text-" + TEXT_WORK.removeprefix("sha256:")
+    item = _item()
+    item["outputs"] = [f"{stem}.result/../{stem}.m4a"]
+    with pytest.raises(ResultProtocolError, match="canonical safe relative path"):
+        _validate_text(_envelope(item))
+
+
+def test_text_result_requires_a_valid_prepared_work_binding() -> None:
+    item = _item()
+    expected = [{"job_id": "job1", "prepared_id": PREPARED, "index": 0,
+                 "cost_unit": "pages", "cost_status": "exact", "measure_id": MEASURE,
+                 "prepared_value": 4.0, "verify_relative_tolerance": 0.0,
+                 "payload_mode": "text", "work_id": "not-an-id", "reservations": []}]
+    with pytest.raises(ResultProtocolError, match="text result output binding"):
+        validate_result_envelope(
+            _envelope(item), batch_id="batch", spec_id=SPEC, adapter_id=ADAPTER,
+            expected_items=expected, completion=_completion(),
+        )
+
+
+def test_file_result_still_requires_a_prepared_reservation() -> None:
+    item = _item()
+    expected = [{"job_id": "job1", "prepared_id": PREPARED, "index": 0,
+                 "cost_unit": "pages", "cost_status": "exact", "measure_id": MEASURE,
+                 "prepared_value": 4.0, "verify_relative_tolerance": 0.0,
+                 "payload_mode": "files", "work_id": TEXT_WORK, "reservations": []}]
+    with pytest.raises(ResultProtocolError, match="no prepared reservation"):
+        validate_result_envelope(
+            _envelope(item), batch_id="batch", spec_id=SPEC, adapter_id=ADAPTER,
+            expected_items=expected, completion=_completion(),
+        )
 
 
 def test_frozen_legacy_work_units_v1_remains_readable() -> None:

@@ -1304,6 +1304,8 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
                 "job_id": job_id, "prepared_id": prepared["prepared_id"],
                 "index": index, "cost_unit": prepared["cost"]["unit"],
                 "cost_status": prepared["cost"]["status"],
+                "payload_mode": prepared["payload"]["mode"],
+                "work_id": prepared["work_id"],
                 "measure_id": prepared["cost"].get("measure_id"),
                 "prepared_value": (
                     item_costs.get(0) if len(prepared["payload"]["items"]) == 1
