@@ -1039,7 +1039,8 @@ def validate_prepared_against_spec(record: Mapping[str, Any], spec: Mapping[str,
         raise PreparationError("prepared output return violates the frozen contract")
     policy = definition["output"]["reservation"]
     reservations = record["output"]["reservations"]
-    if (policy == "none") != (not reservations):
+    expects_reservations = policy != "none" and bool(record["payload"]["items"])
+    if bool(reservations) != expects_reservations:
         raise PreparationError("prepared reservations disagree with the frozen output policy")
     if reservations:
         items = record["payload"]["items"]

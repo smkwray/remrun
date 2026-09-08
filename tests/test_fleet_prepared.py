@@ -718,3 +718,26 @@ def test_opted_in_fallback_updates_placement_without_rewriting_prepared_identity
         assert task.prepared["prepared_id"] == record["prepared_id"]
     finally:
         queue.close()
+
+@pytest.mark.parametrize("reservation", ["source-stem-v1", "content-work-stem-v1"])
+def test_text_or_files_reserves_only_actual_file_items(tmp_path: Path, reservation: str) -> None:
+    raw = _task()
+    raw["input"]["mode"] = "text-or-files"
+    raw["cost"] = {"measure": "none", "bucket_options": []}
+    raw["output"] = {"reservation": reservation, "allow_root_override": False,
+                     "verification": "none"}
+    spec = _spec(tmp_path, raw)
+    text_record = prepare_task_job(spec, repo_root=tmp_path, text="A pasted paragraph.")
+    prepared_mod.validate_prepared_against_spec(text_record, spec)
+    assert text_record["output"]["reservations"] == []
+
+    source = tmp_path / "source.zot"
+    source.write_text("A file paragraph.")
+    file_record = prepare_task_job(spec, repo_root=tmp_path, inputs=[str(source)])
+    prepared_mod.validate_prepared_against_spec(file_record, spec)
+    assert len(file_record["output"]["reservations"]) == 1
+    file_record["output"]["reservations"] = []
+    file_record.pop("prepared_id")
+    file_record["prepared_id"] = prepared_mod.sha256_id(file_record)
+    with pytest.raises(PreparationError, match="reservations disagree"):
+        prepared_mod.validate_prepared_against_spec(file_record, spec)
