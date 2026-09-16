@@ -2450,6 +2450,64 @@ def test_guard_prelaunch_refusal_is_distinct_and_user_code_never_runs(
     assert summary["job_profile"]["predicted_rss_mb"] is None
 
 
+def test_explicit_owner_override_bypasses_memory_admission(env, monkeypatch, capsys):
+    configure_memory_guard(env)
+
+    def must_not_reserve(self, **_kwargs):
+        raise AssertionError("memory admission must be bypassed")
+
+    monkeypatch.setattr(LocalSimTransport, "reserve_memory_guard", must_not_reserve)
+    code = main(
+        [
+            "run",
+            "LOCAL_SIM",
+            "--bypass-memory-guard",
+            "--",
+            sys.executable,
+            "-c",
+            "open('owner-override-ran.txt','w').write('ok')",
+        ]
+    )
+
+    assert code == EXIT_OK
+    assert (env["proj"] / "owner-override-ran.txt").read_text() == "ok"
+    events = capsys.readouterr().err
+    assert "memory_guard_bypassed" in events
+    assert "reason=explicit_owner_override" in events
+
+
+def test_memory_guard_bypass_rejects_auto_and_explicit_limit(env, capsys):
+    code = main(
+        [
+            "run",
+            "--auto",
+            "--bypass-memory-guard",
+            "--",
+            sys.executable,
+            "-c",
+            "print('must not run')",
+        ]
+    )
+    assert code == EXIT_INTERNAL
+    assert "requires an explicitly named target" in capsys.readouterr().err
+
+    code = main(
+        [
+            "run",
+            "LOCAL_SIM",
+            "--bypass-memory-guard",
+            "--memory-limit-mib",
+            "64",
+            "--",
+            sys.executable,
+            "-c",
+            "print('must not run')",
+        ]
+    )
+    assert code == EXIT_INTERNAL
+    assert "cannot be combined" in capsys.readouterr().err
+
+
 def test_run_memory_limit_is_remrun_option_and_same_post_separator_token_is_user_argv(
     env, capsys
 ):

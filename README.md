@@ -430,7 +430,10 @@ do not need to install the helper.
 
 Target forms for `run`/`plan`: an explicit device (`macbox`, `winbox`, `LOCAL_SIM`),
 `--auto`, the literal `auto`, or omit it (defaults to auto). Run flags:
-`--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`.
+`--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`. An owner who deliberately accepts
+the target's memory risk may use `--bypass-memory-guard` with an explicitly named target. The
+override skips admission, reservation, and the command guard; it is rejected for automatic
+placement and cannot be combined with `--memory-limit-mib`.
 
 Exit codes: `0` ok · `1` config/internal · `2` conflict (pre-run, **or** an
 unresolved post-run divergence — local edited during the run and differs from the

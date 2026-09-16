@@ -343,6 +343,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="hard process-tree memory limit for this run; target safety limits still apply",
     )
     p.add_argument(
+        "--bypass-memory-guard",
+        action="store_true",
+        help="explicit-target owner override: skip memory admission, reserve, and command guard",
+    )
+    p.add_argument(
         "--durable", action="store_true",
         help="opt into a target-supervised run resumable by this controller; "
              "with --auto, selection freezes before launch",
@@ -1412,6 +1417,13 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
     telemetry_default = bool(config.defaults.get("telemetry", {}).get("enabled", True))
     command = normalize_cmd(args.cmd)
     target_name = "auto" if args.auto else args.target
+    bypass_memory_guard = bool(getattr(args, "bypass_memory_guard", False))
+    if bypass_memory_guard and target_name == "auto":
+        raise ValueError("--bypass-memory-guard requires an explicitly named target")
+    if bypass_memory_guard and getattr(args, "memory_limit_mib", None) is not None:
+        raise ValueError(
+            "--bypass-memory-guard cannot be combined with --memory-limit-mib"
+        )
     plan = make_run_plan(
         cwd=Path.cwd(),
         config=config,
@@ -1534,6 +1546,13 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("target_reachable", address=probe.address, remote_os=probe.remote_os)
         reporter.event("write_scope", name=plan.write_scope or "project",
                        paths=plan.write_scope_paths)
+        if bypass_memory_guard:
+            transport.memory_guard = None
+            reporter.event(
+                "memory_guard_bypassed",
+                target=plan.target.name,
+                reason="explicit_owner_override",
+            )
         if plan.workload is not None:
             reporter.event("workload", **plan.workload.as_dict())
         # Create the receipt before any target mutation or other failure-prone phase.
