@@ -189,11 +189,12 @@ def enroll_target_key(
     try:
         source = subprocess.Popen(
             export_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=no_window,
+            creationflags=no_window, env=coordinator_transport.runner_stream_env(),
         )
         destination = subprocess.Popen(
             import_argv, stdin=source.stdout, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, creationflags=no_window,
+            env=target_transport.runner_stream_env(),
         )
         if source.stdout is not None:
             source.stdout.close()

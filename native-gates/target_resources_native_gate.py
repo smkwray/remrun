@@ -113,6 +113,7 @@ def _spawn_owner(client, reservation, argv, canonical_json, encode_frame, *, fau
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=os.name == "posix",
+        env=client.transport.runner_stream_env(),
     )
     assert process.stdin is not None
     process.stdin.write(

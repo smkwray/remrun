@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from ..models import Device
-from ..transport import _ssh_base_argv, make_transport
+from ..transport import _ssh_base_argv, make_transport, ssh_child_env
 from .resources import _NO_WINDOW_FLAG, _friendly_error
 
 # Cell states, most to least severe. `unknown` means untested, not failed.
@@ -105,7 +105,8 @@ _PROBE_COMMAND = "exit 0"
 def _run(command: list[str], timeout: float) -> tuple[int, str]:
     try:
         proc = subprocess.run(command, capture_output=True, timeout=timeout,
-                              check=False, creationflags=_NO_WINDOW_FLAG)
+                              check=False, creationflags=_NO_WINDOW_FLAG,
+                              env=ssh_child_env())
     except subprocess.TimeoutExpired:
         return 255, "ssh timed out"
     except OSError as exc:

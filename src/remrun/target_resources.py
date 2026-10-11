@@ -364,6 +364,7 @@ class TargetResourceClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=self.transport.runner_stream_env(),
         )
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(frame)

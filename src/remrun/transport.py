@@ -1866,6 +1866,10 @@ class BaseTransport:
         """Build a no-shell argv for directly piping one runner process to another."""
         raise NotImplementedError
 
+    def runner_stream_env(self) -> dict[str, str] | None:
+        """Environment for a process started from ``runner_stream_argv`` (None inherits)."""
+        return None
+
     # --- project-less helpers (fleet mode) --------------------------------
     def native_join(self, *parts: str) -> str:
         """Join path parts in the remote's native form (default POSIX).
@@ -2516,8 +2520,33 @@ def _ssh_base_argv(
     return ["ssh", *opts, target]
 
 
+_OPENSSH_FD_STATE_ENV = "c28fc6f98a2c44abbbd89d6a3037d0d9_POSIX_FD_STATE"
+
+
+def ssh_child_env() -> dict[str, str] | None:
+    """Drop inherited OpenSSH fd bookkeeping from Windows child environments.
+
+    Windows OpenSSH can leave this private state in the controller environment.
+    A later ssh process may decode it as if its parent had handed off live file
+    descriptors, then hang while starting. Give only ssh children a copy without
+    that exact key; never mutate the environment of the remrun process itself.
+    Every local ``ssh`` launch uses this, including direct probes outside a transport.
+    """
+    if sys.platform != "win32":
+        return None
+    env = os.environ.copy()
+    unwanted = _OPENSSH_FD_STATE_ENV.casefold()
+    for key in tuple(env):
+        if key.casefold() == unwanted:
+            del env[key]
+    return env
+
+
 class _SSHCommon(BaseTransport):
     """Shared OpenSSH plumbing for the ssh-posix and ssh-powershell backends."""
+
+    def runner_stream_env(self) -> dict[str, str] | None:
+        return ssh_child_env()
 
     def __init__(self, device: Device) -> None:
         super().__init__(device)
@@ -2588,12 +2617,14 @@ class _SSHCommon(BaseTransport):
                     timeout=timeout,
                     check=False,
                     creationflags=_NO_WINDOW,
+                    env=ssh_child_env(),
                 )
             proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.PIPE if input_bytes is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=ssh_child_env(),
                 **_stream_spawn_kwargs(),
             )
             if input_bytes is not None:
@@ -2634,6 +2665,7 @@ class _SSHCommon(BaseTransport):
         try:
             proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=ssh_child_env(),
                 **_stream_spawn_kwargs(),
             )
             return _stream_file_process(proc, source, timeout)
@@ -2648,7 +2680,7 @@ class _SSHCommon(BaseTransport):
             with destination.open("wb") as target:
                 return subprocess.run(
                     argv, stdin=subprocess.DEVNULL, stdout=target, stderr=subprocess.PIPE,
-                    check=False, creationflags=_NO_WINDOW,
+                    check=False, creationflags=_NO_WINDOW, env=ssh_child_env(),
                 )
         except FileNotFoundError as exc:
             raise TransportError(f"ssh executable not found: {exc}") from exc

@@ -25,6 +25,7 @@ from ..transport import (
     ControlSourceError,
     TransportError,
     make_transport,
+    ssh_child_env,
 )
 
 # No console-window flash on Windows when invoked from a GUI trigger; 0 elsewhere.
@@ -927,7 +928,8 @@ def _diagnose(device: Device, fallback: str, timeout: float = 10.0) -> str:
                    "-o", "StrictHostKeyChecking=accept-new", target, "exit 0"]
         try:
             proc = subprocess.run(command, capture_output=True, timeout=timeout,
-                                  check=False, creationflags=_NO_WINDOW_FLAG)
+                                  check=False, creationflags=_NO_WINDOW_FLAG,
+                                  env=ssh_child_env())
         except (OSError, subprocess.SubprocessError):
             continue
         if proc.returncode == 0:
