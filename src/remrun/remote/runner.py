@@ -2533,9 +2533,35 @@ def _darwin_start_id(pid: int) -> str:
         )
         if size != ctypes.sizeof(info) or int(info.pbi_pid) != int(pid):
             raise OSError("proc_pidinfo returned no exact identity")
-        return f"darwin:{pid}:{int(info.pbi_start_tvsec)}:{int(info.pbi_start_tvusec)}"
+        started = int(info.pbi_start_tvsec) * 1_000_000 + int(info.pbi_start_tvusec)
+        return f"darwin:{pid}:{started}"
     except (AttributeError, OSError) as exc:
         raise RunnerError("exact process start identity is unavailable") from exc
+
+
+def _process_start_ids_match(current: str, recorded: object, pid: int) -> bool:
+    """Compare exact identities, including both previously emitted Darwin forms."""
+    if not current.startswith("darwin:"):
+        return current == recorded
+
+    def darwin_start(value: object) -> int | None:
+        if not isinstance(value, str) or len(value) > 512:
+            return None
+        match = re.fullmatch(
+            r"darwin:([1-9][0-9]*):(0|[1-9][0-9]*)(?::(0|[1-9][0-9]*))?", value
+        )
+        if match is None or int(match[1]) != pid:
+            return None
+        started = int(match[2])
+        if match[3] is not None:
+            usec = int(match[3])
+            if usec >= 1_000_000:
+                return None
+            started = started * 1_000_000 + usec
+        return started
+
+    actual = darwin_start(current)
+    return actual is not None and actual == darwin_start(recorded)
 
 
 def _parse_linux_proc_stat(text: str, expected_pid: int) -> tuple[int, int]:
@@ -3025,7 +3051,9 @@ def _terminate_resource_owner(row: dict) -> bool:
         if root_pid not in members:
             return False
         try:
-            if _process_start_id(root_pid) != row.get("root_start_id"):
+            if not _process_start_ids_match(
+                _process_start_id(root_pid), row.get("root_start_id"), root_pid
+            ):
                 return False
         except RunnerError:
             return False

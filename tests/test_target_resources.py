@@ -1166,3 +1166,103 @@ def test_fault_after_claim_never_opens_gate_and_is_quarantined(
             "WHERE allocation_id=?",
             (reservation.allocation_id,),
         ).fetchone() == ("QUARANTINED", "NO")
+
+
+@pytest.mark.parametrize("recorded", ["darwin:321:1700000000123456", "darwin:321:1700000000:123456"])
+def test_darwin_observer_durable_owner_cancels_with_exact_start_identity(
+    tmp_path, monkeypatch, recorded
+):
+    from remrun import _job_observer as observer, _durable_runner as durable
+
+    class Libproc:
+        def proc_listallpids(self, buffer, _size):
+            if buffer is not None:
+                buffer[0] = 321
+            return 1
+
+        def proc_pidinfo(self, pid, flavor, _arg, pointer, size):
+            info = pointer._obj
+            if flavor == observer.PROC_PIDTBSDINFO:
+                info.pbi_pid = pid
+                info.pbi_ppid = 1
+                info.pbi_pgid = pid
+                info.pbi_start_tvsec = 1700000000
+                info.pbi_start_tvusec = 123456
+            return size
+
+    lib = Libproc()
+    monkeypatch.setattr(observer, "_darwin_lib", lambda: lib)
+    owner = observer._darwin_processes()[321]
+    assert owner.identity == "darwin:321:1700000000123456"
+    monkeypatch.setattr(observer, "_posix_owner_row", lambda: owner)
+    monkeypatch.setattr(observer, "_register", lambda *a, **kw: "token")
+    monkeypatch.setattr(observer, "_unregister", lambda *a: None)
+
+    class StopBeforeLaunch(Exception):
+        pass
+
+    def stop(*a):
+        raise StopBeforeLaunch
+
+    monkeypatch.setattr(observer, "_wait_start_gate", stop)
+    ready_path = tmp_path / "ready.json"
+    metadata = {"job_id": "job", "command_sha256": "a" * 64}
+    with pytest.raises(StopBeforeLaunch):
+        observer._run_posix_command(tmp_path, metadata, ["never-launch"], str(ready_path))
+    ready = durable._read_control(
+        ready_path, {"run_id": "job", "command_sha256": "a" * 64}, require_owner=True
+    )
+    assert ready["owner"]["root_start_id"] == owner.identity
+    # Existing direct-runner receipts used seconds:microseconds. Preserve them.
+    row = {
+        "owner_kind": ready["owner"]["kind"],
+        "owner_key": ready["owner"]["key"],
+        "root_pid": ready["owner"]["root_pid"],
+        "root_start_id": recorded,
+    }
+    monkeypatch.setattr(remote_runner.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(remote_runner.ctypes, "CDLL", lambda *a, **kw: lib)
+    assert remote_runner._process_start_id(321) == owner.identity
+    killed = []
+    monkeypatch.setattr(remote_runner, "_posix_group_members", lambda _pgid: [] if killed else [321])
+    monkeypatch.setattr(remote_runner, "_kill_posix_group", killed.append)
+    assert remote_runner._terminate_resource_owner(row) is True
+    assert killed == [321]
+    assert row["root_start_id"] == recorded
+
+
+@pytest.mark.parametrize("recorded", [
+    None, "", "darwin:322:1700000000123456", "darwin:321:1700000000123457",
+    "darwin:322:1700000000:123456", "darwin:321:1700000001:123456",
+    "darwin:321:1700000000:123457", "darwin:321:1699999999:1123456",
+    "darwin:321:1700000000:-1", "darwin:321:1700000000:+123456",
+    "darwin:321:1700000000:123456:0", "darwin:321:1700000000:123456\n",
+    "darwin:321:1700000000.123456", "darwin:321:１７００００００００１２３４５６",
+    "darwin:0321:1700000000123456", "darwin:321:" + "1" * 513,
+    "linux:321:1700000000123456", "windows:321:1700000000123456",
+])
+def test_darwin_cancel_rejects_mismatched_or_malformed_recorded_identity(monkeypatch, recorded):
+    row = {"owner_kind": "posix_pgid", "owner_key": "321", "root_pid": 321,
+           "root_start_id": recorded}
+    monkeypatch.setattr(remote_runner, "_posix_group_members", lambda _pgid: [321])
+    monkeypatch.setattr(remote_runner, "_process_start_id", lambda _pid: "darwin:321:1700000000123456")
+    killed = []
+    monkeypatch.setattr(remote_runner, "_kill_posix_group", killed.append)
+    assert remote_runner._terminate_resource_owner(row) is False
+    assert killed == []
+
+
+@pytest.mark.parametrize("current, recorded, expected", [
+    ("darwin:321:1700000000:123456", "darwin:321:1700000000123456", True),
+    ("darwin:321:1700000000:123456", "darwin:321:1700000000:123456", True),
+    ("darwin:322:1700000000123456", "darwin:322:1700000000123456", False),
+    ("darwin:321:bad", "darwin:321:bad", False),
+    ("darwin:321:0:0", "darwin:321:0", True),
+    ("darwin:321:1:999999", "darwin:321:1999999", True),
+    ("linux:321:123456", "linux:321:123456", True),
+    ("linux:321:123456", "linux:321:0123456", False),
+    ("windows:321:123456", "windows:321:123456", True),
+    ("windows:321:123456", "windows:321:0123456", False),
+])
+def test_start_identity_compatibility_is_darwin_only(current, recorded, expected):
+    assert remote_runner._process_start_ids_match(current, recorded, 321) is expected
