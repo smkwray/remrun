@@ -65,8 +65,6 @@ def test_controller_operation_is_opt_in_reports_no_process_metrics_and_cleans_up
 ):
     """A controller-side operation is live, but never pretends to be target CPU/RAM."""
     state_root = tmp_path / "state"
-    monkeypatch.setenv("REMRUN_STATE_ROOT", str(state_root))
-    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "1")
     item = JobObservation.for_command(
         job_id="git-sync-push-1",
         project="demo",
@@ -77,7 +75,7 @@ def test_controller_operation_is_opt_in_reports_no_process_metrics_and_cleans_up
         declared_label="git-sync:push",
     )
 
-    with observation_module.observe_controller_operation(item):
+    with observation_module.observe_controller_operation(item, state_root):
         payload = observer._query(state_root, 0.05)
         assert payload["status"] == "ok"
         assert len(payload["jobs"]) == 1
@@ -95,32 +93,10 @@ def test_controller_operation_is_opt_in_reports_no_process_metrics_and_cleans_up
     assert observer._query(state_root, 0.05)["jobs"] == []
 
 
-def test_controller_operation_is_dormant_without_explicit_observation_switch(
-    tmp_path, monkeypatch
-):
-    state_root = tmp_path / "state"
-    monkeypatch.setenv("REMRUN_STATE_ROOT", str(state_root))
-    monkeypatch.delenv("REMRUN_FLEET_JOBS_OBSERVE", raising=False)
-    item = JobObservation.for_command(
-        job_id="git-sync-pull-1",
-        project="demo",
-        source_controller="CTRL",
-        target="PEER",
-        phase="git-sync",
-        command=["remrun", "git-sync", "PEER", "--pull"],
-        declared_label="git-sync:pull",
-    )
-
-    with observation_module.observe_controller_operation(item):
-        assert not observer._db_path(state_root).exists()
-
-
 def test_controller_operations_from_different_projects_remain_separate_rows(
     tmp_path, monkeypatch
 ):
     state_root = tmp_path / "state"
-    monkeypatch.setenv("REMRUN_STATE_ROOT", str(state_root))
-    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "true")
     alpha = JobObservation.for_command(
         job_id="git-sync-alpha",
         project="alpha",
@@ -140,8 +116,8 @@ def test_controller_operations_from_different_projects_remain_separate_rows(
         declared_label="git-sync:pull",
     )
 
-    with observation_module.observe_controller_operation(alpha):
-        with observation_module.observe_controller_operation(zeta):
+    with observation_module.observe_controller_operation(alpha, state_root):
+        with observation_module.observe_controller_operation(zeta, state_root):
             payload = observer._query(state_root, 0.05)
 
     assert [(job["project"], job["target"]) for job in payload["jobs"]] == [

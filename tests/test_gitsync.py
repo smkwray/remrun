@@ -93,12 +93,26 @@ def sync(cfg: RemrunConfig, **kwargs) -> int:
     return run_git_sync(cfg, device_name="LOCAL_SIM", reporter=Reporter(), **kwargs)
 
 
+def _with_observed_controller(cfg, monkeypatch, state_root: Path, *, observe: bool):
+    """Make this test host a configured controller device with its own registry root."""
+    import remrun.job_observation as observation_module
+
+    monkeypatch.setattr(observation_module.platform, "node", lambda: "ctrl.local")
+    controller = Device.from_mapping("CTRL", {
+        "kind": "ssh-posix",
+        "os": "posix",
+        "state_root": posix(state_root),
+        "observe_jobs": observe,
+    })
+    return replace(cfg, devices={**cfg.devices, "CTRL": controller})
+
+
 def test_git_sync_registers_opt_in_controller_operation_for_its_full_lifecycle(
     repos, monkeypatch
 ):
     cfg, _local, _remote = repos
-    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "1")
-    state_root = Path(os.environ["REMRUN_STATE_ROOT"])
+    state_root = Path(os.environ["REMRUN_STATE_ROOT"]) / "controller"
+    cfg = _with_observed_controller(cfg, monkeypatch, state_root, observe=True)
     seen = []
 
     def fake_result(_config, **_kwargs):
@@ -118,6 +132,21 @@ def test_git_sync_registers_opt_in_controller_operation_for_its_full_lifecycle(
     assert job["command"]["label"] == "git-sync:push"
     assert job["cpu"]["current_pct_one_logical_cpu"] is None
     assert observer._query(state_root, 0.05)["jobs"] == []
+
+
+def test_git_sync_writes_no_row_unless_this_controller_declares_observation(
+    repos, monkeypatch
+):
+    cfg, _local, _remote = repos
+    state_root = Path(os.environ["REMRUN_STATE_ROOT"]) / "controller"
+    cfg = _with_observed_controller(cfg, monkeypatch, state_root, observe=False)
+    monkeypatch.setattr(
+        gitsync_module, "run_git_sync_result",
+        lambda _config, **_kwargs: type("Result", (), {"exit_code": EXIT_OK})(),
+    )
+
+    assert run_git_sync(cfg, device_name="LOCAL_SIM", direction="push", reporter=Reporter()) == EXIT_OK
+    assert not observer._db_path(state_root).exists()
 
 
 def test_git_sync_can_use_broader_roots_for_a_sibling_repository(tmp_path, monkeypatch):

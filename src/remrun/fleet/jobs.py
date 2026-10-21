@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from .. import _job_observer
 from ..models import Device
-from ..state import default_state_root
+from ..job_observation import device_registry_root
 from ..transport import TransportError, make_transport
 
 _QUERY_STATUSES = {"ok", "partial", "unknown", "unsupported"}
@@ -109,7 +109,7 @@ def probe_device(
     """Query one target. Never raises and never maps failure to zero jobs."""
     try:
         if local:
-            payload = _job_observer._query(default_state_root(), sample_interval)
+            payload = _job_observer._query(device_registry_root(device), sample_interval)
         else:
             transport = make_transport(device)
             query = getattr(transport, "query_observed_jobs", None)

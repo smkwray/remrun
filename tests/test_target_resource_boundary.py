@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from remrun.job_observation import active_job_observation_enabled
+from remrun.job_observation import job_observation_enabled
+from remrun.models import Device
 from remrun.protocol import build_capabilities_document
 
 
@@ -38,7 +39,7 @@ def test_target_owner_has_no_source_bound_keeper_or_readiness_marker() -> None:
 
 
 def test_rwo5_leaves_observer_off_and_coordination_legacy() -> None:
-    assert active_job_observation_enabled({}) is False
+    assert job_observation_enabled(Device.from_mapping("T", {})) is False
     example = (ROOT / "config/devices.example.toml").read_text(encoding="utf-8")
     assert 'mode = "legacy"' in example
 

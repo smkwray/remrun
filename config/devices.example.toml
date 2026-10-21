@@ -55,6 +55,8 @@ enabled = false
 # Optional ordinary-run override: explicit `remrun plan/run macbox` only;
 # this never enables automatic or fleet placement.
 # allow_explicit_run = true
+# Register runs here for `fleet jobs` once native-gates/fleet_jobs_native_gate.py passes.
+# observe_jobs = true
 kind = "ssh-posix"
 os = "macos"
 address_candidates = ["macbox.local"]

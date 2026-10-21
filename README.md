@@ -140,6 +140,7 @@ worker service.
 ```bash
 remrun fleet resources                         # CPU, load/queue, RAM, GPU/VRAM, disk
 remrun fleet jobs [--device NAME]              # active jobs across all controllers
+remrun observe --label "regen" -- CMD...       # run CMD on this machine, visible to fleet jobs
 remrun fleet mesh [--no-hops]                  # measured SSH reachability matrix
 remrun fleet plan zotomatic --input items/      # arbitrary configured name; preview only
 remrun fleet plan zotomatic --input items/ --save --json  # save exact prepared placement
@@ -224,14 +225,22 @@ ceiling, `max_jobs`, and host reserve. No-limit submissions retain the existing
 and `submit-explicit` provenance into `prepared_id`. It does not change `work_id`, cost,
 `memory_kind`, or learned profiles.
 
-`fleet jobs` launch-side registration is a separate, real
-activation seam and is **off by default**: ordinary `run` and fleet dispatcher commands
-continue through the established `exec()` path unless the controller process explicitly
-sets `REMRUN_FLEET_JOBS_OBSERVE=1`. Enable it only after the target's bounded native
-Windows/macOS gates pass. Direct callers of the explicit `exec_observed()` transport API
-are opting into that launch boundary themselves.
+`fleet jobs` launch-side registration is **off by default** and is activated per target:
+ordinary `run` and fleet dispatcher commands continue through the established `exec()` path
+unless the target device declares `observe_jobs = true`. Declare it only after
+`native-gates/fleet_jobs_native_gate.py` passes for that target. Direct callers of the
+explicit `exec_observed()` transport API are opting into that launch boundary themselves.
 
-With that setting, `fleet jobs` also shows each in-progress `git-sync` as one
+`remrun observe [--label TEXT] -- CMD...` runs a command on this machine under the same
+observer, so a job started natively (without `run`) appears in every controller's `fleet jobs`
+with its project directory, label, threads, and RAM. The command inherits remrun's standard
+streams; on POSIX with a controlling terminal it becomes the foreground job, so prompts, input,
+and Ctrl-C work as they would without remrun. It returns the command's exit status, which
+observation or terminal cleanup never replaces. This machine must be a configured device
+declaring `observe_jobs`; otherwise the command still runs, unobserved, with a warning.
+
+When this controller declares `observe_jobs`, `fleet jobs` also shows each in-progress
+`git-sync` as one
 operation row: its project, source controller, peer, and direction. CPU, thread, and RAM
 cells intentionally show `-`, because a Git sync spans local Git, transfer, and peer Git;
 partial per-process numbers would be misleading. Simultaneous operations from different
@@ -430,7 +439,9 @@ do not need to install the helper.
 
 Target forms for `run`/`plan`: an explicit device (`macbox`, `winbox`, `LOCAL_SIM`),
 `--auto`, the literal `auto`, or omit it (defaults to auto). Run flags:
-`--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`. An owner who deliberately accepts
+`--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`, and `--label TEXT` (a short
+name `fleet jobs` shows instead of the executable; spaces are stored as underscores). An owner
+who deliberately accepts
 the target's memory risk may use `--bypass-memory-guard` with an explicitly named target. The
 override skips admission, reservation, and the command guard; it is rejected for automatic
 placement and cannot be combined with `--memory-limit-mib`.

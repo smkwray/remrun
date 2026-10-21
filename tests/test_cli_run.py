@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import threading
@@ -3045,8 +3046,13 @@ def test_main_memory_guard_live_path_reserves_renews_executes_and_releases(
     assert ledger["leases"] == []
 
 
+def _declare_observed_target(env) -> None:
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(devices.read_text() + "observe_jobs = true\n")
+
+
 def test_run_routes_command_through_observation_seam(env, monkeypatch):
-    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "1")
+    _declare_observed_target(env)
     captured = []
     original = LocalSimTransport.exec_observed
 
@@ -3066,10 +3072,307 @@ def test_run_routes_command_through_observation_seam(env, monkeypatch):
     assert item.job_id
 
 
-def test_run_observation_is_dormant_by_default(env, monkeypatch):
+def test_run_label_is_what_fleet_jobs_shows_instead_of_the_executable(env, monkeypatch):
+    """Without a label every Python job reads `python`; the label names the work."""
+    _declare_observed_target(env)
+    captured = []
+    original = LocalSimTransport.exec_observed
+
+    def record(self, command, cwd, *, observation, **kwargs):
+        captured.append(observation)
+        return original(self, command, cwd, observation=observation, **kwargs)
+
+    monkeypatch.setattr(LocalSimTransport, "exec_observed", record)
+    code = main(["run", "LOCAL_SIM", "--label", "regen 2019", "--", "python", "-c", "pass"])
+    assert code == EXIT_OK
+    assert [item.command_label for item in captured] == ["regen_2019"]
+
+
+@pytest.mark.parametrize("label", ["", "   ", "a/b", "x" * 65, "régen"])
+def test_run_label_refuses_text_the_registry_would_rewrite(env, label):
+    """A label is refused before any work rather than silently mangled into another."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", "LOCAL_SIM", "--label", label, "--", "python", "-c", "pass"])
+    assert excinfo.value.code == 2
+
+
+def test_durable_ownership_accepts_the_registry_form_of_a_worktree_project():
+    """A worktree project id holds `/` and a run id may hold a space; the registry stores
+    both bounded, and that is the same run, not a mismatch."""
     from remrun import cli
 
-    monkeypatch.delenv("REMRUN_FLEET_JOBS_OBSERVE", raising=False)
+    record = {
+        "run_id": "20260905T111326Z-TARGET-my project-60b59f",
+        "project_id": "proj-a/.worktrees/wt",
+        "controller": "CTRL",
+        "target": "TARGET",
+        "command_sha256": "c" * 64,
+    }
+    job = {
+        "job_id": "20260905T111326Z-TARGET-my_project-60b59f",
+        "project": "proj-a_.worktrees_wt",
+        "source_controller": "CTRL",
+        "target": "TARGET",
+        "command": {"sha256": "c" * 64},
+        "observation_status": "ok",
+    }
+    transport = type("T", (), {"query_observed_jobs": lambda self, **_: {"jobs": [job]}})()
+    assert cli._running_observation_matches(transport, record) is True
+    job["project"] = "other"
+    with pytest.raises(cli.DurableStateError, match="project mismatch"):
+        cli._running_observation_matches(transport, record)
+
+
+def test_a_native_job_is_named_by_the_project_it_runs_in_on_that_machine(tmp_path):
+    """Each machine keeps projects under its own root, and a worktree run is its project's work."""
+    from types import SimpleNamespace
+
+    from remrun import cli
+
+    machine_root = tmp_path / "sync" / "proj"
+    controller_root = tmp_path / "proj"
+    (machine_root / "proj-a" / ".worktrees" / "wt" / "sub").mkdir(parents=True)
+    (controller_root / "proj-b").mkdir(parents=True)
+    (tmp_path / "elsewhere").mkdir()
+    config = SimpleNamespace(project_roots={"default": str(controller_root)})
+    device = SimpleNamespace(project_root=str(machine_root))
+
+    inside = machine_root / "proj-a" / ".worktrees" / "wt" / "sub"
+    assert cli._observed_project(inside, config, device) == "proj-a"
+    assert cli._observed_project(controller_root / "proj-b", config, device) == "proj-b"
+    assert cli._observed_project(controller_root / "proj-b", config, None) == "proj-b"
+    assert cli._observed_project(tmp_path / "elsewhere", config, device) == "elsewhere"
+
+
+def _observe_env(env, monkeypatch, *, observe: bool) -> Path:
+    """Declare this test host as configured device CTRL with its own registry."""
+    import remrun.job_observation as observation_module
+
+    registry = env["state"] / "ctrl-registry"
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text()
+        + "\n[devices.CTRL]\n"
+        + 'kind = "ssh-posix"\n'
+        + 'os = "posix"\n'
+        + f'state_root = "{posix(registry)}"\n'
+        + f"observe_jobs = {'true' if observe else 'false'}\n"
+    )
+    monkeypatch.setattr(observation_module.platform, "node", lambda: "ctrl.local")
+    return registry
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group observer")
+def test_observe_registers_a_native_command_where_other_controllers_query(env, monkeypatch):
+    """A job an agent runs on its own machine appears in `fleet jobs` with its
+    project, label and live threads/RAM, and its real exit status is returned."""
+    from remrun import _job_observer
+
+    registry = _observe_env(env, monkeypatch, observe=True)
+    seen = env["proj"] / "seen.json"
+    script = (
+        "import pathlib, subprocess, sys\n"
+        f"out = subprocess.run([sys.executable, '-S', {str(Path(_job_observer.__file__))!r}, "
+        f"'query', '--state-root', {str(registry)!r}], capture_output=True, text=True).stdout\n"
+        f"pathlib.Path({str(seen)!r}).write_text(out)\n"
+        "sys.exit(7)\n"
+    )
+
+    code = main(["observe", "--label", "regen", "--", sys.executable, "-c", script])
+
+    assert code == 7
+    payload = json.loads(seen.read_text())
+    assert payload["status"] == "ok"
+    [job] = payload["jobs"]
+    assert job["state"] == "RUNNING"
+    assert job["project"] == "proj1"
+    assert job["command"]["label"] == "regen"
+    assert job["target"] == "CTRL"
+    assert job["source_controller"] == "CTRL"
+    assert job["phase"] == "native"
+    assert job["threads"]["current_os_threads"] >= 1
+    assert job["memory"]["current_bytes"] > 0
+    assert _job_observer._query(registry, 0.05)["jobs"] == []
+
+
+def _observe_subprocess_env(env) -> dict:
+    """A real `remrun observe` process: this host is a configured, observed device."""
+    import platform
+
+    name = platform.node().split(".", 1)[0] or "HOST"
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text()
+        + f"\n[devices.{name}]\n"
+        + 'kind = "ssh-posix"\n'
+        + 'os = "posix"\n'
+        + f'state_root = "{posix(env["state"] / "host-registry")}"\n'
+        + "observe_jobs = true\n"
+    )
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    return {**os.environ, "PYTHONPATH": src}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal forwarding")
+def test_observe_returns_only_when_the_command_has_finished_its_own_shutdown(env, tmp_path):
+    """An agent's cancel must not report a job finished while it is still cleaning up,
+    and the status reported is the command's, not remrun's."""
+    import signal
+    import subprocess
+
+    ready = tmp_path / "ready"
+    cleaned = tmp_path / "cleaned"
+    script = (
+        "import pathlib, signal, sys, time\n"
+        "def stop(*_):\n"
+        "    time.sleep(1.0)\n"
+        f"    pathlib.Path({str(cleaned)!r}).write_text('done')\n"
+        "    sys.exit(5)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        f"pathlib.Path({str(ready)!r}).write_text('up')\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "remrun.cli", "observe", "--", sys.executable, "-c", script],
+        env=_observe_subprocess_env(env), cwd=env["proj"],
+    )
+    deadline = time.monotonic() + 20
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists(), "the observed command never started"
+
+    proc.send_signal(signal.SIGTERM)
+    code = proc.wait(timeout=20)
+
+    assert cleaned.exists(), "remrun returned before the command finished shutting down"
+    assert code == 5
+
+
+def _observe_with_fake_terminal(monkeypatch, tmp_path, command, *, fail_on=None,
+                                failure=OSError("tcsetpgrp failed"), before_fail=None):
+    """Run the POSIX observer with a stand-in terminal whose handoff or restore can fail."""
+    import signal
+
+    from remrun import cli as cli_mod
+    from remrun.job_observation import JobObservation
+
+    calls: list[int] = []
+
+    def set_foreground(fd, pgid):  # noqa: ANN001
+        calls.append(pgid)
+        step = "handoff" if len(calls) == 1 else "restore"
+        if step == fail_on:
+            if before_fail is not None:
+                before_fail()
+            raise failure
+
+    monkeypatch.setattr(cli_mod, "_claim_terminal",
+                        lambda: (os.open(os.devnull, os.O_RDWR), os.getpgrp()))
+    monkeypatch.setattr(cli_mod, "_set_foreground", set_foreground)
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    observation = JobObservation.for_command(
+        job_id="job-1", project="proj1", target="CTRL", phase="native", command=command)
+    started = time.monotonic()
+    code = cli_mod._observe_posix(command, tmp_path / "registry", observation)
+    assert {sig: signal.getsignal(sig) for sig in handlers} == handlers
+    return code, time.monotonic() - started
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX terminal job control")
+def test_observe_keeps_the_command_status_when_terminal_restore_fails(monkeypatch, tmp_path):
+    """The command finished with 7; a terminal cleanup failure must not turn that into remrun's."""
+    code, _ = _observe_with_fake_terminal(
+        monkeypatch, tmp_path, [sys.executable, "-c", "raise SystemExit(7)"], fail_on="restore")
+    assert code == 7
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX terminal job control")
+def test_observe_keeps_the_status_when_the_group_is_gone_before_signals(monkeypatch, tmp_path):
+    def vanished(pid, signum):  # noqa: ANN001
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(os, "killpg", vanished)
+    code, _ = _observe_with_fake_terminal(
+        monkeypatch, tmp_path, [sys.executable, "-c", "raise SystemExit(7)"])
+    assert code == 7
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX terminal job control")
+def test_observe_handoff_failure_after_a_fast_exit_keeps_its_status(monkeypatch, tmp_path):
+    code, _ = _observe_with_fake_terminal(
+        monkeypatch, tmp_path, [sys.executable, "-c", "raise SystemExit(7)"],
+        fail_on="handoff", failure=ProcessLookupError("group already exited"),
+        before_fail=lambda: time.sleep(1.0))
+    assert code == 7
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX terminal job control")
+def test_observe_stops_a_command_it_could_not_give_the_terminal(monkeypatch, tmp_path, capsys):
+    """A live command left outside the terminal would hang on its first read; end it."""
+    code, elapsed = _observe_with_fake_terminal(
+        monkeypatch, tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"],
+        fail_on="handoff")
+    assert code == 128 + 15
+    assert elapsed < 20
+    assert "could not give the command the terminal" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX terminal job control")
+def test_observe_in_a_terminal_lets_the_command_use_it_instead_of_stopping(env):
+    """A command that touches its terminal (stty, prompts, raw-mode tools) runs in the
+    foreground under observe; in a background group the kernel would stop it forever."""
+    import pty
+    import select
+
+    environment = _observe_subprocess_env(env)
+    pid, master = pty.fork()
+    if pid == 0:  # pragma: no cover - child
+        os.chdir(env["proj"])
+        os.execve(sys.executable, [
+            sys.executable, "-m", "remrun.cli", "observe", "--",
+            "sh", "-c", "stty -echo </dev/tty && stty echo </dev/tty && exit 3",
+        ], environment)
+    deadline = time.monotonic() + 20
+    status = None
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        if select.select([master], [], [], 0.1)[0]:
+            try:
+                os.read(master, 4096)
+            except OSError:
+                pass
+    else:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        pytest.fail("observe hung: the command was stopped touching its terminal")
+    os.close(master)
+    assert os.waitstatus_to_exitcode(status) == 3
+
+
+@pytest.mark.parametrize("declared", [False, None])
+def test_observe_without_an_activated_local_device_still_runs_the_command(
+    env, monkeypatch, capsys, declared
+):
+    """Observation never decides whether the work runs or what it returns."""
+    if declared is None:
+        import remrun.job_observation as observation_module
+
+        monkeypatch.setattr(observation_module.platform, "node", lambda: "unconfigured")
+        registry = env["state"] / "ctrl-registry"
+    else:
+        registry = _observe_env(env, monkeypatch, observe=declared)
+
+    code = main(["observe", "--", sys.executable, "-c", "import sys; sys.exit(5)"])
+
+    assert code == 5
+    assert "observation_unavailable" in capsys.readouterr().err
+    assert not (registry / "jobs").exists()
+
+
+def test_run_observation_is_dormant_by_default(env, monkeypatch):
+    from remrun import cli
 
     def unexpected(*_args, **_kwargs):
         raise AssertionError("default-off run must not enter observation code")

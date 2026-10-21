@@ -2374,7 +2374,8 @@ def _run_windows_command(
             user_identity=str(row.identity),
         )
         _remove_keeper_ready(root, token)
-    except Exception as exc:
+    except BaseException as exc:
+        # Ctrl-C during startup must also release the suspended command and keeper.
         if registered:
             _unregister(root, token)
         if process is not None and not started:
@@ -2388,14 +2389,21 @@ def _run_windows_command(
             keeper = None
         _win_close(job)
         _remove_keeper_ready(root, token)
-        if ready_file is not None:
+        if ready_file is not None or not isinstance(exc, Exception):
             raise
         _warning(f"{type(exc).__name__}: {exc}")
         return _wait_popen(subprocess.Popen(command))
 
     assert process is not None
     try:
-        return_code = _win_wait_exit(process)
+        while True:
+            try:
+                return_code = _win_wait_exit(process)
+                break
+            except KeyboardInterrupt:
+                # The console delivered Ctrl-C to the command as well; its exit
+                # status, not this helper's interrupt, is the result.
+                continue
     except BaseException:
         # The detached keeper retains the named Job handle if this helper or the
         # source SSH/controller disappears. Query remains exact while that kernel

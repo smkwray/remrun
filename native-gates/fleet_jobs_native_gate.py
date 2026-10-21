@@ -7,8 +7,8 @@ Run from a controller with the production private device configuration::
         --repo /path/to/remrun --target WINDOWS_TARGET \
         --target GUARDED_POSIX_TARGET
 
-The gate calls ``exec_observed()`` directly and never changes
-``REMRUN_FLEET_JOBS_OBSERVE``. Windows proves the telemetry-on direct-root case
+The gate calls ``exec_observed()`` directly and never changes a device's
+``observe_jobs`` declaration; declare it only after this gate passes. Windows proves the telemetry-on direct-root case
 and then kills the controller-side source SSH request while the ordinary user
 root and descendant remain alive. A guarded POSIX target uses remrun's normal
 predicted-RSS reservation seam, queries the live job from a fresh connection,

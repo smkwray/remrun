@@ -14,25 +14,49 @@ import re
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import PurePath, PureWindowsPath
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Iterator
 
 _SAFE = re.compile(r"[^A-Za-z0-9._:@+-]+")
 
 
-_OBSERVATION_ENABLE_ENV = "REMRUN_FLEET_JOBS_OBSERVE"
-_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
+def job_observation_enabled(device: object) -> bool:
+    """Return whether runs on ``device`` register in its active-job registry.
 
-
-def active_job_observation_enabled(environ: dict[str, str] | None = None) -> bool:
-    """Return whether launch-side fleet-job observation is explicitly enabled.
-
-    Querying remains available regardless of this switch.  The seam is evaluated
-    on the controller, before any transport wrapper or target helper is selected,
-    so an exact-base landing is genuinely dormant by default.
+    A target opts in with ``observe_jobs = true`` once its native gate passes. The
+    decision is the target's, so every controller sharing the device configuration
+    observes the same set of targets.
     """
-    source = os.environ if environ is None else environ
-    return str(source.get(_OBSERVATION_ENABLE_ENV, "")).strip().lower() in _ENABLED_VALUES
+    return getattr(device, "observe_jobs", False) is True
+
+
+def local_device(config: object) -> object | None:
+    """Return the configured device that is this machine, matched by short hostname."""
+    controller = (platform.node().split(".", 1)[0] or "").casefold()
+    if not controller:
+        return None
+    for device in getattr(config, "devices", {}).values():
+        if device.name.casefold() == controller and device.kind != "local-sim":
+            return device
+    return None
+
+
+def device_registry_root(device: object | None) -> Path:
+    """Return the active-job registry root of ``device`` as seen on that device.
+
+    It is the configured ``state_root`` other controllers query over SSH, so a job
+    registered locally and a job launched there remotely land in one registry.
+    """
+    from . import _job_observer
+    from .state import default_state_root
+
+    raw = getattr(device, "state_root", "") if device is not None else ""
+    return _job_observer._state_root(raw) if raw else default_state_root()
+
+
+def local_registry_root(config: object) -> Path:
+    """Return this machine's active-job registry root."""
+    return device_registry_root(local_device(config))
 
 
 def _safe_text(value: object, *, fallback: str, limit: int) -> str:
@@ -60,6 +84,16 @@ def command_label(command: list[str], declared: str | None = None) -> str:
     candidates = [PurePath(first).name, PureWindowsPath(first).name, first]
     raw = min((candidate for candidate in candidates if candidate), key=len, default="command")
     return _safe_text(raw, fallback="command", limit=64)
+
+
+def observed_project_id(project: object) -> str:
+    """Return the bounded project text the registry stores for ``project``."""
+    return _safe_text(project, fallback="project", limit=128)
+
+
+def observed_job_id(job_id: object) -> str:
+    """Return the bounded job id the registry stores for ``job_id``."""
+    return _safe_text(job_id, fallback="job", limit=128)
 
 
 def command_digest(command: list[str]) -> str:
@@ -101,8 +135,8 @@ class JobObservation:
         if count < 1 or count > 100_000:
             raise ValueError("member_count must be in 1..100000")
         return cls(
-            job_id=_safe_text(job_id, fallback="job", limit=128),
-            project=_safe_text(project, fallback="project", limit=128),
+            job_id=observed_job_id(job_id),
+            project=observed_project_id(project),
             source_controller=_safe_text(
                 source_controller or controller_label(), fallback="controller", limit=64
             ),
@@ -134,7 +168,7 @@ class JobObservation:
 @contextmanager
 def observe_controller_operation(
     observation: JobObservation,
-    environ: dict[str, str] | None = None,
+    root: Path,
 ) -> Iterator[bool]:
     """Register one controller-orchestrated operation for ``fleet jobs``.
 
@@ -142,12 +176,7 @@ def observe_controller_operation(
     optional and fail-open: observability must never change the operation's
     result.
     """
-    if not active_job_observation_enabled(environ):
-        yield False
-        return
-
     from . import _job_observer  # local imports avoid observer/transport cycles
-    from .state import default_state_root
 
     token: str | None = None
     try:
@@ -155,7 +184,7 @@ def observe_controller_operation(
         if process is None or process.identity is None:
             raise RuntimeError("controller process identity is unavailable")
         token = _job_observer._register(
-            default_state_root(),
+            root,
             observation.payload(),
             process,
             owner_kind="controller_operation",
@@ -175,7 +204,7 @@ def observe_controller_operation(
     try:
         yield True
     finally:
-        if token is not None and not _job_observer._unregister(default_state_root(), token):
+        if token is not None and not _job_observer._unregister(root, token):
             print(
                 "remrun observation cleanup unavailable; the stale operation row "
                 "will be hidden after its exact controller process ends",

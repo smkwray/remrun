@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from remrun.fleet import cli, jobs
@@ -54,12 +55,17 @@ def test_probe_device_preserves_exact_metrics(monkeypatch):
 
 
 def test_probe_device_local_reads_registry_without_transport(monkeypatch, tmp_path):
+    """The local read uses the configured root other controllers query over SSH.
+
+    On Windows the configured root differs from the process default, so reading
+    the default would hide every job launched on this machine by another controller.
+    """
     payload = {
         "schema": 1, "status": "ok", "jobs": [job_row(target="LOCAL")], "errors": [],
         "coverage": {"scope": "registered_jobs_only", "mixed_version": False},
     }
     seen = []
-    monkeypatch.setattr(jobs, "default_state_root", lambda: tmp_path)
+    monkeypatch.setenv("REMRUN_STATE_ROOT", str(tmp_path / "process-default"))
     monkeypatch.setattr(
         jobs._job_observer,
         "_query",
@@ -74,7 +80,7 @@ def test_probe_device_local_reads_registry_without_transport(monkeypatch, tmp_pa
     view = jobs.probe_device(device("LOCAL"), sample_interval=0.05, local=True)
 
     assert view.reachable and view.status == "ok"
-    assert seen == [(tmp_path, 0.05)]
+    assert seen == [(Path("/state"), 0.05)]
 
 
 def test_probe_failure_is_unknown_not_empty_success(monkeypatch):
@@ -247,7 +253,6 @@ def test_parser_exposes_jobs_options():
 
 
 def test_executor_registers_one_observation_for_a_batch(tmp_path, monkeypatch):
-    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "1")
     from remrun.config import RemrunConfig
     from remrun.fleet import executor
     from remrun.fleet.prepared import (
@@ -258,7 +263,7 @@ def test_executor_registers_one_observation_for_a_batch(tmp_path, monkeypatch):
     dev = Device.from_mapping("LOCAL_SIM", {
         "kind": "local-sim", "os": "posix", "address_candidates": ["localhost"],
         "project_root": str(tmp_path / "remote"), "state_root": str(tmp_path / "devstate"),
-        "cache_root": str(tmp_path / "cache"),
+        "cache_root": str(tmp_path / "cache"), "observe_jobs": True,
     })
     cfg = RemrunConfig(
         repo_root=tmp_path, defaults={}, devices={"LOCAL_SIM": dev}, project_roots={}, offload={},
@@ -305,7 +310,6 @@ def test_executor_observation_is_dormant_by_default(tmp_path, monkeypatch):
     )
     from remrun.transport import LocalSimTransport
 
-    monkeypatch.delenv("REMRUN_FLEET_JOBS_OBSERVE", raising=False)
     dev = Device.from_mapping(
         "LOCAL_SIM",
         {

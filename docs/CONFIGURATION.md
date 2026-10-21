@@ -342,12 +342,13 @@ learning. The
 intrinsic `fleet command` family remains exact, nonbatchable argv passthrough and does not
 use a configured task named `cmd`.
 
-`remrun fleet jobs` reads target-local observation registries across the fleet. Querying
-is always read-only. Launch-side registration remains off unless the controller explicitly
-sets `REMRUN_FLEET_JOBS_OBSERVE=1`; enable it only after the target's native lifecycle gate
-passes. This switch changes observation only, not queue placement or memory-guard policy.
-When enabled, it also records each in-progress `git-sync` as one operation row with its
-project, source controller, peer, and direction. Its CPU, thread, and RAM values are
+`remrun fleet jobs` reads target-local observation registries across the fleet, each below
+its device's configured `state_root`. Querying is always read-only. Launch-side registration
+remains off unless the target device declares `observe_jobs = true`; declare it only after
+the target's native lifecycle gate passes. This switch changes observation only, not queue
+placement or memory-guard policy. When this controller's own device declares it, it also
+records each in-progress `git-sync` as one operation row with its project, source
+controller, peer, and direction. Its CPU, thread, and RAM values are
 intentionally unavailable: a Git sync spans local Git, transfer, and peer Git, so partial
 metrics would misstate the operation. Concurrent operations from different projects remain
 separate rows.

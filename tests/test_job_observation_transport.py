@@ -211,7 +211,6 @@ def test_base_transport_default_is_explicitly_unsupported_and_executes_once():
 
 
 def test_dispatch_reclaim_uses_observed_execution(monkeypatch):
-    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "1")
     from types import SimpleNamespace
 
     from remrun.fleet import dispatcher
@@ -219,6 +218,7 @@ def test_dispatch_reclaim_uses_observed_execution(monkeypatch):
     dev = Device.from_mapping("WIN", {
         "kind": "ssh-powershell", "os": "windows", "address_candidates": ["host"],
         "state_root": r"D:\state", "reclaim": {"command": [r"C:\tool.exe", "workingsets"]},
+        "observe_jobs": True,
     })
     captured = []
 
@@ -419,16 +419,19 @@ def test_posix_observer_remains_inside_schema2_guard_with_one_login_shell(monkey
     assert "cd /work && python3 -c" in shell_argv[2]
 
 
-def test_observation_activation_switch_is_default_off_and_explicit(monkeypatch):
-    from remrun.job_observation import active_job_observation_enabled
+def test_observation_activation_is_a_per_target_boolean_declaration():
+    """Only a target that declares it passed its native gate is observed."""
+    from remrun.job_observation import job_observation_enabled
 
-    monkeypatch.delenv("REMRUN_FLEET_JOBS_OBSERVE", raising=False)
-    assert active_job_observation_enabled() is False
-    for value in ("1", "true", "YES", "on"):
-        monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", value)
-        assert active_job_observation_enabled() is True
-    monkeypatch.setenv("REMRUN_FLEET_JOBS_OBSERVE", "0")
-    assert active_job_observation_enabled() is False
+    def device(**extra):
+        return Device.from_mapping("T", {"kind": "ssh-posix", "os": "linux", **extra})
+
+    assert job_observation_enabled(device()) is False
+    assert job_observation_enabled(device(observe_jobs=False)) is False
+    assert job_observation_enabled(device(observe_jobs=True)) is True
+    assert job_observation_enabled(None) is False
+    with pytest.raises(ValueError, match="observe_jobs must be a boolean"):
+        device(observe_jobs="true")
 
 
 def test_dispatch_reclaim_observation_is_dormant_by_default(monkeypatch):
@@ -436,7 +439,6 @@ def test_dispatch_reclaim_observation_is_dormant_by_default(monkeypatch):
 
     from remrun.fleet import dispatcher
 
-    monkeypatch.delenv("REMRUN_FLEET_JOBS_OBSERVE", raising=False)
     dev = Device.from_mapping(
         "WIN",
         {

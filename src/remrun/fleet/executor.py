@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 from ..config import RemrunConfig, load_config, load_retention
-from ..job_observation import JobObservation, active_job_observation_enabled, controller_label
+from ..job_observation import JobObservation, controller_label, job_observation_enabled
 from ..state import default_state_root, iso_plus_seconds, utc_now_iso
 from ..target_resources import (
     EMPTY_POLICY_DIGEST,
@@ -1522,7 +1522,7 @@ def _run_prepared_batch(device_name: str, tasks: list[FleetTask], config: Remrun
             result = finalize_durable_result(terminal, execution)
         else:
             observed_exec = getattr(transport, "exec_observed", None)
-            if not active_job_observation_enabled() or observed_exec is None:
+            if not job_observation_enabled(device) or observed_exec is None:
                 result = transport.exec(
                     command, cwd=stage, telemetry=True, env=env,
                     memory_reservation=reservation,

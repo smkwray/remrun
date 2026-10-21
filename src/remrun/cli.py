@@ -28,13 +28,16 @@ from .config import (
 )
 from .gitsync import HOOK_BEGIN
 from .job_observation import (
-    JobObservation, active_job_observation_enabled, controller_label,
+    JobObservation, controller_label, job_observation_enabled, local_device,
+    local_registry_root, observed_job_id, observed_project_id,
 )
 from .memory_guard import MIB, MemoryAdmissionResult, MemoryReservation
 from .models import RunPlan, WorkloadSpec
 from .output import Reporter, emit_json_document
 from .planner import make_run_plan
-from .project import ProjectDetectionError, detect_project, find_project_config
+from .project import (
+    ProjectDetectionError, detect_project, find_project_config, project_root_base,
+)
 from .profile import (
     LOCAL_DEVICE, WorkloadObservation, command_key, device_profile, load_job_costs,
     load_profiles, merge_job_costs, predict_job, profile_project_id,
@@ -93,7 +96,7 @@ from .transport import (
 
 KNOWN_COMMANDS = {
     "capabilities", "devices", "doctor", "plan", "run", "status", "logs", "clean", "bench", "sync",
-    "git-sync", "runner", "action", "resolve-unknown", "resume",
+    "git-sync", "runner", "action", "resolve-unknown", "resume", "observe",
 }
 
 # Exit codes (see docs/AGENT_OUTPUT_SPEC.md).
@@ -212,6 +215,20 @@ def split_command(argv: list[str]) -> tuple[list[str], list[str]]:
     return argv, []
 
 
+_JOB_LABEL_LIMIT = 64
+
+
+def _job_label(value: str) -> str:
+    """A short human label for ``fleet jobs``; spaces are stored as underscores."""
+    text = value.strip()
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:@+- ")
+    if not text or len(text) > _JOB_LABEL_LIMIT or not set(text) <= allowed:
+        raise argparse.ArgumentTypeError(
+            f"must be 1-{_JOB_LABEL_LIMIT} letters, digits, spaces or . _ : @ + -"
+        )
+    return text
+
+
 def _positive_mib(value: str) -> int:
     try:
         result = int(value)
@@ -247,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     head, cmd_tokens = split_command(argv)
     parser = build_parser()
     args = parser.parse_args(head)
-    if args.command_name in {"run", "plan", "bench"}:
+    if args.command_name in {"run", "plan", "bench", "observe"}:
         args.cmd = cmd_tokens
     if args.command_name == "capabilities":
         try:
@@ -267,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_plan(args, reporter)
         if args.command_name == "run":
             return cmd_run(args, reporter)
+        if args.command_name == "observe":
+            return cmd_observe(args, reporter)
         if args.command_name == "resume":
             return cmd_resume(args, reporter)
         if args.command_name == "status":
@@ -333,6 +352,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auto", action="store_true", help="Pick the target device automatically")
     p.add_argument("--scope", help="declared [parallel.scopes.<name>] write scope for this run")
     p.add_argument("--workload", help="selected schema-1 project resource workload")
+    p.add_argument("--label", type=_job_label,
+                   help="short label shown by `fleet jobs`, e.g. 'regen 2019'")
     p.add_argument("--dry-run", action="store_true", help="Print plan and do not execute")
     p.add_argument("--no-pullback", action="store_true", help="Skip post-run pullback")
     p.add_argument("--no-telemetry", action="store_true", help="Skip resource telemetry")
@@ -352,6 +373,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="opt into a target-supervised run resumable by this controller; "
              "with --auto, selection freezes before launch",
     )
+
+    p = sub.add_parser(
+        "observe",
+        help="Run a command on this machine, registered so `fleet jobs` can see it",
+    )
+    p.add_argument("--label", type=_job_label,
+                   help="short label shown by `fleet jobs`, e.g. 'regen 2019'")
 
     p = sub.add_parser("resume", help="Resume an exact controller-owned durable run")
     p.add_argument("run_id", help="the exact durable run ID")
@@ -2213,8 +2241,8 @@ def _run_locked(
         if memory_reservation is not None:
             exec_kwargs["memory_reservation"] = memory_reservation
         observed_exec = getattr(transport, "exec_observed", None)
-        if not active_job_observation_enabled() or observed_exec is None:
-            # Exact-base landing is dormant unless the controller explicitly opts in.
+        if not job_observation_enabled(plan.target) or observed_exec is None:
+            # Observation is dormant unless the target declares observe_jobs.
             # Third-party/test doubles continue through their established exec seam.
             result = transport.exec(dispatch_command, cwd=remote_cwd, **exec_kwargs)
         else:
@@ -2224,6 +2252,7 @@ def _run_locked(
                 target=plan.target.name,
                 phase="command",
                 command=dispatch_command,
+                declared_label=getattr(args, "label", None),
             )
             result = observed_exec(
                 dispatch_command,
@@ -2716,6 +2745,207 @@ def _run_locked(
     return final_exit
 
 
+def _observed_project(cwd: Path, config, device) -> str:  # noqa: ANN001
+    """The project directory a local command runs in, for display in ``fleet jobs``.
+
+    Projects on this machine live under its own device ``project_root``; the
+    controller project root is the fallback. A command started anywhere inside a
+    project, including its ``.worktrees``, is that project's work.
+    """
+    here = cwd.resolve()
+    bases = []
+    if device is not None and device.project_root:
+        bases.append(Path(device.project_root).expanduser())
+    try:
+        bases.append(project_root_base(config))
+    except ProjectDetectionError:
+        pass
+    for base in bases:
+        try:
+            parts = here.relative_to(base.resolve()).parts
+        except (OSError, ValueError):
+            continue
+        if parts:
+            return parts[0]
+    return here.name or "project"
+
+
+def _exit_status(code: int) -> int:
+    return (128 - code) if code < 0 else code
+
+
+def _claim_terminal() -> tuple[int, int] | None:
+    """Return this process's controlling terminal and group when it holds the foreground."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        if os.tcgetpgrp(fd) == os.getpgrp():
+            return fd, os.getpgrp()
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def _set_foreground(fd: int, pgid: int) -> None:
+    import signal
+
+    previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    try:
+        os.tcsetpgrp(fd, pgid)
+    finally:
+        signal.signal(signal.SIGTTOU, previous)
+
+
+def _observe_posix(command: list[str], root: Path, observation: JobObservation) -> int:
+    """Run ``command`` as its own process group, registered as that group.
+
+    The group is what ``fleet jobs`` measures, and it is the foreground job when a
+    terminal is attached, so Ctrl-C and terminal input reach the command exactly as
+    they would without remrun. Signals sent to remrun are passed to the group, and
+    remrun returns only when the command itself has exited, with the command's status:
+    observation, terminal restoration and registry cleanup can only warn.
+    """
+    import signal
+
+    from . import _job_observer as observer
+
+    started: list[subprocess.Popen] = []
+    pending: list[int] = []
+
+    def signal_group(pid: int, signum: int) -> None:
+        try:
+            os.killpg(pid, signum)
+        except (ProcessLookupError, PermissionError):
+            pass  # the group has already exited
+
+    def forward(signum, _frame) -> None:  # noqa: ANN001
+        if not started:
+            pending.append(signum)
+            return
+        signal_group(started[0].pid, signum)
+
+    previous = {
+        sig: signal.signal(sig, forward)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    }
+    terminal = None
+    try:
+        terminal = _claim_terminal()
+        proc = subprocess.Popen(command, process_group=0)
+        started.append(proc)
+        if terminal is not None:
+            try:
+                _set_foreground(terminal[0], proc.pid)
+            except OSError as exc:
+                if proc.poll() is None:
+                    # A command left outside the terminal stops on its first read and
+                    # nothing would resume it, so end it rather than leave it running.
+                    print(f"remrun observe: could not give the command the terminal ({exc}); "
+                          "stopping it", file=sys.stderr, flush=True)
+                    signal_group(proc.pid, signal.SIGTERM)
+                    try:
+                        return _exit_status(proc.wait(timeout=10))
+                    except subprocess.TimeoutExpired:
+                        signal_group(proc.pid, signal.SIGKILL)
+                        return _exit_status(proc.wait())
+            signal_group(proc.pid, signal.SIGCONT)
+        for signum in pending:
+            signal_group(proc.pid, signum)
+        try:
+            child = observer._child_row(proc)
+            owner = observer._processes().get(os.getpid())
+            if child is None or owner is None:
+                raise RuntimeError("process identity is unavailable")
+            token = observer._register(
+                root, observation.payload(), child,
+                owner_kind="posix_pgid", owner_key=str(proc.pid),
+                owner_process=owner, witness=child,
+            )
+        except Exception as exc:  # noqa: BLE001 - observation never decides the run
+            token = None
+            print(f"remrun observation unavailable; command runs unobserved: {exc}",
+                  file=sys.stderr, flush=True)
+        code = proc.wait()
+        if token is not None:
+            # Descendants left in the group are still this job; keep one as its witness.
+            try:
+                survivors = [row for row in observer._processes().values()
+                             if row.pgid == proc.pid and row.identity is not None]
+                if survivors:
+                    observer._update_record_processes(root, token, witness=survivors[0])
+                else:
+                    observer._unregister(root, token)
+            except Exception as exc:  # noqa: BLE001
+                print(f"remrun observation cleanup unavailable: {exc}", file=sys.stderr)
+        return _exit_status(code)
+    finally:
+        try:
+            if terminal is not None:
+                try:
+                    _set_foreground(*terminal)
+                finally:
+                    os.close(terminal[0])
+        except OSError as exc:
+            print(f"remrun observe: could not restore the terminal: {exc}", file=sys.stderr)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def _observe_windows(command: list[str], root: Path, observation: JobObservation) -> int:
+    """Run ``command`` under the job-object observer; the console delivers Ctrl-C to it."""
+    from . import _job_observer
+
+    proc = subprocess.Popen([
+        sys.executable, "-S", str(Path(_job_observer.__file__)), "run",
+        "--state-root", str(root), "--metadata-b64", observation.encoded(), "--", *command,
+    ])
+    while True:
+        try:
+            return _exit_status(proc.wait())
+        except KeyboardInterrupt:
+            continue
+
+
+def cmd_observe(args: argparse.Namespace, reporter: Reporter) -> int:
+    """Run a command on this machine, registered in its active-job registry.
+
+    Other controllers see it through ``fleet jobs`` exactly like a job launched here
+    by ``run``. Observation is fail-open: the command runs and its exit status is
+    returned whether or not it could be registered.
+    """
+    command = normalize_cmd(args.cmd)
+    config = load_config()
+    device = local_device(config)
+    if not job_observation_enabled(device):
+        reporter.event(
+            "observation_unavailable",
+            reason=(
+                "this machine is not a configured remrun device" if device is None
+                else f"{device.name} does not declare observe_jobs"
+            ),
+            detail="command runs unobserved",
+        )
+        return _exit_status(subprocess.call(command))
+    project = _observed_project(Path.cwd(), config, device)
+    observation = JobObservation.for_command(
+        job_id=new_run_id(device.name, project),
+        project=project,
+        target=device.name,
+        phase="native",
+        command=command,
+        declared_label=getattr(args, "label", None),
+        source_controller=device.name,
+    )
+    root = local_registry_root(config)
+    if os.name == "posix":
+        return _observe_posix(command, root, observation)
+    return _observe_windows(command, root, observation)
+
+
 def cmd_bench(args: argparse.Namespace, reporter: Reporter) -> int:
     """Benchmark a command: time it locally and via the full remrun trip to each
     target, fold both into the profile, and print an offload recommendation.
@@ -3045,12 +3275,13 @@ def _running_observation_matches(transport, record: dict[str, object]) -> bool: 
     jobs = payload.get("jobs") if isinstance(payload, dict) else None
     if not isinstance(jobs, list):
         raise DurableStateError("observer query returned malformed jobs")
-    matches = [job for job in jobs if isinstance(job, dict) and job.get("job_id") == record["run_id"]]
+    run_id = observed_job_id(record["run_id"])
+    matches = [job for job in jobs if isinstance(job, dict) and job.get("job_id") == run_id]
     if len(matches) != 1:
         return False
     job = matches[0]
     expected = {
-        "project": record["project_id"],
+        "project": observed_project_id(record["project_id"]),
         "source_controller": record["controller"],
         "target": record["target"],
     }
@@ -3487,6 +3718,7 @@ def _run_durable_locked(
         target=plan.target.name,
         phase="command",
         command=dispatch_command,
+        declared_label=getattr(args, "label", None),
         source_controller=source_controller,
     )
     record: dict[str, object] = {

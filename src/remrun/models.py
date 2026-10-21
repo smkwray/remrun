@@ -27,6 +27,9 @@ class Device:
     # Enabled devices may still be reserved for explicit jobs while they are
     # being qualified or when they are unsuitable for general auto-placement.
     automatic_placement: bool = True
+    # Register runs on this target in its active-job registry so `fleet jobs` can see
+    # them. Declare it only after the target passes native-gates/fleet_jobs_native_gate.py.
+    observe_jobs: bool = False
     tags: list[str] = field(default_factory=list)
     max_jobs: int = 1
     notes: str = ""
@@ -75,6 +78,8 @@ class Device:
             raise ValueError("allow_explicit_run must be a boolean")
         if type(self.automatic_placement) is not bool:
             raise ValueError("automatic_placement must be a boolean")
+        if type(self.observe_jobs) is not bool:
+            raise ValueError("observe_jobs must be a boolean")
         topology = parse_gpu_memory_topology(self.gpu_memory_topology)
         object.__setattr__(self, "gpu_memory_topology", topology)
         if topology == "unified" and self.vram_gb > 0:
@@ -96,6 +101,7 @@ class Device:
             cache_root=str(data.get("cache_root", "")),
             allow_explicit_run=data.get("allow_explicit_run", False),
             automatic_placement=data.get("automatic_placement", True),
+            observe_jobs=data.get("observe_jobs", False),
             tags=list(data.get("tags", [])),
             max_jobs=int(data.get("max_jobs", 1)),
             notes=str(data.get("notes", "")),

@@ -30,7 +30,7 @@ from typing import Any, Callable
 from .. import sync
 from ..config import RemrunConfig, global_excludes, load_config
 from ..output import Reporter
-from ..job_observation import JobObservation, active_job_observation_enabled
+from ..job_observation import JobObservation, job_observation_enabled
 from ..state import default_state_root, utc_now_iso
 from ..target_resources import TargetReservation, TargetResourceClient, TargetResourceError
 from . import adapters, executor, placement, probes, profiles
@@ -1054,7 +1054,7 @@ def _run_device_reclaim(dev, reporter: Reporter) -> bool:  # noqa: ANN001
             return False
         tokens = [transport.expand_remote(t) if t.startswith("~") else t for t in tokens]
         observed_exec = getattr(transport, "exec_observed", None)
-        if not active_job_observation_enabled() or observed_exec is None:
+        if not job_observation_enabled(dev) or observed_exec is None:
             transport.exec(tokens, cwd=("C:\\" if dev.is_windows else "/"),
                            telemetry=False, timeout=30)
         else:

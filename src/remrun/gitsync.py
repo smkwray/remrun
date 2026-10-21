@@ -17,7 +17,9 @@ from pathlib import Path
 from .config import RemrunConfig, load_project_config
 from .job_observation import (
     JobObservation,
-    active_job_observation_enabled,
+    job_observation_enabled,
+    local_device,
+    local_registry_root,
     observe_controller_operation,
 )
 from .output import Reporter
@@ -47,8 +49,12 @@ class GitSyncError(RuntimeError):
 def _git_sync_observation_context(
     config: RemrunConfig, *, device_name: str, operation: str
 ):
-    """Return an opt-in, fail-open controller-operation observation context."""
-    if not active_job_observation_enabled():
+    """Return an opt-in, fail-open controller-operation observation context.
+
+    The row lives in this controller's registry, so this controller's own device
+    declaration decides whether it is written.
+    """
+    if not job_observation_enabled(local_device(config)):
         return nullcontext(False)
     try:
         effective = _git_sync_config(config)
@@ -68,7 +74,7 @@ def _git_sync_observation_context(
         # The real Git-sync path owns project/config error reporting. Failure to
         # prepare optional observation must not replace or duplicate that error.
         return nullcontext(False)
-    return observe_controller_operation(observation)
+    return observe_controller_operation(observation, local_registry_root(config))
 
 
 class _MemoryLimitedGitTransport:
