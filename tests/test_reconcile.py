@@ -29,6 +29,42 @@ def setup(tmp_path: Path):
     return local, remote_root, transport, backup
 
 
+def test_preflight_refuses_local_edit_after_push(tmp_path: Path, monkeypatch):
+    local, remote_root, transport, backup = setup(tmp_path)
+    path = local / "input.txt"
+    path.write_text("initial", encoding="utf-8")
+    first = reconcile(local, remote_root, transport, backup)
+    path.write_text("intended push", encoding="utf-8")
+    original_push = transport.push_file
+
+    def push_then_edit(source, destination):
+        original_push(source, destination)
+        source.write_text("concurrent local edit", encoding="utf-8")
+
+    monkeypatch.setattr(transport, "push_file", push_then_edit)
+    result = reconcile(
+        local, remote_root, transport, backup, first.local_manifest, first.remote_manifest,
+    )
+    assert result.has_conflicts
+    assert result.conflicts[0].path == "input.txt"
+    assert path.read_text() == "concurrent local edit"
+    assert (Path(remote_root) / "input.txt").read_text() == "intended push"
+
+
+def test_preflight_does_not_rehash_untouched_large_historical_file(tmp_path, monkeypatch):
+    local, remote_root, transport, backup = setup(tmp_path)
+    (local / "large.bin").write_bytes(b"unchanged content")
+    kwargs = dict(transport=transport, local_root=local, remote_root=remote_root,
+                  excludes=[], hash_below_bytes=1, backup_root=backup)
+    first = preflight_reconcile(**kwargs, prev_local=None, prev_remote=None)
+    assert not first.has_conflicts
+    monkeypatch.setattr(transport, "hash_file", lambda *_args: pytest.fail("untouched historical file"))
+    result = preflight_reconcile(
+        **kwargs, prev_local=first.local_manifest, prev_remote=first.remote_manifest,
+    )
+    assert not result.has_conflicts
+
+
 def test_fresh_local_entry_fails_closed_on_unexplained_inspection_error(
     tmp_path: Path, monkeypatch
 ):

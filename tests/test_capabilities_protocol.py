@@ -8,7 +8,7 @@ from remrun.protocol import build_capabilities_document
 EXPECTED = {
     "schema": "remrun.capabilities",
     "version": 1,
-    "protocol": {"major": 1, "minor": 1},
+    "protocol": {"major": 1, "minor": 2},
     "package_version": "0.1.0",
     "documents": {
         "requests": [{"schema": "remrun.target-resource-policy", "version": 1}],

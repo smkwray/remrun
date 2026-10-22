@@ -21,6 +21,16 @@ def test_should_exclude_tree_pattern():
     assert not should_exclude("src/scratch/a.txt", ["scratch/**"])
 
 
+def test_default_transfer_surface_includes_dependency_lockfiles(tmp_path: Path):
+    config = load_config(Path(__file__).resolve().parents[1])
+    for name in ("Cargo.lock", "uv.lock", "nested/Cargo.lock"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("pinned dependency inputs", encoding="utf-8")
+    manifest = build_manifest(tmp_path, global_excludes(config), always_hash=True)
+    assert set(manifest) == {"Cargo.lock", "uv.lock", "nested/Cargo.lock"}
+
+
 def test_build_manifest_excludes(tmp_path: Path):
     (tmp_path / "a.txt").write_text("a")
     (tmp_path / "scratch").mkdir()

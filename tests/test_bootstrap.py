@@ -60,6 +60,32 @@ def _plan(project: ProjectContext):
     )
 
 
+@pytest.mark.parametrize("stdout", ["not JSON\n", "[]\n"])
+def test_bootstrap_protocol_failure_preserves_helper_diagnostics(
+    tmp_path: Path, monkeypatch, stdout: str,
+):
+    project = _project(tmp_path)
+    device = _device(tmp_path)
+    transport = LocalSimTransport(device)
+    plan = _plan(project)
+    runenv = resolve_run_env(
+        device=device, project=project,
+        project_config={"run": {
+            "use_venv": True, "venv_layout": "external", "bootstrap": {},
+        }},
+    )
+    monkeypatch.setattr(
+        transport, "exec", lambda *_args, **_kwargs: ExecResult(1, stdout, "helper error\n")
+    )
+    result = execute_bootstrap(
+        transport, device=device, project=project, plan=plan,
+        remote_root=str(project.local_project_root), runenv=runenv,
+    )
+    assert result.status == "unsupported"
+    assert result.helper_stdout == stdout
+    assert result.helper_stderr == "helper error\n"
+
+
 def test_parse_fingerprint_covers_declaration_and_lock_bytes(tmp_path: Path):
     project = _project(tmp_path)
     first = _plan(project)

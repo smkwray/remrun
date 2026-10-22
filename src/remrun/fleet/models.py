@@ -336,6 +336,7 @@ class DrainResultV1:
     completed: list[dict[str, Any]] = field(default_factory=list)
     left_running: list[dict[str, Any]] = field(default_factory=list)
     stop: dict[str, Any] | None = None
+    job_outcomes: dict[str, str] | None = None
     schema: int = field(default=1, init=False)
 
     def __post_init__(self) -> None:
@@ -359,6 +360,13 @@ class DrainResultV1:
             raise ValueError(f"{self.status} may not carry an error object")
         if self.status == "drained" and (self.queued or self.active):
             raise ValueError("drained requires an empty final queue")
+        if self.job_outcomes is not None and (
+            not isinstance(self.job_outcomes, dict)
+            or any(not isinstance(job_id, str) or not job_id
+                   or state not in {"done", "failed_final", "needs_review", "cancelled"}
+                   for job_id, state in self.job_outcomes.items())
+        ):
+            raise ValueError("job outcomes require named terminal job states")
         if self.status == "stopped":
             if not isinstance(self.stop, dict) or set(self.stop) != {
                 "reason", "return_bound_s", "bound_exceeded",
@@ -385,6 +393,8 @@ class DrainResultV1:
             return 4
         if self.status == "stuck_unplaceable":
             return 2
+        if self.job_outcomes is not None:
+            return int(any(state != "done" for state in self.job_outcomes.values()))
         return 1 if self.failed or self.review else 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -403,4 +413,5 @@ class DrainResultV1:
             "completed": [dict(row) for row in self.completed],
             "left_running": [dict(row) for row in self.left_running],
             "stop": dict(self.stop) if self.stop is not None else None,
+            "job_outcomes": dict(self.job_outcomes) if self.job_outcomes is not None else None,
         }

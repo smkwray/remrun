@@ -636,7 +636,12 @@ def test_exec_observed_telemetry_grants_breakaway_only_to_observer_wrapper(
     telemetry_stderr = (
         "\n__REMRUN_TELEMETRY__ " + json.dumps(telemetry_payload) + "\n"
     ).encode()
-    rec = Recorder(lambda argv, inp: cp(37, stderr=telemetry_stderr))
+    def observed_result(argv, inp):
+        request = json.loads(next(data for name, _remote, data in staged if name == "argv.json"))
+        token = request[request.index("--exit-token") + 1]
+        return cp(37, stderr=telemetry_stderr + f"__REMRUN_OBSERVED_EXIT_{token}__37;".encode())
+
+    rec = Recorder(observed_result)
     monkeypatch.setattr(t, "_run", rec)
     command = [r"C:\project\adapter.ps1", "observed"]
     observation = JobObservation.for_command(
@@ -708,7 +713,12 @@ def test_exec_observed_telemetry_staging_failure_falls_back_before_user_start(
     monkeypatch.setattr(t, "push_file", fail_request_stage)
     deleted = []
     monkeypatch.setattr(t, "delete_remote", lambda remote: deleted.append(remote))
-    rec = Recorder(lambda argv, inp: cp(19))
+    def observed_result(argv, inp):
+        import re
+        token = re.search(r"'--exit-token' '([a-f0-9]{32})'", decoded(argv[-1])).group(1)
+        return cp(19, stderr=f"__REMRUN_OBSERVED_EXIT_{token}__19;".encode())
+
+    rec = Recorder(observed_result)
     monkeypatch.setattr(t, "_run", rec)
     command = [r"C:\project\adapter.ps1", "once"]
     observation = JobObservation.for_command(
@@ -1056,6 +1066,43 @@ def test_pull_decodes_base64_and_sets_mtime(monkeypatch, tmp_path: Path):
     assert abs(out.stat().st_mtime_ns - ns) < 1_000_000
 
 
+@pytest.mark.parametrize("code", [0, 1, 130])
+def test_short_control_preserves_native_exit_through_ssh(monkeypatch, code):
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+
+    def remote(_address, source, **kwargs):
+        marker = re.search(r"__REMRUN_CONTROL_EXIT_[0-9a-f]+__", source).group()
+        return cp(0 if code == 0 else 1, b"helper stdout", ("user error" + marker + str(code) + ";").encode())
+
+    monkeypatch.setattr(t, "_ps_remote", remote)
+    result = t.exec_control(["python", "-c", f"raise SystemExit({code})"], cwd=r"C:\project")
+    assert result.exit_code == code
+    assert result.stdout == "helper stdout"
+    assert result.stderr == "user error"
+
+
+def test_large_control_argv_uses_stdin_without_losing_helper_exit(monkeypatch):
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    argument = "quoted ' argument " * 1000
+    seen = []
+
+    def framed(source, cwd, **kwargs):
+        seen.append(source)
+        assert argument.replace("'", "''") in source
+        marker = re.search(r"__REMRUN_CONTROL_EXIT_[0-9a-f]+__", source).group()
+        return transport_mod.ExecResult(0, "helper stdout", marker + "7;")
+
+    monkeypatch.setattr(t, "exec_control_source", framed)
+    monkeypatch.setattr(t, "_ps_remote", lambda *_a, **_k: pytest.fail("oversized encoded command"))
+    result = t.exec_control(["python", "helper.py", argument], cwd=r"C:\project")
+    assert len(seen) == 1
+    assert result.exit_code == 7
+    assert result.stdout == "helper stdout"
+    assert result.stderr == ""
+
+
 def test_pull_empty_file(monkeypatch, tmp_path: Path):
     t = SSHPowerShellTransport(device())
     t._address = "winbox"
@@ -1065,6 +1112,70 @@ def test_pull_empty_file(monkeypatch, tmp_path: Path):
     out = tmp_path / "e.bin"
     t.pull_file("C:\\proj\\e.bin", out)
     assert out.read_bytes() == b""
+
+
+def test_pull_does_not_narrow_windows_timestamp_to_int64(monkeypatch, tmp_path: Path):
+    t = SSHPowerShellTransport(device())
+    t._address = "winbox"
+    rec = Recorder(lambda _a, _i: cp(0, b"-11644473600000000000\r\neA==\r\n"))
+    monkeypatch.setattr(t, "_run", rec)
+    out = tmp_path / "old.bin"
+    t.pull_file("C:\\project\\old.bin", out)
+    assert out.read_bytes() == b"x"
+    script = decoded(rec.commands[-1])
+    assert "[long]" not in script
+    assert "[decimal]" in script
+
+
+@pytest.mark.parametrize("cancelled", [True, False])
+def test_observed_windows_interrupt_cancels_only_exact_owned_job(monkeypatch, cancelled):
+    t = SSHPowerShellTransport(device())
+    metadata = JobObservation.for_command(
+        job_id="run-1", project="example-project", target="WINBOX",
+        source_controller="CTRL", phase="command", command=["example.exe"],
+    )
+    monkeypatch.setattr(t, "_ensure_job_observer", lambda: (r"D:\state", r"D:\state\helper.py"))
+
+    def interrupted(command, *_args, **_kwargs):
+        assert "--exit-token" in command
+        raise KeyboardInterrupt
+
+    def cancel(command, **_kwargs):
+        assert "cancel-windows" in command
+        assert command[command.index("--metadata-b64") + 1] == metadata.encoded()
+        return transport_mod.ExecResult(0 if cancelled else 2, json.dumps({
+            "schema": 1, "job_id": metadata.payload()["job_id"],
+            "command_sha256": metadata.command_sha256, "owned_job_cancelled": cancelled,
+        }), "")
+
+    monkeypatch.setattr(t, "exec", interrupted)
+    monkeypatch.setattr(t, "exec_control", cancel)
+    with pytest.raises(transport_mod.CommandCancelledError) as caught:
+        t.exec_observed(["example.exe"], r"C:\project", observation=metadata)
+    assert caught.value.owned_job_cancelled is cancelled
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_observer_failure_is_not_command_completion(monkeypatch, completed):
+    t = SSHPowerShellTransport(device())
+    metadata = JobObservation.for_command(
+        job_id="run-1", project="example-project", target="WINBOX",
+        source_controller="CTRL", phase="command", command=["example.exe"],
+    )
+    monkeypatch.setattr(t, "_ensure_job_observer", lambda: (r"D:\state", r"D:\state\helper.py"))
+
+    def result(command, *_args, **_kwargs):
+        token = command[command.index("--exit-token") + 1]
+        stderr = f"__REMRUN_OBSERVED_EXIT_{token}__1;" if completed else "helper failed"
+        return transport_mod.ExecResult(1, "partial", stderr)
+
+    monkeypatch.setattr(t, "exec", result)
+    if completed:
+        actual = t.exec_observed(["example.exe"], r"C:\project", observation=metadata)
+        assert actual.exit_code == 1 and actual.stderr == ""
+    else:
+        with pytest.raises(TransportError, match="completion is unknown"):
+            t.exec_observed(["example.exe"], r"C:\project", observation=metadata)
 
 
 def test_delete_and_mkdir(monkeypatch):

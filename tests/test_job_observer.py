@@ -991,3 +991,104 @@ def test_windows_handle_keeper_unregisters_only_after_job_is_empty(tmp_path, mon
         tmp_path, "keeper-token", observer._win_job_name("keeper-token")
     ) == 0
     assert events == ["ready", "sample", "sample", "unregister", "closed"]
+
+
+@pytest.mark.parametrize("keeper_matches", [True, False])
+def test_cancel_windows_job_requires_exact_keeper_and_only_terminates_owned_handle(
+    tmp_path, monkeypatch, keeper_matches,
+):
+    from types import SimpleNamespace
+
+    metadata = _metadata().payload()
+    keeper = observer.ProcessRow(300, 1, "windows:300:7", 7, 0.0, 4096, 1)
+    record = {**metadata, "owner_kind": "windows_job_v2", "owner_key": "unique-job",
+              "owner_pid": keeper.pid, "owner_identity": keeper.identity}
+    monkeypatch.setattr(observer, "_read_records", lambda _root: ([record], []))
+    monkeypatch.setattr(observer, "_processes", lambda: {300: keeper} if keeper_matches else {})
+    members = {200, 201}
+    monkeypatch.setattr(observer, "_windows_job_pids_by_name", lambda _name: set(members))
+    opened, terminated, closed = [], [], []
+
+    def open_job(name, *, terminate=False):
+        opened.append((name, terminate))
+        return "owned-handle"
+
+    def terminate(handle, code):
+        terminated.append((handle, code))
+        members.clear()
+        return True
+
+    monkeypatch.setattr(observer, "_win_open_job", open_job)
+    monkeypatch.setattr(observer, "_win_kernel32", lambda: SimpleNamespace(TerminateJobObject=terminate))
+    monkeypatch.setattr(observer, "_win_job_pids", lambda handle: set(members))
+    monkeypatch.setattr(observer, "_win_close", closed.append)
+    receipt = observer._cancel_windows_job(tmp_path, metadata)
+    assert receipt["owned_job_cancelled"] is keeper_matches
+    assert opened == [("unique-job", True)]
+    assert terminated == ([("owned-handle", 130)] if keeper_matches else [])
+    assert closed == ["owned-handle"]
+
+
+def test_cancel_windows_missing_or_mismatched_record_does_not_open_job(tmp_path, monkeypatch):
+    metadata = _metadata().payload()
+    monkeypatch.setattr(observer, "_read_records", lambda _root: ([{**metadata, "job_id": "other"}], []))
+    monkeypatch.setattr(observer, "_win_open_job", lambda *_a, **_kw: pytest.fail("unproved owner"))
+    assert observer._cancel_windows_job(tmp_path, metadata)["owned_job_cancelled"] is False
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_observer_completion_marker_requires_normal_command_return(tmp_path, monkeypatch, capsys, failed):
+    def run(*_args):
+        if failed:
+            raise RuntimeError("wait failed after launch")
+        return 7
+
+    monkeypatch.setattr(observer, "_run_command", run)
+    token = "a" * 32
+    argv = ["run", "--state-root", str(tmp_path), "--metadata-b64", _metadata().encoded(),
+            "--exit-token", token, "--", "example"]
+    if failed:
+        with pytest.raises(RuntimeError, match="wait failed"):
+            observer.main(argv)
+        assert "__REMRUN_OBSERVED_EXIT_" not in capsys.readouterr().err
+    else:
+        assert observer.main(argv) == 7
+        assert capsys.readouterr().err == f"__REMRUN_OBSERVED_EXIT_{token}__7;"
+
+
+def test_windows_postpublication_resume_failure_never_relaunches(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    user = SimpleNamespace(hProcess="user", hThread="user-thread", dwProcessId=200)
+    keeper = SimpleNamespace(hProcess="keeper", hThread="keeper-thread", dwProcessId=300)
+    events = []
+    monkeypatch.setattr(observer, "_win_create_named_job", lambda _name: "job")
+    monkeypatch.setattr(observer, "_win_create_suspended", lambda _command: user)
+    monkeypatch.setattr(observer, "_win_assign_process", lambda *_a: None)
+    monkeypatch.setattr(observer, "_win_create_keeper_suspended", lambda *_a: keeper)
+    monkeypatch.setattr(observer, "_win_process_row", lambda proc: observer.ProcessRow(
+        proc.dwProcessId, 100, f"windows:{proc.dwProcessId}:1", 1, 0.0, None, None,
+    ))
+    monkeypatch.setattr(observer, "_wait_for_keeper_ready", lambda *_a: None)
+    monkeypatch.setattr(observer, "_register", lambda *_a, **_kw: events.append("published"))
+    monkeypatch.setattr(observer, "_unregister", lambda *_a: events.append("unregistered"))
+    monkeypatch.setattr(observer, "_win_discard_suspended", lambda proc: events.append("discarded"))
+    monkeypatch.setattr(observer, "_win_terminate_process", lambda proc: None)
+    monkeypatch.setattr(observer, "_win_close", lambda handle: None)
+
+    def resume(proc):
+        if proc is user:
+            raise OSError("owned job was cancelled before ResumeThread")
+
+    def fallback(*_a, **_kw):
+        pytest.fail("a published command must never be relaunched unobserved")
+
+    monkeypatch.setattr(observer, "_win_resume", resume)
+    monkeypatch.setattr(observer.subprocess, "Popen", fallback)
+    metadata = JobObservation.for_command(
+        job_id="run-1", project="example-project", source_controller="CTRL",
+        target="WINBOX", phase="command", command=["example.exe"],
+    ).payload()
+    with pytest.raises(OSError, match="cancelled before ResumeThread"):
+        observer._run_windows_command(tmp_path, metadata, ["example.exe"])
+    assert events == ["published", "unregistered", "discarded"]

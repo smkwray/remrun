@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -45,6 +46,43 @@ def _active_and_queued_jobs(state_root: Path) -> tuple[str, str, str]:
         return running_id, queued_id, batch_id
     finally:
         queue.close()
+
+
+@pytest.mark.parametrize("stop_on_tick", [False, True])
+@pytest.mark.parametrize("terminal", ["done", "failed_final", "needs_review"])
+def test_recovered_attempt_exit_follows_final_job_outcome(
+    tmp_path, monkeypatch, terminal, stop_on_tick,
+):
+    stop = threading.Event() if stop_on_tick else None
+    state_root = tmp_path / "state"
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    job = queue.enqueue_prepared(
+        prepare_raw_command(["python", "-c", "pass"], device="A"), spec=None,
+        idempotency_key="recovered-attempt",
+    )
+    owner = queue.claim_many([job], "A", batch_id="recovered-batch",
+                             lease_until="2099-01-01T00:00:00Z", pool=None)
+    assert queue.complete_batch("recovered-batch", expected_state="leased", owner_token=owner)
+    if terminal != "done":
+        with sqlite3.connect(state_root / "fleet" / "fleet.db") as fixture:
+            fixture.execute("UPDATE jobs SET state=? WHERE job_id=?", (terminal, job))
+    queue.close()
+
+    def recovered_tick(*_args, **kwargs):
+        kwargs["_ledger"].record_started({"batch_id": "recovered-batch", "job_ids": [job]})
+        if stop is not None:
+            stop.set()
+        return {"recovered": 0, "placed": 0, "ran": 2, "ok": 1,
+                "failed": 1, "review": 0, "skipped": {}, "cooled": []}
+
+    monkeypatch.setattr(dispatcher, "drain_once", recovered_tick)
+    result = dispatcher.run(
+        SimpleNamespace(defaults={}), state_root=state_root,
+        job_ids=[job], until_empty=True, max_ticks=1, stop_event=stop,
+    )
+    assert result.failed == 1
+    assert result.exit_code == (0 if terminal == "done" else 1)
+    assert result.to_dict()["job_outcomes"] == {job: terminal}
 
 
 def test_stop_mid_tick_returns_within_bound_without_mutating_queue_evidence(
@@ -374,3 +412,31 @@ def test_immutable_scope_finishes_without_open_queue_idle_grace(tmp_path, monkey
     )
     assert result.status == "drained"
     assert sum(sleeps) == (0 if scoped else 60)
+
+
+def test_unscoped_drain_retains_outcomes_beyond_queue_retention(tmp_path, monkeypatch):
+    from remrun.config import RemrunConfig
+
+    state_root = tmp_path / "state"
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    members = [queue.enqueue_prepared(
+        prepare_raw_command(["python", "-c", "pass"], device="A"), spec=None,
+        idempotency_key=f"job-{index}",
+    ) for index in range(501)]
+    queue.close()
+    # All candidates have refused: the live tick finalizes each queued member,
+    # then runs the same 500-row pruning used after successful execution.
+    monkeypatch.setattr(dispatcher, "_known_candidates", lambda *_args: ["A"])
+    monkeypatch.setattr(dispatcher, "_excluded_devices", lambda *_args: {"A"})
+    result = dispatcher.run(
+        RemrunConfig(repo_root=tmp_path, defaults={}, devices={}, project_roots={}),
+        state_root=state_root, until_empty=True, max_ticks=1,
+    )
+    assert result.status == "drained"
+    assert result.exit_code == 1
+    assert result.job_outcomes == dict.fromkeys(members, "failed_final")
+    queue = FleetQueue(state_root / "fleet" / "fleet.db")
+    try:
+        assert len(queue.list()) == 500
+    finally:
+        queue.close()

@@ -53,7 +53,7 @@ project must opt into `[run] use_venv = true` before using the virtualenv placeh
 keys or a schema other than `1` are unsupported.
 The controller fingerprints the canonical declaration, its rendered target paths, and
 the bytes of every `lock_inputs` path. Those exact paths are included in the
-preflight/postrun manifests even when a global exclude (such as `*.lock`) would
+preflight/postrun manifests even when a configured exclude (such as `*.lock`) would
 otherwise omit them. A matching receipt is retained under the target's configured
 state root. Readiness additionally requires the external environment directory, its
 expected interpreter, and an environment-local marker authenticated to the same

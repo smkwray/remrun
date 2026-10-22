@@ -133,6 +133,29 @@ class _DrainLedger:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._started: dict[str, dict[str, Any]] = {}
+        self._seen_jobs: set[str] = set()
+        self._terminal_outcomes: dict[str, str] = {}
+
+    def record_seen(self, job_ids) -> None:
+        with self._lock:
+            self._seen_jobs.update(str(job_id) for job_id in job_ids)
+
+    def job_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._seen_jobs)
+
+    def record_outcomes(self, rows) -> None:
+        with self._lock:
+            for row in rows:
+                job_id, state = str(row["job_id"]), str(row["state"])
+                if state in _TERMINAL_JOB_STATES:
+                    self._terminal_outcomes[job_id] = state
+                else:
+                    self._terminal_outcomes.pop(job_id, None)
+
+    def terminal_outcomes(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._terminal_outcomes)
 
     def record_started(self, claim: dict[str, Any]) -> None:
         row = {
@@ -141,6 +164,7 @@ class _DrainLedger:
         }
         with self._lock:
             self._started[row["batch_id"]] = row
+            self._seen_jobs.update(row["job_ids"])
 
     def started(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -1628,6 +1652,11 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                                "failed": 0, "review": 0, "skipped": {}, "cooled": []}
     try:
         now0 = utc_now_iso()
+        if _ledger is not None:
+            _ledger.record_seen(
+                row["job_id"] for row in q.list(job_ids=job_ids)
+                if row["state"] in _ACTIVE_JOB_STATES or row["state"] == "queued"
+            )
         summary["recovered"] = q.recover_stale(now0, job_ids=job_ids)
         summary["recovered"] += _recover_target_stale(
             config, q, now0, reporter=reporter, job_ids=job_ids,
@@ -1651,6 +1680,8 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
                 return summary
 
         # Snapshot cooldowns + held leases ONCE (current after any debounce). Placement skips a
+        if _ledger is not None:
+            _ledger.record_seen(row["job_id"] for row in queued)
         # cooled (device,engine) and — via pool_used — a device whose configured resource
         # pool is already leased by another dispatcher or ad-hoc run.
         now = utc_now_iso()
@@ -1950,6 +1981,8 @@ def drain_once(config: RemrunConfig, *, state_root: Path | None = None,
         if stop_event is not None and stop_event.is_set():
             summary["stop_requested"] = True
         if job_ids is None and not summary.get("stop_requested"):
+            if _ledger is not None:
+                _ledger.record_outcomes(q.list(job_ids=_ledger.job_ids()))
             q.prune_final()
         return summary
     finally:
@@ -2026,16 +2059,38 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
             "left_running": left_running,
         }
 
+    def final_job_outcomes() -> dict[str, str] | None:
+        members = set(job_ids) if job_ids is not None else ledger.job_ids()
+        if not members:
+            return None
+        queue = FleetQueue(sr / "fleet" / "fleet.db")
+        try:
+            outcomes = {job_id: state for job_id, state in ledger.terminal_outcomes().items()
+                        if job_id in members}
+            outcomes.update({str(row["job_id"]): str(row["state"])
+                             for row in queue.list(job_ids=members)})
+        finally:
+            queue.close()
+        if set(outcomes) != members or any(
+            state not in _TERMINAL_JOB_STATES for state in outcomes.values()
+        ):
+            raise RuntimeError("drained jobs have missing or nonterminal final outcomes")
+        return outcomes
+
     def stopped_result(request_observed_at: float) -> DrainResultV1:
         snapshot: list[tuple[
             tuple[int, int],
             tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]],
+            dict[str, str] | None,
         ]] = []
         snapshot_done = threading.Event()
 
         def read_snapshot() -> None:
             try:
-                snapshot.append((queue_counts(), _drain_identities(sr, ledger, job_ids)))
+                counts = queue_counts()
+                identities = _drain_identities(sr, ledger, job_ids)
+                outcomes = final_job_outcomes() if sum(counts) == 0 else None
+                snapshot.append((counts, identities, outcomes))
             except Exception:  # noqa: BLE001 - bounded fallback is explicit in the document
                 pass
             finally:
@@ -2051,7 +2106,7 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         snapshot_done.wait(remaining)
         snapshot_complete = bool(snapshot)
         if snapshot_complete:
-            (queued, active), identities = snapshot[0]
+            (queued, active), identities, outcomes = snapshot[0]
             started, completed, left_running = identities
         else:
             queued, active = last_queued, last_active
@@ -2063,7 +2118,8 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         if snapshot_complete and queued + active == 0:
             return DrainResultV1(
                 status="drained", queued=0, active=0, skipped={}, error=None,
-                started=started, completed=completed, left_running=[], **totals,
+                started=started, completed=completed, left_running=[],
+                job_outcomes=outcomes, **totals,
             )
         reporter.event(
             "dispatch_stop", return_bound_s=stop_timeout_s,
@@ -2146,6 +2202,7 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
                         reporter.event("dispatch_drain_idle", waited_s=0.0)
                         return DrainResultV1(
                             status="drained", queued=0, active=0, skipped={}, error=None,
+                            job_outcomes=final_job_outcomes(),
                             **identity_fields(),
                             **totals,
                         )
@@ -2158,6 +2215,7 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
                         reporter.event("dispatch_drain_idle", waited_s=grace_s)
                         return DrainResultV1(
                             status="drained", queued=0, active=0, skipped={}, error=None,
+                            job_outcomes=final_job_outcomes(),
                             **identity_fields(),
                             **totals,
                         )
@@ -2194,6 +2252,7 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         )
     try:
         queued, active = queue_counts()
+        outcomes = final_job_outcomes() if queued + active == 0 else None
     except Exception as exc:  # noqa: BLE001 - stable drain error document
         return DrainResultV1(
             status="infrastructure_error", queued=last_queued, active=last_active,
@@ -2206,4 +2265,5 @@ def run(config: RemrunConfig, *, state_root: Path | None = None, poll_s: float =
         status="drained" if queued + active == 0 else "stuck_unplaceable",
         queued=queued, active=active, skipped=last_skipped, error=None,
         started=started, completed=completed, left_running=left_running, **totals,
+        job_outcomes=outcomes,
     )

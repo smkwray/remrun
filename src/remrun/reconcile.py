@@ -516,7 +516,8 @@ def preflight_reconcile(
         if progress and (completed == total or completed % 25 == 0):
             progress(completed, total, action_totals)
 
-    # Rebuild converged manifests to use as pre-run baselines.
+    # A writer can change either tree after an applied transfer. Verify the final
+    # pair before accepting it as both the execution snapshot and a new baseline.
     result.local_manifest = _build_local_manifest(
         local_root,
         excludes,
@@ -526,6 +527,52 @@ def preflight_reconcile(
     result.remote_manifest = _remote_manifest(
         transport, remote_root, excludes, hash_below_bytes, include_paths
     )
+    if not local_root.is_dir() or (
+        remote_manifest and not result.remote_manifest
+        and not _remote_root_present(transport, remote_root)
+    ):
+        result.conflicts.append(ClassifiedPath(
+            "<project root>", "preflight-changed", ABORT_CONFLICT,
+            "a project root disappeared during preflight reconciliation",
+        ))
+    touched = set(result.pushed + result.pulled + result.skipped_identical
+                  + result.converged_conflicts)
+    for rel in sorted(set(result.local_manifest) | set(result.remote_manifest)):
+        left = result.local_manifest.get(rel)
+        right = result.remote_manifest.get(rel)
+        if left is not None and right is not None:
+            if left.sha256 is not None and right.sha256 is not None:
+                if left.kind == right.kind and left.size == right.size and left.sha256 == right.sha256:
+                    continue
+            elif (
+                rel not in touched and have_prev
+                and prev_local.get(rel) is not None and prev_remote.get(rel) is not None
+                and entries_same(prev_local[rel], local_manifest.get(rel))
+                and entries_same(prev_remote[rel], remote_manifest.get(rel))
+                and entries_same(local_manifest.get(rel), left)
+                and entries_same(remote_manifest.get(rel), right)
+            ):
+                # Retain an untouched historical generation without rehashing it.
+                continue
+            try:
+                fresh = _fresh_local_entry(local_root / rel, hash_if_size=right.size)
+                remote_hash = right.sha256 or transport.hash_file(
+                    transport.remote_join(remote_root, rel)
+                )
+                if (
+                    fresh is not None and fresh.kind == right.kind
+                    and fresh.size == right.size and fresh.sha256 is not None
+                    and fresh.sha256 == remote_hash
+                ):
+                    result.local_manifest[rel] = fresh
+                    result.remote_manifest[rel] = replace(right, sha256=remote_hash)
+                    continue
+            except (TransportError, NotImplementedError, OSError, ValueError):
+                pass  # Unavailable identity keeps the conflict.
+        result.conflicts.append(ClassifiedPath(
+            rel, "preflight-changed", ABORT_CONFLICT,
+            "the final preflight file pair is divergent or could not be verified; retry reconciliation",
+        ))
     return result
 
 

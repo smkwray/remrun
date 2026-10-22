@@ -31,7 +31,6 @@ global_exclude = [
   "Thumbs.db",
   "**/Thumbs.db",
   "*.tmp",
-  "*.lock",
   # Syncthing's own device-local metadata: folder markers, per-device ignore
   # files, version archives, and in-progress transfer temp files. These must
   # NEVER be transferred between devices (esp. relevant to `remrun sync` on the

@@ -636,6 +636,8 @@ def _win_kernel32():
             ctypes.POINTER(_WinFileTime), ctypes.POINTER(_WinFileTime),
         )
         k32.GetProcessTimes.restype = _WIN_BOOL
+        k32.TerminateJobObject.argtypes = (_WIN_HANDLE, _WIN_UINT)
+        k32.TerminateJobObject.restype = _WIN_BOOL
         k32.TerminateProcess.argtypes = (_WIN_HANDLE, _WIN_UINT)
         k32.TerminateProcess.restype = _WIN_BOOL
         k32.CloseHandle.argtypes = (_WIN_HANDLE,)
@@ -696,9 +698,11 @@ def _win_create_named_job(name: str):
     return handle
 
 
-def _win_open_job(name: str):
+def _win_open_job(name: str, *, terminate: bool = False):
     ctypes.set_last_error(0)
-    handle = _win_kernel32().OpenJobObjectW(_WIN_JOB_OBJECT_QUERY, False, name)
+    handle = _win_kernel32().OpenJobObjectW(
+        _WIN_JOB_OBJECT_QUERY | (0x0008 if terminate else 0), False, name
+    )
     if _win_valid_handle(handle):
         return handle
     code = ctypes.get_last_error()
@@ -2389,7 +2393,7 @@ def _run_windows_command(
             keeper = None
         _win_close(job)
         _remove_keeper_ready(root, token)
-        if ready_file is not None or not isinstance(exc, Exception):
+        if registered or ready_file is not None or not isinstance(exc, Exception):
             raise
         _warning(f"{type(exc).__name__}: {exc}")
         return _wait_popen(subprocess.Popen(command))
@@ -2467,6 +2471,41 @@ def _run_command(
     return (128 - return_code) if return_code < 0 else return_code
 
 
+def _cancel_windows_job(root: Path, metadata: dict[str, object]) -> dict[str, object]:
+    """Cancel only an exact observed Job. Explicit breakaway is outside this proof."""
+    receipt = {
+        "schema": 1, "job_id": metadata["job_id"],
+        "command_sha256": metadata["command_sha256"], "owned_job_cancelled": False,
+    }
+    records, errors = _read_records(root)
+    keys = ("job_id", "command_sha256", "project", "target", "source_controller", "phase")
+    matches = [record for record in records
+               if all(record.get(key) == metadata.get(key) for key in keys)]
+    if errors or len(matches) != 1 or matches[0]["owner_kind"] != "windows_job_v2":
+        return receipt
+    record = matches[0]
+    # Pin the object before checking the keeper generation, preventing name reuse
+    # between the identity check and termination. Never target a shared build Job.
+    handle = _win_open_job(str(record["owner_key"]), terminate=True)
+    if handle is None:
+        return receipt
+    try:
+        state, _rows, _detail = _windows_owned_sample(record, _processes())
+        if state not in {"live", "stale"}:
+            return receipt
+        if not _win_kernel32().TerminateJobObject(handle, 130):
+            raise _win_error("TerminateJobObject")
+        deadline = time.monotonic() + 5.0
+        while _win_job_pids(handle):
+            if time.monotonic() >= deadline:
+                return receipt
+            time.sleep(0.02)
+        receipt["owned_job_cancelled"] = True
+        return receipt
+    finally:
+        _win_close(handle)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="remrun-job-observer")
     sub = parser.add_subparsers(dest="operation", required=True)
@@ -2476,7 +2515,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--ready-file")
     run.add_argument("--start-gate-file")
     run.add_argument("--started-file")
+    run.add_argument("--exit-token")
     run.add_argument("command", nargs=argparse.REMAINDER)
+    cancel = sub.add_parser("cancel-windows")
+    cancel.add_argument("--state-root", required=True)
+    cancel.add_argument("--metadata-b64", required=True)
     query_parser = sub.add_parser("query")
     query_parser.add_argument("--state-root", required=True)
     query_parser.add_argument("--sample-interval", type=float, default=0.2)
@@ -2497,7 +2540,10 @@ def main(argv: list[str] | None = None) -> int:
         metadata = _decode_metadata(args.metadata_b64)
         if (args.start_gate_file is None) != (args.started_file is None):
             raise ValueError("observer start gate and started receipt must be supplied together")
-        return _run_command(
+        exit_token = args.exit_token
+        if exit_token is not None and not re.fullmatch(r"[0-9a-f]{32}", exit_token):
+            raise ValueError("invalid completion token")
+        code = _run_command(
             root,
             metadata,
             command,
@@ -2505,6 +2551,14 @@ def main(argv: list[str] | None = None) -> int:
             args.start_gate_file,
             args.started_file,
         )
+        if exit_token is not None:
+            sys.stderr.write(f"__REMRUN_OBSERVED_EXIT_{exit_token}__{code};")
+            sys.stderr.flush()
+        return code
+    if args.operation == "cancel-windows":
+        receipt = _cancel_windows_job(root, _decode_metadata(args.metadata_b64))
+        print(json.dumps(receipt, sort_keys=True))
+        return 0 if receipt["owned_job_cancelled"] else 2
     if args.operation == "hold-windows-job":
         token = _bounded_text(args.token, "token", 64)
         expected = _win_job_name(token)

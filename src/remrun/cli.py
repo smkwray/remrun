@@ -91,7 +91,7 @@ from .state import (
     write_unknown_completion_hazard,
 )
 from .transport import (
-    CommandNotStartedError, DurablePrestartError, DurableStateError, TelemetryRequest,
+    CommandCancelledError, CommandNotStartedError, DurablePrestartError, DurableStateError, TelemetryRequest,
     TransportError, finalize_durable_result, make_transport,
 )
 
@@ -2010,6 +2010,11 @@ def _run_locked(
 
     write_manifest(rdir / "pre_local_manifest.json", pre.local_manifest)
     write_manifest(rdir / "pre_remote_manifest.json", pre.remote_manifest)
+    # This positively reconciled generation survives bootstrap failure, transport
+    # loss and cancellation. Later local edits must compare against the last push,
+    # while command outputs remain unbaselined until verified pullback.
+    write_baseline(plan.target.name, plan.project.project_id,
+                   pre.local_manifest, pre.remote_manifest)
     reporter.event("preflight_summary", pulled=len(pre.pulled), pushed=len(pre.pushed),
                    deleted_remote=len(pre.deleted_remote), deleted_local=len(pre.deleted_local),
                    skipped_identical=len(pre.skipped_identical),
@@ -2113,6 +2118,14 @@ def _run_locked(
                 if memory_reservation_ref is not None:
                     memory_reservation_ref["value"] = None
             if bootstrap_result is None or bootstrap_result.status not in {"ready", "bootstrapped"}:
+                if bootstrap_result is not None:
+                    for name, text in (
+                        ("bootstrap.stdout.log", bootstrap_result.helper_stdout),
+                        ("bootstrap.stderr.log", bootstrap_result.helper_stderr),
+                    ):
+                        (rdir / name).write_text(
+                            cap_text(text, policy.max_log_bytes), encoding="utf-8"
+                        )
                 detail = (
                     bootstrap_result.detail if bootstrap_result is not None
                     else "bootstrap did not return an outcome"
@@ -2302,6 +2315,22 @@ def _run_locked(
                 observation=observation,
                 **exec_kwargs,
             )
+    except CommandCancelledError as exc:
+        # The observer permits explicit breakaway for arbitrary-command compatibility.
+        # Cancelling its exact Job cannot prove that escaped work has ended.
+        reporter.event("completion_unknown", guidance=guidance)
+        reporter.event("command_cancelled", owned_job_cancelled=exc.owned_job_cancelled,
+                       message=str(exc))
+        write_json(summary_path, {
+            "run_id": run_id, "project_id": plan.project.project_id,
+            "target": plan.target.name, "command": plan.command,
+            "started_at": started_at, "ended_at": utc_now_iso(), "phase": "exec",
+            "completion_state": "unknown", "command_started": None,
+            "terminal": True, "error": str(exc),
+            "owned_job_cancelled": exc.owned_job_cancelled,
+            "guidance": guidance, "plan": plan.as_dict(),
+        })
+        return EXIT_CANCELLED
     except CommandNotStartedError as exc:
         # The same target process that resolves a bare Windows command can prove it
         # refused the unsupported entry point before invoking user code. Remove the

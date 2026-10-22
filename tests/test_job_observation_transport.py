@@ -118,7 +118,8 @@ def test_powershell_exec_observed_preserves_shell_resolution_inside_child(monkey
 
     def fake_exec(command, cwd, **kwargs):
         calls.append((command, cwd, kwargs))
-        return ExecResult(0, "ok", "")
+        token = command[command.index("--exit-token") + 1]
+        return ExecResult(0, "ok", f"__REMRUN_OBSERVED_EXIT_{token}__0;")
 
     monkeypatch.setattr(transport, "exec", fake_exec)
     transport.exec_observed(

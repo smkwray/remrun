@@ -102,10 +102,15 @@ immutable members and then exits. Unrelated queued rows remain untouched.
 
 `remrun fleet dispatch --drain --json` writes reporter events to stderr and exactly one compact
 `DrainResultV1` document to stdout. Its status is `drained`, `stuck_unplaceable`, `cancelled`, or
-`infrastructure_error`; exit codes are respectively 0/1 (depending on failed or review attempts),
+`infrastructure_error`; exit codes are respectively 0/1 (depending on final job outcomes),
 2, 130, and 4. Every stderr event carries
 `{"schema":"remrun.fleet.lifecycle","version":1,"event":"..."}`. Parse the final JSON
 before converting a nonzero process status into an error.
+
+Protocol 1.2 adds `job_outcomes`, a job-id-to-terminal-state map for a drained scope.
+Recovered attempts remain visible in the `ran`, `ok`, `failed`, and `review` counters;
+they do not cause a nonzero exit when every final job is `done`. A missing outcome
+snapshot is explicit (`null`), and older results retain their attempt-based exit semantics.
 
 When a fleet submission includes `--memory-limit-mib N`, plan and submit JSON include the
 frozen `limits` object. Synchronous execution includes a token-free `memory_limit` receipt.

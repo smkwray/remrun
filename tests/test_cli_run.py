@@ -584,6 +584,50 @@ def test_ctrl_c_during_preflight_returns_130_and_terminalizes_not_started_receip
     assert not list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
 
 
+@pytest.mark.parametrize("failure", [KeyboardInterrupt, TransportError])
+def test_completed_preflight_survives_interrupted_execution(env, monkeypatch, failure):
+    path = env["proj"] / "input.txt"
+    path.write_text("initial", encoding="utf-8")
+    command = ["run", "LOCAL_SIM", "--", "python", "-c", "pass"]
+    assert main(command) == EXIT_OK
+    path.write_text("pushed-before-interruption", encoding="utf-8")
+    original_exec = LocalSimTransport.exec
+
+    def interrupt(*_args, **_kwargs):
+        raise failure("interrupted")
+
+    monkeypatch.setattr(LocalSimTransport, "exec", interrupt)
+    assert main(command) in {130, EXIT_INFRA}
+    summaries = [json.loads(p.read_text(encoding="utf-8"))
+                 for p in (env["state"] / "runs").glob("*/summary.json")]
+    interrupted = next(row for row in summaries if row["completion_state"] == "unknown")
+    assert main(["resolve-unknown", interrupted["run_id"], "--confirmed-ended"]) == EXIT_OK
+    path.write_text("edited-after-interruption", encoding="utf-8")
+    monkeypatch.setattr(LocalSimTransport, "exec", original_exec)
+    assert main(command) == EXIT_OK
+    assert (env["remote_proj"] / "input.txt").read_text() == "edited-after-interruption"
+
+
+@pytest.mark.parametrize("owned_job_cancelled", [True, False])
+def test_observed_cancellation_retains_unknown_completion(env, monkeypatch, owned_job_cancelled):
+    from remrun.transport import CommandCancelledError
+
+    def cancelled(_self, _command, **kwargs):
+        assert kwargs["observation"].phase == "command"
+        raise CommandCancelledError("cancelled", owned_job_cancelled=owned_job_cancelled)
+
+    monkeypatch.setattr("remrun.cli.job_observation_enabled", lambda _device: True)
+    monkeypatch.setattr(LocalSimTransport, "exec_observed", cancelled, raising=False)
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "pass"]) == 130
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["completion_state"] == "unknown"
+    assert summary["command_started"] is None
+    assert summary["owned_job_cancelled"] is owned_job_cancelled
+    hazards = list((env["state"] / "hazards" / "project").glob("*/unknown.json"))
+    assert hazards
+
+
 def test_disappearing_file_during_preflight_hash_is_concise_retryable_failure(
     env, monkeypatch, capsys
 ):

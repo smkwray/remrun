@@ -1451,7 +1451,7 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
         )
         if transaction_total != host_total:
             raise RuntimeError("physical-memory total changed while deriving admission policy")
-        if predicted is not None and explicit_limit is None:
+        if explicit_limit is None:
             live_allowance, remaining_backed = _live_backed_allowance(
                 capacity,
                 candidate_lease_id=lease_id,
@@ -1459,18 +1459,23 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                 policy=policy,
                 control_overhead_bytes=control_overhead,
             )
-            allowance_details.update(
-                {
-                    "learned_allowance_bytes": learned_allowance,
-                    "live_backed_allowance_bytes": live_allowance,
-                    "learned_allowance_live_backed": allowance <= live_allowance,
-                    "predicted_rss_bytes": predicted_value,
-                    "allocation_rule": _UNPROFILED_ALLOCATION_RULE,
-                    "remaining_backed_capacity_bytes": remaining_backed,
-                    "policy_command_ceiling_bytes": int(policy["max_command_bytes"]),
-                    "strict_margin_bytes": MIB,
-                }
-            )
+            if predicted is not None:
+                allowance_details.update(
+                    {
+                        "learned_allowance_bytes": learned_allowance,
+                        "live_backed_allowance_bytes": live_allowance,
+                        "learned_allowance_live_backed": allowance <= live_allowance,
+                        "predicted_rss_bytes": predicted_value,
+                        "allocation_rule": _UNPROFILED_ALLOCATION_RULE,
+                        "remaining_backed_capacity_bytes": remaining_backed,
+                        "policy_command_ceiling_bytes": int(policy["max_command_bytes"]),
+                        "strict_margin_bytes": MIB,
+                    }
+                )
+            else:
+                allowance_details["remaining_backed_capacity_bytes"] = min(
+                    int(allowance_details["remaining_backed_capacity_bytes"]), remaining_backed
+                )
             capacity.update(allowance_details)
             lease.update(allowance_details)
             if not capacity["safe"]:
@@ -1487,17 +1492,18 @@ def _reserve_memory_lease(request: dict[str, object]) -> dict[str, object]:
                     lower_capacity = live_allowance + control_overhead
                     capacity_delta = capacity_bytes - lower_capacity
                     allowance = live_allowance
-                    allowance_basis = "learned_profile_live_headroom"
-                    allowance_details.update(
-                        {
-                            "learned_allowance_bytes": learned_allowance,
-                            "live_backed_allowance_bytes": live_allowance,
-                            "learned_allowance_live_backed": False,
-                            "learned_allowance_clip_reason": (
-                                "insufficient_live_headroom"
-                            ),
-                        }
-                    )
+                    if predicted is not None:
+                        allowance_basis = "learned_profile_live_headroom"
+                        allowance_details.update(
+                            {
+                                "learned_allowance_bytes": learned_allowance,
+                                "live_backed_allowance_bytes": live_allowance,
+                                "learned_allowance_live_backed": False,
+                                "learned_allowance_clip_reason": (
+                                    "insufficient_live_headroom"
+                                ),
+                            }
+                        )
                     capacity.update(
                         {
                             "safe": True,

@@ -496,6 +496,35 @@ def test_unprofiled_refusal_requires_actual_live_headroom_exhaustion(
     assert result["capacity"]["allowance_bytes"] < MIB
 
 
+def test_unprofiled_reservation_resizes_to_transaction_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    available = 26 * GIB
+    monkeypatch.setattr(telemetry, "_host_memory", lambda: (TOTAL, available))
+    monkeypatch.setattr(telemetry, "_control_overhead_budget_bytes", lambda: 128 * MIB)
+    real_transaction = telemetry._capacity_transaction
+
+    def transaction(leases, **kwargs):
+        nonlocal available
+        if kwargs.get("sizing_lease_id") is not None:
+            available = 25 * GIB
+        return real_transaction(leases, **kwargs)
+
+    monkeypatch.setattr(telemetry, "_capacity_transaction", transaction)
+    admitted = telemetry._handle_admission_request(
+        _request(tmp_path / "state", command_fraction=0.3125)
+    )
+    assert admitted["status"] == "admitted"
+    assert admitted["capacity"]["safe"] is True
+    assert admitted["lease"]["allowance_bytes"] == (9 * 1024 - 129) * MIB
+    assert admitted["lease"]["allowance_basis"] == "unprofiled_available_backed"
+    assert admitted["lease"]["command_limit_bytes"] is None
+    assert admitted["capacity"]["available_floor_bytes"] > admitted["capacity"]["required_available_bytes"]
+    assert admitted["lease"].get("learned_allowance_bytes") is None
+    renewed = telemetry._handle_admission_request(_lease_request(admitted))
+    assert renewed["status"] == "admitted"
+
+
 def test_unprofiled_allowance_uses_all_available_backed_capacity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

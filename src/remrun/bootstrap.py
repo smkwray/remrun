@@ -90,6 +90,8 @@ class BootstrapResult:
     fingerprint: str | None = None
     receipt_path: str | None = None
     output: str = ""
+    helper_stdout: str = ""
+    helper_stderr: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -721,18 +723,22 @@ def execute_bootstrap(
     }
     if memory_reservation is not None:
         exec_kwargs["memory_reservation"] = memory_reservation
-    result = transport.exec(helper_argv, cwd=remote_root, **exec_kwargs)
+    execute = transport.exec_control if device.is_windows else transport.exec
+    result = execute(helper_argv, cwd=remote_root, **exec_kwargs)
+    diagnostics = {"helper_stdout": result.stdout, "helper_stderr": result.stderr}
     try:
         data = json.loads(result.stdout)
     except (TypeError, json.JSONDecodeError) as exc:
         return BootstrapResult(
             status="unsupported", detail=f"bootstrap helper returned malformed JSON: {exc}",
             fingerprint=fingerprint, receipt_path=receipt_path,
+            **diagnostics,
         )
     if not isinstance(data, dict):
         return BootstrapResult(
             status="unsupported", detail="bootstrap helper returned a non-object",
             fingerprint=fingerprint, receipt_path=receipt_path,
+            **diagnostics,
         )
     status = str(data.get("status", "unsupported"))
     if result.exit_code != 0 and status in {"ready", "bootstrapped"}:
@@ -745,6 +751,7 @@ def execute_bootstrap(
         fingerprint=fingerprint,
         receipt_path=receipt_path,
         output=str(data.get("output") or ""),
+        **diagnostics,
     )
 
 

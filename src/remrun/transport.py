@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO, Callable, Iterable
 
@@ -1268,6 +1268,12 @@ class GuardFinalizationError(TransportError):
 
 class CommandNotStartedError(TransportError):
     """A conclusive ordinary-run refusal before the user's command starts."""
+
+
+class CommandCancelledError(TransportError):
+    def __init__(self, detail: str, *, owned_job_cancelled: bool) -> None:
+        super().__init__(detail)
+        self.owned_job_cancelled = owned_job_cancelled
 
 
 class ControlSourceError(TransportError):
@@ -2553,6 +2559,7 @@ class _SSHCommon(BaseTransport):
         self._address: str | None = None
         self._remote_home: str | None = None
         self._durable_runner_cache: tuple[str, str] | None = None
+        self._interrupted_stream: subprocess.Popen | None = None
 
     def expand_remote(self, path: str) -> str:
         # Both ssh backends define _expand_remote (POSIX vs backslash ~ handling).
@@ -2637,6 +2644,11 @@ class _SSHCommon(BaseTransport):
                                                err.encode("utf-8", "replace"))
         except FileNotFoundError as exc:
             raise TransportError(f"ssh executable not found: {exc}") from exc
+        except KeyboardInterrupt:
+            # The observed Windows caller cancels target ownership before
+            # disposing of the local SSH process and its reader threads.
+            self._interrupted_stream = locals().get("proc")
+            raise
         except subprocess.TimeoutExpired as exc:
             # A blackholed / very slow candidate must not abort --auto failover:
             # surface the timeout as a typed transport error so probe() and
@@ -4540,6 +4552,7 @@ class SSHPowerShellTransport(_SSHCommon):
             )
             return observation_warning(result, f"{type(exc).__name__}: {exc}")
 
+        exit_token = uuid.uuid4().hex
         wrapped = [
             self.device.remote_python or "python",
             "-S",
@@ -4549,28 +4562,62 @@ class SSHPowerShellTransport(_SSHCommon):
             state_root,
             "--metadata-b64",
             metadata,
+            "--exit-token",
+            exit_token,
             "--",
             *child,
         ]
-        result = self.exec(
-            wrapped,
-            cwd,
-            env=env,
-            timeout=timeout,
-            path_prepend=path_prepend,
-            telemetry=telemetry,
-            on_stdout=on_stdout,
-            telemetry_request=telemetry_request,
-            memory_reservation=memory_reservation,
-            _allow_observed_breakaway=True,
-        )
+        try:
+            result = self.exec(
+                wrapped,
+                cwd,
+                env=env,
+                timeout=timeout,
+                path_prepend=path_prepend,
+                telemetry=telemetry,
+                on_stdout=on_stdout,
+                telemetry_request=telemetry_request,
+                memory_reservation=memory_reservation,
+                _allow_observed_breakaway=True,
+            )
+        except KeyboardInterrupt as interrupted:
+            cancelled = False
+            detail = "Windows owned-job cancellation is unconfirmed"
+            try:
+                receipt = self.exec_control(
+                    [self.device.remote_python or "python", "-S", helper, "cancel-windows",
+                     "--state-root", state_root, "--metadata-b64", metadata],
+                    cwd=cwd, timeout=15.0,
+                )
+                cancelled = receipt.exit_code == 0 and json.loads(receipt.stdout) == {
+                    "schema": 1, "job_id": observation.payload()["job_id"],
+                    "command_sha256": observation.command_sha256, "owned_job_cancelled": True,
+                }
+                if cancelled:
+                    detail = "Windows owned job cancelled; escaped work remains unproved"
+            except Exception as exc:
+                detail += f": {type(exc).__name__}: {exc}"
+            raise CommandCancelledError(detail, owned_job_cancelled=cancelled) from interrupted
+        finally:
+            proc = self._interrupted_stream
+            self._interrupted_stream = None
+            if proc is not None:
+                _kill_stream_process(proc, process_group=True)
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
         if batch_marker in result.stderr:
             raise CommandNotStartedError(_WINDOWS_BATCH_UNSUPPORTED)
         if language_marker in result.stderr:
             raise CommandNotStartedError(_WINDOWS_POWERSHELL_COMMAND_UNSUPPORTED)
         if not_found_marker in result.stderr:
             raise CommandNotStartedError(_WINDOWS_COMMAND_NOT_FOUND)
-        return result
+        marker = f"__REMRUN_OBSERVED_EXIT_{exit_token}__"
+        stderr, code = _extract_windows_exit_marker(result.stderr, marker)
+        if code is None:
+            raise TransportError("Windows observer omitted command completion; completion is unknown")
+        return replace(result, stderr=stderr, exit_code=code)
 
     def query_observed_jobs(
         self, *, sample_interval: float = 0.2, timeout: float = 45.0
@@ -5006,13 +5053,26 @@ class SSHPowerShellTransport(_SSHCommon):
             lines.append(f"$env:PATH = {_ps_squote(joined)} + $env:PATH")
         lines.append(f"Set-Location -LiteralPath {_ps_squote(self._expand_remote(cwd))}")
         lines.append("& " + " ".join(_ps_squote(token) for token in command))
-        lines.append("exit $LASTEXITCODE")
+        marker = f"__REMRUN_CONTROL_EXIT_{uuid.uuid4().hex}__"
+        lines.append(f"[Console]::Error.Write({_ps_squote(marker)} + [string]$LASTEXITCODE + ';')")
+        if not _ps_remote_command_fits(self._ps_exe(), "\n".join(lines)):
+            # Reuse validated stdin source delivery for large helper arguments.
+            # Let its frame finish normally; the private marker preserves the
+            # native helper's exit independently of the source launcher's exit.
+            result = self.exec_control_source("\n".join(lines), cwd, timeout=timeout)
+            stderr, code = _extract_windows_exit_marker(result.stderr, marker)
+            if code is None:
+                raise TransportError("framed control helper omitted its native exit status")
+            return ExecResult(code, result.stdout, stderr)
         proc = self._ps_remote(address, "\n".join(lines), timeout=timeout)
         stdout = proc.stdout.decode("utf-8", "replace")
         stderr = proc.stderr.decode("utf-8", "replace")
         if proc.returncode == 255:
             raise TransportError(f"ssh connection failed (exit 255): {stderr.strip()}")
-        return ExecResult(proc.returncode, stdout, stderr)
+        stderr, code = _extract_windows_exit_marker(stderr, marker)
+        if code is None:
+            raise TransportError("control helper omitted its native exit status")
+        return ExecResult(code, stdout, stderr)
 
     def exec_control_source(
         self,
@@ -5352,7 +5412,8 @@ class SSHPowerShellTransport(_SSHCommon):
             f"$p = {_ps_squote(remote_path)}\n"
             "$ts = [IO.File]::GetLastWriteTimeUtc($p)\n"
             "$epoch = [DateTime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc)\n"
-            "Write-Output ([long]((($ts - $epoch).Ticks) * 100))\n"
+            "Write-Output (([decimal]($ts.Ticks - $epoch.Ticks) * 100).ToString('0', "
+            "[Globalization.CultureInfo]::InvariantCulture))\n"
             "Write-Output ([Convert]::ToBase64String([IO.File]::ReadAllBytes($p)))\n"
         )
         proc = self._ps_remote(address, script)

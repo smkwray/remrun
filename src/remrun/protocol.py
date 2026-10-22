@@ -14,7 +14,7 @@ def build_capabilities_document() -> dict[str, Any]:
     return {
         "schema": "remrun.capabilities",
         "version": 1,
-        "protocol": {"major": 1, "minor": 1},
+        "protocol": {"major": 1, "minor": 2},
         "package_version": __version__,
         "documents": {
             "requests": [{"schema": "remrun.target-resource-policy", "version": 1}],

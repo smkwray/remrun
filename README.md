@@ -51,6 +51,12 @@ noninteractive command that must survive controller sleep or connectivity loss, 
 SSH target selected automatically or named explicitly can use a target-supervised
 durable run and later resume from the originating controller.
 
+On an observed Windows run, Ctrl-C attempts to terminate only remrun's exact named
+Job Object and reports `owned_job_cancelled`. Observation remains optional and permits
+programs to break away for compatibility with shared build jobs. Escaped processes and
+interruptions during startup remain unproved, so cancellation always retains the
+completion-unknown fence until `resolve-unknown --confirmed-ended`.
+
 ## How to run it
 
 remrun has **no install step required** — use the launcher in `bin/`. Always run
@@ -293,10 +299,10 @@ The most common failure modes and their fixes:
    repo in place (`git init` + full-history fetch + HEAD set to the peer's tip) and
    leaves the working tree byte-for-byte untouched, so your uncommitted local work
    survives and shows up as modified/untracked vs the fetched HEAD.
-8. **Default excludes drop `*.lock`, `dist/`, and `target/` — outputs written there are
+8. **Default excludes drop `dist/` and `target/` — outputs written there are
    neither pushed nor pulled back.** These remain excluded as conventional generated/cache
-   surfaces, so a lockfile a command regenerates (`uv.lock`, `renv.lock`) or a retained
-   product written under `dist/`/`target/` will not return. `build/` is intentionally
+   surfaces. Dependency lockfiles such as `Cargo.lock`, `uv.lock`, and `renv.lock` are
+   included; projects can exclude their own transient locks. `build/` is intentionally
    included because real build commands commonly put their requested product there.
    Project `[transfer] exclude` only adds patterns; sanity-check unusual output paths with
    `remrun plan`.
