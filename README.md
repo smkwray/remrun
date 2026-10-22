@@ -142,6 +142,7 @@ remrun fleet resources                         # CPU, load/queue, RAM, GPU/VRAM,
 remrun fleet jobs [--device NAME]              # active jobs across all controllers
 remrun observe --label "regen" -- CMD...       # run CMD on this machine, visible to fleet jobs
 remrun fleet mesh [--no-hops]                  # measured SSH reachability matrix
+remrun fleet presence [--device NAME] [--in M]  # owner presence windows (no probe)
 remrun fleet plan zotomatic --input items/      # arbitrary configured name; preview only
 remrun fleet plan zotomatic --input items/ --save --json  # save exact prepared placement
 remrun fleet run zotomatic --input items/       # synchronous placement + execution

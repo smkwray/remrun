@@ -43,6 +43,38 @@ An unreachable candidate performs no preflight and therefore does not consume th
 first-attempt reconciliation semantics. Global controller-tree conflicts such as
 `local-vanished` abort the whole run.
 
+## Owner presence
+
+The owner states once, in a Markdown routing file, when they may be at a device.
+devices.toml names the file per controller OS:
+
+```toml
+[scheduler.routing_file]
+macos = "~/notes/ROUTING.md"
+windows = '~\notes\ROUTING.md'
+```
+
+Only list items (`-`, `*` or `+`) under its `## Owner presence` heading count, one per device
+group, in the controller's local time; prose lines there are ignored:
+
+```markdown
+## Owner presence
+
+- macbox, winbox: Wed 04:30-09:30; Sat 00:00-20:00 (owner note)
+```
+
+For a heavy job — predicted to run at least `[scheduler] heavy_job_seconds`, or never
+measured — `--auto` takes a device inside one of its windows out of the ranking whenever
+another reachable candidate remains. When that changes the pick it reports
+`target_reason = "presence-avoided"`; otherwise the ordinary reason stands. If
+every reachable candidate is inside a window the job still runs, on the best of them, as
+`presence-fallback`: presence never refuses work. A named target is used as given, with an
+`owner_presence` warning. A list item that does not parse (a numbered one included), or names
+an unknown device, marks the whole policy `malformed`; an unreadable or unconfigured file is
+`unavailable`. Neither applies any rule, and both are reported in the `owner_presence` event,
+`plan --probe --json`, and `fleet presence` (which then exits nonzero). Every run records its
+`target_reason` and `label` under `plan` in `summary.json`.
+
 ## Static capabilities
 
 Device config can define:

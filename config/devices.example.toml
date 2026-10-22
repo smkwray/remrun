@@ -40,6 +40,15 @@ default = "ask"
 # [scheduler]
 # primary = "macbox"
 # fallback = ["winbox"]
+#
+# Optional owner presence: a Markdown file whose `## Owner presence` section lists when
+# the owner may be at a device, one `-`/`*`/`+` item per device group in controller local time:
+#   - macbox, winbox: Wed 04:30-09:30; Sat 00:00-20:00
+# `--auto` then keeps heavy jobs off those devices during a window whenever another
+# device can take them. A bad list item disables the whole section and is reported.
+# [scheduler.routing_file]
+# macos = "~/notes/ROUTING.md"
+# windows = '~\notes\ROUTING.md'
 
 [devices.local]
 enabled = true

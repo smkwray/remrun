@@ -115,6 +115,11 @@ ram_headroom_pct = 80
 # ...and skip the multi-device load probe for jobs predicted shorter than this
 # (the ~2-4s of probing isn't worth it for a quick job).
 trivial_job_seconds = 30
+# Owner presence: `--auto` keeps a heavy job off a device inside a window of the
+# `## Owner presence` section of the owner's routing file (path: devices.toml
+# [scheduler.routing_file]) whenever another reachable device can take it; that device
+# stays a last resort. Heavy = predicted to run at least this long, or never measured.
+heavy_job_seconds = 300
 # Offload recommendation (advisory; see `remrun bench`). Compares a job's measured
 # LOCAL baseline against the best device's full remrun round-trip. Bias tilts toward
 # remote for responsiveness: 1.25 = prefer remote even when its trip is up to 25%

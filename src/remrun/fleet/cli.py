@@ -1822,12 +1822,59 @@ def build_parser() -> argparse.ArgumentParser:
     psb.add_argument("--json", action="store_true")
     psl = storage_sub.add_parser("list", help="show this controller's verified bindings")
     psl.add_argument("--json", action="store_true")
+    ppr = sub.add_parser(
+        "presence",
+        help="owner presence windows from the routing file (read-only; no device probe)",
+    )
+    ppr.add_argument("--device", action="append",
+                     help="limit to this device (repeatable; default is every device with a window)")
+    ppr.add_argument("--in", dest="in_minutes", type=int, default=0, metavar="MINUTES",
+                     help="evaluate this many minutes from now (default 0)")
+    ppr.add_argument("--json", action="store_true")
     pti = sub.add_parser(
         "task-interfaces",
         help="show resolved task/device routes (read-only; no device probe)",
     )
     pti.add_argument("--json", action="store_true")
     return p
+
+
+def cmd_presence(args, reporter: Reporter) -> int:
+    """When the owner may be at a device, from the one place the owner states it.
+
+    Exits nonzero when the policy cannot be read or does not parse, so a script that
+    waits out owner windows never mistakes a broken schedule for an empty one.
+    """
+    from datetime import timedelta
+
+    from ..config import load_config
+    from ..presence import load_presence, local_now
+
+    config = load_config()
+    policy = load_presence(config)
+    at = local_now() + timedelta(minutes=args.in_minutes)
+    names = list(args.device or policy.windows)
+    unknown = sorted(set(names) - set(config.devices))
+    if unknown:
+        raise ValueError(f"unknown device(s): {', '.join(unknown)}")
+
+    def stamp(value):
+        return value.isoformat(timespec="minutes") if value is not None else None
+
+    rows = [{"name": name,
+             "window_until": stamp(policy.window_end(name, at)),
+             "next_window_start": stamp(policy.next_window_start(name, at))}
+            for name in names]
+    payload = {**policy.as_dict(), "evaluated_at": stamp(at), "devices": rows}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"owner presence: {policy.status} ({policy.source or '-'}) at {stamp(at)}"
+              + (f": {policy.detail}" if policy.detail else ""))
+        for row in rows:
+            print(f"{row['name']:<8} {'present until ' + row['window_until'] if row['window_until'] else '-':<32}"
+                  f" next {row['next_window_start'] or '-'}")
+    return EXIT_OK if policy.status in {"valid", "absent"} else EXIT_ERROR
 
 
 def main(argv: list[str]) -> int:
@@ -1871,6 +1918,8 @@ def main(argv: list[str]) -> int:
             return cmd_storage(args, reporter)
         if args.fleet_command == "task-interfaces":
             return cmd_task_interfaces(args, reporter)
+        if args.fleet_command == "presence":
+            return cmd_presence(args, reporter)
     except Exception as exc:  # noqa: BLE001 - keep agent-visible error concise
         reporter.event("error", type=type(exc).__name__, message=str(exc))
         return EXIT_ERROR

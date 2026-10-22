@@ -46,6 +46,7 @@ from .profile import (
 from .protocol import (
     build_capabilities_document, build_error_document, format_capabilities_human,
 )
+from .presence import PresencePolicy, load_presence, local_now
 from .scheduler import pick_by_load
 from .reconcile import postrun_pullback, preflight_reconcile
 from .resource_context import (
@@ -819,12 +820,14 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
     )
     candidates = None
     target_reason = None
+    presence = None
     if args.probe or args.check_git:
         candidates = []
+        presence = load_presence(config)
         selection = _resolve_targets(
             plan, target_name, scheduler_config(config), reporter,
             _job_prediction(config, plan), diagnostics=candidates,
-            check_git=args.check_git, emit_events=False)
+            check_git=args.check_git, emit_events=False, presence=presence)
         if selection:
             plan = replace(plan, target=selection[0][0])
             target_reason = selection[0][3]
@@ -864,6 +867,7 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         if candidates is not None:
             payload["target_reason"] = target_reason
             payload["candidates_probed"] = candidates
+            payload["owner_presence"] = presence.as_dict()
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         reporter.event("project", project_id=plan.project.project_id, relative_cwd=plan.project.relative_cwd)
@@ -909,13 +913,27 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
 
 def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, reporter: Reporter,
                      prediction: dict | None = None, *, diagnostics: list[dict] | None = None,
-                     check_git: bool = False, emit_events: bool = True):
+                     check_git: bool = False, emit_events: bool = True,
+                     presence: PresencePolicy | None = None):
     """Probe and rank once for both ``run`` and opt-in, read-only ``plan`` diagnostics.
 
     Returns ``[(device, transport, probe, reason), ...]``. Diagnostics only record
     observations from this path; they never choose or mutate a target.
+
+    A heavy job (predicted at least ``heavy_job_seconds``, or never measured) avoids a
+    device inside an owner presence window whenever another reachable candidate exists;
+    such a device stays a last resort, chosen with reason ``presence-fallback``.
     """
     entries: dict[str, dict] = {}
+    pred_dur = (prediction or {}).get("dur_s")
+    heavy = pred_dur is None or pred_dur >= float(sched.get("heavy_job_seconds", 300))
+    now = local_now()
+    owner_until: dict[str, str] = {}
+    if presence is not None and heavy:
+        for device in plan.candidates:
+            end = presence.window_end(device.name, now)
+            if end is not None:
+                owner_until[device.name] = end.isoformat(timespec="minutes")
     if diagnostics is not None:
         for device in plan.candidates:
             entry = _candidate_probe_entry(device, sched)
@@ -946,6 +964,15 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
         entry["reachable"] = False
         entry["detail"] = str(exc)
         return True
+
+    if presence is not None and emit_events and heavy and (
+            owner_until or presence.status in {"malformed", "unavailable"}):
+        reporter.event("owner_presence", **presence.as_dict(), heavy=heavy,
+                       predicted_dur_s=pred_dur, evaluated_at=now.isoformat(timespec="minutes"),
+                       devices_in_window=owner_until or None)
+    for name, until in owner_until.items():
+        if name in entries:
+            entries[name]["owner_window_until"] = until
 
     if target_name and target_name != "auto":
         device = plan.target
@@ -978,7 +1005,6 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
 
     # Job-cost-aware adjustments (advisory; only when a learned profile exists).
     pred_rss = (prediction or {}).get("rss_mb")
-    pred_dur = (prediction or {}).get("dur_s")
     if pred_rss:
         frac = float(sched.get("ram_headroom_pct", 80)) / 100.0
         fits = [d for d in candidates
@@ -1040,18 +1066,32 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
         event("unreachable", target=first, detail="no candidate reachable")
         return []
 
-    ranked = [(d, busy) for (d, _t, _pr, busy) in reachable]
+    # Owner-present devices leave the ranking while any other candidate is reachable.
+    clear = [x for x in reachable if x[0].name not in owner_until]
+    pool = clear or reachable
+    ranked = [(d, busy) for (d, _t, _pr, busy) in pool]
     chosen_device, balance_reason = pick_by_load(ranked, sched)
     device, transport, probe, _busy = next(x for x in reachable if x[0] is chosen_device)
-    reason = balance_reason
-    if reason == "auto" and plan.candidates and device is not plan.candidates[0]:
+    # Presence is named as the reason only when it changed the pick; otherwise the
+    # reason is what ranking every reachable candidate would have said.
+    unfiltered, reason = (
+        pick_by_load([(d, busy) for (d, _t, _pr, busy) in reachable], sched)
+        if pool is not reachable else (device, balance_reason)
+    )
+    if not clear:
+        reason = "presence-fallback"
+    elif unfiltered is not device:
+        reason = "presence-avoided"
+    elif reason == "auto" and plan.candidates and device is not plan.candidates[0]:
         reason = "auto-failover"  # preferred candidate was unreachable
     if device.name in entries:
         entries[device.name]["recommended"] = True
     # pick_by_load names the winner; the rest stay in preference order behind it as
     # fallbacks. Their reason is "auto-failover": reaching them means the winner
-    # failed for a candidate-local reason.
-    rest = [(d, t, pr, "auto-failover") for (d, t, pr, _b) in reachable if d is not device]
+    # failed for a candidate-local reason. Owner-present devices come last.
+    rest = [(d, t, pr, "auto-failover") for (d, t, pr, _b) in clear if d is not device]
+    rest += [(d, t, pr, "presence-fallback") for (d, t, pr, _b) in reachable
+             if d is not device and d.name in owner_until]
     return [(device, transport, probe, reason), *rest]
 
 
@@ -1519,7 +1559,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             key: value for key, value in prediction.items() if key != "rss_mb"
         }
     selection = _resolve_targets(
-        plan, target_name, sched, reporter, placement_prediction
+        plan, target_name, sched, reporter, placement_prediction,
+        presence=load_presence(config),
     )
     if getattr(args, "durable", False) and target_name == "auto":
         durable_selection = []
@@ -1558,7 +1599,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
     # Every attempted run_id, so retention can't prune a skipped candidate's receipt.
     attempted_run_ids: set[str] = set()
     for attempt, (chosen, transport, probe, reason) in enumerate(selection):
-        plan = replace(base_plan, target=chosen)
+        plan = replace(base_plan, target=chosen, target_reason=reason,
+                       label=getattr(args, "label", None))
         remaining = len(selection) - attempt - 1
 
         run_id = new_run_id(plan.target.name, plan.project.project_id)
@@ -3876,6 +3918,11 @@ def _load_resume_plan(
         or not isinstance(command, list)
     ):
         raise UnknownCompletionHazardError("saved durable plan is malformed")
+    # Why the target was chosen and the run's label describe the run; they are carried,
+    # while every field that decides what runs where must still rebuild exactly.
+    saved_reason, saved_label = saved_plan.get("target_reason"), saved_plan.get("label")
+    if not all(value is None or isinstance(value, str) for value in (saved_reason, saved_label)):
+        raise UnknownCompletionHazardError("saved durable plan is malformed")
     config = load_config()
     local_cwd = Path(str(saved_project.get("local_cwd", "")))
     plan = make_run_plan(
@@ -3888,6 +3935,7 @@ def _load_resume_plan(
         requested_workload=None,
         allow_default_workload=False,
     )
+    plan = replace(plan, target_reason=saved_reason, label=saved_label)
     if plan.as_dict() != saved_plan:
         raise UnknownCompletionHazardError(
             "current project/config no longer matches the exact saved durable plan"

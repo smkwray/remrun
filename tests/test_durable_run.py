@@ -258,6 +258,21 @@ def test_complete_result_logs_and_pullback_finalize_exactly_once(
     assert pullbacks == 1
 
 
+def test_a_labelled_durable_run_resumes_with_its_recorded_reason_and_label(
+    durable_env, monkeypatch, capsys
+):
+    """The run record names why its device was chosen; resume must still accept it,
+    while every field that decides what runs where is rebuilt and compared exactly."""
+    _install_fake(monkeypatch)
+    assert main(["run", "--durable", "TEST", "--label", "regen 2019", "--",
+                 sys.executable, "-c", "print('ok')"]) == 0
+    run_id = _only_run_id(durable_env["state"])
+    summary = json.loads((durable_env["state"] / "runs" / run_id / "summary.json").read_text())
+    assert (summary["plan"]["target_reason"], summary["plan"]["label"]) == ("explicit", "regen 2019")
+    capsys.readouterr()
+    assert main(["resume", run_id]) == 0
+
+
 def test_durable_managed_command_dispatches_absolute_entrypoint(
     durable_env, monkeypatch, capsys
 ):

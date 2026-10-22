@@ -1687,6 +1687,135 @@ def test_plan_auto_probe_displays_load_balanced_target_read_only(
     assert not (env["proj"].parent.parent / "remote-b").exists()
 
 
+def _two_sims_with_presence(env, monkeypatch, routing: str, *, busy=None, now=None):
+    """SIM_A is preferred and idle; SIM_B is busier. The routing file names SIM_A."""
+    from datetime import datetime
+
+    from remrun import cli as cli_mod
+    from remrun import transport as transport_mod
+
+    routing_path = env["remrun_root"] / "ROUTING.md"
+    routing_path.write_text(routing, encoding="utf-8")
+    devices = env["remrun_root"] / "config" / "devices.toml"
+    devices.write_text(
+        devices.read_text(encoding="utf-8")
+        + "\n[scheduler]\n"
+        + 'primary = "SIM_A"\n'
+        + 'fallback = ["SIM_B"]\n'
+        + "\n[scheduler.routing_file]\n"
+        + f'default = "{posix(routing_path)}"\n'
+        + f'macos = "{posix(routing_path)}"\n'
+        + f'windows = "{posix(routing_path)}"\n'
+        + "".join(
+            f"\n[devices.{name}]\n"
+            + 'kind = "local-sim"\n'
+            + 'os = "posix"\n'
+            + f'project_root = "{posix(env["proj"].parent.parent / ("remote-" + name))}"\n'
+            + f'state_root = "{posix(env["state"])}"\n'
+            + "perf_cores = 8\n"
+            for name in ("SIM_A", "SIM_B")
+        ),
+        encoding="utf-8",
+    )
+    load = busy or {"SIM_A": 0.0, "SIM_B": 10.0, "LOCAL_SIM": 50.0}
+    monkeypatch.setattr(transport_mod.LocalSimTransport, "sample_load",
+                        lambda self: load[self.device.name], raising=False)
+    monkeypatch.setattr(cli_mod, "local_now", lambda: now or datetime(2026, 10, 21, 6, 0))
+
+
+_SIM_A_WEDNESDAY = "# Routing\n\n## Owner presence\n\n- SIM_A: Wed 04:30-09:30 (owner)\n"
+
+
+def _probe_plan(capsys) -> dict:
+    code = main(["plan", "--auto", "--probe", "--json", "--", "python", "-c", "print('p')"])
+    assert code == EXIT_OK
+    return json.loads(capsys.readouterr().out)
+
+
+def test_auto_keeps_an_unmeasured_job_off_the_device_the_owner_is_at(env, capsys, monkeypatch):
+    """The owner sits at SIM_A on Wednesday morning: the less busy, preferred device
+    must still lose to SIM_B, because a job never measured counts as heavy."""
+    _two_sims_with_presence(env, monkeypatch, _SIM_A_WEDNESDAY)
+    payload = _probe_plan(capsys)
+    assert payload["target"]["name"] == "SIM_B"
+    assert payload["target_reason"] == "presence-avoided"
+    assert payload["owner_presence"]["status"] == "valid"
+    entry = {e["name"]: e for e in payload["candidates_probed"]}
+    assert entry["SIM_A"]["owner_window_until"] == "2026-10-21T09:30"
+    assert "owner_window_until" not in entry["SIM_B"]
+
+
+def test_auto_returns_to_the_preferred_device_once_the_window_ends(env, capsys, monkeypatch):
+    from datetime import datetime
+
+    _two_sims_with_presence(env, monkeypatch, _SIM_A_WEDNESDAY,
+                            now=datetime(2026, 10, 21, 9, 30))
+    payload = _probe_plan(capsys)
+    assert payload["target"]["name"] == "SIM_A"
+    assert payload["target_reason"] == "auto"
+
+
+def test_an_asterisk_bullet_is_honoured_like_a_dash(env, capsys, monkeypatch):
+    """A standard Markdown `*` item must switch presence on, not read as a valid empty schedule."""
+    _two_sims_with_presence(env, monkeypatch, _SIM_A_WEDNESDAY.replace("- SIM_A", "* SIM_A"))
+    payload = _probe_plan(capsys)
+    assert payload["target"]["name"] == "SIM_B"
+    assert payload["target_reason"] == "presence-avoided"
+
+
+def test_presence_is_not_the_reason_when_load_alone_moves_the_job(env, capsys, monkeypatch):
+    """The busy owner device would have lost on load anyway, so the run says so."""
+    _two_sims_with_presence(env, monkeypatch, _SIM_A_WEDNESDAY,
+                            busy={"SIM_A": 95.0, "SIM_B": 0.0, "LOCAL_SIM": 50.0})
+    payload = _probe_plan(capsys)
+    assert payload["target"]["name"] == "SIM_B"
+    assert payload["target_reason"] == "auto-loadbalance"
+
+
+def test_a_job_measured_as_short_may_use_the_owner_device(env, capsys, monkeypatch):
+    """Presence avoidance is for heavy work; a two-minute job does not disturb the owner."""
+    from remrun import cli as cli_mod
+
+    _two_sims_with_presence(env, monkeypatch, _SIM_A_WEDNESDAY)
+    monkeypatch.setattr(cli_mod, "_job_prediction",
+                        lambda config, plan: {"dur_s": 120.0, "rss_mb": None})
+    payload = _probe_plan(capsys)
+    assert payload["target"]["name"] == "SIM_A"
+    assert "owner_window_until" not in payload["candidates_probed"][0]
+
+
+def test_the_owner_device_is_a_last_resort_not_a_refusal(env, capsys, monkeypatch):
+    routing = "# Routing\n\n## Owner presence\n\n- SIM_A, SIM_B: Wed 00:00-24:00\n"
+    _two_sims_with_presence(env, monkeypatch, routing)
+    payload = _probe_plan(capsys)
+    assert payload["target"]["name"] == "SIM_A"
+    assert payload["target_reason"] == "presence-fallback"
+
+
+def test_a_malformed_schedule_is_reported_and_applies_no_partial_rule(env, capsys, monkeypatch):
+    routing = _SIM_A_WEDNESDAY + "- SIM_B: Wednesday mornings\n"
+    _two_sims_with_presence(env, monkeypatch, routing)
+    payload = _probe_plan(capsys)
+    assert payload["owner_presence"]["status"] == "malformed"
+    assert "line 6" in payload["owner_presence"]["detail"]
+    assert payload["target"]["name"] == "SIM_A"
+    assert payload["target_reason"] == "auto"
+
+
+def test_run_records_why_its_device_was_chosen_and_its_label(env, capsys, monkeypatch):
+    """Without the reason in the run record, nobody can tell whether --auto is used."""
+    _two_sims_with_presence(env, monkeypatch, _SIM_A_WEDNESDAY)
+    code = main(["run", "--auto", "--label", "regen 2019", "--",
+                 "python", "-c", "print('ran')"])
+    assert code == EXIT_OK
+    err = capsys.readouterr().err
+    assert "owner_presence" in err and "SIM_A" in err
+    summary = json.loads(next((env["state"] / "runs").glob("*/summary.json")).read_text())
+    assert summary["target"] == "SIM_B"
+    assert summary["plan"]["target_reason"] == "presence-avoided"
+    assert summary["plan"]["label"] == "regen 2019"
+
+
 def test_plan_probe_reports_unknown_load_as_null_not_zero(env, capsys, monkeypatch):
     # A backend that cannot measure must yield null. Zero would read as "totally idle"
     # and attract every routing decision to the device we know least about.

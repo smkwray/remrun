@@ -273,6 +273,7 @@ def scheduler_config(config: RemrunConfig) -> dict[str, Any]:
     s.setdefault("headroom_margin_cores", 4)
     s.setdefault("ram_headroom_pct", 80)
     s.setdefault("trivial_job_seconds", 30)
+    s.setdefault("heavy_job_seconds", 300)
     return s
 
 

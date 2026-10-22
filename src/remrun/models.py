@@ -200,6 +200,9 @@ class RunPlan:
     candidates: list[Device] = field(default_factory=list)
     workload: WorkloadSpec | None = None
     bootstrap: BootstrapPlan | None = None
+    # Set once a run attempt binds a target: why it was chosen, and the run's label.
+    target_reason: str | None = None
+    label: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         result = {
@@ -231,4 +234,7 @@ class RunPlan:
             result["workload"] = self.workload.as_dict()
         if self.bootstrap is not None:
             result["bootstrap"] = self.bootstrap.as_dict()
+        if self.target_reason is not None:
+            result["target_reason"] = self.target_reason
+            result["label"] = self.label
         return result
