@@ -65,7 +65,12 @@ def test_bootstrap_protocol_failure_preserves_helper_diagnostics(
     tmp_path: Path, monkeypatch, stdout: str,
 ):
     project = _project(tmp_path)
-    device = _device(tmp_path)
+    device = Device.from_mapping("LOCAL_SIM", {
+        "kind": "local-sim", "os": "windows" if sys.platform == "win32" else "posix",
+        "project_root": str(tmp_path / "remote"),
+        "state_root": str(tmp_path / "target-state"),
+        "remote_python": sys.executable, "venv_root": str(tmp_path / "venvs"),
+    })
     transport = LocalSimTransport(device)
     plan = _plan(project)
     runenv = resolve_run_env(
@@ -75,7 +80,7 @@ def test_bootstrap_protocol_failure_preserves_helper_diagnostics(
         }},
     )
     monkeypatch.setattr(
-        transport, "exec", lambda *_args, **_kwargs: ExecResult(1, stdout, "helper error\n")
+        transport, "exec_control" if device.is_windows else "exec", lambda *_args, **_kwargs: ExecResult(1, stdout, "helper error\n")
     )
     result = execute_bootstrap(
         transport, device=device, project=project, plan=plan,
