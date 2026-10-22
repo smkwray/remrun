@@ -2,6 +2,8 @@
 /config/devices.toml
 /config/fleet_costs.toml
 /config/private_release_patterns.txt
+/.private-denylist
+*.sync-conflict-*
 /config/private_worker_scripts.json
 
 # Agent worktrees and session config. Nested checkouts must never be committed as gitlinks.

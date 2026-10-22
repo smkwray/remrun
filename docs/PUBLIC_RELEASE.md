@@ -19,17 +19,23 @@ private comments in agent docs
 any data paths that reveal projects or clients
 ```
 
-Run the checked public-surface scan:
+Run both checks before every push, with the history range of what is about to be published:
 
 ```bash
 bash scripts/hygiene_check.sh
-python3 scripts/public_release_check.py
+python3 scripts/public_release_check.py --history-base origin/main
 ```
 
-The hygiene gate checks paths, diffs, and commit attribution. The release checker
-scans package code, tests, generic native gates, examples, schemas, README,
-generic docs, and example config. Both intentionally exclude private
-continuity/work-order notes and ignored local config.
+The hygiene gate checks paths, diffs, and commit attribution. The release checker scans both
+surfaces of the next commit: every staged index entry (reported as `:path`) and every
+working-tree file that is tracked or untracked but not ignored. Then, for the history range,
+it scans every path, blob and message of every commit: an intermediate version, a file name
+or a message is published with the branch even when the final tree is clean. Path and file
+type do not matter and undecodable bytes are read, not skipped. It fails while a path that
+`.gitignore` ignores (private config, `.env`, agent session folders, local state and logs,
+continuity notes) or a nested repository would be published, and while any device identity
+in the local `config/devices.toml` (name, user, addresses, home-path account) is missing from
+the private pattern file. Ignored local config is safe only while it stays untracked.
 
 ## Rename or scope if needed
 
