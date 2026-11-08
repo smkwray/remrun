@@ -3194,12 +3194,25 @@ def _run_locked(
                 report=reporter.event,
             )
         except TransportError as exc:
+            failed_exit = EXIT_GUARD if guard_failed else EXIT_TRANSFER
+            # Delivery is incomplete, so the fence stays: it keeps leasing the outputs
+            # (an overlapping run would race this one's undelivered files) and keeps
+            # the retained tree, which holds them, from being pruned.
+            guidance = (
+                f"the command ended (exit {command_exit_code}) but its outputs were not all "
+                f"returned ({exc}); they stay in the retained private tree {work.tree} on "
+                f"{plan.target.name}, and this run keeps its --output lease. Copy what you "
+                f"need from there, then run `remrun resolve-unknown {run_id} "
+                "--confirmed-ended` to release the lease"
+            )
             reporter.event("transfer_error", phase="pullback", message=str(exc))
+            reporter.event("output_lease_kept", run_id=run_id, guidance=guidance)
             write_json(summary_path, {
                 "run_id": run_id,
-                "exit_code": EXIT_GUARD if guard_failed else result.exit_code,
+                "exit_code": failed_exit,
                 "command_exit_code": command_exit_code,
                 "error": str(exc),
+                "guidance": guidance,
                 "phase": "pullback",
                 "completion_state": "finalization_failed",
                 "command_started": guarded_started,
@@ -3209,10 +3222,9 @@ def _run_locked(
                 "work": {**work.as_dict(), "state": "retained", "reason": str(exc)},
                 "plan": plan.as_dict(),
             })
-            return EXIT_GUARD if guard_failed else EXIT_TRANSFER
-        finally:
-            # The command's end is known either way; the lease ends with the pullback.
-            clear_unknown_completion_hazard(plan.project.project_id, run_id, per_run=True)
+            return failed_exit
+        # The outputs are delivered; the lease ends with the pullback.
+        clear_unknown_completion_hazard(plan.project.project_id, run_id, per_run=True)
         post = commit_final.post
         verify_fields = {
             **verify_fields,
@@ -5406,8 +5418,8 @@ def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
         target=hazard["target"],
         run_id=args.run_id,
         note=(
-            "commit run: its output lease is released; nothing was pulled back, and its "
-            "private tree stays on the target until a later commit run prunes it"
+            "commit run: its output lease is released; resolving pulls nothing back, and "
+            "its private tree stays on the target until a later commit run prunes it"
             if per_run and "outputs" in hazard
             else "untransferred run: nothing was transferred and no baseline exists"
             if per_run

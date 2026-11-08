@@ -270,7 +270,10 @@ time per project, without the target's checkout changing under them. It works wi
   `resume` and by the next commit run there.
 - **Concurrency.** No project lock is taken. Each run holds a lease on its outputs
   until its pullback ends: a commit run whose outputs overlap a live one's (one path
-  is a prefix of the other) is refused before any target is touched. Commit runs with
+  is a prefix of the other, ignoring case and Unicode form) is refused before any
+  target is touched. If the pullback fails, the run exits `3`, its outputs stay in the
+  retained tree named in `summary.json`, and the lease stays until
+  `remrun resolve-unknown RUN_ID --confirmed-ended`. Commit runs with
   disjoint outputs, and ordinary runs, may run at the same time. A commit run still
   refuses while an ordinary run of the project has unknown completion.
 - **Environment.** The command runs in `tree/<your relative directory>`. The project's

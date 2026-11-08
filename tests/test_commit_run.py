@@ -523,9 +523,22 @@ def test_tree_is_removed_only_after_a_clean_pullback(commit_env, monkeypatch):
         *_py(_write("out/r2.txt", "lost?")),
     ])
     assert status == 3  # EXIT_TRANSFER
-    assert _summary(env["state"], run_id)["work"]["state"] == "retained"
+    summary = _summary(env["state"], run_id)
+    assert (summary["exit_code"], summary["command_exit_code"]) == (3, 0)
+    assert summary["work"]["state"] == "retained"
     assert len(_work_dirs(env)) == 2
+    # Delivery is incomplete, so the lease stands: it refuses an overlapping run and
+    # keeps the retained tree, which holds the undelivered output, from being pruned.
+    assert _lease_fences(env) == {run_id: ["out/"]}
+    assert summary["work"]["tree"] in summary["guidance"]
+    assert f"remrun resolve-unknown {run_id} --confirmed-ended" in summary["guidance"]
+    assert _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/r2.txt", "--",
+        *_py("print(1)"),
+    ]) == (EXIT_CONFLICT, None)
     monkeypatch.setattr(LocalSimTransport, "pull_file", real_pull)
+    assert main(["resolve-unknown", run_id, "--confirmed-ended"]) == EXIT_OK
+    assert _lease_fences(env) == {}
 
     def broken_remove(self, remote_path):  # noqa: ANN001
         raise TransportError("injected removal failure")
