@@ -1810,6 +1810,30 @@ def test_cancel_while_the_original_controller_waits_only_requests_the_stop(
     assert (durable_env["project"] / "partial.txt").read_text() == "partial"
 
 
+@pytest.mark.parametrize(("state", "expected"), [("failed", EXIT_INFRA), ("complete", EXIT_OK)])
+def test_cancel_handed_off_reports_a_failed_target_state_as_unknown(
+    durable_env, monkeypatch, capsys, state, expected
+):
+    """A target whose durable state failed closed cannot say whether the command
+    ended; `cancel` must not exit 0 as if it had handed off a finished run. A
+    complete run, by contrast, is the waiting controller's to finalize."""
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    assert fake.status is not None
+    fake.status = {**fake.status, "state": state}
+    waiting = ProjectLock("proj1", "TEST", run_id=run_id).acquire()
+    try:
+        capsys.readouterr()
+        assert main(["cancel", run_id]) == expected
+        err = capsys.readouterr().err
+    finally:
+        waiting.release()
+    assert fake.cancel_calls == []
+    assert ("completion_unknown" in err) is (state == "failed")
+    assert ("cancel_handed_off" in err) is (state == "complete")
+    hazard = cli.read_unknown_completion_hazard("proj1")
+    assert hazard is not None and hazard["run_id"] == run_id
+
+
 def _detached_untransferred_run(durable_env, monkeypatch):  # noqa: ANN001
     """An untransferred durable run still running on the target after its controller left."""
     _set_transfer_mode(durable_env, "none")

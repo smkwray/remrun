@@ -4912,7 +4912,17 @@ def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
         # summary and finalization; racing it could pull outputs back twice.
         status = transport.durable_status(run_id, token)
         _validate_durable_identity(status, record)
-        if status.get("state") not in {"complete", "failed"} and not _request_durable_stop(
+        if status.get("state") == "failed":
+            # Completion is unknown, exactly as the waiting controller will report it.
+            reporter.event(
+                "completion_unknown", run_id=run_id,
+                reason="target durable state is missing, corrupt, mismatched, or ambiguous",
+                guidance=_unknown_completion_guidance(
+                    hazard, per_run=plan.transfer_mode == "none"
+                ),
+            )
+            return EXIT_INFRA
+        if status.get("state") != "complete" and not _request_durable_stop(
             **stop, status=status, summary_path=None
         ):
             return EXIT_INFRA

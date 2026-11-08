@@ -153,7 +153,8 @@ already finished is finalized exactly as `resume` would. If another remrun proce
 still waiting on the run (the original `run --durable`, or a `resume`), `cancel` only
 stops the command and exits `0`; the waiting process finalizes it, but only once the
 cancel has confirmed the processes are gone (it waits up to two minutes for that and
-reports `cancel_pending`). A cancel that signalled the command but could not confirm
+reports `cancel_pending`). If the target's durable state there has failed closed,
+`cancel` instead exits `4` with completion unknown. A cancel that signalled the command but could not confirm
 its processes are gone leaves completion unknown, for any later `resume` too: prove
 the processes ended, then use `resolve-unknown`. `cancel` stops
 nothing while the run is still starting or when the target holds no record with the
