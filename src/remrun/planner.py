@@ -17,6 +17,39 @@ from .resource_context import select_workload
 from .scheduler import order_devices
 from .scopes import resolve_write_scope
 
+# The transfer modes `run` implements. `safe` reconciles the project tree before and
+# after the command; `none` runs in the target's existing checkout and moves no files.
+TRANSFER_MODES = ("safe", "none")
+
+
+def _transfer_mode(config: RemrunConfig, requested: str | None) -> str:
+    """The run's transfer mode: ``requested`` (the per-run flag) or ``[transfer] mode``."""
+    if requested is not None:
+        mode, source = requested, "--transfer"
+    else:
+        mode, source = config.defaults.get("transfer", {}).get("mode", "safe"), "[transfer] mode"
+    if not isinstance(mode, str) or mode not in TRANSFER_MODES:
+        raise ValueError(
+            f"{source} must be one of {', '.join(TRANSFER_MODES)}; got {mode!r}"
+        )
+    return mode
+
+
+def _verify_path(raw: object) -> str:
+    """One ``--verify`` file as a root-anchored, project-relative POSIX path."""
+    text = str(raw).strip().replace("\\", "/")
+    parts = text.split("/")
+    if (
+        not text
+        or text.startswith("/")
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(char in text for char in ":*?[]\x00")
+    ):
+        raise ValueError(
+            f"--verify takes a file path relative to the project root, without globs: {raw!r}"
+        )
+    return text
+
 
 def make_run_plan(
     *,
@@ -28,7 +61,15 @@ def make_run_plan(
     json_events: bool = False,
     requested_workload: str | None = None,
     allow_default_workload: bool = True,
+    transfer_mode: str | None = None,
+    verify: list[str] | tuple[str, ...] = (),
 ) -> RunPlan:
+    mode = _transfer_mode(config, transfer_mode)
+    verify_paths = tuple(dict.fromkeys(_verify_path(path) for path in verify))
+    if verify_paths and mode != "none":
+        raise ValueError("--verify applies only to --transfer none")
+    if mode == "none" and scope_name:
+        raise ValueError("--transfer none cannot take --scope: it pulls nothing back to scope")
     project = detect_project(cwd, config)
     project_config_path = find_project_config(project.local_project_root)
     project_config = load_project_config(project_config_path)
@@ -46,7 +87,11 @@ def make_run_plan(
         config.devices, target_name, project_config=project_config, command=command,
         scheduler_cfg=scheduler_config(config),
     )
-    transfer_mode = str(config.defaults.get("transfer", {}).get("mode", "safe"))
+    if mode == "none" and workload is not None:
+        raise ValueError(
+            "--transfer none does not support workload envelopes/receipts "
+            f"(workload {workload.name!r} is selected)"
+        )
     write_scope = resolve_write_scope(project_config, scope_name)
     max_push_files, max_push_bytes = push_limits(config, project_config)
 
@@ -55,7 +100,8 @@ def make_run_plan(
         candidates=candidates,
         project=project,
         command=command,
-        transfer_mode=transfer_mode,
+        transfer_mode=mode,
+        verify=verify_paths,
         project_config_path=project_config_path,
         excludes=resolve_excludes(config, project_config),
         hash_below_bytes=hash_below_bytes(config),

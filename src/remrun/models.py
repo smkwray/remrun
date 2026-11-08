@@ -206,6 +206,9 @@ class RunPlan:
     # Set once a run attempt binds a target: why it was chosen, and the run's label.
     target_reason: str | None = None
     label: str | None = None
+    # Project-relative files whose target copy must hash-equal the local one before an
+    # untransferred (``transfer_mode == "none"``) run dispatches.
+    verify: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         result = {
@@ -233,6 +236,9 @@ class RunPlan:
             "write_scope": self.write_scope,
             "write_scope_paths": self.write_scope_paths,
         }
+        # Only untransferred plans carry it, so a saved ordinary plan rebuilds exactly.
+        if self.transfer_mode == "none":
+            result["verify"] = list(self.verify)
         if self.workload is not None:
             result["workload"] = self.workload.as_dict()
         if self.bootstrap is not None:

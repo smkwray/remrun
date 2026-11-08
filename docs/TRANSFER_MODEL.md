@@ -2,7 +2,9 @@
 
 ## Default: Mode 1 / safe
 
-Mode 1 is the default.
+Mode 1 (`safe`) is the default. `[transfer] mode` in `config/defaults.toml` sets the
+default mode (`safe` or `none`); `run --transfer` and `plan --transfer` override it for
+one invocation. Any other value is a configuration error.
 
 It reconciles the active run surface conservatively and incrementally:
 
@@ -31,6 +33,33 @@ a fallback plan that would `PULL` or `DELETE_LOCAL` is ineligible. `PUSH` remain
 allowed because it sends the controller's bytes outward. The first device that
 actually reaches preflight uses the normal reconciliation rules above; an
 unreachable device has read or mutated nothing and does not consume that position.
+
+## Mode `none`: run in place
+
+`--transfer none` runs the command in the target's existing checkout and moves no files:
+
+```text
+no preflight reconcile -> the command sees the target's bytes as they are
+no pullback            -> outputs stay in the target's tree
+no baseline            -> the next ordinary run reconciles from the last ordinary baseline
+no project lock        -> untransferred runs of one project may run concurrently
+```
+
+It assumes the target's tree is current, for example because Syncthing keeps it so.
+`--verify PATH` proves that for named files: the target's copy must have the same
+SHA-256 as the local copy. Before the command starts, a run refuses with exit 2 and a
+conflict record when:
+
+```text
+target-checkout-missing -> the checkout or the run's directory is absent on the target
+verify-mismatch         -> a --verify file differs on the target
+verify-unavailable      -> the target could not hash a --verify file (fail closed)
+bootstrap-not-ready     -> a declared [run.bootstrap] is not ready; setup never runs here
+```
+
+All four are candidate-local, so `--auto` tries the next candidate. Each untransferred
+run keeps its own completion fence; it still refuses while an ordinary run of the
+project has unknown completion, while ordinary runs do not wait for untransferred ones.
 
 ## Why remote-newer is pulled by default
 

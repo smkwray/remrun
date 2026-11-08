@@ -91,6 +91,8 @@ remrun resume <run_id> --no-wait    # report authenticated target state and retu
 remrun run --scope spec_a --auto -- <cmd>  # opt-in declared write scope
 remrun run macbox --memory-limit-mib 8192 -- <cmd>  # optional hard limit for a heavy first run
 remrun run macbox --wait-lock 600 -- <cmd>  # wait up to 600 s for a running holder of the project lock
+remrun run macbox --transfer none -- <cmd>  # run in the target's checkout as it is; move no files
+remrun run macbox --transfer none --verify src/model.py -- <cmd>  # first prove that file matches
 remrun status [DEVICE] [--limit N]  # recent runs, optionally filtered by target
 remrun logs [last|<run_id>] [--json]
 remrun clean [--older-than 30d] [--keep N] [--dry-run]   # prune state folder
@@ -145,6 +147,41 @@ target, noninteractive input, and the controller that created the run. It does n
 support workload envelopes, target reboot restart, adoption from a different
 controller, or a global fence against another controller starting an unrelated
 ordinary run. Ordinary `remrun run` behavior is unchanged.
+
+### Untransferred runs (`--transfer none`)
+
+`--transfer none` runs the command in the target's existing checkout of the project,
+as that checkout is. remrun does not reconcile the tree before the command, does not
+pull outputs back after it, and records no baseline. Use it when the target already
+holds the code and data (for example because Syncthing keeps it current) and you want
+several long jobs of one project to run at once, or the project is too large to scan
+on every run. It works with `--durable`, `--auto` and `--label`.
+
+- The checkout, including the directory you run from, must already exist on the
+  target; remrun never creates or changes files in it. With `--auto`, a target without
+  the checkout is skipped.
+- remrun assumes the target's tree is current. `--verify PATH` (repeatable; a file
+  path relative to the project root, no globs) proves it for the files that matter:
+  before starting, remrun compares the SHA-256 of the local file with the target's
+  copy. If they differ, or the target cannot hash its copy, the run stops with exit `2`
+  before the command starts; with `--auto` the next target is tried. The verified
+  digests are recorded under `verify` in the run's `summary.json`.
+- Outputs stay where the command wrote them on the target. Syncthing, or a later
+  ordinary run, brings them back.
+- No project lock is taken, so untransferred runs of one project can run side by
+  side. Each records its own completion fence, which `resume` and `resolve-unknown`
+  clear for that run only. An untransferred run still refuses to start while an
+  ordinary run of the project has unknown completion. Ordinary runs do not wait for
+  untransferred ones: an ordinary run's pullback may bring back files an untransferred
+  run is still writing.
+- A project that declares `[run.bootstrap]` must already be set up on the target. An
+  untransferred run checks readiness but never runs setup; run one ordinary run there
+  first.
+- It cannot be combined with `--scope` or a resource workload. A successful
+  untransferred run updates the learned job costs like an ordinary one.
+
+`[transfer] mode = "none"` in `config/defaults.toml` makes this the default; then
+`--transfer safe` gives one run the ordinary behavior. `plan` accepts both flags.
 
 ### Fleet utilities
 
@@ -475,7 +512,8 @@ do not need to install the helper.
 Target forms for `run`/`plan`: an explicit device (`macbox`, `winbox`, `LOCAL_SIM`),
 `--auto`, the literal `auto`, or omit it (defaults to auto). Run flags:
 `--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`, `--allow-large-push` (skip the
-push guard below for one run), and `--label TEXT` (a short
+push guard below for one run), `--transfer safe|none` and `--verify PATH` (see
+untransferred runs above), and `--label TEXT` (a short
 name `fleet jobs` shows instead of the executable; spaces are stored as underscores). An owner
 who deliberately accepts
 the target's memory risk may use `--bypass-memory-guard` with an explicitly named target. The

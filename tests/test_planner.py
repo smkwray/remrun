@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from remrun.config import RemrunConfig
 from remrun.models import Device, ProjectContext, WorkloadSpec
 from remrun.planner import make_run_plan
@@ -141,3 +143,42 @@ def test_bench_can_suppress_project_default_workload(monkeypatch, tmp_path: Path
     assert ordinary.workload is not None
     assert ordinary.workload.name == "demo.build"
     assert bench_remote_leg.workload is None
+
+
+def test_transfer_mode_is_one_validated_value_set(monkeypatch, tmp_path: Path) -> None:
+    """[transfer] mode used to be echoed and never obeyed. Now that it decides whether
+    files move, a value remrun does not implement must stop the run instead of quietly
+    running as something else, and the per-run flag must beat the default."""
+    _patch_planning_dependencies(monkeypatch, tmp_path, {})
+    monkeypatch.setattr(
+        "remrun.planner.order_devices",
+        lambda devices, target_name, **kwargs: [devices["BOX"]],
+    )
+
+    def plan(mode: object = "safe", **kwargs):
+        config = _config(tmp_path)
+        config.defaults["transfer"]["mode"] = mode
+        return make_run_plan(
+            cwd=tmp_path, config=config, target_name="BOX", command=["true"], **kwargs
+        )
+
+    assert plan().transfer_mode == "safe"
+    assert plan("none").transfer_mode == "none"
+    assert plan("none", transfer_mode="safe").transfer_mode == "safe"
+    assert plan(transfer_mode="none").as_dict()["verify"] == []
+    for bad in ("commit", "", "SAFE", 1, None):
+        with pytest.raises(ValueError, match=r"\[transfer\] mode"):
+            plan(bad)
+    with pytest.raises(ValueError, match="--transfer"):
+        plan(transfer_mode="commit")
+
+    checked = plan(transfer_mode="none", verify=["src/model.py", "src\\model.py", "data.csv"])
+    assert checked.verify == ("src/model.py", "data.csv")
+    assert checked.as_dict()["verify"] == ["src/model.py", "data.csv"]
+    for bad_path in ("../escape.py", "/etc/passwd", "src/", "src/*.py", "./model.py", "C:x", ""):
+        with pytest.raises(ValueError, match="--verify"):
+            plan(transfer_mode="none", verify=[bad_path])
+    with pytest.raises(ValueError, match="only to --transfer none"):
+        plan(verify=["src/model.py"])
+    with pytest.raises(ValueError, match="--scope"):
+        plan(transfer_mode="none", scope_name="outputs")

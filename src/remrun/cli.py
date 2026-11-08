@@ -13,6 +13,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import NoReturn
 
 from . import __version__
 from .bootstrap import (
@@ -31,10 +32,11 @@ from .job_observation import (
     JobObservation, controller_label, job_observation_enabled, local_device,
     local_registry_root, observed_job_id, observed_project_id,
 )
+from .manifest import sha256_file
 from .memory_guard import MIB, MemoryAdmissionResult, MemoryReservation
 from .models import RunPlan, WorkloadSpec
 from .output import Reporter, emit_json_document
-from .planner import make_run_plan
+from .planner import TRANSFER_MODES, make_run_plan
 from .project import (
     ProjectDetectionError, detect_project, find_project_config, project_root_base,
 )
@@ -254,6 +256,19 @@ def _wait_seconds(value: str) -> float:
     return result
 
 
+def _add_transfer_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--transfer", choices=TRANSFER_MODES,
+        help="safe: reconcile the project tree before and after the command; none: run in "
+             "the target's existing checkout and transfer nothing (default: [transfer] mode)",
+    )
+    p.add_argument(
+        "--verify", action="append", default=[], metavar="PATH",
+        help="with --transfer none, refuse to run unless the target's copy of this "
+             "project-relative file has the same SHA-256 as the local one (repeatable)",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     # On Windows the console defaults to a legacy codepage (e.g. cp1252).
     # Remote command output is decoded as UTF-8 and may contain characters that
@@ -352,6 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auto", action="store_true", help="Pick the target device automatically")
     p.add_argument("--scope", help="declared [parallel.scopes.<name>] write scope for this run")
     p.add_argument("--workload", help="selected schema-1 project resource workload")
+    _add_transfer_arguments(p)
     p.add_argument("--probe", action="store_true",
                    help="probe each candidate for reachability and live CPU load "
                         "(costs a round-trip per device; off by default)")
@@ -369,6 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workload", help="selected schema-1 project resource workload")
     p.add_argument("--label", type=_job_label,
                    help="short label shown by `fleet jobs`, e.g. 'regen 2019'")
+    _add_transfer_arguments(p)
     p.add_argument("--dry-run", action="store_true", help="Print plan and do not execute")
     p.add_argument("--no-pullback", action="store_true", help="Skip post-run pullback")
     p.add_argument("--no-telemetry", action="store_true", help="Skip resource telemetry")
@@ -841,13 +858,20 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         scope_name=args.scope,
         json_events=args.json,
         requested_workload=args.workload,
+        transfer_mode=args.transfer,
+        verify=args.verify,
     )
     candidates = None
     target_reason = None
     presence = None
+    untransferred = plan.transfer_mode == "none"
     # Measuring the push needs the target's manifest, a round-trip, so only with --probe.
-    push: dict = {"status": "not_measured", "max_files": plan.max_push_files,
-                  "max_bytes": plan.max_push_bytes, "hint": "add --probe to measure it"}
+    push: dict = (
+        {"status": "not_applicable", "detail": "--transfer none pushes nothing"}
+        if untransferred else
+        {"status": "not_measured", "max_files": plan.max_push_files,
+         "max_bytes": plan.max_push_bytes, "hint": "add --probe to measure it"}
+    )
     if args.probe or args.check_git:
         candidates = []
         presence = load_presence(config)
@@ -887,11 +911,13 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
                             plan.bootstrap, status="unsupported", detail=str(exc)
                         ),
                     )
-            push = _plan_push_estimate(plan, selection[0][1])
+            if not untransferred:
+                push = _plan_push_estimate(plan, selection[0][1])
         else:
             target_reason = "unreachable"
-            push = {"status": "unavailable", "max_files": plan.max_push_files,
-                    "max_bytes": plan.max_push_bytes, "error": "target unreachable"}
+            if not untransferred:
+                push = {"status": "unavailable", "max_files": plan.max_push_files,
+                        "max_bytes": plan.max_push_bytes, "error": "target unreachable"}
     if args.json:
         payload = plan.as_dict()
         if candidates is not None:
@@ -908,7 +934,8 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
             reporter.event("target", name=plan.target.name, kind=plan.target.kind,
                            reason=target_reason)
         reporter.event("command", argv=plan.command)
-        reporter.event("transfer_mode", mode=plan.transfer_mode)
+        reporter.event("transfer_mode", mode=plan.transfer_mode,
+                       **({"verify": list(plan.verify)} if untransferred else {}))
         reporter.event("write_scope", name=plan.write_scope or "project",
                        paths=plan.write_scope_paths)
         if plan.workload is not None:
@@ -1163,8 +1190,24 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
     return [(device, transport, probe, reason), *rest]
 
 
-def _unknown_completion_guidance(hazard: dict[str, object]) -> str:
+def _unknown_completion_guidance(hazard: dict[str, object], *, per_run: bool = False) -> str:
     run_id = str(hazard["run_id"])
+    if per_run:
+        # An untransferred run fences only itself; nothing was pushed and nothing will be
+        # pulled back, so finalizing it changes no project files.
+        first = (
+            f"run `remrun resume {run_id}` from this project: it reattaches, waits and "
+            "finalizes. Only if resume reports the target's durable state is missing or "
+            "failed, use"
+            if _durable_record_path(run_dir(run_id)).is_file()
+            else "use"
+        )
+        return (
+            f"completion of untransferred run {run_id} is not confirmed; its fence blocks "
+            f"only that run, not other runs of this project. To clear it, {first} a "
+            "read-only process/artifact probe to prove the command ended, then run "
+            f"`remrun resolve-unknown {run_id} --confirmed-ended`"
+        )
     if _durable_record_path(run_dir(run_id)).is_file():
         # A durable run's target supervisor may still own the job and its result.
         # Resuming finalizes it and pulls outputs back; resolving it as ended would
@@ -1214,6 +1257,108 @@ def _report_unknown_completion_hazard(
         guidance=_unknown_completion_guidance(hazard),
     )
     return hazard
+
+
+def _local_verify_digests(plan: RunPlan) -> dict[str, str]:
+    """SHA-256 of each ``--verify`` file in this controller's tree, taken once per run."""
+    digests: dict[str, str] = {}
+    for rel in plan.verify:
+        path = plan.project.local_project_root.joinpath(*rel.split("/"))
+        if not path.is_file():
+            raise ValueError(f"--verify {rel}: no such file in this project")
+        digests[rel] = sha256_file(path)
+    return digests
+
+
+def _verify_untransferred_target(
+    transport, plan: RunPlan, remote_root: str, remote_cwd: str, local: dict[str, str],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Check an untransferred run's target before dispatch, writing nothing.
+
+    Returns ``(verified, conflicts)``. The checkout, including the run's working
+    directory, must already exist, and every ``--verify`` file must hash the same as the
+    local copy. A digest the target cannot produce refuses too: equality is proved,
+    never assumed.
+    """
+    if not transport.remote_path_exists(remote_cwd):
+        return [], [{
+            "path": plan.project.relative_cwd or ".",
+            "state": "target-checkout-missing",
+            "reason": f"{remote_cwd} does not exist on {plan.target.name}; --transfer none "
+                      "runs only in the target's existing checkout",
+        }]
+    verified: list[dict[str, str]] = []
+    conflicts: list[dict[str, str]] = []
+    for rel, mine in local.items():
+        try:
+            theirs = transport.hash_file(transport.remote_join(remote_root, rel))
+        except (TransportError, NotImplementedError, OSError, ValueError) as exc:
+            conflicts.append({"path": rel, "state": "verify-unavailable",
+                              "reason": f"target hash failed: {type(exc).__name__}: {exc}"})
+            continue
+        digest = theirs.strip().lower() if isinstance(theirs, str) else ""
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            conflicts.append({"path": rel, "state": "verify-unavailable",
+                              "reason": "target returned no valid SHA-256"})
+        elif digest != mine:
+            conflicts.append({"path": rel, "state": "verify-mismatch",
+                              "reason": f"local sha256 {mine}, target sha256 {digest}"})
+        else:
+            verified.append({"path": rel, "sha256": mine})
+    return verified, conflicts
+
+
+def _refuse_untransferred_candidate(
+    *,
+    reporter: Reporter,
+    plan: RunPlan,
+    run_id: str,
+    summary_path: Path,
+    started_at: str,
+    phase: str,
+    conflicts: list[dict[str, str]],
+    verified: list[dict[str, str]],
+) -> NoReturn:
+    """Record why an untransferred run cannot start on this candidate, then skip it.
+
+    Nothing was written to either tree and no fence exists yet, so ``--auto`` may try
+    the next candidate, whose checkout may be current.
+    """
+    cdir = conflict_dir(run_id)
+    write_json(cdir / "conflicts.json", {
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "conflicts": conflicts,
+    })
+    for item in conflicts:
+        reporter.event("conflict", **item)
+    reporter.event("action", value="not running command")
+    reporter.event("conflict_state", path=str(cdir))
+    write_json(summary_path, {
+        "run_id": run_id,
+        "project_id": plan.project.project_id,
+        "target": plan.target.name,
+        "command": plan.command,
+        "started_at": started_at,
+        "ended_at": utc_now_iso(),
+        "exit_code": EXIT_CONFLICT,
+        "phase": phase,
+        "completion_state": "not_started",
+        "command_started": False,
+        "terminal": True,
+        "conflicts": len(conflicts),
+        "conflict_state": str(cdir),
+        "verify": verified,
+        "plan": plan.as_dict(),
+    })
+    first = conflicts[0]
+    raise _PreflightConflict(
+        exit_code=EXIT_CONFLICT,
+        conflict_dir=cdir,
+        detail=f"{len(conflicts)} refused path(s); first: {first['path']} ({first['state']})",
+        retryable=True,
+    )
 
 
 def _stage_workload_context(
@@ -1593,7 +1738,12 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         json_events=args.json,
         requested_workload=getattr(args, "workload", None),
         allow_default_workload=not getattr(args, "suppress_default_workload", False),
+        transfer_mode=getattr(args, "transfer", None),
+        verify=getattr(args, "verify", None) or (),
     )
+    # An untransferred run moves no files, so it takes no project lock and fences only
+    # itself; it still refuses while an ordinary run's project-wide fence stands.
+    untransferred = plan.transfer_mode == "none"
 
     if getattr(args, "durable", False):
         if (
@@ -1610,7 +1760,7 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
 
     if not args.dry_run and _report_unknown_completion_hazard(
         plan.project.project_id, reporter,
-        wait_for_live_owner=getattr(args, "wait_lock", 0.0) > 0,
+        wait_for_live_owner=getattr(args, "wait_lock", 0.0) > 0 and not untransferred,
     ):
         return EXIT_INTERNAL
 
@@ -1628,6 +1778,7 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                    {"run_id": run_id, "dry_run": True, "plan": plan.as_dict()})
         return EXIT_OK
 
+    verify_digests = _local_verify_digests(plan)
     sched = scheduler_config(config)
     # When explicitly enabled, placement overlays the project's PORTABLE job costs so
     # --auto can use prior measurements from another controller.
@@ -1822,24 +1973,27 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         remote_cwd = transport.remote_join(remote_root, plan.project.relative_cwd)
         reporter.event("remote_cwd", path=remote_cwd)
 
-        try:
-            lock = ProjectLock(
-                plan.project.project_id,
-                plan.target.name,
-                scope=plan.write_scope,
-                run_id=run_id,
-                report=reporter.event,
-            ).acquire(wait_seconds=getattr(args, "wait_lock", 0.0))
-        except LockError as exc:
-            if reservation is not None:
-                transport.release_memory_guard(reservation, reserved_only=True)
-            reporter.event("locked", message=str(exc))
-            write_json(summary_path, {"run_id": run_id, "error": str(exc), "plan": plan.as_dict()})
-            return EXIT_INTERNAL
+        lock: ProjectLock | None = None
+        if not untransferred:
+            try:
+                lock = ProjectLock(
+                    plan.project.project_id,
+                    plan.target.name,
+                    scope=plan.write_scope,
+                    run_id=run_id,
+                    report=reporter.event,
+                ).acquire(wait_seconds=getattr(args, "wait_lock", 0.0))
+            except LockError as exc:
+                if reservation is not None:
+                    transport.release_memory_guard(reservation, reserved_only=True)
+                reporter.event("locked", message=str(exc))
+                write_json(summary_path, {"run_id": run_id, "error": str(exc), "plan": plan.as_dict()})
+                return EXIT_INTERNAL
         # The pre-planning hazard check is stale by now: a holder waited on (or one
         # that finished while this run was planning) may have left its fence behind.
         def _drop_lock() -> None:
-            lock.release()
+            if lock is not None:
+                lock.release()
             if reservation is not None:
                 transport.release_memory_guard(reservation, reserved_only=True)
 
@@ -1866,7 +2020,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                                resource_policy, reservation,
                                memory_limit_mib=memory_limit_mib,
                                predicted_rss_mb=(prediction.get("rss_mb") if prediction else None),
-                               memory_reservation_ref=reservation_ref)
+                               memory_reservation_ref=reservation_ref,
+                               verify_digests=verify_digests)
         except _PreflightConflict as exc:
             last_conflict_exit = exc.exit_code
             # A non-retryable conflict (e.g. local-vanished) is global: stop the whole run.
@@ -1909,7 +2064,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             write_json(summary_path, checkpoint)
             raise
         finally:
-            lock.release()
+            if lock is not None:
+                lock.release()
             current_reservation = reservation_ref["value"]
             if current_reservation is not None:
                 transport.release_memory_guard(current_reservation, reserved_only=True)
@@ -1945,9 +2101,12 @@ def _run_locked(
     memory_limit_mib: int | None = None,
     predicted_rss_mb: object = None,
     memory_reservation_ref: dict[str, MemoryReservation | None] | None = None,
+    verify_digests: dict[str, str] | None = None,
 ) -> int:
     local_root = plan.project.local_project_root
-    prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
+    # An untransferred run neither reconciles, nor reads or writes a baseline, nor pulls
+    # back: the command runs on whatever the target's checkout holds.
+    untransferred = plan.transfer_mode == "none"
     backup_root = conflict_dir(run_id) / "backup"
 
     if plan.bootstrap is not None and plan.bootstrap.status == "unsupported":
@@ -2044,6 +2203,41 @@ def _run_locked(
             return EXIT_TRANSFER
         return None
 
+    # The untransferred target check runs first: a missing checkout or a differing
+    # --verify file is this candidate's problem, so --auto may try the next one.
+    verified: list[dict[str, str]] = []
+    if untransferred:
+        try:
+            verified, problems = _verify_untransferred_target(
+                transport, plan, remote_root, remote_cwd, verify_digests or {}
+            )
+        except TransportError as exc:
+            reporter.event("transfer_error", phase="verify", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "command": plan.command,
+                "started_at": started_at,
+                "ended_at": utc_now_iso(),
+                "error": str(exc),
+                "phase": "verify",
+                "completion_state": "not_started",
+                "command_started": False,
+                "terminal": True,
+                "plan": plan.as_dict(),
+            })
+            return EXIT_TRANSFER
+        if problems:
+            _refuse_untransferred_candidate(
+                reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+                started_at=started_at, phase="verify", conflicts=problems, verified=verified,
+            )
+        for item in verified:
+            reporter.event("verify", path=item["path"], sha256=item["sha256"], status="match")
+    # Untransferred summaries carry what --verify proved about the code that ran.
+    verify_fields = {"verify": verified} if untransferred else {}
+
     # Preserve the ordinary path's pre-mutation rejection boundary.  Only a
     # declared bootstrap may defer validation, because it can install the
     # requested entrypoint.
@@ -2063,104 +2257,115 @@ def _run_locked(
             **action_totals,
         )
 
-    allow_large_push = getattr(args, "allow_large_push", False)
-    try:
-        pre = preflight_reconcile(
-            transport=transport,
-            local_root=local_root,
-            remote_root=remote_root,
-            excludes=plan.excludes,
-            hash_below_bytes=plan.hash_below_bytes,
-            prev_local=prev_local,
-            prev_remote=prev_remote,
-            backup_root=backup_root,
-            backup_below_bytes=policy.backup_below_bytes,
-            progress=report_preflight_progress,
-            is_fallback=is_fallback,
-            include_paths=bootstrap_inputs,
-            max_push_files=None if allow_large_push else plan.max_push_files,
-            max_push_bytes=None if allow_large_push else plan.max_push_bytes,
+    pre = None
+    if untransferred:
+        reporter.event(
+            "transfer_skipped", mode=plan.transfer_mode,
+            note="no reconcile, baseline or pullback; outputs stay on the target",
         )
-    except TransportError as exc:
-        reporter.event("transfer_error", phase="preflight", message=str(exc))
-        write_json(summary_path, {
-            "run_id": run_id,
-            "project_id": plan.project.project_id,
-            "target": plan.target.name,
-            "command": plan.command,
-            "started_at": started_at,
-            "ended_at": utc_now_iso(),
-            "error": str(exc),
-            "phase": "preflight",
-            "completion_state": "not_started",
-            "command_started": False,
-            "terminal": True,
-            "plan": plan.as_dict(),
-        })
-        return EXIT_TRANSFER
+    else:
+        prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
+        allow_large_push = getattr(args, "allow_large_push", False)
+        try:
+            pre = preflight_reconcile(
+                transport=transport,
+                local_root=local_root,
+                remote_root=remote_root,
+                excludes=plan.excludes,
+                hash_below_bytes=plan.hash_below_bytes,
+                prev_local=prev_local,
+                prev_remote=prev_remote,
+                backup_root=backup_root,
+                backup_below_bytes=policy.backup_below_bytes,
+                progress=report_preflight_progress,
+                is_fallback=is_fallback,
+                include_paths=bootstrap_inputs,
+                max_push_files=None if allow_large_push else plan.max_push_files,
+                max_push_bytes=None if allow_large_push else plan.max_push_bytes,
+            )
+        except TransportError as exc:
+            reporter.event("transfer_error", phase="preflight", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "command": plan.command,
+                "started_at": started_at,
+                "ended_at": utc_now_iso(),
+                "error": str(exc),
+                "phase": "preflight",
+                "completion_state": "not_started",
+                "command_started": False,
+                "terminal": True,
+                "plan": plan.as_dict(),
+            })
+            return EXIT_TRANSFER
 
-    if pre.push_refused is not None:
-        # Not a candidate-local conflict: the bulk is in the local tree, so failing over
-        # would only repeat the same push elsewhere. Stop and let the user decide.
-        message = pre.push_refused.message()
-        reporter.event("push_refused", files=pre.push_refused.files,
-                       bytes=pre.push_refused.bytes, max_files=pre.push_refused.max_files,
-                       max_bytes=pre.push_refused.max_bytes, message=message)
-        write_json(summary_path, {
-            "run_id": run_id,
-            "project_id": plan.project.project_id,
-            "target": plan.target.name,
-            "command": plan.command,
-            "started_at": started_at,
-            "ended_at": utc_now_iso(),
-            "exit_code": EXIT_GUARD,
-            "error": message,
-            "phase": "preflight",
-            "completion_state": "not_started",
-            "command_started": False,
-            "terminal": True,
-            "push_guard": pre.push_refused.as_dict(),
-            "plan": plan.as_dict(),
-        })
-        return EXIT_GUARD
+        if pre.push_refused is not None:
+            # Not a candidate-local conflict: the bulk is in the local tree, so failing over
+            # would only repeat the same push elsewhere. Stop and let the user decide.
+            message = pre.push_refused.message()
+            reporter.event("push_refused", files=pre.push_refused.files,
+                           bytes=pre.push_refused.bytes, max_files=pre.push_refused.max_files,
+                           max_bytes=pre.push_refused.max_bytes, message=message)
+            write_json(summary_path, {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "command": plan.command,
+                "started_at": started_at,
+                "ended_at": utc_now_iso(),
+                "exit_code": EXIT_GUARD,
+                "error": message,
+                "phase": "preflight",
+                "completion_state": "not_started",
+                "command_started": False,
+                "terminal": True,
+                "push_guard": pre.push_refused.as_dict(),
+                "plan": plan.as_dict(),
+            })
+            return EXIT_GUARD
 
-    if pre.has_conflicts:
-        cdir = conflict_dir(run_id)
-        write_json(cdir / "conflicts.json", {
-            "run_id": run_id,
-            "project_id": plan.project.project_id,
-            "target": plan.target.name,
-            "conflicts": [{"path": c.path, "state": c.state, "reason": c.reason} for c in pre.conflicts],
-        })
-        for c in pre.conflicts:
-            reporter.event("conflict", path=c.path, state=c.state, reason=c.reason)
-        reporter.event("action", value="not running command")
-        reporter.event("conflict_state", path=str(cdir))
-        write_json(summary_path, {
-            "run_id": run_id, "exit_code": EXIT_CONFLICT, "conflicts": len(pre.conflicts),
-            "conflict_state": str(cdir), "plan": plan.as_dict(),
-        })
-        # Signal rather than return so `cmd_run` can retry only conflicts positively
-        # classified as candidate-local. Global failures (notably local-vanished) abort.
-        # The receipt is exempted from pruning until the whole candidate loop exits.
-        raise _PreflightConflict(
-            exit_code=EXIT_CONFLICT,
-            conflict_dir=cdir,
-            detail=f"{len(pre.conflicts)} conflicting path(s); first: {pre.conflicts[0].path}",
-            retryable=pre.conflicts_are_candidate_local,
-        )
+        if pre.has_conflicts:
+            cdir = conflict_dir(run_id)
+            write_json(cdir / "conflicts.json", {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "conflicts": [
+                    {"path": c.path, "state": c.state, "reason": c.reason}
+                    for c in pre.conflicts
+                ],
+            })
+            for c in pre.conflicts:
+                reporter.event("conflict", path=c.path, state=c.state, reason=c.reason)
+            reporter.event("action", value="not running command")
+            reporter.event("conflict_state", path=str(cdir))
+            write_json(summary_path, {
+                "run_id": run_id, "exit_code": EXIT_CONFLICT, "conflicts": len(pre.conflicts),
+                "conflict_state": str(cdir), "plan": plan.as_dict(),
+            })
+            # Signal rather than return so `cmd_run` can retry only conflicts positively
+            # classified as candidate-local. Global failures (notably local-vanished) abort.
+            # The receipt is exempted from pruning until the whole candidate loop exits.
+            raise _PreflightConflict(
+                exit_code=EXIT_CONFLICT,
+                conflict_dir=cdir,
+                detail=f"{len(pre.conflicts)} conflicting path(s); first: {pre.conflicts[0].path}",
+                retryable=pre.conflicts_are_candidate_local,
+            )
 
-    write_manifest(rdir / "pre_local_manifest.json", pre.local_manifest)
-    write_manifest(rdir / "pre_remote_manifest.json", pre.remote_manifest)
-    # This positively reconciled generation survives bootstrap failure, transport
-    # loss and cancellation. Later local edits must compare against the last push,
-    # while command outputs remain unbaselined until verified pullback.
-    write_baseline(plan.target.name, plan.project.project_id,
-                   pre.local_manifest, pre.remote_manifest)
-    reporter.event("preflight_summary", pulled=len(pre.pulled), pushed=len(pre.pushed),
-                   deleted_remote=len(pre.deleted_remote), deleted_local=len(pre.deleted_local),
-                   skipped_identical=len(pre.skipped_identical),
-                   converged_conflicts=len(pre.converged_conflicts), conflicts=0)
+        write_manifest(rdir / "pre_local_manifest.json", pre.local_manifest)
+        write_manifest(rdir / "pre_remote_manifest.json", pre.remote_manifest)
+        # This positively reconciled generation survives bootstrap failure, transport
+        # loss and cancellation. Later local edits must compare against the last push,
+        # while command outputs remain unbaselined until verified pullback.
+        write_baseline(plan.target.name, plan.project.project_id,
+                       pre.local_manifest, pre.remote_manifest)
+        reporter.event("preflight_summary", pulled=len(pre.pulled), pushed=len(pre.pushed),
+                       deleted_remote=len(pre.deleted_remote), deleted_local=len(pre.deleted_local),
+                       skipped_identical=len(pre.skipped_identical),
+                       converged_conflicts=len(pre.converged_conflicts), conflicts=0)
 
     def fail_bootstrap_input_drift(detail: str) -> int:
         reporter.event("bootstrap_failed", status="input_changed", detail=detail)
@@ -2221,6 +2426,22 @@ def _run_locked(
                 "bootstrap": target_bootstrap.as_dict(), "plan": plan.as_dict(),
             })
             return EXIT_INTERNAL
+        elif untransferred and target_bootstrap.status != "ready":
+            # Setup mutates an environment other in-flight runs may import from, and an
+            # untransferred run has not pushed the lock inputs it would build from.
+            _refuse_untransferred_candidate(
+                reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+                started_at=started_at, phase="bootstrap", verified=verified,
+                conflicts=[{
+                    "path": ".",
+                    "state": "bootstrap-not-ready",
+                    "reason": (
+                        f"the target's declared environment is not ready "
+                        f"({target_bootstrap.detail or target_bootstrap.status}); "
+                        "--transfer none never runs setup, so run one ordinary run first"
+                    ),
+                }],
+            )
         elif target_bootstrap.status != "ready":
             used_existing_guard = (
                 memory_reservation is not None
@@ -2343,6 +2564,7 @@ def _run_locked(
             policy=policy, telemetry_default=telemetry_default, pre=pre,
             backup_root=backup_root, memory_reservation=memory_reservation,
             bootstrap_result=bootstrap_result, command=dispatch_command,
+            verify_fields=verify_fields,
         )
 
     # --- execute -------------------------------------------------------------
@@ -2384,7 +2606,8 @@ def _run_locked(
     if exec_env or runenv.path_prepend:
         reporter.event("run_env", vars=sorted(exec_env), path_prepend=len(runenv.path_prepend))
     telemetry_on = telemetry_default and not args.no_telemetry
-    transport.ensure_remote_dir(remote_cwd)
+    if not untransferred:  # an untransferred run never writes into the target's tree
+        transport.ensure_remote_dir(remote_cwd)
     guarded_dispatch = (
         getattr(transport, "memory_guard", None) is not None
         or transport.command_start_requires_confirmation()
@@ -2396,8 +2619,9 @@ def _run_locked(
         plan.project.project_id,
         plan.target.name,
         run_id,
+        per_run=untransferred,
     )
-    guidance = _unknown_completion_guidance(hazard)
+    guidance = _unknown_completion_guidance(hazard, per_run=untransferred)
     write_json(summary_path, {
         "run_id": run_id,
         "project_id": plan.project.project_id,
@@ -2409,6 +2633,7 @@ def _run_locked(
         "command_started": None,
         "terminal": False,
         "guidance": guidance,
+        **verify_fields,
         "plan": plan.as_dict(),
     })
     reporter.event(
@@ -2470,14 +2695,16 @@ def _run_locked(
             "completion_state": "unknown", "command_started": None,
             "terminal": True, "error": str(exc),
             "owned_job_cancelled": exc.owned_job_cancelled,
-            "guidance": guidance, "plan": plan.as_dict(),
+            "guidance": guidance, **verify_fields, "plan": plan.as_dict(),
         })
         return EXIT_CANCELLED
     except CommandNotStartedError as exc:
         # The same target process that resolves a bare Windows command can prove it
         # refused the unsupported entry point before invoking user code. Remove the
         # conservative fence rather than manufacturing UNKNOWN.
-        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        clear_unknown_completion_hazard(
+            plan.project.project_id, run_id, per_run=untransferred
+        )
         reporter.event("command_rejected", phase="exec", message=str(exc))
         rejected_summary = {
             "run_id": run_id,
@@ -2491,6 +2718,7 @@ def _run_locked(
             "completion_state": "not_started",
             "command_started": False,
             "terminal": True,
+            **verify_fields,
             "plan": plan.as_dict(),
         }
         if plan.workload is not None and workload_runtime is not None:
@@ -2515,6 +2743,7 @@ def _run_locked(
             "terminal": True,
             "ended_at": utc_now_iso(),
             "guidance": guidance,
+            **verify_fields,
             "plan": plan.as_dict(),
         }
         if plan.workload is not None and workload_runtime is not None:
@@ -2554,14 +2783,15 @@ def _run_locked(
         "target": plan.target.name,
         "command": plan.command,
         "started_at": started_at,
-        "phase": "finalize" if args.no_pullback else "pullback",
+        "phase": "finalize" if untransferred or args.no_pullback else "pullback",
         "completion_state": "command_complete",
         "command_started": guarded_started,
         "command_exit_code": command_exit_code_checkpoint,
         "terminal": False,
+        **verify_fields,
         "plan": plan.as_dict(),
     })
-    clear_unknown_completion_hazard(plan.project.project_id, run_id)
+    clear_unknown_completion_hazard(plan.project.project_id, run_id, per_run=untransferred)
 
     for log_name, text in (("stdout.log", result.stdout), ("stderr.log", result.stderr)):
         try:
@@ -2656,7 +2886,11 @@ def _run_locked(
 
     # --- post-run pullback ---------------------------------------------------
     post = None
-    if not args.no_pullback:
+    if untransferred:
+        # Outputs stay where the command wrote them in the target's tree. There are no
+        # launch manifests to attribute changes against, and no baseline to advance.
+        pass
+    elif not args.no_pullback:
         try:
             post = postrun_pullback(
                 transport=transport,
@@ -2780,15 +3014,22 @@ def _run_locked(
     # Scheduler-consumed profiles are admitted only after a successful command and
     # positively attributable pullback. Failed commands, disabled pullback, scope
     # escapes, invalid required receipts, and uncertain baselines are not evidence
-    # of a reusable job cost. Best-effort storage must never break a valid run.
+    # of a reusable job cost. An untransferred run has no pullback to attribute, so a
+    # successful command under a clean guard is the whole evidence. Best-effort
+    # storage must never break a valid run.
     profile_admissible = bool(
         not guard_failed
         and result.exit_code == 0
         and final_exit == EXIT_OK
-        and not args.no_pullback
-        and post is not None
-        and not post.conflicts
-        and post.next_baseline is not None
+        and (
+            untransferred
+            or (
+                not args.no_pullback
+                and post is not None
+                and not post.conflicts
+                and post.next_baseline is not None
+            )
+        )
     )
     if profile_admissible:
         profile_exec_s = exec_s
@@ -2855,12 +3096,12 @@ def _run_locked(
         "completion_state": "complete",
         "terminal": True,
         "duration_sec": duration,
-        "files_pushed": len(pre.pushed),
-        "files_pulled_pre": len(pre.pulled),
-        "files_deleted_remote_pre": len(pre.deleted_remote),
-        "files_deleted_local_pre": len(pre.deleted_local),
-        "files_skipped_identical_pre": len(pre.skipped_identical),
-        "files_converged_conflicts_pre": len(pre.converged_conflicts),
+        "files_pushed": len(pre.pushed) if pre else 0,
+        "files_pulled_pre": len(pre.pulled) if pre else 0,
+        "files_deleted_remote_pre": len(pre.deleted_remote) if pre else 0,
+        "files_deleted_local_pre": len(pre.deleted_local) if pre else 0,
+        "files_skipped_identical_pre": len(pre.skipped_identical) if pre else 0,
+        "files_converged_conflicts_pre": len(pre.converged_conflicts) if pre else 0,
         "files_pulled_post": len(post.pulled) if post else 0,
         "files_deleted_local_post": len(post.deleted_local) if post else 0,
         "preflight_conflicts": 0,
@@ -2876,6 +3117,7 @@ def _run_locked(
         "bootstrap": bootstrap_result.as_dict() if bootstrap_result is not None else None,
         "peak_rss_mb": result.telemetry.get("peak_rss_mb") if result.telemetry else None,
         "avg_cpu_pct": result.telemetry.get("avg_cpu_pct") if result.telemetry else None,
+        **verify_fields,
         "plan": plan.as_dict(),
     }
     if plan.workload is not None and workload_runtime is not None:
@@ -3588,10 +3830,14 @@ def _finalize_durable_run(
     execution = record.get("execution")
     if not isinstance(execution, dict):
         raise UnknownCompletionHazardError("saved durable execution metadata is missing")
+    untransferred = plan.transfer_mode == "none"
+    verify_fields = {"verify": record.get("verify")} if untransferred else {}
     try:
         result = finalize_durable_result(payload, execution)
     except CommandNotStartedError as exc:
-        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        clear_unknown_completion_hazard(
+            plan.project.project_id, run_id, per_run=untransferred
+        )
         reporter.event("command_rejected", phase="durable_exec", message=str(exc))
         write_json(summary_path, {
             "run_id": run_id,
@@ -3633,13 +3879,14 @@ def _finalize_durable_run(
         "target": plan.target.name,
         "command": plan.command,
         "started_at": record["started_at"],
-        "phase": "finalize" if bool(record["no_pullback"]) else "pullback",
+        "phase": "finalize" if untransferred or bool(record["no_pullback"]) else "pullback",
         "completion_state": "command_complete",
         "command_started": guarded_started,
         "command_exit_code": command_exit_code_checkpoint,
         "terminal": False,
         "durable": True,
         "bootstrap": record.get("bootstrap"),
+        **verify_fields,
         "plan": plan.as_dict(),
     })
 
@@ -3677,7 +3924,11 @@ def _finalize_durable_run(
     pre_remote = read_manifest(rdir / "pre_remote_manifest.json")
     backup_root = conflict_dir(run_id) / "backup"
     post = None
-    if not bool(record["no_pullback"]):
+    if untransferred:
+        # No launch manifests exist for this run (both read back empty), so a pullback
+        # here would treat every target path as a command output. Outputs stay put.
+        pass
+    elif not bool(record["no_pullback"]):
         try:
             post = postrun_pullback(
                 transport=transport,
@@ -3761,10 +4012,13 @@ def _finalize_durable_run(
         "memory_guard": guard_result,
         "durable": True,
         "bootstrap": record.get("bootstrap"),
+        **verify_fields,
         "plan": plan.as_dict(),
     }
     write_json(summary_path, checkpoint)
-    if not clear_unknown_completion_hazard(plan.project.project_id, run_id):
+    if not clear_unknown_completion_hazard(
+        plan.project.project_id, run_id, per_run=untransferred
+    ):
         raise UnknownCompletionHazardError(
             f"durable completion fence changed before finalization for {run_id!r}"
         )
@@ -3772,17 +4026,20 @@ def _finalize_durable_run(
     checkpoint["terminal"] = True
     write_json(summary_path, checkpoint)
     # Same admission rule as an ordinary run: only a successful command with a
-    # positively attributable pullback is evidence of a reusable job cost. The trip
-    # time is not comparable (the controller may have been detached), so only the
-    # target-measured command time is learned.
+    # positively attributable pullback (none for an untransferred run) is evidence of
+    # a reusable job cost. The trip time is not comparable (the controller may have
+    # been detached), so only the target-measured command time is learned.
+    pullback_attributable = untransferred or (
+        not bool(record["no_pullback"])
+        and post is not None
+        and not post.conflicts
+        and post.next_baseline is not None
+    )
     if (
         not guard_failed
         and result.exit_code == 0
         and final_exit == EXIT_OK
-        and not bool(record["no_pullback"])
-        and post is not None
-        and not post.conflicts
-        and post.next_baseline is not None
+        and pullback_attributable
         and duration is not None
     ):
         _record_job_profile(
@@ -4022,13 +4279,17 @@ def _run_durable_locked(
     memory_reservation: MemoryReservation | None,
     bootstrap_result=None,
     command: list[str] | None = None,
+    verify_fields: dict[str, object] | None = None,
 ) -> int:
     del t0, pre, backup_root
+    untransferred = plan.transfer_mode == "none"
+    verify_fields = verify_fields or {}
     runenv = resolve_run_env(
         device=plan.target, project=plan.project, project_config=plan.project_config
     )
     dispatch_command = list(command if command is not None else plan.command)
-    transport.ensure_remote_dir(remote_cwd)
+    if not untransferred:  # an untransferred run never writes into the target's tree
+        transport.ensure_remote_dir(remote_cwd)
     resume_token = secrets.token_urlsafe(32)
     source_controller = controller_label()
     observation = JobObservation.for_command(
@@ -4055,10 +4316,11 @@ def _run_durable_locked(
         "plan": plan.as_dict(),
         "bootstrap": bootstrap_result.as_dict() if bootstrap_result is not None else None,
         "execution": None,
+        **verify_fields,
     }
     write_json(_durable_record_path(rdir), record)
     hazard = write_unknown_completion_hazard(
-        plan.project.project_id, plan.target.name, run_id
+        plan.project.project_id, plan.target.name, run_id, per_run=untransferred
     )
     write_json(summary_path, {
         "run_id": run_id,
@@ -4070,8 +4332,9 @@ def _run_durable_locked(
         "completion_state": "unknown",
         "command_started": None,
         "terminal": False,
-        "guidance": _unknown_completion_guidance(hazard),
+        "guidance": _unknown_completion_guidance(hazard, per_run=untransferred),
         "durable": True,
+        **verify_fields,
         "plan": plan.as_dict(),
     })
     telemetry_on = telemetry_default and not args.no_telemetry
@@ -4094,7 +4357,9 @@ def _run_durable_locked(
             memory_reservation=memory_reservation,
         )
     except CommandNotStartedError as exc:
-        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        clear_unknown_completion_hazard(
+            plan.project.project_id, run_id, per_run=untransferred
+        )
         reporter.event(
             "durable_prestart_refused", run_id=run_id, target=plan.target.name,
             detail=str(exc),
@@ -4116,7 +4381,9 @@ def _run_durable_locked(
         })
         return EXIT_INFRA
     except DurablePrestartError as exc:
-        clear_unknown_completion_hazard(plan.project.project_id, run_id)
+        clear_unknown_completion_hazard(
+            plan.project.project_id, run_id, per_run=untransferred
+        )
         reporter.event(
             "durable_prestart_refused", run_id=run_id, target=plan.target.name,
             detail=str(exc),
@@ -4200,6 +4467,13 @@ def _load_resume_plan(
     saved_reason, saved_label = saved_plan.get("target_reason"), saved_plan.get("label")
     if not all(value is None or isinstance(value, str) for value in (saved_reason, saved_label)):
         raise UnknownCompletionHazardError("saved durable plan is malformed")
+    # The run's transfer mode and verified files are part of what ran, so they come from
+    # the saved plan, never from today's [transfer] mode default.
+    saved_mode, saved_verify = saved_plan.get("transfer_mode"), saved_plan.get("verify", [])
+    if not isinstance(saved_mode, str) or not (
+        isinstance(saved_verify, list) and all(isinstance(path, str) for path in saved_verify)
+    ):
+        raise UnknownCompletionHazardError("saved durable plan is malformed")
     config = load_config()
     local_cwd = Path(str(saved_project.get("local_cwd", "")))
     plan = make_run_plan(
@@ -4211,6 +4485,8 @@ def _load_resume_plan(
         json_events=False,
         requested_workload=None,
         allow_default_workload=False,
+        transfer_mode=saved_mode,
+        verify=saved_verify,
     )
     plan = replace(plan, target_reason=saved_reason, label=saved_label)
     if plan.as_dict() != saved_plan:
@@ -4238,6 +4514,9 @@ def _load_resume_plan(
 
 def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
     plan, record, rdir, summary_path, _config = _load_resume_plan(args.run_id)
+    # An untransferred run is fenced by its own record and never held the project lock.
+    untransferred = plan.transfer_mode == "none"
+    fence_run = args.run_id if untransferred else None
     summary = read_json(summary_path)
     if (
         isinstance(summary, dict)
@@ -4271,7 +4550,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
             raise UnknownCompletionHazardError(
                 "durable finalization checkpoint has invalid exit code"
             )
-        hazard = read_unknown_completion_hazard(plan.project.project_id)
+        hazard = read_unknown_completion_hazard(plan.project.project_id, run_id=fence_run)
         if hazard is not None:
             if (
                 hazard.get("run_id") != args.run_id
@@ -4281,7 +4560,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
                     "durable completion fence changed after finalization checkpoint"
                 )
             if not clear_unknown_completion_hazard(
-                plan.project.project_id, args.run_id
+                plan.project.project_id, args.run_id, per_run=untransferred
             ):
                 raise UnknownCompletionHazardError(
                     "durable completion fence could not be cleared"
@@ -4304,13 +4583,13 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
             summary["durable_cleanup_complete"] = True
             write_json(summary_path, summary)
         return code
-    hazard = read_unknown_completion_hazard(plan.project.project_id)
+    hazard = read_unknown_completion_hazard(plan.project.project_id, run_id=fence_run)
     if hazard is None or hazard.get("run_id") != args.run_id or hazard.get("target") != plan.target.name:
         raise UnknownCompletionHazardError(
             "durable completion fence is missing or names a different run"
         )
     transport = make_transport(plan.target)
-    lock = ProjectLock(
+    lock = None if untransferred else ProjectLock(
         plan.project.project_id,
         plan.target.name,
         scope=plan.write_scope,
@@ -4328,7 +4607,8 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
             record=record, initial_status=status, no_wait=bool(args.no_wait),
         )
     finally:
-        lock.release()
+        if lock is not None:
+            lock.release()
 
 
 def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
@@ -4344,15 +4624,22 @@ def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
     config = load_config()
     project = detect_project(Path.cwd(), config)
     hazard = read_unknown_completion_hazard(project.project_id)
-    if hazard is None:
-        raise UnknownCompletionHazardError(
-            f"project {project.project_id!r} has no unknown-completion hazard"
-        )
-    if hazard["run_id"] != args.run_id:
-        raise UnknownCompletionHazardError(
-            f"project {project.project_id!r} is blocked by run {hazard['run_id']!r}, "
-            f"not {args.run_id!r}"
-        )
+    # An untransferred run's fence is its own record; it never blocks the project.
+    per_run = hazard is None or hazard["run_id"] != args.run_id
+    if per_run:
+        run_fence = read_unknown_completion_hazard(project.project_id, run_id=args.run_id)
+        if run_fence is not None:
+            hazard = run_fence
+        elif hazard is None:
+            raise UnknownCompletionHazardError(
+                f"project {project.project_id!r} has no unknown-completion hazard "
+                f"for run {args.run_id!r}"
+            )
+        else:
+            raise UnknownCompletionHazardError(
+                f"project {project.project_id!r} is blocked by run {hazard['run_id']!r}, "
+                f"not {args.run_id!r}"
+            )
 
     summary_path = run_dir(args.run_id) / "summary.json"
     summary = read_json(summary_path)
@@ -4368,7 +4655,7 @@ def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
         }
         write_json(summary_path, summary)
 
-    if not clear_unknown_completion_hazard(project.project_id, args.run_id):
+    if not clear_unknown_completion_hazard(project.project_id, args.run_id, per_run=per_run):
         raise UnknownCompletionHazardError(
             f"unknown-completion hazard changed while resolving run {args.run_id!r}"
         )
@@ -4377,7 +4664,11 @@ def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
         project_id=project.project_id,
         target=hazard["target"],
         run_id=args.run_id,
-        note="baseline unchanged; next run will perform normal whole-project preflight",
+        note=(
+            "untransferred run: nothing was transferred and no baseline exists"
+            if per_run
+            else "baseline unchanged; next run will perform normal whole-project preflight"
+        ),
     )
     return EXIT_OK
 

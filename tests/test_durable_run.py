@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,9 +16,9 @@ import pytest
 import remrun.cli as cli
 import remrun._durable_runner as durable_runner
 import remrun.state as state_module
-from remrun.cli import EXIT_GUARD, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, main
+from remrun.cli import EXIT_CONFLICT, EXIT_GUARD, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, main
 from remrun._durable_runner import TRUNCATION_MARKER, _BoundedWriter, _boot_marker
-from remrun.job_observation import JobObservation
+from remrun.job_observation import JobObservation, command_label
 from remrun.memory_guard import MemoryAdmissionResult, MemoryReservation
 from remrun.state import LockError, ProjectLock
 from remrun.transport import (
@@ -603,6 +604,397 @@ def test_ordinary_run_without_flag_does_not_enter_durable_path(durable_env, monk
     assert fake.launch_calls == 0
     assert fake.exec_calls == 1
     assert (durable_env["project"] / "ordinary.txt").read_text() == "ordinary"
+
+
+# --- untransferred runs (--transfer none) ---------------------------------------
+
+
+class _ConcurrentDurableTransport(_FakeDurableTransport):
+    """A target that keeps every launched run's durable state, as a real one does.
+
+    Launches detach after acknowledgement (the target then looks unreachable) until a
+    test calls ``finish`` and clears ``unreachable``.
+    """
+
+    def __init__(self, device: Device) -> None:
+        super().__init__(device, "detached")
+        self.runs: dict[str, dict[str, object]] = {}
+        self.observations: list[JobObservation] = []
+        self.pulls = 0
+
+    def launch_durable(self, command, cwd, *, run_id, observation, **kwargs):  # noqa: ANN001, ANN003
+        status, execution = super().launch_durable(
+            command, cwd, run_id=run_id, observation=observation, **kwargs
+        )
+        self.runs[run_id] = dict(status)
+        self.observations.append(observation)
+        return status, execution
+
+    def exec_observed(self, command, cwd, *, observation, **kwargs):  # noqa: ANN001, ANN003
+        self.observations.append(observation)
+        return self.exec(command, cwd, **kwargs)
+
+    def finish(self, run_id: str, exit_code: int = 0) -> None:
+        self.runs[run_id].update(
+            state="complete", wrapper_exit_code=exit_code,
+            acknowledged_at=1000.0, ended_at=1012.5,
+        )
+
+    def durable_status(self, run_id, resume_token, *, include_logs=False):  # noqa: ANN001
+        del resume_token
+        if self.unreachable:
+            raise TransportError("injected connection loss during status read")
+        status = dict(self.runs[run_id])
+        if include_logs:
+            return {"status": status, "stdout_b64": "", "stderr_b64": ""}
+        return status
+
+    def query_observed_jobs(self, *, sample_interval=0.05, timeout=30.0):  # noqa: ANN001
+        del sample_interval, timeout
+        if self.unreachable:
+            raise TransportError("injected connection loss during observer query")
+        return {"status": "ok", "jobs": [
+            {
+                "job_id": status["run_id"], "project": status["project_id"],
+                "source_controller": status["controller"], "target": status["target"],
+                "command": {"sha256": status["command_sha256"]},
+                "observation_status": "observed",
+            }
+            for status in self.runs.values() if status["state"] != "complete"
+        ]}
+
+    def pull_file(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        self.pulls += 1
+        return super().pull_file(*args, **kwargs)
+
+    def pull_files(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        self.pulls += 1
+        return super().pull_files(*args, **kwargs)
+
+
+def _install_concurrent(monkeypatch) -> dict[str, _ConcurrentDurableTransport]:
+    transports: dict[str, _ConcurrentDurableTransport] = {}
+    monkeypatch.setattr(
+        cli, "make_transport",
+        lambda device: transports.setdefault(device.name, _ConcurrentDurableTransport(device)),
+    )
+    monkeypatch.setattr(cli, "DURABLE_STATUS_RETRY_SECONDS", 0.0)
+    return transports
+
+
+def _set_transfer_mode(env: dict, mode: str) -> None:
+    """Set the deployment default ``[transfer] mode``, as an owner would."""
+    defaults = env["state"].parent / "remrun" / "config" / "defaults.toml"
+    text = defaults.read_text(encoding="utf-8")
+    defaults.write_text(
+        re.sub(r'(?m)^mode = "[a-z]+"$', f'mode = "{mode}"', text), encoding="utf-8"
+    )
+
+
+def _run_ids(state: Path) -> set[str]:
+    runs = state / "runs"
+    return {path.name for path in runs.iterdir() if path.is_dir()} if runs.exists() else set()
+
+
+def _launch(state: Path, argv: list[str]) -> tuple[int, str | None]:
+    """Run ``main(argv)``; return its exit code and the one run it recorded, if any."""
+    before = _run_ids(state)
+    code = main(argv)
+    new = _run_ids(state) - before
+    assert len(new) <= 1
+    return code, next(iter(new), None)
+
+
+def _summary(state: Path, run_id: str) -> dict:
+    return json.loads((state / "runs" / run_id / "summary.json").read_text(encoding="utf-8"))
+
+
+def _run_fences(state: Path) -> set[str]:
+    return {
+        json.loads(path.read_text(encoding="utf-8"))["run_id"]
+        for path in (state / "hazards" / "project").glob("*/runs/*.json")
+    }
+
+
+def _project_fences(state: Path) -> list[Path]:
+    return list((state / "hazards" / "project").glob("*/unknown.json"))
+
+
+def _counted_pullbacks(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real_pullback = cli.postrun_pullback
+
+    def counted(*args, **kwargs):  # noqa: ANN002, ANN003
+        calls.append(1)
+        return real_pullback(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "postrun_pullback", counted)
+    return calls
+
+
+LONG_JOB = [sys.executable, "-c", "print('long job')"]
+
+
+def test_two_untransferred_durable_runs_on_one_project_launch_concurrently(
+    durable_env, monkeypatch
+):
+    """Two long jobs of one project must both be in flight at once. The per-project
+    completion fence, not the lock, used to refuse the second for as long as the first
+    ran. Neither job moved a file, so neither may take the project lock or write a
+    baseline that a later ordinary run would trust."""
+    state = durable_env["state"]
+    _set_transfer_mode(durable_env, "none")
+    durable_env["remote_project"].mkdir()
+    transports = _install_concurrent(monkeypatch)
+
+    first_code, first = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+    second_code, second = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+
+    # Both detached while still running on the target (exit 4 is "not finished").
+    assert (first_code, second_code) == (EXIT_INFRA, EXIT_INFRA)
+    assert transports["TEST"].launch_calls == 2
+    assert _run_fences(state) == {first, second}
+    assert not _project_fences(state)
+    for run_id in (first, second):
+        summary = _summary(state, run_id)
+        assert summary["completion_state"] == "detached"
+        assert summary["plan"]["transfer_mode"] == "none"
+    assert not (state / "locks").exists()
+    assert not (state / "manifests").exists()
+
+
+def test_verify_mismatch_refuses_before_dispatch_without_fence(
+    durable_env, monkeypatch, capsys
+):
+    """An untransferred run trusts the target's checkout, so --verify is the proof of
+    which code runs. A differing or unreadable copy must stop the command before it
+    starts and leave no fence to resolve; under --auto the job moves on to a target
+    whose copy matches."""
+    state = durable_env["state"]
+    stale = durable_env["remote_project"]
+    current = stale.parent.parent / "remote-other" / "proj1"
+    for root in (stale, current):
+        root.mkdir()
+    (durable_env["project"] / "model.py").write_text("v2")
+    (stale / "model.py").write_text("v1")
+    (current / "model.py").write_text("v2")
+    transports: dict[str, _FakeDurableTransport] = {}
+
+    def factory(device: Device):
+        transport = transports.setdefault(device.name, _FakeDurableTransport(device))
+        transport.load = 0.0 if device.name == "TEST" else 90.0  # rank the stale one first
+        return transport
+
+    monkeypatch.setattr(cli, "make_transport", factory)
+    flags = ["--transfer", "none", "--verify", "model.py"]
+    job = [sys.executable, "-c", "import pathlib; pathlib.Path('ran.txt').write_text('ran')"]
+
+    code, refused = _launch(state, ["run", "TEST", *flags, "--", *job])
+    assert code == EXIT_CONFLICT
+    assert transports["TEST"].exec_calls == 0
+    assert not (stale / "ran.txt").exists()
+    assert not list((state / "hazards").glob("**/*.json"))
+    conflicts = json.loads((state / "conflicts" / refused / "conflicts.json").read_text())
+    assert [(c["path"], c["state"]) for c in conflicts["conflicts"]] == [
+        ("model.py", "verify-mismatch")
+    ]
+    assert _summary(state, refused)["command_started"] is False
+
+    # A copy the target cannot hash refuses the same way: equality is proved, not assumed.
+    (stale / "model.py").unlink()
+    code, refused = _launch(state, ["run", "TEST", *flags, "--", *job])
+    assert code == EXIT_CONFLICT
+    assert transports["TEST"].exec_calls == 0
+    conflicts = json.loads((state / "conflicts" / refused / "conflicts.json").read_text())
+    assert [c["state"] for c in conflicts["conflicts"]] == ["verify-unavailable"]
+
+    capsys.readouterr()
+    before = _run_ids(state)
+    assert main(["run", "--auto", *flags, "--", *job]) == EXIT_OK
+    assert transports["TEST"].exec_calls == 0
+    assert transports["OTHER"].exec_calls == 1
+    assert (current / "ran.txt").read_text() == "ran"
+    assert not (durable_env["project"] / "ran.txt").exists()
+    assert "reason=preflight_conflict" in capsys.readouterr().err
+    (ran,) = [r for r in _run_ids(state) - before if _summary(state, r)["target"] == "OTHER"]
+    assert _summary(state, ran)["verify"] == [
+        {"path": "model.py", "sha256": hashlib.sha256(b"v2").hexdigest()}
+    ]
+    assert not list((state / "hazards").glob("**/*.json"))
+
+
+def test_resume_finalizes_one_untransferred_run_and_clears_only_its_fence(
+    durable_env, monkeypatch
+):
+    """Finalizing an untransferred job must pull nothing back: it has no launch
+    manifests, so a pullback would claim every file on the target as its output. It
+    must also leave a sibling job's fence standing, and resolve-unknown likewise clears
+    only the run it names."""
+    state = durable_env["state"]
+    _set_transfer_mode(durable_env, "none")
+    durable_env["remote_project"].mkdir()
+    (durable_env["remote_project"] / "target-only.txt").write_text("stays on the target")
+    transports = _install_concurrent(monkeypatch)
+    pullbacks = _counted_pullbacks(monkeypatch)
+    _, first = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+    _, second = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+    fake = transports["TEST"]
+    fake.unreachable = False
+    fake.finish(first)
+
+    assert main(["resume", first]) == EXIT_OK
+    assert pullbacks == []
+    assert fake.pulls == 0
+    assert not (durable_env["project"] / "target-only.txt").exists()
+    assert _run_fences(state) == {second}
+    summary = _summary(state, first)
+    assert (summary["completion_state"], summary["terminal"], summary["exit_code"]) == (
+        "complete", True, EXIT_OK
+    )
+    assert fake.cleanup_calls == 1
+
+    assert main(["resolve-unknown", first, "--confirmed-ended"]) == EXIT_INTERNAL
+    assert main(["resolve-unknown", second, "--confirmed-ended"]) == EXIT_OK
+    assert _run_fences(state) == set()
+    assert _summary(state, second)["unknown_resolution"]["action"] == "confirmed-ended"
+
+
+def test_untransferred_run_respects_an_ordinary_unknown_fence(
+    durable_env, monkeypatch, capsys
+):
+    """An untransferred job never starts beside an ordinary run whose completion is
+    unknown: that run may be rewriting the checkout the job would read. A sibling
+    untransferred job's own fence, by contrast, blocks nobody."""
+    state = durable_env["state"]
+    durable_env["remote_project"].mkdir()
+    transports = _install_concurrent(monkeypatch)
+    _set_transfer_mode(durable_env, "none")
+    _, untransferred = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+    _set_transfer_mode(durable_env, "safe")
+    code, ordinary = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+    assert code == EXIT_INFRA and ordinary is not None
+    assert len(_project_fences(state)) == 1
+    capsys.readouterr()
+
+    code, refused = _launch(
+        state, ["run", "--durable", "--transfer", "none", "TEST", "--", *LONG_JOB]
+    )
+    assert (code, refused) == (EXIT_INTERNAL, None)
+    assert transports["TEST"].launch_calls == 2
+    assert f"remrun resume {ordinary}" in capsys.readouterr().err
+    assert _run_fences(state) == {untransferred}
+
+
+def test_untransferred_resume_rebuilds_the_exact_saved_plan(durable_env, monkeypatch):
+    """Resume finalizes a job as the mode and verified files it ran with. Rebuilding
+    from today's [transfer] mode would refuse the job (or, worse, pull back every
+    target file) after an owner changes the default. A local edit made while the job
+    runs must not block its resume, and resume must not wait on the project lock it
+    never held."""
+    state = durable_env["state"]
+    durable_env["remote_project"].mkdir()
+    (durable_env["project"] / "model.py").write_text("v1")
+    (durable_env["remote_project"] / "model.py").write_text("v1")
+    transports = _install_concurrent(monkeypatch)
+    pullbacks = _counted_pullbacks(monkeypatch)
+    code, run_id = _launch(state, [
+        "run", "--durable", "--transfer", "none", "--verify", "model.py", "TEST",
+        "--", *LONG_JOB,
+    ])
+    assert code == EXIT_INFRA
+    record = json.loads((state / "runs" / run_id / "durable.json").read_text())
+    digest = hashlib.sha256(b"v1").hexdigest()
+    assert (record["plan"]["transfer_mode"], record["plan"]["verify"]) == ("none", ["model.py"])
+    assert record["verify"] == [{"path": "model.py", "sha256": digest}]
+
+    (durable_env["project"] / "model.py").write_text("v2")  # local work continues
+    holder = ProjectLock("proj1", "TEST", run_id="ordinary-run").acquire()  # a live holder
+    try:
+        transports["TEST"].unreachable = False
+        transports["TEST"].finish(run_id)
+        assert main(["resume", run_id]) == EXIT_OK
+        assert holder.path.is_dir()
+    finally:
+        holder.release()
+    assert pullbacks == []
+    summary = _summary(state, run_id)
+    assert summary["completion_state"] == "complete"
+    assert summary["verify"] == [{"path": "model.py", "sha256": digest}]
+
+
+def test_untransferred_observation_uses_real_project_and_label(durable_env, monkeypatch):
+    """`fleet jobs` must show concurrent untransferred jobs as what they are: the real
+    project, each under its own label, never a synthetic per-job project id."""
+    state = durable_env["state"]
+    devices = state.parent / "remrun" / "config" / "devices.toml"
+    devices.write_text(devices.read_text(encoding="utf-8").replace(
+        'address_candidates = ["test.invalid"]\n',
+        'address_candidates = ["test.invalid"]\nobserve_jobs = true\n', 1,
+    ), encoding="utf-8")
+    _set_transfer_mode(durable_env, "none")
+    durable_env["remote_project"].mkdir()
+    transports = _install_concurrent(monkeypatch)
+    for label in ("regen 2019", "regen 2020"):
+        _launch(state, ["run", "--durable", "TEST", "--label", label, "--", *LONG_JOB])
+    transports["TEST"].unreachable = False
+    assert main(["run", "TEST", "--label", "smoke", "--", *LONG_JOB]) == EXIT_OK
+
+    assert [(o.project, o.command_label) for o in transports["TEST"].observations] == [
+        ("proj1", command_label(LONG_JOB, label))
+        for label in ("regen 2019", "regen 2020", "smoke")
+    ]
+
+
+def test_successful_untransferred_run_records_learned_cost(durable_env, monkeypatch):
+    """Placement and admission learn job costs from completed runs. An untransferred
+    run pulls nothing back, so its successful command is the whole evidence, for
+    ordinary and durable runs alike; a failed command still teaches nothing."""
+    state = durable_env["state"]
+    _set_transfer_mode(durable_env, "none")
+    durable_env["remote_project"].mkdir()
+    _install_fake(monkeypatch)
+    write = "import pathlib; pathlib.Path('out.txt').write_text({!r})"
+    ordinary = [sys.executable, "-c", write.format("ordinary")]
+    durable = [sys.executable, "-c", write.format("durable")]
+    failing = [sys.executable, "-c", "raise SystemExit(3)"]
+
+    assert main(["run", "TEST", "--", *ordinary]) == EXIT_OK
+    assert main(["run", "--durable", "TEST", "--", *durable]) == EXIT_OK
+    assert main(["run", "TEST", "--", *failing]) == 3
+
+    learned = load_profiles(state)["proj1"]
+    assert learned[command_key(ordinary)]["TEST"]["exec_s"] > 0
+    assert learned[command_key(durable)]["TEST"]["exec_s"] == 12.5  # the target's clock
+    assert command_key(failing) not in learned
+    assert (durable_env["remote_project"] / "out.txt").read_text() == "durable"
+    assert not (durable_env["project"] / "out.txt").exists()
+
+
+def test_prune_keeps_summaries_pinned_by_per_run_fences(durable_env, monkeypatch):
+    """Retention must never delete the summary a per-run fence points at: resume and
+    resolve-unknown record their outcome there. An unreadable fence stops pruning
+    rather than being taken as absent; a resolved run is ordinary history again."""
+    state = durable_env["state"]
+    _set_transfer_mode(durable_env, "none")
+    durable_env["remote_project"].mkdir()
+    _install_concurrent(monkeypatch)
+    _, run_id = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+
+    assert main(["clean", "--keep", "0"]) == EXIT_OK
+    assert (state / "runs" / run_id / "summary.json").is_file()
+    assert _run_fences(state) == {run_id}
+
+    (fence,) = (state / "hazards" / "project").glob("*/runs/*.json")
+    good = fence.read_bytes()
+    fence.write_text("{corrupt", encoding="utf-8")
+    assert main(["clean", "--keep", "0"]) == EXIT_INTERNAL
+    assert (state / "runs" / run_id / "summary.json").is_file()
+    assert fence.read_text(encoding="utf-8") == "{corrupt"
+    fence.write_bytes(good)
+
+    assert main(["resolve-unknown", run_id, "--confirmed-ended"]) == EXIT_OK
+    assert main(["clean", "--keep", "0"]) == EXIT_OK
+    assert not (state / "runs" / run_id).exists()
 
 
 def _helper_call(helper: Path, *args: str, input_bytes: bytes | None = None):

@@ -1,6 +1,9 @@
 # Global remrun defaults. Project configs may narrow these.
 
 [transfer]
+# Default transfer mode for `run` and `plan`; `--transfer` overrides it per run.
+# "safe": reconcile the project tree before the command and pull outputs back after.
+# "none": run in the target's existing checkout; transfer nothing, outputs stay there.
 mode = "safe"
 # Do not use .gitignore as the default remrun ignore list. Many generated project
 # outputs are gitignored but still important and synced.

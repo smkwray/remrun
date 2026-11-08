@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -1735,6 +1736,76 @@ def test_conflict_aborts_with_exit_2(env):
     # Conflict metadata recorded outside the project tree.
     conflicts = list((env["state"] / "conflicts").glob("*/conflicts.json"))
     assert conflicts
+
+
+def set_transfer_mode(env: dict, mode: str) -> None:
+    """Set the deployment default ``[transfer] mode``, as an owner would."""
+    defaults = env["remrun_root"] / "config" / "defaults.toml"
+    text = defaults.read_text(encoding="utf-8")
+    defaults.write_text(
+        re.sub(r'(?m)^mode = "[a-z]+"$', f'mode = "{mode}"', text), encoding="utf-8"
+    )
+
+
+def test_untransferred_run_never_reconciles_or_pulls_back(env, capsys):
+    """An untransferred run runs on whatever the target's checkout holds. A local-only
+    file is never pushed and a local edit never overwrites the target; a file the
+    command writes is never pulled back; no baseline, lock or fence is left behind;
+    and the command's own exit code passes through."""
+    set_transfer_mode(env, "none")
+    env["remote_proj"].mkdir()
+    (env["remote_proj"] / "input.txt").write_text("target copy")
+    (env["proj"] / "input.txt").write_text("local copy")
+    (env["proj"] / "local-only.txt").write_text("never leaves")
+    job = (
+        "import pathlib,sys; "
+        "pathlib.Path('result.txt').write_text(pathlib.Path('input.txt').read_text()); "
+        "sys.exit(3)"
+    )
+
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", job]) == 3
+    assert (env["remote_proj"] / "result.txt").read_text() == "target copy"
+    assert (env["remote_proj"] / "input.txt").read_text() == "target copy"
+    assert not (env["remote_proj"] / "local-only.txt").exists()
+    assert (env["proj"] / "input.txt").read_text() == "local copy"
+    assert not (env["proj"] / "result.txt").exists()
+    assert not (env["state"] / "manifests").exists()
+    assert not (env["state"] / "locks").exists()
+    assert not list((env["state"] / "hazards").glob("**/*.json"))
+    (summary_path,) = (env["state"] / "runs").glob("*/summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert (summary["exit_code"], summary["command_exit_code"]) == (3, 3)
+    assert (summary["files_pushed"], summary["files_pulled_post"], summary["verify"]) == (0, 0, [])
+    assert "transfer_skipped" in capsys.readouterr().err
+
+
+def test_untransferred_run_refuses_unready_bootstrap_without_running_setup(env, capsys):
+    """Setup rebuilds an environment that other in-flight runs may be importing from,
+    so an untransferred run never runs it: on a target that is not ready it refuses
+    before the command, and once an ordinary run has set the target up it runs in
+    place, only reading that readiness."""
+    managed = configure_managed_bootstrap(env)
+    env["remote_proj"].mkdir()
+    (env["remote_proj"] / "uv.lock").write_text("lock-v1", encoding="utf-8")
+    job = ["python", "-c", "from pathlib import Path; Path('ran.txt').write_text('ran')"]
+    set_transfer_mode(env, "none")
+
+    assert main(["run", "LOCAL_SIM", "--", *job]) == EXIT_CONFLICT
+    assert not managed.exists()
+    assert not list((env["state"] / "bootstrap").glob("*.json"))
+    assert not (env["remote_proj"] / "ran.txt").exists()
+    err = capsys.readouterr().err
+    assert "state=bootstrap-not-ready" in err and "ordinary run first" in err
+
+    set_transfer_mode(env, "safe")
+    assert main(["run", "LOCAL_SIM", "--", "python", "-c", "pass"]) == EXIT_OK
+    (receipt,) = (env["state"] / "bootstrap").glob("*.json")
+    ready = receipt.read_bytes()
+    set_transfer_mode(env, "none")
+    assert main(["run", "LOCAL_SIM", "--", *job]) == EXIT_OK
+    assert (env["remote_proj"] / "ran.txt").read_text() == "ran"
+    assert not (env["proj"] / "ran.txt").exists()
+    assert receipt.read_bytes() == ready
 
 
 def test_status_and_logs(env, capsys):

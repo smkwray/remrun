@@ -204,11 +204,21 @@ class UnknownCompletionHazardError(RuntimeError):
 def unknown_completion_hazard_path(
     project_id: str,
     state_root: Path | None = None,
+    *,
+    run_id: str | None = None,
 ) -> Path:
-    """Return the controller-local path for a project's unknown-completion record."""
+    """Return the controller-local path for a project's unknown-completion record.
+
+    With ``run_id``, the path of that one run's own record. Untransferred runs fence
+    per run, so several can be in flight for one project; only the project-wide
+    record (no ``run_id``) blocks admission.
+    """
     root = state_root or default_state_root()
     project_hash = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
-    return root / "hazards" / "project" / project_hash / "unknown.json"
+    project_dir = root / "hazards" / "project" / project_hash
+    if run_id is None:
+        return project_dir / "unknown.json"
+    return project_dir / "runs" / f"{_safe_component(run_id)}.json"
 
 
 def _validate_unknown_completion_hazard(
@@ -216,6 +226,7 @@ def _validate_unknown_completion_hazard(
     *,
     project_id: str,
     path: Path,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise UnknownCompletionHazardError(
@@ -243,19 +254,26 @@ def _validate_unknown_completion_hazard(
             f"unknown-completion hazard is malformed at {path}: "
             "completion_state must be 'unknown'"
         )
+    if run_id is not None and data["run_id"] != run_id:
+        raise UnknownCompletionHazardError(
+            f"per-run completion fence at {path} names run {data['run_id']!r}, not {run_id!r}"
+        )
     return data
 
 
 def read_unknown_completion_hazard(
     project_id: str,
     state_root: Path | None = None,
+    *,
+    run_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Read and validate a project's persistent unknown-completion hazard.
 
+    With ``run_id``, read that run's per-run fence instead of the project-wide one.
     Absence returns ``None``. Any present but unreadable, malformed, or mismatched
     record raises instead of being treated as safe; its bytes are left untouched.
     """
-    path = unknown_completion_hazard_path(project_id, state_root)
+    path = unknown_completion_hazard_path(project_id, state_root, run_id=run_id)
     if not path.exists():
         return None
     try:
@@ -264,7 +282,9 @@ def read_unknown_completion_hazard(
         raise UnknownCompletionHazardError(
             f"unknown-completion hazard is unreadable at {path}: {type(exc).__name__}"
         ) from exc
-    return _validate_unknown_completion_hazard(data, project_id=project_id, path=path)
+    return _validate_unknown_completion_hazard(
+        data, project_id=project_id, path=path, run_id=run_id
+    )
 
 
 def write_unknown_completion_hazard(
@@ -274,11 +294,13 @@ def write_unknown_completion_hazard(
     state_root: Path | None = None,
     *,
     created_at: str | None = None,
+    per_run: bool = False,
 ) -> dict[str, Any]:
     """Atomically record unknown command completion for a project.
 
     Repeating the same project/target/run write is idempotent. A different existing
     hazard, or malformed existing bytes, fails closed and is never overwritten.
+    ``per_run`` writes the run's own fence, which does not block other runs.
     """
     for field_name, value in (
         ("project_id", project_id),
@@ -290,11 +312,12 @@ def write_unknown_completion_hazard(
     if created_at is not None and (not isinstance(created_at, str) or not created_at):
         raise ValueError("created_at must be a non-empty string")
 
-    current = read_unknown_completion_hazard(project_id, state_root)
+    fence_run = run_id if per_run else None
+    current = read_unknown_completion_hazard(project_id, state_root, run_id=fence_run)
     if current is not None:
         if current["run_id"] == run_id and current["target"] == target:
             return current
-        path = unknown_completion_hazard_path(project_id, state_root)
+        path = unknown_completion_hazard_path(project_id, state_root, run_id=fence_run)
         raise UnknownCompletionHazardError(
             f"project {project_id!r} already has an unknown-completion hazard "
             f"for run {current['run_id']!r} at {path}"
@@ -308,7 +331,9 @@ def write_unknown_completion_hazard(
         "created_at": created_at or utc_now_iso(),
         "completion_state": "unknown",
     }
-    write_json(unknown_completion_hazard_path(project_id, state_root), record)
+    write_json(
+        unknown_completion_hazard_path(project_id, state_root, run_id=fence_run), record
+    )
     return record
 
 
@@ -316,18 +341,21 @@ def clear_unknown_completion_hazard(
     project_id: str,
     run_id: str,
     state_root: Path | None = None,
+    *,
+    per_run: bool = False,
 ) -> bool:
     """Clear a hazard only when its validated record names ``run_id``.
 
-    Returns ``False`` for an absent record or run-id mismatch. Malformed records raise
-    and remain byte-for-byte intact.
+    ``per_run`` clears that run's own fence. Returns ``False`` for an absent record or
+    run-id mismatch. Malformed records raise and remain byte-for-byte intact.
     """
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id must be a non-empty string")
-    current = read_unknown_completion_hazard(project_id, state_root)
+    fence_run = run_id if per_run else None
+    current = read_unknown_completion_hazard(project_id, state_root, run_id=fence_run)
     if current is None or current["run_id"] != run_id:
         return False
-    unknown_completion_hazard_path(project_id, state_root).unlink()
+    unknown_completion_hazard_path(project_id, state_root, run_id=fence_run).unlink()
     return True
 
 
@@ -337,7 +365,9 @@ def _active_unknown_completion_run_ids(state_root: Path) -> set[str]:
     if not hazards_root.exists():
         return set()
     run_ids: set[str] = set()
-    for path in sorted(hazards_root.glob("*/unknown.json")):
+    paths = [(path, False) for path in sorted(hazards_root.glob("*/unknown.json"))]
+    paths += [(path, True) for path in sorted(hazards_root.glob("*/runs/*.json"))]
+    for path, per_run in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -351,9 +381,12 @@ def _active_unknown_completion_run_ids(state_root: Path) -> set[str]:
         record = _validate_unknown_completion_hazard(
             data, project_id=data["project_id"], path=path
         )
-        if unknown_completion_hazard_path(record["project_id"], state_root) != path:
+        expected = unknown_completion_hazard_path(
+            record["project_id"], state_root, run_id=record["run_id"] if per_run else None
+        )
+        if expected != path:
             raise UnknownCompletionHazardError(
-                f"unknown-completion hazard is stored under the wrong project hash at {path}"
+                f"unknown-completion hazard is stored under the wrong project or run at {path}"
             )
         run_ids.add(record["run_id"])
     return run_ids
