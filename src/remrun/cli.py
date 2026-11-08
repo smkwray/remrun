@@ -4833,6 +4833,42 @@ def _request_durable_stop(
             guidance=guidance,
         )
         return False
+    # One cancel of a run at a time: the earlier evidence is read, the job signalled
+    # and the outcome saved as one step, so a concurrent cancel that signals nothing
+    # can never overwrite another's "signalled but unconfirmed" with "nothing sent".
+    cancel_lock = ProjectLock(
+        f"{plan.project.project_id} cancel {run_id}", plan.target.name, run_id=run_id,
+        report=reporter.event,
+    )
+    try:
+        cancel_lock.acquire(wait_seconds=DURABLE_CANCEL_PENDING_SECONDS)
+    except LockError as exc:
+        reporter.event(
+            "cancel_refused", run_id=run_id,
+            reason=f"another cancel of this run is still in progress: {exc}",
+            guidance=guidance,
+        )
+        return False
+    try:
+        return _request_durable_stop_locked(
+            reporter=reporter, transport=transport, plan=plan, record=record, rdir=rdir,
+            summary_path=summary_path, run_id=run_id, guidance=guidance,
+        )
+    finally:
+        cancel_lock.release()
+
+
+def _request_durable_stop_locked(
+    *,
+    reporter: Reporter,
+    transport,  # noqa: ANN001
+    plan: RunPlan,
+    record: dict[str, object],
+    rdir: Path,
+    summary_path: Path | None,
+    run_id: str,
+    guidance: str,
+) -> bool:
     # An earlier cancel that may have signalled the job without confirming the stop
     # stays unproven: this cancel signalling nothing does not show nothing was stopped.
     earlier = (read_json(_durable_record_path(rdir)) or {}).get("cancel")
@@ -4844,8 +4880,13 @@ def _request_durable_stop(
     request: dict[str, object] = {"requested_at": utc_now_iso(), "owned_job_cancelled": None}
 
     def save() -> None:
+        # Merge into the record as it is on disk now, not the copy loaded earlier.
+        current = read_json(_durable_record_path(rdir))
+        if not isinstance(current, dict):
+            current = record
+        current["cancel"] = request
         record["cancel"] = request
-        write_json(_durable_record_path(rdir), record)
+        write_json(_durable_record_path(rdir), current)
         if summary_path is not None:
             summary = read_json(summary_path) or {"run_id": run_id}
             summary["cancel"] = request

@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1879,6 +1880,48 @@ def test_one_process_at_a_time_waits_on_an_untransferred_run(durable_env, monkey
     # The stop was requested; the next waiter finalizes it exactly once.
     assert main(["resume", run_id]) == 137
     assert _run_fences(durable_env["state"]) == set()
+
+
+def test_a_concurrent_cancel_never_erases_another_cancels_unconfirmed_signal(
+    durable_env, monkeypatch
+):
+    """Cancel A signals the job but cannot confirm every process is gone; cancel B,
+    racing it, finds nothing left to signal. B must not overwrite A's evidence with
+    "nothing was sent", or finalization would clear the fence while a process runs."""
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    record_path = durable_env["state"] / "runs" / run_id / "durable.json"
+    a_holds = ProjectLock(f"proj1 cancel {run_id}", "TEST", run_id=run_id).acquire()
+
+    def cancel_a_finishes() -> None:
+        time.sleep(0.3)
+        saved = json.loads(record_path.read_text())
+        saved["cancel"] = {
+            "requested_at": "earlier", "owned_job_cancelled": False, "signals_sent": True,
+            "detail": "the process group still has members",
+        }
+        record_path.write_text(json.dumps(saved))
+        a_holds.release()
+
+    def slow_refusal(observation, *, cwd, timeout=30.0):  # noqa: ANN001
+        del observation, cwd, timeout
+        time.sleep(0.6)  # the remote call outlasts A's write
+        return False, False, "remrun cancel refused: no registered job has this exact identity"
+
+    monkeypatch.setattr(fake, "cancel_observed", slow_refusal)
+    racer = threading.Thread(target=cancel_a_finishes)
+    racer.start()
+    try:
+        assert main(["cancel", run_id]) == EXIT_INFRA
+    finally:
+        racer.join()
+    saved = json.loads(record_path.read_text())["cancel"]
+    assert saved["owned_job_cancelled"] is False and saved["signals_sent"] is not False
+    assert fake.status is not None
+    fake.status.update(state="complete", wrapper_exit_code=143,
+                       acknowledged_at=1000.0, ended_at=1001.0)
+    monkeypatch.setattr(cli, "DURABLE_CANCEL_PENDING_SECONDS", 0.0)
+    assert main(["resume", run_id]) == EXIT_INFRA  # the fence stays; nothing finalized
+    assert cli.read_unknown_completion_hazard("proj1") is not None
 
 
 def test_cancel_of_a_run_that_already_finished_behaves_like_resume(durable_env, monkeypatch):
