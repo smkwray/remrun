@@ -1490,6 +1490,7 @@ def test_posix_cancel_asks_first_and_kills_only_what_outlives_the_grace(tmp_path
         _stop_session(session, rows)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cancel")
 @pytest.mark.parametrize("after_grace", ["reused", "unseen", "same", "late child"])
 def test_posix_cancel_kills_only_a_group_it_can_still_prove(tmp_path, monkeypatch, after_grace):
     """During the grace period the job's group can empty and its number be taken by an
