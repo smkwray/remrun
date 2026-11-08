@@ -253,7 +253,7 @@ def test_input_overlay_is_copied_hashed_and_recorded(commit_env):
     env = commit_env
     data = env["project"] / "data" / "in.csv"
     data.parent.mkdir()
-    data.write_text("1,2,3\n", encoding="utf-8")
+    data.write_bytes(b"1,2,3\n")  # exact bytes on every OS (no newline translation)
     copy = "import pathlib; pathlib.Path('out/copy.csv').write_text(pathlib.Path('data/in.csv').read_text())"
     status, run_id = _launch(env["state"], [
         "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/copy.csv",
