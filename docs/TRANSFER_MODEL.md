@@ -59,7 +59,8 @@ bootstrap-not-ready     -> a declared [run.bootstrap] is not ready; setup never 
 
 All four are candidate-local, so `--auto` tries the next candidate. Each untransferred
 run keeps its own completion fence; it still refuses while an ordinary run of the
-project has unknown completion, while ordinary runs do not wait for untransferred ones.
+project has unknown completion. An ordinary run refuses a target named by any live
+untransferred fence of the project (`target-busy-untransferred`, candidate-local).
 
 ## Why remote-newer is pulled by default
 

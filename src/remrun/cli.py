@@ -80,6 +80,7 @@ from .state import (
     conflict_dir,
     default_state_root,
     new_run_id,
+    per_run_completion_fences,
     prune_state,
     read_baseline,
     read_json,
@@ -1308,7 +1309,7 @@ def _verify_untransferred_target(
     return verified, conflicts
 
 
-def _refuse_untransferred_candidate(
+def _refuse_candidate(
     *,
     reporter: Reporter,
     plan: RunPlan,
@@ -1319,10 +1320,10 @@ def _refuse_untransferred_candidate(
     conflicts: list[dict[str, str]],
     verified: list[dict[str, str]],
 ) -> NoReturn:
-    """Record why an untransferred run cannot start on this candidate, then skip it.
+    """Record why a run cannot start on this candidate, then skip it.
 
     Nothing was written to either tree and no fence exists yet, so ``--auto`` may try
-    the next candidate, whose checkout may be current.
+    the next candidate.
     """
     cdir = conflict_dir(run_id)
     write_json(cdir / "conflicts.json", {
@@ -1349,7 +1350,7 @@ def _refuse_untransferred_candidate(
         "terminal": True,
         "conflicts": len(conflicts),
         "conflict_state": str(cdir),
-        "verify": verified,
+        **({"verify": verified} if plan.transfer_mode == "none" else {}),
         "plan": plan.as_dict(),
     })
     first = conflicts[0]
@@ -2229,7 +2230,7 @@ def _run_locked(
             })
             return EXIT_TRANSFER
         if problems:
-            _refuse_untransferred_candidate(
+            _refuse_candidate(
                 reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
                 started_at=started_at, phase="verify", conflicts=problems, verified=verified,
             )
@@ -2264,6 +2265,28 @@ def _run_locked(
             note="no reconcile, baseline or pullback; outputs stay on the target",
         )
     else:
+        # Untransferred runs work in this target's checkout without the project lock.
+        # Reconciling that tree under them could change files they are reading and pull
+        # back their half-written outputs, so a reconciling run takes another target.
+        busy = [
+            fence["run_id"]
+            for fence in per_run_completion_fences(plan.project.project_id)
+            if fence["target"] == plan.target.name
+        ]
+        if busy:
+            _refuse_candidate(
+                reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+                started_at=started_at, phase="preflight", verified=[],
+                conflicts=[{
+                    "path": plan.project.relative_cwd or ".",
+                    "state": "target-busy-untransferred",
+                    "reason": (
+                        f"untransferred run(s) {', '.join(busy)} may still be working in "
+                        f"{plan.target.name}'s checkout; wait for them (`remrun resume "
+                        f"{busy[0]}`) or choose another target"
+                    ),
+                }],
+            )
         prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
         allow_large_push = getattr(args, "allow_large_push", False)
         try:
@@ -2429,7 +2452,7 @@ def _run_locked(
         elif untransferred and target_bootstrap.status != "ready":
             # Setup mutates an environment other in-flight runs may import from, and an
             # untransferred run has not pushed the lock inputs it would build from.
-            _refuse_untransferred_candidate(
+            _refuse_candidate(
                 reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
                 started_at=started_at, phase="bootstrap", verified=verified,
                 conflicts=[{

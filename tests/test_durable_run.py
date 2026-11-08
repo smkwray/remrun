@@ -763,6 +763,32 @@ def test_two_untransferred_durable_runs_on_one_project_launch_concurrently(
     assert not (state / "manifests").exists()
 
 
+def test_reconciling_run_refuses_a_target_where_an_untransferred_run_works(
+    durable_env, monkeypatch, capsys
+):
+    """An untransferred job works in the target's checkout without the project lock.
+    A reconciling run there could change files under it and pull back its half-written
+    outputs, so that target is refused (a candidate-local conflict, so --auto moves on);
+    other targets stay usable."""
+    state = durable_env["state"]
+    _set_transfer_mode(durable_env, "none")
+    durable_env["remote_project"].mkdir()
+    transports = _install_concurrent(monkeypatch)
+    code, untransferred = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+    assert code == EXIT_INFRA and _run_fences(state) == {untransferred}
+    capsys.readouterr()
+
+    code, refused = _launch(state, ["run", "--transfer", "safe", "TEST", "--", *LONG_JOB])
+    assert code == cli.EXIT_CONFLICT
+    assert "target-busy-untransferred" in capsys.readouterr().err
+    assert _summary(state, refused)["completion_state"] == "not_started"
+    assert transports["TEST"].exec_calls == 0
+    assert _run_fences(state) == {untransferred}
+
+    code, _other = _launch(state, ["run", "--transfer", "safe", "OTHER", "--", *LONG_JOB])
+    assert code == EXIT_OK
+
+
 def test_verify_mismatch_refuses_before_dispatch_without_fence(
     durable_env, monkeypatch, capsys
 ):
@@ -871,7 +897,9 @@ def test_untransferred_run_respects_an_ordinary_unknown_fence(
     _set_transfer_mode(durable_env, "none")
     _, untransferred = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
     _set_transfer_mode(durable_env, "safe")
-    code, ordinary = _launch(state, ["run", "--durable", "TEST", "--", *LONG_JOB])
+    # The ordinary run reconciles, so it must use a target where no untransferred job
+    # works; its project-wide fence still applies to every target.
+    code, ordinary = _launch(state, ["run", "--durable", "OTHER", "--", *LONG_JOB])
     assert code == EXIT_INFRA and ordinary is not None
     assert len(_project_fences(state)) == 1
     capsys.readouterr()
@@ -880,7 +908,8 @@ def test_untransferred_run_respects_an_ordinary_unknown_fence(
         state, ["run", "--durable", "--transfer", "none", "TEST", "--", *LONG_JOB]
     )
     assert (code, refused) == (EXIT_INTERNAL, None)
-    assert transports["TEST"].launch_calls == 2
+    assert transports["TEST"].launch_calls == 1
+    assert transports["OTHER"].launch_calls == 1
     assert f"remrun resume {ordinary}" in capsys.readouterr().err
     assert _run_fences(state) == {untransferred}
 

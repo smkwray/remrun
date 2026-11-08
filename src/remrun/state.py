@@ -359,6 +359,25 @@ def clear_unknown_completion_hazard(
     return True
 
 
+def per_run_completion_fences(
+    project_id: str, state_root: Path | None = None
+) -> list[dict[str, Any]]:
+    """Every per-run completion fence of a project, validated; bad bytes raise."""
+    project_dir = unknown_completion_hazard_path(project_id, state_root).parent / "runs"
+    if not project_dir.exists():
+        return []
+    fences: list[dict[str, Any]] = []
+    for path in sorted(project_dir.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise UnknownCompletionHazardError(
+                f"unknown-completion hazard is unreadable at {path}: {type(exc).__name__}"
+            ) from exc
+        fences.append(_validate_unknown_completion_hazard(data, project_id=project_id, path=path))
+    return fences
+
+
 def _active_unknown_completion_run_ids(state_root: Path) -> set[str]:
     """Return run summaries pinned by active hazards, failing closed on bad bytes."""
     hazards_root = state_root / "hazards" / "project"

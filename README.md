@@ -171,9 +171,10 @@ on every run. It works with `--durable`, `--auto` and `--label`.
 - No project lock is taken, so untransferred runs of one project can run side by
   side. Each records its own completion fence, which `resume` and `resolve-unknown`
   clear for that run only. An untransferred run still refuses to start while an
-  ordinary run of the project has unknown completion. Ordinary runs do not wait for
-  untransferred ones: an ordinary run's pullback may bring back files an untransferred
-  run is still writing.
+  ordinary run of the project has unknown completion. An ordinary (reconciling) run
+  refuses a target while an untransferred run of the project may still be working
+  there (`target-busy-untransferred`; `--auto` tries another target), so it never
+  changes files under that run or pulls back its half-written outputs.
 - A project that declares `[run.bootstrap]` must already be set up on the target. An
   untransferred run checks readiness but never runs setup; run one ordinary run there
   first.
