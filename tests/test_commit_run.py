@@ -767,6 +767,38 @@ def test_disk_floor_refuses_before_any_target_write(commit_env, capsys, monkeypa
     assert not marker.exists() and not (env["target_state"] / "work").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="the local memory-admission helper is POSIX")
+def test_a_one_slot_guarded_target_seeds_then_readmits_the_command(commit_env):
+    """On a memory-guarded target every seeding git command takes a guard slot of its
+    own, while the run's reservation for its command (held from admission until
+    dispatch) would occupy the only one (`max_jobs = 1`). The run gives it up for the
+    seed and is admitted again before dispatch; the real admission helper decides, and
+    a second run proves no slot was left behind."""
+    from remrun import _posix_telemetry as telemetry
+
+    env = commit_env
+    total_bytes, _available = telemetry._host_memory()
+    devices = env["defaults"].parent / "devices.toml"
+    devices.write_text(
+        devices.read_text(encoding="utf-8")
+        + "\n[git_sync]\nremote_memory_limit_mib = 256\n"
+        + "\n[devices.LOCAL_SIM.memory_guard]\nschema = 3\n"
+        + f"command_limit_fraction = {(512.25 * 1024**2) / total_bytes!r}\n"
+        + f"host_reserve_fraction = {(15.75 * 1024**2) / total_bytes!r}\n",
+        encoding="utf-8",
+    )
+    for name in ("a", "b"):
+        status, run_id = _launch(env["state"], [
+            "run", "LOCAL_SIM", "--transfer", "commit", "--output", f"out/{name}.txt",
+            "--", *_py(_write(f"out/{name}.txt", name)),
+        ])
+        assert status == EXIT_OK
+        assert (env["project"] / "out" / f"{name}.txt").read_text() == name
+        summary = _summary(env["state"], run_id)
+        assert summary["memory_guard"]["status"] == "ok"
+        assert summary["work"]["state"] == "removed"
+
+
 def test_floor_is_a_required_config_value(commit_env):
     env = commit_env
     env["defaults"].write_text(
