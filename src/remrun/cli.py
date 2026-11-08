@@ -2549,10 +2549,10 @@ def _run_locked(
         # holder is on its target (_publish_completion_fence). Whichever of the two
         # goes first, the other sees it.
         # A commit run's fence (it has outputs) names a private tree, not this checkout,
-        # so it is no obstacle here. Nor does its lease need a guard in this run: a
-        # leased output this run changes locally makes the commit run's pullback save
-        # its copy as a conflict, and a commit-run pullback landing while this run works
-        # is a local change this run's own pullback treats the same way (invariant 6).
+        # so it is no obstacle here. Nor does its lease need a guard in this run: both
+        # runs write local files only under the local tree's write lock, re-checking
+        # each file there, so whichever writes a leased output second saves its copy as
+        # a conflict instead of overwriting the first (invariant 6).
         busy = [
             fence["run_id"]
             for fence in per_run_completion_fences(plan.project.project_id)
@@ -2590,6 +2590,7 @@ def _run_locked(
                 include_paths=bootstrap_inputs,
                 max_push_files=None if allow_large_push else plan.max_push_files,
                 max_push_bytes=None if allow_large_push else plan.max_push_bytes,
+                report=reporter.event,
             )
         except TransportError as exc:
             reporter.event("transfer_error", phase="preflight", message=str(exc))
@@ -3283,6 +3284,7 @@ def _run_locked(
                 backup_below_bytes=policy.backup_below_bytes,
                 write_scope_paths=plan.write_scope_paths or None,
                 include_paths=bootstrap_inputs,
+                report=reporter.event,
             )
         except TransportError as exc:
             reporter.event("transfer_error", phase="pullback", message=str(exc))
@@ -4462,6 +4464,7 @@ def _finalize_durable_run(
                     if plan.bootstrap is not None and plan.bootstrap.status == "bootstrap-needed"
                     else ()
                 ),
+                report=reporter.event,
             )
         except TransportError as exc:
             reporter.event("transfer_error", phase="pullback", message=str(exc))

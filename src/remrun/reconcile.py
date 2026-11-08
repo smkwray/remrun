@@ -3,9 +3,10 @@ from __future__ import annotations
 import shutil
 import stat
 from collections import Counter
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from .config import case_insensitive, casefold_collisions, current_os_key, device_os_key
 from .manifest import (
@@ -25,8 +26,13 @@ from .transfer_plan import (
     diff_remote_changes,
     entries_same,
 )
+from .state import LockError, local_write_lock
 from .transport import BaseTransport, TransportError
 
+# How long a phase waits while another live remrun process writes into the same local
+# tree (see ``state.local_write_lock``). A holder whose process has exited is reclaimed
+# at once; a wait that runs out fails the phase as a transfer error, before it writes.
+LOCAL_WRITE_WAIT_SECONDS = 1800.0
 
 # Positively enumerated candidate-local preflight failures. Any new/unknown state is
 # non-retryable by default so a global controller-side problem cannot silently fail over.
@@ -367,6 +373,42 @@ def _backup_local(local_root: Path, rel: str, backup_root: Path, max_bytes: int 
     return True
 
 
+@contextmanager
+def _local_writes(local_root: Path, report: Callable[..., None] | None) -> Iterator[None]:
+    """Hold the local tree's write lock for one check-then-write phase.
+
+    Another controller process's pullback or preflight may write the same local file;
+    while this is held, it cannot, so each re-check below sees every earlier write.
+    """
+    lock = local_write_lock(
+        local_root,
+        report=None if report is None else (
+            lambda event, **fields: report(event, lock="local_writes", **fields)
+        ),
+    )
+    try:
+        lock.acquire(wait_seconds=LOCAL_WRITE_WAIT_SECONDS)
+    except LockError as exc:
+        raise TransportError(
+            f"another remrun process is still writing into {local_root}; nothing was "
+            f"written there: {exc}"
+        ) from exc
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _local_moved(path: Path, planned: FileEntry | None) -> bool:
+    """Has the local file changed since the manifest a plan was built from?
+
+    By content when the plan hashed the file, otherwise by size and mtime.
+    """
+    hashed = planned is not None and planned.sha256 is not None
+    now = _fresh_local_entry(path, hash_if_size=planned.size if hashed else None)
+    return _changed_since(planned, now)
+
+
 def _matches_any_scope_path(rel: str, patterns: list[str] | tuple[str, ...]) -> bool:
     return any(should_exclude(rel, [pattern]) for pattern in patterns)
 
@@ -418,6 +460,7 @@ def preflight_reconcile(
     include_paths: list[str] | tuple[str, ...] = (),
     max_push_files: int | None = None,
     max_push_bytes: int | None = None,
+    report: Callable[..., None] | None = None,
 ) -> ReconcileResult:
     """Reconcile the active run surface before running the command (Mode 1/safe).
 
@@ -427,6 +470,8 @@ def preflight_reconcile(
     local files before deleting them). A fallback candidate may push local bytes
     outward but may not pull or delete anything locally while candidate selection
     is still in progress. Returns converged manifests to serve as pre-run baselines.
+    Local pulls and deletes hold the local tree's write lock; ``report`` receives
+    its wait and reclaim events.
     """
     result = ReconcileResult()
 
@@ -614,25 +659,53 @@ def preflight_reconcile(
     if progress:
         progress(0, total, action_totals)
 
-    for completed, item in enumerate(actions, start=1):
+    completed = 0
+
+    def advance() -> None:
+        nonlocal completed
+        completed += 1
+        if progress and (completed == total or completed % 25 == 0):
+            progress(completed, total, action_totals)
+
+    # Local writes first, under the local tree's write lock: another remrun process (a
+    # commit run's pullback) may write these files too. Each is re-checked under the
+    # lock against the manifest it was planned from; one that changed since is left as
+    # it is, and the final pair check below reports it, so the run does not start.
+    local_actions = [item for item in actions if item.action in (PULL, DELETE_LOCAL)]
+    if local_actions:
+        with _local_writes(local_root, report):
+            for item in local_actions:
+                remote_path = transport.remote_join(remote_root, item.path)
+                local_path = local_root / item.path
+                if item.action == PULL:
+                    # Re-check the LOCAL file RIGHT BEFORE writing it. The plan above was
+                    # built from a manifest snapshot; an external writer (Syncthing) may have
+                    # delivered the very bytes we are about to pull in the meantime.
+                    # Rewriting an already-converged file is not just wasted work — it
+                    # re-touches a path Syncthing is actively watching, which is how remrun
+                    # ends up racing the delivery it was trying to stay clear of. This is
+                    # the same guard postrun_pullback already applies; see below.
+                    if _already_converged(local_path, remote_manifest.get(item.path)):
+                        result.skipped_identical.append(item.path)
+                    elif not _local_moved(local_path, local_manifest.get(item.path)):
+                        # Snapshot the prior local version before overwriting it, so a
+                        # wrong pull is recoverable (no-op when the file is new or over
+                        # the backup size cap).
+                        _backup_local(local_root, item.path, backup_root, backup_below_bytes)
+                        transport.pull_file(remote_path, local_path)
+                        result.pulled.append(item.path)
+                elif not _local_moved(local_path, local_manifest.get(item.path)):
+                    _backup_local(local_root, item.path, backup_root, backup_below_bytes)
+                    local_path.unlink(missing_ok=True)
+                    result.deleted_local.append(item.path)
+                advance()
+
+    for item in actions:
+        if item.action in (PULL, DELETE_LOCAL):
+            continue
         remote_path = transport.remote_join(remote_root, item.path)
         local_path = local_root / item.path
-        if item.action == PULL:
-            # Re-check the LOCAL file RIGHT BEFORE writing it. The plan above was built from
-            # a manifest snapshot; an external writer (Syncthing) may have delivered the very
-            # bytes we are about to pull in the meantime. Rewriting an already-converged file
-            # is not just wasted work — it re-touches a path Syncthing is actively watching,
-            # which is how remrun ends up racing the delivery it was trying to stay clear of.
-            # This is the same guard postrun_pullback already applies; see below.
-            if _already_converged(local_path, remote_manifest.get(item.path)):
-                result.skipped_identical.append(item.path)
-            else:
-                # Snapshot the prior local version before overwriting it, so a wrong pull
-                # is recoverable (no-op when the file is new or over the backup size cap).
-                _backup_local(local_root, item.path, backup_root, backup_below_bytes)
-                transport.pull_file(remote_path, local_path)
-                result.pulled.append(item.path)
-        elif item.action == PUSH:
+        if item.action == PUSH:
             # The same guard in the other direction: if the remote already holds these exact
             # bytes there is nothing to send. Compares the freshly-stat'd local file against
             # the remote entry from the manifest already fetched above, so no extra
@@ -645,12 +718,7 @@ def preflight_reconcile(
         elif item.action == DELETE_REMOTE:
             transport.delete_remote(remote_path)
             result.deleted_remote.append(item.path)
-        elif item.action == DELETE_LOCAL:
-            _backup_local(local_root, item.path, backup_root, backup_below_bytes)
-            local_path.unlink(missing_ok=True)
-            result.deleted_local.append(item.path)
-        if progress and (completed == total or completed % 25 == 0):
-            progress(completed, total, action_totals)
+        advance()
 
     # A writer can change either tree after an applied transfer. Verify the final
     # pair before accepting it as both the execution snapshot and a new baseline.
@@ -728,6 +796,7 @@ def postrun_pullback(
     include_paths: list[str] | tuple[str, ...] = (),
     within: list[str] | tuple[str, ...] | None = None,
     held: list[str] | tuple[str, ...] = (),
+    report: Callable[..., None] | None = None,
 ) -> PullbackResult:
     """Pull command-caused remote changes back to local project paths.
 
@@ -743,6 +812,11 @@ def postrun_pullback(
     compared ignoring case and Unicode form, are neither pulled nor mirrored as
     deletions: the caller found something there the manifests cannot represent (a
     symlink or special file).
+
+    Each local re-check and the write it decides happen under the local tree's write
+    lock, so a concurrent pullback or preflight of another remrun process that wrote
+    the same path first is seen as a local change: a saved conflict, never an
+    overwrite. ``report`` receives the lock's wait and reclaim events.
     """
     result = PullbackResult()
 
@@ -801,13 +875,15 @@ def postrun_pullback(
         groups = casefold_collisions(list(cur_local) + list(changed))
         collide = {p for ps in groups.values() for p in ps if p in set(changed)}
 
+    # Everything that reads only the remote side comes first, outside the local tree's
+    # write lock; the lock then covers each local re-check and the write it decides.
+    candidates: list[tuple[str, FileEntry]] = []
     for rel in changed:
         if rel in collide:
             result.conflicts.append(rel)   # would collapse on a case-insensitive local FS — skip
             continue
         remote_entry = post_remote.get(rel)
         remote_path = transport.remote_join(remote_root, rel)
-        local_path = local_root / rel
         if remote_entry is None:
             # ``changed`` is derived from ``post_remote``, so this can only happen
             # if a malformed/unstable transport response broke attribution. Fail
@@ -835,69 +911,75 @@ def postrun_pullback(
                 transport.pull_file(remote_path, dest)
                 result.conflicts.append(rel)
                 continue
+        candidates.append((rel, remote_entry))
 
-        # Re-check the local file RIGHT BEFORE writing (not the stale cur_local): Syncthing may have
-        # delivered the identical bytes during/after the run. If local already == the remote output,
-        # SKIP the pull — that avoids an unnecessary overwrite that races Syncthing's own delivery
-        # (the temp-orphan / sync-conflict source). Idempotent external-writer behavior.
-        local_now = _fresh_local_entry(
-            local_path, hash_if_size=remote_entry.size)
-        if local_now is not None and entries_same(local_now, remote_entry):
-            result.skipped_identical.append(rel)
-            # Both entries are positively content-equal here: ``remote_entry`` has
-            # a strong hash and ``local_now`` hashes same-sized local content.
-            next_local[rel] = replace(local_now, path=rel)
+    # Nothing to write locally takes no lock, so it never waits on another process.
+    with _local_writes(local_root, report) if candidates or deleted else nullcontext():
+        for rel, remote_entry in candidates:
+            remote_path = transport.remote_join(remote_root, rel)
+            local_path = local_root / rel
+            # Re-check the local file RIGHT BEFORE writing (not the stale cur_local): Syncthing may have
+            # delivered the identical bytes during/after the run. If local already == the remote output,
+            # SKIP the pull — that avoids an unnecessary overwrite that races Syncthing's own delivery
+            # (the temp-orphan / sync-conflict source). Idempotent external-writer behavior.
+            local_now = _fresh_local_entry(
+                local_path, hash_if_size=remote_entry.size)
+            if local_now is not None and entries_same(local_now, remote_entry):
+                result.skipped_identical.append(rel)
+                # Both entries are positively content-equal here: ``remote_entry`` has
+                # a strong hash and ``local_now`` hashes same-sized local content.
+                next_local[rel] = replace(local_now, path=rel)
+                next_remote[rel] = post_remote[rel]
+                continue
+
+            local_changed_during_run = _changed_since(pre_local_manifest.get(rel), local_now)
+            if local_changed_during_run:
+                # Local edited during the run and differs from the remote output -> preserve both.
+                dest = conflict_remote_root / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                transport.pull_file(remote_path, dest)
+                result.conflicts.append(rel)
+                continue
+
+            _backup_local(local_root, rel, backup_root, backup_below_bytes)  # rollback snapshot
+            transport.pull_file(remote_path, local_path)
+            # Every candidate has a strong remote hash by this point, so a successful
+            # pull always has positive content verification before its baseline path
+            # advances.
+            verify = _fresh_local_entry(local_path, hash_if_size=remote_entry.size)
+            if verify is None or not entries_same(verify, remote_entry):
+                raise TransportError(f"pull verification failed for {rel}")
+            result.pulled.append(rel)
+            next_local[rel] = replace(verify, path=rel)
             next_remote[rel] = post_remote[rel]
-            continue
 
-        local_changed_during_run = _changed_since(pre_local_manifest.get(rel), local_now)
-        if local_changed_during_run:
-            # Local edited during the run and differs from the remote output -> preserve both.
-            dest = conflict_remote_root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            transport.pull_file(remote_path, dest)
-            result.conflicts.append(rel)
-            continue
-
-        _backup_local(local_root, rel, backup_root, backup_below_bytes)  # rollback snapshot
-        transport.pull_file(remote_path, local_path)
-        # Every candidate has a strong remote hash by this point, so a successful
-        # pull always has positive content verification before its baseline path
-        # advances.
-        verify = _fresh_local_entry(local_path, hash_if_size=remote_entry.size)
-        if verify is None or not entries_same(verify, remote_entry):
-            raise TransportError(f"pull verification failed for {rel}")
-        result.pulled.append(rel)
-        next_local[rel] = replace(verify, path=rel)
-        next_remote[rel] = post_remote[rel]
-
-    for rel in deleted:
-        local_path = local_root / rel
-        pre_local_entry = pre_local_manifest.get(rel)
-        local_now = _fresh_local_entry(
-            local_path,
-            hash_if_size=(pre_local_entry.size if pre_local_entry is not None else None),
-        )
-        if local_now is None:
-            # The command-attributed remote deletion is already reflected locally
-            # (for example, Syncthing delivered it first).
+        for rel in deleted:
+            local_path = local_root / rel
+            pre_local_entry = pre_local_manifest.get(rel)
+            local_now = _fresh_local_entry(
+                local_path,
+                hash_if_size=(pre_local_entry.size if pre_local_entry is not None else None),
+            )
+            if local_now is None:
+                # The command-attributed remote deletion is already reflected locally
+                # (for example, Syncthing delivered it first).
+                next_local.pop(rel, None)
+                next_remote.pop(rel, None)
+                continue
+            local_changed_during_run = _changed_since(
+                pre_local_entry, local_now
+            )
+            if local_changed_during_run:
+                # Remote deleted it but local changed it during the run -> keep local.
+                result.conflicts.append(rel)
+                continue
+            _backup_local(local_root, rel, backup_root, backup_below_bytes)
+            local_path.unlink(missing_ok=True)
+            if _fresh_local_entry(local_path, hash_if_size=None) is not None:
+                raise TransportError(f"delete verification failed for {rel}")
+            result.deleted_local.append(rel)
             next_local.pop(rel, None)
             next_remote.pop(rel, None)
-            continue
-        local_changed_during_run = _changed_since(
-            pre_local_entry, local_now
-        )
-        if local_changed_during_run:
-            # Remote deleted it but local changed it during the run -> keep local.
-            result.conflicts.append(rel)
-            continue
-        _backup_local(local_root, rel, backup_root, backup_below_bytes)
-        local_path.unlink(missing_ok=True)
-        if _fresh_local_entry(local_path, hash_if_size=None) is not None:
-            raise TransportError(f"delete verification failed for {rel}")
-        result.deleted_local.append(rel)
-        next_local.pop(rel, None)
-        next_remote.pop(rel, None)
 
     result.post_remote_manifest = post_remote
     result.local_manifest_after = _build_local_manifest(

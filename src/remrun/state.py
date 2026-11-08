@@ -715,6 +715,25 @@ class ProjectLock:
         self.release()
 
 
+def local_write_lock(
+    local_root: Path, state_root: Path | None = None, *,
+    report: Callable[..., None] | None = None,
+) -> ProjectLock:
+    """The lock that serializes remrun's own writes into one local project tree.
+
+    Ordinary runs hold the project lock and commit runs do not, yet both write files
+    into the same local tree. Each phase that checks a local project file and then
+    writes or deletes it holds this lock, so whichever phase goes second sees the
+    first one's write as a local change. It is keyed by the resolved local root, the
+    tree it guards, and has its own lock table and guard.
+
+    Acquisition order: a run's project lock (or its per-run lock) first, then this one.
+    Its holder takes no other lock, so the two never wait on each other.
+    """
+    root = os.path.normcase(str(Path(local_root).resolve()))
+    return ProjectLock(f"{root} local writes", "local", state_root, report=report)
+
+
 # --- retention ---------------------------------------------------------------
 
 @dataclass(frozen=True)

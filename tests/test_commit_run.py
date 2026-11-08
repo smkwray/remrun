@@ -989,7 +989,7 @@ def test_a_lease_differing_only_in_case_or_unicode_form_still_overlaps(commit_en
 def test_an_ordinary_run_is_not_blocked_by_a_commit_lease(commit_env):
     """A commit run works in a private tree, not the target's checkout, so a reconciling
     run on the same target may proceed; same-path collisions on the controller are
-    settled by the pullback conflict rule (exercised above)."""
+    settled under the local tree's write lock (test_reconcile's concurrent-writer tests)."""
     env = commit_env
     write_unknown_completion_hazard(
         "proj1", "LOCAL_SIM", "20260101T000000Z-LOCAL_SIM-proj1-aaaaaa",

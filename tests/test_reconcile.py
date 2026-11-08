@@ -2,15 +2,24 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
+import remrun.reconcile as reconcile_module
+import remrun.state as state_module
 from remrun.manifest import build_manifest
 from remrun.models import Device
 from remrun.reconcile import ReconcileResult, postrun_pullback, preflight_reconcile
 from remrun.transfer_plan import ABORT_CONFLICT, ClassifiedPath
 from remrun.transport import LocalSimTransport, TransportError
+
+
+@pytest.fixture(autouse=True)
+def _controller_state(tmp_path: Path, monkeypatch):
+    """Keep the local-write lock table out of the real controller state."""
+    monkeypatch.setenv("REMRUN_STATE_ROOT", str(tmp_path / "controller-state"))
 
 
 def make_transport(remote_base: Path) -> LocalSimTransport:
@@ -1103,3 +1112,258 @@ def test_held_link_with_another_case_keeps_the_file_it_replaced(tmp_path: Path):
 
     assert post.deleted_local == [] and post.conflicts == []
     assert (local / "out" / "keep.txt").read_text() == "keep me"
+
+
+# --- concurrent writers of one local tree ---------------------------------------------
+#
+# Ordinary runs hold the project lock and commit runs do not, so two controller
+# processes can pull files into the same local tree at once. Each pullback checks a
+# local file (unchanged since launch?) and then writes it; unless those steps are
+# serialized, the second writer's check passes against bytes the first is about to
+# replace, and one run's result silently overwrites the other's.
+
+
+class _PausingTransport(LocalSimTransport):
+    """Holds its pull into one local path until released: the window after a phase
+    has checked the local file (and backed it up) and before it writes."""
+
+    def __init__(self, device: Device, pause_at: Path):
+        super().__init__(device)
+        self.pause_at = pause_at
+        self.paused = threading.Event()
+        self.resume = threading.Event()
+
+    def pull_file(self, remote_path: str, local_path: Path) -> None:
+        if Path(local_path) == self.pause_at and not self.paused.is_set():
+            self.paused.set()
+            if not self.resume.wait(timeout=30):
+                raise AssertionError("the paused pull was never released")
+        super().pull_file(remote_path, local_path)
+
+
+def _interleave(first, second, pausing: _PausingTransport) -> dict[str, object]:
+    """Run ``first`` until it pauses in its write, let ``second`` run (to completion,
+    unless something makes it wait), then release ``first``. Returns each outcome."""
+    outcomes: dict[str, object] = {}
+
+    def call(name, fn):  # noqa: ANN001
+        try:
+            outcomes[name] = fn()
+        except BaseException as exc:  # noqa: BLE001 - reported by the assertions
+            outcomes[name] = exc
+
+    one = threading.Thread(target=call, args=("first", first), daemon=True)
+    one.start()
+    assert pausing.paused.wait(timeout=10), "the first phase never reached its write"
+    two = threading.Thread(target=call, args=("second", second), daemon=True)
+    two.start()
+    two.join(timeout=2)  # unserialized, the second phase finishes inside this window
+    pausing.resume.set()
+    one.join(timeout=30)
+    two.join(timeout=30)
+    assert not one.is_alive() and not two.is_alive(), "a phase never finished"
+    for name, outcome in outcomes.items():
+        assert not isinstance(outcome, BaseException), f"{name} phase failed: {outcome!r}"
+    return outcomes
+
+
+def _sim_device(tmp_path: Path) -> Device:
+    return Device.from_mapping(
+        "LOCAL_SIM", {"kind": "local-sim", "project_root": str(tmp_path / "remote")}
+    )
+
+
+@pytest.mark.parametrize("first", ["commit", "ordinary"])
+def test_concurrent_pullbacks_of_one_path_never_overwrite_each_other(
+    tmp_path: Path, monkeypatch, first: str,
+):
+    """A commit run and an ordinary run both changed ``out/r.txt``. Whichever pullback
+    writes it first wins; the other must see that write as a local change and save its
+    own result as a conflict, never overwrite it (invariant 6)."""
+    monkeypatch.setattr(reconcile_module, "LOCAL_WRITE_WAIT_SECONDS", 20.0, raising=False)
+    local = tmp_path / "local" / "proj"
+    (local / "out").mkdir(parents=True)
+    target = local / "out" / "r.txt"
+    target.write_text("as launched")
+    pre_local = manifest(local)
+    roots = {"commit": tmp_path / "remote" / "tree", "ordinary": tmp_path / "remote" / "proj"}
+    produced = {"commit": "commit run result", "ordinary": "ordinary run's result"}
+    pre_remote = {}
+    for name, root in roots.items():
+        (root / "out").mkdir(parents=True)
+        (root / "out" / "r.txt").write_text("as launched")
+        pre_remote[name] = manifest(root)
+        (root / "out" / "r.txt").write_text(produced[name])  # the command's output
+
+    def pullback(name: str, transport: LocalSimTransport):  # noqa: ANN202
+        scoped = {"within": ["out/"], "include_paths": ["out/"]} if name == "commit" else {}
+        return lambda: postrun_pullback(
+            transport=transport, local_root=local, remote_root=str(roots[name]),
+            excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+            pre_remote_manifest=pre_remote[name], pre_local_manifest=pre_local,
+            backup_root=tmp_path / name / "backup",
+            conflict_remote_root=tmp_path / name / "remote", **scoped,
+        )
+
+    second = "ordinary" if first == "commit" else "commit"
+    pausing = _PausingTransport(_sim_device(tmp_path), target)
+    outcomes = _interleave(
+        pullback(first, pausing), pullback(second, make_transport(tmp_path / "remote")),
+        pausing,
+    )
+    won, lost = outcomes["first"], outcomes["second"]
+
+    # The phase that checked first writes first; the other sees its write.
+    assert target.read_text() == produced[first]
+    assert (won.pulled, won.conflicts) == (["out/r.txt"], [])
+    assert (lost.pulled, lost.conflicts) == ([], ["out/r.txt"])
+    assert (tmp_path / second / "remote" / "out" / "r.txt").read_text() == produced[second]
+    assert lost.next_baseline is None
+
+
+@pytest.mark.parametrize("first", ["preflight", "commit"])
+def test_preflight_local_pull_and_a_commit_pullback_never_overwrite_each_other(
+    tmp_path: Path, monkeypatch, first: str,
+):
+    """An ordinary run's preflight plans to pull a newer ``out/r.txt`` from its target
+    while a commit run's pullback writes the same local file. If the commit result
+    lands first, preflight must leave it and refuse to start; if preflight's pull lands
+    first, the commit pullback must save its result as a conflict."""
+    monkeypatch.setattr(reconcile_module, "LOCAL_WRITE_WAIT_SECONDS", 20.0, raising=False)
+    local, remote_root, transport, backup = setup(tmp_path)
+    (local / "out").mkdir()
+    target = local / "out" / "r.txt"
+    target.write_text("as launched")
+    synced = reconcile(local, remote_root, transport, backup)
+    assert not synced.has_conflicts
+    (Path(remote_root) / "out" / "r.txt").write_text("newer on the target")
+    tree = tmp_path / "remote" / "tree"
+    (tree / "out").mkdir(parents=True)
+    (tree / "out" / "r.txt").write_text("as launched")
+    tree_pre = manifest(tree)
+    (tree / "out" / "r.txt").write_text("commit run result")
+    commit_conflicts = tmp_path / "commit" / "remote"
+
+    def preflight(t: LocalSimTransport):  # noqa: ANN202
+        return lambda: reconcile(
+            local, remote_root, t, backup,
+            prev_local=synced.local_manifest, prev_remote=synced.remote_manifest,
+        )
+
+    def commit_pullback(t: LocalSimTransport):  # noqa: ANN202
+        return lambda: postrun_pullback(
+            transport=t, local_root=local, remote_root=str(tree),
+            excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+            pre_remote_manifest=tree_pre, pre_local_manifest=synced.local_manifest,
+            backup_root=tmp_path / "commit" / "backup",
+            conflict_remote_root=commit_conflicts,
+            within=["out/"], include_paths=["out/"],
+        )
+
+    pausing = _PausingTransport(_sim_device(tmp_path), target)
+    plain = make_transport(tmp_path / "remote")
+    if first == "preflight":
+        outcomes = _interleave(preflight(pausing), commit_pullback(plain), pausing)
+        pre, post = outcomes["first"], outcomes["second"]
+        assert target.read_text() == "newer on the target"
+        assert (pre.pulled, pre.conflicts) == (["out/r.txt"], [])
+        assert (post.pulled, post.conflicts) == ([], ["out/r.txt"])
+        assert (commit_conflicts / "out" / "r.txt").read_text() == "commit run result"
+    else:
+        outcomes = _interleave(commit_pullback(pausing), preflight(plain), pausing)
+        post, pre = outcomes["first"], outcomes["second"]
+        assert target.read_text() == "commit run result"
+        assert (post.pulled, post.conflicts) == (["out/r.txt"], [])
+        # Preflight left the commit result in place and does not let the run start.
+        assert pre.pulled == []
+        assert [c.path for c in pre.conflicts] == ["out/r.txt"]
+        assert (Path(remote_root) / "out" / "r.txt").read_text() == "newer on the target"
+
+
+def _one_output(tmp_path: Path):  # noqa: ANN202
+    """A run whose command changed ``out.txt``; returns the pullback to finish it."""
+    local, remote_root, transport, backup = setup(tmp_path)
+    (local / "out.txt").write_text("before")
+    pre = reconcile(local, remote_root, transport, backup)
+    (Path(remote_root) / "out.txt").write_text("after the run")
+    events: list[tuple[str, dict]] = []
+
+    def pullback(t=transport):  # noqa: ANN001, ANN202
+        return postrun_pullback(
+            transport=t, local_root=local, remote_root=remote_root,
+            excludes=["node_modules/**"], hash_below_bytes=1_000_000,
+            pre_remote_manifest=pre.remote_manifest, pre_local_manifest=pre.local_manifest,
+            backup_root=backup, conflict_remote_root=tmp_path / "state" / "remote",
+            report=lambda event, **fields: events.append((event, fields)),
+        )
+    return local, pullback, events
+
+
+def test_local_write_lock_is_released_when_the_pullback_fails(tmp_path: Path):
+    """A pullback that raises mid-write must not leave the tree locked: every later
+    run of the project would otherwise wait on a holder that is still alive."""
+    from remrun.state import LockError, local_write_lock
+
+    local, pullback, _events = _one_output(tmp_path)
+    held_during_write: list[bool] = []
+
+    class FailingPull(LocalSimTransport):
+        def pull_file(self, remote_path: str, local_path: Path) -> None:
+            probe = local_write_lock(local)
+            try:
+                probe.acquire()
+            except LockError:
+                held_during_write.append(True)
+            else:
+                probe.release()
+                held_during_write.append(False)
+            raise TransportError("injected pull failure")
+
+    with pytest.raises(TransportError, match="injected pull failure"):
+        pullback(FailingPull(_sim_device(tmp_path)))
+    assert held_during_write == [True]
+    assert (local / "out.txt").read_text() == "before"
+    local_write_lock(local).acquire().release()  # free again
+
+
+def test_dead_local_write_holder_is_reclaimed(tmp_path: Path, monkeypatch):
+    """A controller killed mid-pullback leaves its lock behind; once its process has
+    provably exited, the next writer reclaims it and says so."""
+    from remrun.state import local_write_lock
+
+    local, pullback, events = _one_output(tmp_path)
+    stale = local_write_lock(local)
+    stale.acquire()
+    info = state_module.read_json(stale.path / "info.json")
+    state_module.write_json(stale.path / "info.json", {**info, "pid": 4242})
+    real = state_module.pid_liveness
+    monkeypatch.setattr(
+        state_module, "pid_liveness", lambda pid: False if pid == 4242 else real(pid)
+    )
+
+    post = pullback()
+
+    assert post.pulled == ["out.txt"] and (local / "out.txt").read_text() == "after the run"
+    assert [(e, f["lock"], f["pid"]) for e, f in events if e == "stale_lock_reclaimed"] == [
+        ("stale_lock_reclaimed", "local_writes", 4242)
+    ]
+    assert not stale.path.exists()
+
+
+def test_live_local_write_holder_bounds_the_wait_and_writes_nothing(
+    tmp_path: Path, monkeypatch,
+):
+    """Another live process still writing into the tree is waited on, but not forever:
+    the pullback then fails as a transfer error before touching the file."""
+    from remrun.state import local_write_lock
+
+    monkeypatch.setattr(reconcile_module, "LOCAL_WRITE_WAIT_SECONDS", 0.3)
+    local, pullback, events = _one_output(tmp_path)
+    holder = local_write_lock(local).acquire()
+    try:
+        with pytest.raises(TransportError, match="still writing into"):
+            pullback()
+    finally:
+        holder.release()
+    assert (local / "out.txt").read_text() == "before"
+    assert [(e, f["lock"]) for e, f in events] == [("lock_wait", "local_writes")]

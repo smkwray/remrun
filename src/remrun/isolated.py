@@ -662,6 +662,7 @@ def finalize_commit_outputs(
             include_paths=plan.outputs,
             within=plan.outputs,
             held=unsupported,
+            report=report,
         )
     except TransportError as exc:
         _retain(plan, run_id, registry, f"pullback failed: {exc}", report)
