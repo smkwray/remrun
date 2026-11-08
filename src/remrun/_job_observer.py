@@ -49,6 +49,13 @@ _WIN_KEEPER_CLEANUP_RETRIES = 50
 _SCHEMA_READY_ATTEMPTS = 25
 _SCHEMA_READY_DELAY_SECONDS = 0.02
 _START_GATE_TIMEOUT_SECONDS = 60.0
+# A record that started more than this long before the current boot is stale:
+# no process survives a restart. The boot-time estimate (wall clock minus an
+# uptime that counts sleep) has under a second of sampling/rounding jitter, but a
+# wall-clock step after boot moves it by the size of the step, so the margin also
+# absorbs ordinary post-boot clock corrections. A larger margin only leaves a job
+# that started just before the restart visible as UNKNOWN, as before.
+_BOOT_STALE_MARGIN_NS = 600 * 1_000_000_000
 _SAFE = re.compile(r"^[A-Za-z0-9._:@+-]+$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -1050,6 +1057,42 @@ def _platform_name() -> str:
         return "windows"
     return "unsupported"
 
+def _boot_time_ns() -> int | None:
+    """Return this host's boot moment on the wall clock, or None when unproven.
+
+    Every source counts time spent asleep or hibernated, so a suspend never dates
+    the boot later than it was. There is deliberately no ``time.monotonic()``
+    fallback: it stops during sleep on Linux and macOS and would place the boot
+    after jobs that are still running. This mirrors the durable runner's boot
+    marker but stays local because this file is staged alone onto targets.
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            uptime = Path("/proc/uptime").read_text(encoding="ascii").split()[0]
+            boot = time.time_ns() - int(float(uptime) * 1e9)
+        elif sys.platform == "darwin":
+            output = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "kern.boottime"],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=2.0,
+            ).stdout
+            match = re.search(r"sec = (\d+), usec = (\d+)", output)
+            if match is None:
+                return None
+            boot = int(match[1]) * 1_000_000_000 + int(match[2]) * 1_000
+        elif os.name == "nt":
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+            boot = time.time_ns() - int(kernel32.GetTickCount64()) * 1_000_000
+        else:
+            return None
+    except Exception:
+        return None
+    return boot if 0 < boot <= time.time_ns() else None
+
+
 def _processes() -> dict[int, ProcessRow]:
     if sys.platform.startswith("linux") and Path("/proc/self/stat").exists():
         return _linux_processes()
@@ -1868,6 +1911,7 @@ def _query(root: Path, sample_interval: float) -> dict[str, object]:
             "records_seen": len(records) + len(record_errors),
             "invalid_records": len(record_errors),
             "stale_hidden": 0,
+            "boot_time_unix_ns": None,
             "query_mutated_registry": False,
         },
         "coverage": {
@@ -1910,6 +1954,18 @@ def _query(root: Path, sample_interval: float) -> dict[str, object]:
         })
         result["query_elapsed_seconds"] = time.monotonic() - started
         return result
+    if records:
+        # A restart ends every process, so a record from before the current boot
+        # is stale whatever its owner kind. Decide that before any ownership
+        # sample, which could only add an inconclusive UNKNOWN. An unreadable
+        # boot time hides nothing.
+        boot_ns = _boot_time_ns()
+        result["registry"]["boot_time_unix_ns"] = boot_ns
+        if boot_ns is not None:
+            cutoff = boot_ns - _BOOT_STALE_MARGIN_NS
+            current = [record for record in records if int(record["started_at_ns"]) >= cutoff]
+            result["registry"]["stale_hidden"] += len(records) - len(current)
+            records = current
     if not records:
         result["query_elapsed_seconds"] = time.monotonic() - started
         return result

@@ -248,6 +248,14 @@ unless the target device declares `observe_jobs = true`. Declare it only after
 `native-gates/fleet_jobs_native_gate.py` passes for that target. Direct callers of the
 explicit `exec_observed()` transport API are opting into that launch boundary themselves.
 
+A job registered before the target's current boot is never shown: a restart ends every
+process, so `fleet jobs` counts it as stale (`registry.stale_hidden`) instead of listing it as
+`UNKNOWN`, and reports the boot time it used as `registry.boot_time_unix_ns`. Only jobs that
+started more than 10 minutes before the boot are hidden, which absorbs small clock corrections
+made after boot. If the target's boot time cannot be read, the field is `null` and nothing is
+hidden on that basis. On Windows, a shutdown with Fast Startup enabled does not count as a
+boot; use Restart, or disable Fast Startup, for jobs from before it to clear.
+
 `remrun observe [--label TEXT] -- CMD...` runs a command on this machine under the same
 observer, so a job started natively (without `run`) appears in every controller's `fleet jobs`
 with its project directory, label, threads, and RAM. The command inherits remrun's standard

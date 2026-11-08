@@ -230,6 +230,129 @@ def test_stale_pid_identity_is_hidden_and_query_does_not_mutate_registry(tmp_pat
     assert len(observer._read_records(tmp_path)[0]) == 1
 
 
+_BOOT_NS = 1_700_000_000 * 1_000_000_000
+
+
+def _boot_case(tmp_path, monkeypatch, kind: str, boot_ns: int | None):
+    """Seed one owned record from before the boot and one from just after it.
+
+    Both rows sample as UNKNOWN on their own: a Windows record whose handle keeper
+    is gone, or a POSIX group with members but no exact generation witness. That
+    is the phantom a restart leaves behind, so only the boot proof can hide it.
+    """
+    if kind == "windows_job_v2":
+        monkeypatch.setattr(observer.os, "name", "nt")
+        monkeypatch.setattr(observer, "_platform_name", lambda: "windows")
+        snapshot: dict[int, observer.ProcessRow] = {}
+        owner = (300, "windows:300:7", r"Global\remrun-job-observer-v1-{token}")
+    else:
+        monkeypatch.setattr(observer.os, "name", "posix")
+        monkeypatch.setattr(observer, "_platform_name", lambda: "linux")
+        snapshot = {501: observer.ProcessRow(501, 1, "linux:501:9", 9, 0.0, 4096, 1, pgid=500)}
+        owner = (500, "linux:500:8", "500")
+
+        def no_such_process(pid, _signal):
+            raise ProcessLookupError(pid)
+
+        monkeypatch.setattr(observer.os, "kill", no_such_process)
+    values = _metadata().payload()
+    conn = observer._writer(tmp_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for token, started in (
+            ("before-boot", _BOOT_NS - observer._BOOT_STALE_MARGIN_NS - 1_000_000_000),
+            ("after-boot", _BOOT_NS + 1_000_000_000),
+        ):
+            conn.execute(
+                "INSERT INTO owned_jobs_v2("
+                "token,schema,job_id,project,source_controller,target,phase,command_label,"
+                "command_sha256,member_count,root_pid,root_identity,started_at_ns,"
+                "owner_kind,owner_key,owner_pid,owner_identity,witness_pid,witness_identity"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (token, 2, token, values["project"], values["source_controller"],
+                 values["target"], values["phase"], values["command_label"],
+                 values["command_sha256"], 1, owner[0], owner[1], started, kind,
+                 owner[2].format(token=token), owner[0], owner[1], owner[0], owner[1]),
+            )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    sampled: list[str] = []
+    real_owned_sample = observer._owned_sample
+
+    def owned_sample(record, rows):
+        sampled.append(str(record["token"]))
+        return real_owned_sample(record, rows)
+
+    monkeypatch.setattr(observer, "_owned_sample", owned_sample)
+    monkeypatch.setattr(observer, "_processes", lambda: snapshot)
+    monkeypatch.setattr(observer, "_boot_time_ns", lambda: boot_ns)
+    db = observer._db_path(tmp_path)
+    before = (db.stat().st_mtime_ns, hashlib.sha256(db.read_bytes()).hexdigest())
+    payload = observer._query(tmp_path, 0.05)
+    after = (db.stat().st_mtime_ns, hashlib.sha256(db.read_bytes()).hexdigest())
+    # Queries are read-only: the boot proof hides rows, it never deletes them.
+    assert after == before
+    assert payload["registry"]["query_mutated_registry"] is False
+    assert len(observer._read_records(tmp_path)[0]) == 2
+    return payload, sampled
+
+
+@pytest.mark.parametrize("kind", ["windows_job_v2", "posix_pgid"])
+def test_record_from_before_current_boot_is_stale_without_ownership_sampling(
+    tmp_path, monkeypatch, kind
+):
+    payload, sampled = _boot_case(tmp_path, monkeypatch, kind, _BOOT_NS)
+
+    # No process outlives a restart, so the pre-boot row is stale outright; an
+    # inconclusive ownership sample must not resurrect it as an UNKNOWN phantom.
+    assert payload["registry"]["stale_hidden"] == 1
+    assert payload["registry"]["boot_time_unix_ns"] == _BOOT_NS
+    assert "before-boot" not in sampled
+    # A job started after the boot keeps today's ownership verdict.
+    assert [(job["job_id"], job["state"]) for job in payload["jobs"]] == [
+        ("after-boot", "UNKNOWN")
+    ]
+
+
+@pytest.mark.parametrize("kind", ["windows_job_v2", "posix_pgid"])
+def test_unreadable_boot_time_hides_nothing(tmp_path, monkeypatch, kind):
+    payload, sampled = _boot_case(tmp_path, monkeypatch, kind, None)
+
+    assert payload["registry"]["stale_hidden"] == 0
+    assert payload["registry"]["boot_time_unix_ns"] is None
+    assert sorted(sampled) == ["after-boot", "before-boot"]
+    assert sorted((job["job_id"], job["state"]) for job in payload["jobs"]) == [
+        ("after-boot", "UNKNOWN"),
+        ("before-boot", "UNKNOWN"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("{ sec = 1700000000, usec = 250000 } Tue Nov 14 22:13:20 2023\n",
+         1_700_000_000_250_000_000),
+        ("unexpected\n", None),
+    ],
+)
+def test_darwin_boot_time_reads_kern_boottime_or_fails_closed(monkeypatch, stdout, expected):
+    monkeypatch.setattr(observer.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        observer.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout, ""),
+    )
+    assert observer._boot_time_ns() == expected
+
+
+def test_boot_time_fails_closed_without_a_sleep_counting_source(monkeypatch):
+    # time.monotonic() stops during sleep, so it must never stand in for uptime.
+    monkeypatch.setattr(observer.sys, "platform", "sunos5")
+    monkeypatch.setattr(observer.os, "name", "posix")
+    assert observer._boot_time_ns() is None
+
+
 def test_registry_hard_bound_is_transactional(tmp_path):
     current = observer._processes()[os.getpid()]
     conn = observer._writer(tmp_path)

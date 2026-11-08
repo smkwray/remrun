@@ -343,7 +343,10 @@ intrinsic `fleet command` family remains exact, nonbatchable argv passthrough an
 use a configured task named `cmd`.
 
 `remrun fleet jobs` reads target-local observation registries across the fleet, each below
-its device's configured `state_root`. Querying is always read-only. Launch-side registration
+its device's configured `state_root`. Querying is always read-only. A row registered before the
+target's current boot (by more than a 10-minute clock margin) is counted in
+`registry.stale_hidden` and not shown; when the boot time is unreadable nothing is hidden on
+that basis. Launch-side registration
 remains off unless the target device declares `observe_jobs = true`; declare it only after
 the target's native lifecycle gate passes. This switch changes observation only, not queue
 placement or memory-guard policy. When this controller's own device declares it, it also
