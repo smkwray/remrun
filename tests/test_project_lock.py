@@ -383,3 +383,22 @@ def test_a_lock_whose_metadata_cannot_be_written_is_removed_not_leaked(tmp_path:
     assert not lock.path.exists()
     monkeypatch.setattr(state_module, "write_json", real_write)
     ProjectLock("proj", "MACBOX", state_root=tmp_path).acquire().release()
+
+
+def test_a_lock_whose_metadata_rename_fails_leaves_nothing_behind(tmp_path: Path, monkeypatch):
+    """The metadata is staged as info.json.tmp and renamed into place; a failure at the
+    rename leaves the staged file, which must not keep the lock directory alive."""
+    real_replace = Path.replace
+
+    def failing_replace(self, target):  # noqa: ANN001
+        if self.name == "info.json.tmp":
+            raise OSError("injected rename failure")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    lock = ProjectLock("proj", "MACBOX", state_root=tmp_path)
+    with pytest.raises(OSError):
+        lock.acquire()
+    assert not lock.path.exists()
+    monkeypatch.setattr(Path, "replace", real_replace)
+    ProjectLock("proj", "MACBOX", state_root=tmp_path).acquire().release()

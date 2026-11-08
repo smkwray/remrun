@@ -1355,6 +1355,32 @@ def test_every_spelling_of_a_project_root_shares_one_local_write_lock(tmp_path: 
         held.release()
 
 
+def test_without_file_identity_every_spelling_still_shares_one_lock(tmp_path: Path, monkeypatch):
+    """A filesystem that reports no inode cannot tell two spellings of one directory
+    apart, so the lock must not fall back to the spelling."""
+    import os as _os
+    from remrun.state import LockError, local_write_lock
+
+    a, b = tmp_path / "proj", tmp_path / "other"
+    a.mkdir()
+    b.mkdir()
+    real_stat = Path.stat
+
+    def no_inode(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        st = real_stat(self, *args, **kwargs)
+        if self in (a.resolve(), b.resolve()):
+            return _os.stat_result((st.st_mode, 0, st.st_dev, *tuple(st)[3:10]))
+        return st
+
+    monkeypatch.setattr(Path, "stat", no_inode)
+    held = local_write_lock(a, tmp_path / "state").acquire()
+    try:
+        with pytest.raises(LockError):  # b stands in for a spelling that cannot be identified
+            local_write_lock(b, tmp_path / "state").acquire()
+    finally:
+        held.release()
+
+
 def test_dead_local_write_holder_is_reclaimed(tmp_path: Path, monkeypatch):
     """A controller killed mid-pullback leaves its lock behind; once its process has
     provably exited, the next writer reclaims it and says so."""

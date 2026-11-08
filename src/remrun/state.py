@@ -674,9 +674,10 @@ class ProjectLock:
                 )
             except BaseException:
                 # A lock directory without its metadata can never be proved stale, so it
-                # would block every later run; this process just created it, still under
-                # the guard, so remove it before reporting the failure.
-                self._remove_lock_dir(self.path)
+                # would block every later run. This process created it with an exclusive
+                # mkdir and still holds the guard, so everything in it (including a staged
+                # ``info.json.tmp``) is its own: remove the whole directory.
+                shutil.rmtree(self.path, ignore_errors=True)
                 raise
         finally:
             self._release_guard()
@@ -741,12 +742,13 @@ def local_write_lock(
     """
     root = Path(local_root).resolve()
     info = root.stat()
-    if not info.st_ino:
-        # No stable identity (some network filesystems): fall back to the path, which
-        # still serializes every caller that spells the root the same way.
-        key = os.path.normcase(str(root))
-    else:
+    if info.st_ino:
         key = f"dev {info.st_dev} ino {info.st_ino}"
+    else:
+        # The filesystem reports no file identity, so two spellings of one directory
+        # cannot be told apart: every project root on that device shares one lock.
+        # Conservative (unrelated projects there serialize their writes), never split.
+        key = f"dev {info.st_dev} without file identity"
     return ProjectLock(f"{key} local writes", "local", state_root, report=report)
 
 
