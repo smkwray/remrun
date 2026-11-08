@@ -4,11 +4,11 @@ import os
 import platform
 import tomllib
 import socket
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .manifest import path_identity
 from .memory_guard import parse_memory_guard
 from .models import Device
 
@@ -251,7 +251,7 @@ def casefold_collisions(paths) -> dict[str, list[str]]:
     """Group distinct paths that fold to the same case-insensitive (NFC+casefold) key."""
     groups: dict[str, list[str]] = {}
     for p in paths:
-        key = unicodedata.normalize("NFC", p).casefold()
+        key = path_identity(p)
         groups.setdefault(key, []).append(p)
     return {k: sorted(set(v)) for k, v in groups.items() if len(set(v)) > 1}
 

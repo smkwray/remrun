@@ -220,4 +220,7 @@ def test_commit_paths_are_normalized_prefixes_and_overlap_by_prefix(
     assert paths_overlap("out/", "out/a.txt") and paths_overlap("out/a/", "out/")
     assert paths_overlap("out", "out/") and paths_overlap("a.txt", "a.txt")
     assert not paths_overlap("out/", "output/") and not paths_overlap("out/a", "out/ab")
+    # Case- and normalization-insensitive, as APFS and NTFS are.
+    assert paths_overlap("out/", "OUT/a.txt") and paths_overlap("Out", "oUT/")
+    assert paths_overlap("caf\u00e9/", "cafe\u0301/a") and not paths_overlap("OUT/", "output/")
 

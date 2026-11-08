@@ -20,7 +20,7 @@ import remrun.cli as cli
 from remrun.cli import EXIT_CONFLICT, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, main
 from remrun.models import Device
 from remrun.profile import command_key, load_profiles
-from remrun.state import write_unknown_completion_hazard
+from remrun.state import clear_unknown_completion_hazard, write_unknown_completion_hazard
 from remrun.transport import (
     ExecResult,
     LocalSimTransport,
@@ -591,6 +591,28 @@ def test_lease_taken_at_dispatch_refuses_a_run_that_raced_past_the_early_check(
     assert not marker.exists()
     assert _work_dirs(env) == set() and _registry(env) == {}
     assert "output-leased" in capsys.readouterr().err
+
+
+def test_a_lease_differing_only_in_case_or_unicode_form_still_overlaps(commit_env, capsys):
+    """APFS and NTFS (the usual controller filesystems) ignore case and Unicode
+    normalization, so `OUT/` and `out/`, or a composed and a decomposed `é`, are one
+    directory there. Two leases on it would let two runs return the same files."""
+    env = commit_env
+    for held, mine in (("OUT/", "out/"), ("caf\u00e9/", "cafe\u0301/")):
+        write_unknown_completion_hazard(
+            "proj1", "LOCAL_SIM", "20260101T000000Z-LOCAL_SIM-proj1-aaaaaa",
+            per_run=True, outputs=[held],
+        )
+        status, run_id = _launch(env["state"], [
+            "run", "LOCAL_SIM", "--transfer", "commit", "--output", mine, "--",
+            *_py("print(1)"),
+        ])
+        assert (status, run_id) == (EXIT_CONFLICT, None)
+        assert "output-leased" in capsys.readouterr().err
+        assert not (env["target_state"] / "work").exists()
+        clear_unknown_completion_hazard(
+            "proj1", "20260101T000000Z-LOCAL_SIM-proj1-aaaaaa", per_run=True
+        )
 
 
 def test_an_ordinary_run_is_not_blocked_by_a_commit_lease(commit_env):

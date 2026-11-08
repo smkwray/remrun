@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import stat
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -72,9 +73,19 @@ def should_exclude(rel_posix: str, patterns: Iterable[str]) -> bool:
     return False
 
 
-def path_within(rel: str, paths: Iterable[str]) -> bool:
+def path_identity(path: str) -> str:
+    """``path`` as a case- and normalization-insensitive filesystem (APFS by default,
+    NTFS) identifies it: Unicode NFC, then case-folded. Paths with one identity may
+    name one file there. On a case-sensitive filesystem, treating them as one
+    over-matches, which only ever refuses or flags more: it fails closed."""
+    return unicodedata.normalize("NFC", path).casefold()
+
+
+def path_within(rel: str, paths: Iterable[str], *, fold: bool = False) -> bool:
     """Whether project-relative file ``rel`` is one of ``paths`` or under one of its
-    directories (a path ending in ``/``)."""
+    directories (a path ending in ``/``); with ``fold``, compared by ``path_identity``."""
+    if fold:
+        rel, paths = path_identity(rel), [path_identity(path) for path in paths]
     return any(rel == path or (path.endswith("/") and rel.startswith(path)) for path in paths)
 
 
@@ -96,9 +107,11 @@ def build_manifest(
     as a planning/cache optimization). Default False preserves current behavior.
 
     ``within`` limits the walk to those files and ``dir/`` prefixes (see
-    ``path_within``); directories that cannot hold one are never entered.
+    ``path_within``), matched by ``path_identity`` so that ``OUT/a`` on a
+    case-insensitive filesystem is in ``out/``; on a case-sensitive one the walk takes
+    in a little more, never less. Directories that cannot hold one are never entered.
     """
-    scope = None if within is None else tuple(within)
+    scope = None if within is None else tuple(path_identity(path) for path in within)
     root = root.resolve()
     # A declared bootstrap lock input is an exact, opt-in exception to the
     # normal excludes (for example the global ``*.lock`` rule).  Keep this
@@ -135,7 +148,8 @@ def build_manifest(
             if excluded(rel):
                 continue
             if scope is not None and not any(
-                path.startswith(rel + "/") or path_within(rel + "/", [path])
+                path.startswith(path_identity(rel) + "/")
+                or path_within(path_identity(rel) + "/", [path])
                 for path in scope
             ):
                 continue
@@ -150,7 +164,9 @@ def build_manifest(
         for filename in filenames:
             path = current / filename
             rel = path.relative_to(root).as_posix()
-            if excluded(rel) or (scope is not None and not path_within(rel, scope)):
+            if excluded(rel) or (
+                scope is not None and not path_within(path_identity(rel), scope)
+            ):
                 continue
             try:
                 # A symlink would manifest content OUTSIDE the tree, and a later pull

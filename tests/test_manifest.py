@@ -40,6 +40,18 @@ def test_build_manifest_excludes(tmp_path: Path):
     assert "scratch/b.txt" not in manifest
 
 
+def test_within_scope_matches_case_and_unicode_variants(tmp_path: Path):
+    """A commit run's local walk feeds its conflict and alias checks. On APFS or NTFS
+    `OUT/a.txt` is the file `out/a.txt` names, so the walk must not skip it; on a
+    case-sensitive filesystem the walk takes in more, never less."""
+    for rel in ("OUT/a.txt", "Res.CSV", "cafe\u0301/b.txt", "other/c.txt"):
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+    manifest = build_manifest(tmp_path, [], within=["out/", "res.csv", "caf\u00e9/"])
+    assert set(manifest) == {"OUT/a.txt", "Res.CSV", "cafe\u0301/b.txt"}
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory-symlink coverage; Windows uses junction test")
 def test_build_manifest_prunes_directory_symlinks(tmp_path: Path):
     # Guard, not a regression test: directory symlinks were already pruned before this fix set.

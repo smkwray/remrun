@@ -12,7 +12,7 @@ from .config import (
     resolve_excludes,
     scheduler_config,
 )
-from .manifest import should_exclude
+from .manifest import path_identity, should_exclude
 from .models import RunPlan
 from .project import detect_project, find_project_config
 from .resource_context import select_workload
@@ -67,13 +67,16 @@ def _verify_path(raw: object) -> str:
 
 
 def paths_overlap(first: str, second: str) -> bool:
-    """Whether two normalized ``--output`` paths name any common file (a prefix test)."""
+    """Whether two normalized ``--output`` paths may name a common file: a prefix test on
+    their ``path_identity``. The controller's filesystem may ignore case and Unicode
+    normalization, so ``out/`` and ``OUT/`` overlap; on a case-sensitive one this
+    over-matches, which only refuses a lease (fail closed)."""
+    first, second = path_identity(first), path_identity(second)
     if first.rstrip("/") == second.rstrip("/"):
         return True
     return (first.endswith("/") and second.startswith(first)) or (
         second.endswith("/") and first.startswith(second)
     )
-
 
 
 def make_run_plan(
