@@ -234,7 +234,9 @@ time per project, without the target's checkout changing under them. It works wi
 - **Source.** The project root must be its git repository's top level. A tracked file
   that differs from `HEAD` refuses the run (exit `2`) unless it is under an `--output`
   or named by `--input`. `--input FILE` copies that working-tree file (tracked or not)
-  over the commit before the command starts; the commit and each input's size and
+  over the commit before the command starts. It must be a regular file with no symlink
+  at or above it, in the working tree or in `HEAD`, so the copy can neither read from
+  nor write outside the project's own tree. The commit and each input's size and
   SHA-256 are recorded under `source` in `summary.json`. Nothing else uncommitted
   reaches the command. Submodules are refused, and Git LFS content is not fetched.
 - **Seeding.** remrun keeps one bare git cache per project under

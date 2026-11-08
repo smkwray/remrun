@@ -26,7 +26,14 @@ from .gitsync import (
     _remote_memory_limit_mib,
     _repository_scaled_transport,
 )
-from .manifest import build_manifest, path_within, sha256_file, should_exclude
+from .manifest import (
+    ManifestError,
+    build_manifest,
+    nonregular_paths,
+    path_within,
+    sha256_file,
+    should_exclude,
+)
 from .models import RunPlan
 from .planner import paths_overlap
 from .reconcile import PullbackResult, postrun_pullback
@@ -163,6 +170,7 @@ def commit_source(plan: RunPlan) -> CommitSource:
             dirty,
         )
     tree_bytes = 0
+    links: list[str] = []
     for line in _nul_fields(_git(root, "ls-tree", "-r", "-l", "-z", "--full-tree", commit)):
         meta, _tab, path = line.partition("\t")
         parts = meta.split()
@@ -170,15 +178,39 @@ def commit_source(plan: RunPlan) -> CommitSource:
             raise CommitSourceError(
                 f"--transfer commit does not check out submodules ({path} is one)"
             )
+        if parts[:1] == ["120000"]:
+            links.append(path)
         if len(parts) == 4 and parts[3].isdigit():
             tree_bytes += int(parts[3])
     inputs = []
     for rel in plan.inputs:
+        # The overlay is written into the checked-out commit, where a symlink of HEAD's
+        # at or above it would carry the write out of the private tree; locally, one
+        # would read bytes from outside the project. Both are refused.
+        link = _head_link(rel, links)
+        if link is not None:
+            raise CommitSourceError(
+                f"--input {rel}: HEAD has a symlink at {link}, so the overlay could be "
+                "written outside the run's private tree"
+            )
         local = root.joinpath(*rel.split("/"))
-        if local.is_symlink() or not local.is_file():
-            raise CommitSourceError(f"--input {rel}: no such regular file in this project")
+        try:
+            odd = nonregular_paths(root, [rel])
+        except ManifestError as exc:
+            raise CommitSourceError(f"--input {rel}: {exc}") from exc
+        if odd or not local.is_file() or not local.resolve().is_relative_to(root.resolve()):
+            raise CommitSourceError(
+                f"--input {rel}: no such regular file in this project"
+                + (f" ({odd[0]} is a symlink or special file)" if odd else "")
+            )
         inputs.append({"path": rel, "bytes": local.stat().st_size, "sha256": sha256_file(local)})
     return CommitSource(commit=commit, tree_bytes=tree_bytes, inputs=tuple(inputs))
+
+
+def _head_link(rel: str, links: list[str]) -> str | None:
+    """A symlink of HEAD at, above or under project path ``rel`` (by ``path_identity``,
+    since the target's filesystem may ignore case)."""
+    return next((link for link in links if paths_overlap(link + "/", rel)), None)
 
 
 # --- target layout ---------------------------------------------------------------

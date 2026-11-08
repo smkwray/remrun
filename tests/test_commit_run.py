@@ -273,6 +273,57 @@ def test_input_overlay_is_copied_hashed_and_recorded(commit_env):
     assert status == 1
 
 
+_posix_links = pytest.mark.skipif(os.name == "nt", reason="needs POSIX symlinks")
+
+
+@_posix_links
+def test_input_through_a_symlinked_directory_is_refused(commit_env):
+    """A committed `data -> /elsewhere` makes `data/in.csv` a file outside the project:
+    reading it would ship foreign bytes, and on the target the checked-out link would
+    carry the overlay's write out of the private tree. Refused before any target."""
+    env = commit_env
+    elsewhere = env["project"].parent.parent / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "in.csv").write_bytes(b"foreign\n")
+    (env["project"] / "data").symlink_to(elsewhere, target_is_directory=True)
+    _git(env["project"], "add", "data")
+    _git(env["project"], "commit", "-qm", "link")
+    status, run_id = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/copy.csv",
+        "--input", "data/in.csv", "--", *_py(_write("out/copy.csv", "ran")),
+    ])
+    assert (status, run_id) == (EXIT_CONFLICT, None)
+    assert not (env["project"] / "out" / "copy.csv").exists()
+    assert not env["target_state"].exists()
+
+
+@_posix_links
+@pytest.mark.parametrize("link", ["data", "Data"])
+def test_input_under_a_symlink_only_head_has_is_refused(commit_env, link):
+    """The working tree can disagree with HEAD where git does not look (skip-worktree,
+    sparse checkouts). The private tree is HEAD's, so a symlink HEAD has above an input
+    would carry the overlay's write outside it, even though the local path is plain.
+    A case variant counts too: the target's filesystem may ignore case."""
+    env = commit_env
+    elsewhere = env["project"].parent.parent / "elsewhere"
+    elsewhere.mkdir()
+    (env["project"] / link).symlink_to(elsewhere, target_is_directory=True)
+    _git(env["project"], "add", link)
+    _git(env["project"], "commit", "-qm", "link")
+    _git(env["project"], "update-index", "--skip-worktree", link)
+    (env["project"] / link).unlink()
+    (env["project"] / "data").mkdir()
+    (env["project"] / "data" / "in.csv").write_bytes(b"local\n")
+    assert _git(env["project"], "status", "--porcelain", "--untracked-files=no") == ""
+    status, run_id = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/copy.csv",
+        "--input", "data/in.csv", "--", *_py(_write("out/copy.csv", "ran")),
+    ])
+    assert (status, run_id) == (EXIT_CONFLICT, None)
+    assert list(elsewhere.iterdir()) == []
+    assert not env["target_state"].exists()
+
+
 def test_unexpected_write_keeps_the_tree_exits_2_and_still_returns_outputs(
     commit_env, capsys
 ):

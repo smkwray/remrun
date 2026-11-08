@@ -89,6 +89,49 @@ def path_within(rel: str, paths: Iterable[str], *, fold: bool = False) -> bool:
     return any(rel == path or (path.endswith("/") and rel.startswith(path)) for path in paths)
 
 
+def nonregular_paths(root: Path, paths: Iterable[str]) -> list[str]:
+    """Project paths at, above or under ``paths`` (files, or ``dir/``) that are neither
+    regular files nor plain directories: symlinks, junctions, FIFOs, sockets, devices.
+
+    An ancestor counts because a link there redirects every path below it. Excludes do
+    not apply, and a missing path has nothing to report. An entry that cannot be
+    inspected raises ``ManifestError`` rather than reading as plain.
+    """
+    found: set[str] = set()
+
+    def plain(path: Path, rel: str) -> bool:
+        try:
+            mode = path.lstat().st_mode
+            return stat.S_ISREG(mode) or (stat.S_ISDIR(mode) and not _is_directory_link(path))
+        except OSError as exc:
+            raise ManifestError(f"cannot inspect {rel}: {exc}") from exc
+
+    def _abort(err: OSError) -> None:
+        raise ManifestError(f"cannot scan a directory under {root}: {err}") from err
+
+    for declared in paths:
+        parts = [part for part in declared.split("/") if part]
+        current, rel = root, ""
+        for part in parts:
+            current, rel = current / part, f"{rel}/{part}" if rel else part
+            if not os.path.lexists(current):
+                break
+            if not plain(current, rel):
+                found.add(rel)
+                break
+        else:
+            if not declared.endswith("/") or not current.is_dir():
+                continue
+            for dirpath, dirnames, filenames in os.walk(current, onerror=_abort):
+                here = Path(dirpath)
+                base = here.relative_to(root).as_posix()
+                for name in [*dirnames, *filenames]:
+                    if not plain(here / name, f"{base}/{name}"):
+                        found.add(f"{base}/{name}")
+                dirnames[:] = [name for name in dirnames if f"{base}/{name}" not in found]
+    return sorted(found)
+
+
 def build_manifest(
     root: Path,
     exclude_patterns: Iterable[str],

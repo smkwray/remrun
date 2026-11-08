@@ -95,6 +95,10 @@ source-dirty   -> a tracked file differs from HEAD outside --output/--input
 output-leased  -> a live commit run of the project holds an overlapping --output
 ```
 
+An `--input` that is not a regular file, or has a symlink at or above it in the working
+tree or in `HEAD`, is refused the same way: the overlay is written into `HEAD`'s
+checkout, where such a link would carry the write out of the private tree.
+
 Refusals of one candidate (exit 2, nothing written to it; `--auto` tries the next):
 
 ```text
