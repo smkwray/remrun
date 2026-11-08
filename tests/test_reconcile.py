@@ -1326,6 +1326,35 @@ def test_local_write_lock_is_released_when_the_pullback_fails(tmp_path: Path):
     local_write_lock(local).acquire().release()  # free again
 
 
+def _case_insensitive(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.mkdir()
+    try:
+        return (directory / "caseprobe").exists()
+    finally:
+        probe.rmdir()
+
+
+def test_every_spelling_of_a_project_root_shares_one_local_write_lock(tmp_path: Path):
+    """On a case-insensitive filesystem `proj` and `PROJ` are one directory; a lock keyed
+    on the spelling would let two runs write the same files unserialized."""
+    from remrun.state import LockError, local_write_lock
+
+    local = tmp_path / "proj"
+    local.mkdir()
+    (tmp_path / "alias").symlink_to(local, target_is_directory=True)
+    spellings = [tmp_path / "alias"]
+    if _case_insensitive(tmp_path):
+        spellings.append(tmp_path / "PROJ")
+    held = local_write_lock(local, tmp_path / "state").acquire()
+    try:
+        for other in spellings:
+            with pytest.raises(LockError):
+                local_write_lock(other, tmp_path / "state").acquire()
+    finally:
+        held.release()
+
+
 def test_dead_local_write_holder_is_reclaimed(tmp_path: Path, monkeypatch):
     """A controller killed mid-pullback leaves its lock behind; once its process has
     provably exited, the next writer reclaims it and says so."""

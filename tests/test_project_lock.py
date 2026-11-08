@@ -364,3 +364,22 @@ def test_liveness_of_invalid_pid_is_unknown(value):
 
 def test_liveness_of_this_process_is_running():
     assert durable_runner.pid_liveness(state_module.os.getpid()) is True
+
+
+def test_a_lock_whose_metadata_cannot_be_written_is_removed_not_leaked(tmp_path: Path, monkeypatch):
+    """A lock directory without metadata can never be proved stale and would block every
+    later run, so a failed metadata write must remove the directory it just created."""
+    real_write = state_module.write_json
+
+    def failing_write(path, data):  # noqa: ANN001
+        if path.name == "info.json":
+            raise OSError("injected metadata write failure")
+        return real_write(path, data)
+
+    monkeypatch.setattr(state_module, "write_json", failing_write)
+    lock = ProjectLock("proj", "MACBOX", state_root=tmp_path)
+    with pytest.raises(OSError):
+        lock.acquire()
+    assert not lock.path.exists()
+    monkeypatch.setattr(state_module, "write_json", real_write)
+    ProjectLock("proj", "MACBOX", state_root=tmp_path).acquire().release()

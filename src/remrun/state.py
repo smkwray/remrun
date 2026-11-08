@@ -664,13 +664,20 @@ class ProjectLock:
                     f"project {self.project_id} already locked at {self.path} "
                     f"({self._describe_holder(self.path)})"
                 ) from exc
-            write_json(
-                self.path / "info.json",
-                {"project_id": self.project_id, "target": self.target,
-                 "scope": self.scope or "project",
-                 "run_id": self.run_id,
-                 "pid": os.getpid(), "acquired_at": utc_now_iso()},
-            )
+            try:
+                write_json(
+                    self.path / "info.json",
+                    {"project_id": self.project_id, "target": self.target,
+                     "scope": self.scope or "project",
+                     "run_id": self.run_id,
+                     "pid": os.getpid(), "acquired_at": utc_now_iso()},
+                )
+            except BaseException:
+                # A lock directory without its metadata can never be proved stale, so it
+                # would block every later run; this process just created it, still under
+                # the guard, so remove it before reporting the failure.
+                self._remove_lock_dir(self.path)
+                raise
         finally:
             self._release_guard()
 
@@ -725,13 +732,22 @@ def local_write_lock(
     into the same local tree. Each phase that checks a local project file and then
     writes or deletes it holds this lock, so whichever phase goes second sees the
     first one's write as a local change. It is keyed by the resolved local root, the
-    tree it guards, and has its own lock table and guard.
+    tree it guards, and has its own lock table and guard. The key is the directory's
+    filesystem identity (device and inode), so every spelling of one directory (``proj``
+    and ``PROJ`` on a case-insensitive filesystem, a symlinked path) shares one lock.
 
     Acquisition order: a run's project lock (or its per-run lock) first, then this one.
     Its holder takes no other lock, so the two never wait on each other.
     """
-    root = os.path.normcase(str(Path(local_root).resolve()))
-    return ProjectLock(f"{root} local writes", "local", state_root, report=report)
+    root = Path(local_root).resolve()
+    info = root.stat()
+    if not info.st_ino:
+        # No stable identity (some network filesystems): fall back to the path, which
+        # still serializes every caller that spells the root the same way.
+        key = os.path.normcase(str(root))
+    else:
+        key = f"dev {info.st_dev} ino {info.st_ino}"
+    return ProjectLock(f"{key} local writes", "local", state_root, report=report)
 
 
 # --- retention ---------------------------------------------------------------
