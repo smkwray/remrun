@@ -11,6 +11,7 @@ import os
 import posixpath
 import shlex
 import shutil
+import stat
 import signal
 import subprocess
 import sys
@@ -2512,8 +2513,18 @@ class LocalSimTransport(BaseTransport):
         return str(d)
 
     def remove_remote_tree(self, remote_path: str) -> None:
+        def writable_then_retry(func, path, _exc):  # noqa: ANN001
+            # Git marks its object files read-only; on Windows that blocks deletion
+            # until the read-only attribute is cleared (Remove-Item -Force does this
+            # on PowerShell targets).
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            func(path)
+
         try:
-            shutil.rmtree(remote_path)
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(remote_path, onexc=writable_then_retry)
+            else:
+                shutil.rmtree(remote_path, onerror=writable_then_retry)
         except FileNotFoundError:
             return
         if Path(remote_path).exists():
