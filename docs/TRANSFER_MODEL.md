@@ -88,7 +88,8 @@ no project lock -> each run leases its outputs instead
 
 A declared output returns whatever project or global exclude matches it: `out/`
 covers the directory and everything under it (`out/x.tmp` included), `out/a.csv` covers
-one file. An output that is itself under a global exclude (`.git/`, `node_modules/`) is
+one file. An output that a global exclude covers (the pattern matches the path itself, a
+directory above it, or everything in it: `.git/`, `node_modules/`, `results.tmp/`) is
 refused when the run is planned. Paths are compared as prefixes.
 
 Refusals before the target is chosen (exit 2, nothing written anywhere):

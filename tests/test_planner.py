@@ -224,3 +224,49 @@ def test_commit_paths_are_normalized_prefixes_and_overlap_by_prefix(
     assert paths_overlap("out/", "OUT/a.txt") and paths_overlap("Out", "oUT/")
     assert paths_overlap("caf\u00e9/", "cafe\u0301/a") and not paths_overlap("OUT/", "output/")
 
+
+
+
+def _plan_commit_output(monkeypatch, tmp_path: Path, output: str):
+    _patch_planning_dependencies(monkeypatch, tmp_path, {})
+    monkeypatch.setattr(
+        "remrun.planner.order_devices",
+        lambda devices, target_name, **kwargs: [devices["BOX"]],
+    )
+    config = _config(tmp_path)
+    config.defaults["transfer"]["global_exclude"] = [
+        ".git/**", "*.tmp", "**/node_modules", "**/dist/**",
+    ]
+    return make_run_plan(
+        cwd=tmp_path, config=config, target_name="BOX", command=["true"],
+        transfer_mode="commit", outputs=[output],
+    )
+
+
+@pytest.mark.parametrize("output", [
+    # The output itself, or one of its directories, matches (`*.tmp` matches
+    # `results.tmp` but not `results.tmp/x`; `**/node_modules` only the directory).
+    "results.tmp/", "a/results.tmp/b/", "results.tmp/r.csv",
+    "a/node_modules/b/", "a/node_modules/", "a/node_modules/b.txt",
+    # Refused before too: the file itself, or only what is inside the directory.
+    "results.tmp", "a/dist/", "a/dist/app.js", ".git/", ".git/config",
+])
+def test_an_output_at_or_under_a_global_exclude_is_refused(
+    monkeypatch, tmp_path: Path, output: str
+) -> None:
+    """A directory output's contents all return, global excludes included, and the
+    tree build prunes an excluded directory only for the output to bring it back. So
+    an output that is excluded content itself (VCS, environment, cache or sync paths)
+    is refused when planned, whichever of its parts a pattern matches."""
+    with pytest.raises(ValueError, match="global_exclude"):
+        _plan_commit_output(monkeypatch, tmp_path, output)
+
+
+@pytest.mark.parametrize("output", [
+    "results/", "results/r.csv", "build/", "a/dist.csv", "out.tmpl/",
+])
+def test_an_output_whose_contents_include_excluded_names_still_plans(
+    monkeypatch, tmp_path: Path, output: str
+) -> None:
+    """`results/` may hold `x.tmp` or `node_modules/`; those return with it."""
+    assert _plan_commit_output(monkeypatch, tmp_path, output).outputs == (output,)

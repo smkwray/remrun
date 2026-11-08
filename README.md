@@ -230,8 +230,9 @@ time per project, without the target's checkout changing under them. It works wi
 - **Paths.** `--output` (required, repeatable) and `--input` (repeatable) take paths
   relative to the project root, without globs. An output ending in `/` is a directory
   and everything under it, including names a `[transfer] global_exclude` pattern
-  matches (`results/x.tmp`, `results/__pycache__/`). An output that is itself under a
-  global exclude pattern (`.git/`, `node_modules/`) is refused.
+  matches (`results/x.tmp`, `results/__pycache__/`). An output that a global exclude
+  pattern covers is refused: the pattern matches the path itself, a directory above it,
+  or everything in it (`.git/`, `node_modules/`, `results.tmp/`, `results.tmp/a.csv`).
 - **Source.** The project root must be its git repository's top level. A tracked file
   that differs from `HEAD` refuses the run (exit `2`) unless it is under an `--output`
   or named by `--input`. `--input FILE` copies that working-tree file (tracked or not)

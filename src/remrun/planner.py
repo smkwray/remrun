@@ -113,14 +113,22 @@ def make_run_plan(
         if not output_paths:
             raise ValueError("--transfer commit needs at least one --output PATH")
         # Everything under a declared output returns, but an output that is itself under
-        # a global exclude names VCS, environment, sync or remrun-private paths
-        # (`.git/`, `node_modules/`, `.remrun-*`); returning those is never intended.
+        # a global exclude names VCS, environment, cache, sync or remrun-private paths
+        # (`.git/`, `node_modules/`, `results.tmp/`, `.remrun-*`); returning those is
+        # never intended. A pattern may match the output itself, one of its directories
+        # (`*.tmp` matches `results.tmp`, not `results.tmp/x`), or, for a directory
+        # output, only what is inside it (`**/dist/**`); each one refuses it.
         for path in output_paths:
-            probe = path + "x" if path.endswith("/") else path
-            if should_exclude(probe, tree_excludes):
+            parts = path.rstrip("/").split("/")
+            probes = ["/".join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+            if path.endswith("/"):
+                probes.append(path + "x")
+            matched = next((probe for probe in probes if should_exclude(probe, tree_excludes)), None)
+            if matched is not None:
+                where = "what is under it" if matched == path + "x" else matched
                 raise ValueError(
-                    f"--output {path} is under a [transfer] global_exclude pattern; "
-                    "remrun never returns such paths"
+                    f"--output {path} is under a [transfer] global_exclude pattern "
+                    f"(one matches {where}); remrun never returns such paths"
                 )
     project = detect_project(cwd, config)
     project_config_path = find_project_config(project.local_project_root)
