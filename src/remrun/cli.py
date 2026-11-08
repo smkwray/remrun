@@ -1242,6 +1242,32 @@ def _mode_paths(plan: RunPlan) -> dict[str, list[str]]:
     return {}
 
 
+def _kept_lease_guidance(run_id: str, plan: RunPlan, tree: object, why: str) -> str:
+    """How to end the --output lease a commit run keeps after its command ended.
+
+    It keeps the lease while its outputs are not all in the project: an overlapping run
+    would race the undelivered files, and the lease keeps the retained tree that holds
+    them from being pruned.
+    """
+    return (
+        f"{why}; its outputs stay in the retained private tree {tree} on "
+        f"{plan.target.name}, and this run keeps its --output lease. Copy what you need "
+        f"from there, then run `remrun resolve-unknown {run_id} --confirmed-ended` to "
+        "release the lease"
+    )
+
+
+def _unsupported_outputs_why(command_exit_code: object, unsupported: list[str]) -> str:
+    listed = ", ".join(unsupported[:5]) + (
+        f" and {len(unsupported) - 5} more" if len(unsupported) > 5 else ""
+    )
+    return (
+        f"the command ended (exit {command_exit_code}) but {len(unsupported)} path(s) at "
+        f"or under --output are symlinks or special files, which remrun does not return "
+        f"({listed}); nothing at or under them was pulled or deleted"
+    )
+
+
 def _unknown_completion_guidance(hazard: dict[str, object], *, per_run: bool = False) -> str:
     run_id = str(hazard["run_id"])
     if per_run:
@@ -3177,6 +3203,7 @@ def _run_locked(
     # --- post-run pullback ---------------------------------------------------
     post = None
     commit_final = None
+    lease_guidance: str | None = None
     if untransferred:
         # Outputs stay where the command wrote them in the target's tree. There are no
         # launch manifests to attribute changes against, and no baseline to advance.
@@ -3195,15 +3222,11 @@ def _run_locked(
             )
         except TransportError as exc:
             failed_exit = EXIT_GUARD if guard_failed else EXIT_TRANSFER
-            # Delivery is incomplete, so the fence stays: it keeps leasing the outputs
-            # (an overlapping run would race this one's undelivered files) and keeps
-            # the retained tree, which holds them, from being pruned.
-            guidance = (
-                f"the command ended (exit {command_exit_code}) but its outputs were not all "
-                f"returned ({exc}); they stay in the retained private tree {work.tree} on "
-                f"{plan.target.name}, and this run keeps its --output lease. Copy what you "
-                f"need from there, then run `remrun resolve-unknown {run_id} "
-                "--confirmed-ended` to release the lease"
+            # Delivery is incomplete, so the fence stays (see _kept_lease_guidance).
+            guidance = _kept_lease_guidance(
+                run_id, plan, work.tree,
+                f"the command ended (exit {command_exit_code}) but its outputs were not "
+                f"all returned ({exc})",
             )
             reporter.event("transfer_error", phase="pullback", message=str(exc))
             reporter.event("output_lease_kept", run_id=run_id, guidance=guidance)
@@ -3223,8 +3246,16 @@ def _run_locked(
                 "plan": plan.as_dict(),
             })
             return failed_exit
-        # The outputs are delivered; the lease ends with the pullback.
-        clear_unknown_completion_hazard(plan.project.project_id, run_id, per_run=True)
+        if commit_final.unsupported:
+            # What is at or under a held path was not delivered: the fence stays.
+            lease_guidance = _kept_lease_guidance(
+                run_id, plan, work.tree,
+                _unsupported_outputs_why(command_exit_code, commit_final.unsupported),
+            )
+            reporter.event("output_lease_kept", run_id=run_id, guidance=lease_guidance)
+        else:
+            # The outputs are delivered; the lease ends with the pullback.
+            clear_unknown_completion_hazard(plan.project.project_id, run_id, per_run=True)
         post = commit_final.post
         verify_fields = {
             **verify_fields,
@@ -3467,6 +3498,7 @@ def _run_locked(
         "peak_rss_mb": result.telemetry.get("peak_rss_mb") if result.telemetry else None,
         "avg_cpu_pct": result.telemetry.get("avg_cpu_pct") if result.telemetry else None,
         **verify_fields,
+        **({"guidance": lease_guidance} if lease_guidance else {}),
         "plan": plan.as_dict(),
     }
     if plan.workload is not None and workload_runtime is not None:
@@ -4498,13 +4530,23 @@ def _finalize_durable_run(
         **verify_fields,
         "plan": plan.as_dict(),
     }
-    write_json(summary_path, checkpoint)
-    if not clear_unknown_completion_hazard(
-        plan.project.project_id, run_id, per_run=per_run
-    ):
-        raise UnknownCompletionHazardError(
-            f"durable completion fence changed before finalization for {run_id!r}"
+    if commit_final is not None and commit_final.unsupported:
+        # What is at or under a held path was not delivered: the fence stays, and the
+        # summary goes straight to complete, so `resume` never reaches the
+        # finalization_complete step that clears it.
+        checkpoint["guidance"] = _kept_lease_guidance(
+            run_id, plan, work["tree"],
+            _unsupported_outputs_why(command_exit_code, commit_final.unsupported),
         )
+        reporter.event("output_lease_kept", run_id=run_id, guidance=checkpoint["guidance"])
+    else:
+        write_json(summary_path, checkpoint)
+        if not clear_unknown_completion_hazard(
+            plan.project.project_id, run_id, per_run=per_run
+        ):
+            raise UnknownCompletionHazardError(
+                f"durable completion fence changed before finalization for {run_id!r}"
+            )
     checkpoint["completion_state"] = "complete"
     checkpoint["terminal"] = True
     write_json(summary_path, checkpoint)

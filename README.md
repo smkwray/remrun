@@ -256,9 +256,9 @@ time per project, without the target's checkout changing under them. It works wi
   outputs come back after a failed or cancelled command too. Only regular files return:
   a symlink or special file at or under an output, in the private tree or locally, is
   listed in `work.unsupported_paths`, nothing is pulled or deleted at or under that
-  path (in any spelling that differs only in case or Unicode form), the tree is kept
-  and the run exits `2`. One already there when the run starts, locally or in `HEAD`,
-  refuses the run (exit `2`).
+  path (in any spelling that differs only in case or Unicode form), the tree is kept,
+  the run exits `2` and it keeps its lease (see Concurrency). One already there when
+  the run starts, locally or in `HEAD`, refuses the run (exit `2`).
 - **Other writes.** A file written or deleted outside the outputs that the project's
   transfer excludes cover is scratch: counted (`scratch_writes`) and discarded. Any
   other is an unexpected write: listed in the run's `work` record, never copied into
@@ -274,9 +274,11 @@ time per project, without the target's checkout changing under them. It works wi
 - **Concurrency.** No project lock is taken. Each run holds a lease on its outputs
   until its pullback ends: a commit run whose outputs overlap a live one's (one path
   is a prefix of the other, ignoring case and Unicode form) is refused before any
-  target is touched. If the pullback fails, the run exits `3`, its outputs stay in the
-  retained tree named in `summary.json`, and the lease stays until
-  `remrun resolve-unknown RUN_ID --confirmed-ended`. Commit runs with
+  target is touched. If the pullback fails (exit `3`) or holds unsupported outputs
+  (exit `2`), the outputs it did not return stay in the retained tree named in
+  `summary.json`, and the lease stays until
+  `remrun resolve-unknown RUN_ID --confirmed-ended`; `resume` releases it only by
+  retrying a durable run's failed pullback. Commit runs with
   disjoint outputs, and ordinary runs, may run at the same time. A commit run still
   refuses while an ordinary run of the project has unknown completion.
 - **Environment.** The command runs in `tree/<your relative directory>`. The project's

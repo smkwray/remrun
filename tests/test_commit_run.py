@@ -419,7 +419,9 @@ def test_symlinks_the_command_leaves_under_an_output_are_held_never_dropped(comm
     `--output` would be silently left behind with its tree, and a regular output it
     replaced with a link would read as deleted and delete the local copy. Both paths
     are held: nothing is pulled or deleted there, the other outputs still return, the
-    tree is kept and the run exits 2."""
+    tree is kept and the run exits 2. What is held was not delivered, so, as for a
+    failed pullback, the lease stands until resolve-unknown: it refuses an overlapping
+    run and keeps the retained tree from being pruned."""
     env = commit_env
     code = _write("out/r.txt", "r") + (
         ";import os;os.symlink('r.txt','out/link');"
@@ -433,11 +435,31 @@ def test_symlinks_the_command_leaves_under_an_output_are_held_never_dropped(comm
     assert (out / "r.txt").read_text() == "r"
     assert (out / "keep.txt").read_text() == "tracked output\n"  # never read as deleted
     assert not os.path.lexists(out / "link")
-    work = _summary(env["state"], run_id)["work"]
+    summary = _summary(env["state"], run_id)
+    work = summary["work"]
     assert work["state"] == "retained" and "unsupported" in work["reason"]
     assert work["unsupported_paths"] == ["out/keep.txt", "out/link"]
     assert (Path(work["tree"]) / "out" / "link").is_symlink()
+    assert (summary["exit_code"], summary["command_exit_code"]) == (EXIT_CONFLICT, 0)
+    assert _lease_fences(env) == {run_id: ["out/"]}
+    for named in (work["tree"], "out/keep.txt", "out/link",
+                  f"remrun resolve-unknown {run_id} --confirmed-ended"):
+        assert named in summary["guidance"]
+    assert _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/link", "--",
+        *_py("print(1)"),
+    ]) == (EXIT_CONFLICT, None)
+    (record_path,) = (env["state"] / "commit-work").glob("*/*.json")
+    record = json.loads(record_path.read_text())
+    record_path.write_text(json.dumps({**record, "created_at": "2000-01-01T00:00:00Z"}))
+    disjoint = ["run", "LOCAL_SIM", "--transfer", "commit", "--output", "other/", "--",
+                *_py("print(1)")]
+    assert main(disjoint) == EXIT_OK
+    assert _work_dirs(env) == {work["id"]}  # past retention, but leased
+    assert main(["resolve-unknown", run_id, "--confirmed-ended"]) == EXIT_OK
     assert _lease_fences(env) == {}
+    assert main(disjoint) == EXIT_OK
+    assert _work_dirs(env) == set()
 
 
 @_posix_links
@@ -1044,6 +1066,32 @@ def test_cancel_of_a_durable_commit_run_returns_outputs_and_keeps_its_tree(
     assert work["state"] == "retained" and "137" in work["reason"]
     assert _lease_fences(env) == {}
     assert (Path(work["tree"]) / "partial.txt").exists()  # the fake's cancel output
+
+
+@_posix_links
+def test_durable_unsupported_outputs_keep_the_lease_through_resume(commit_env, monkeypatch):
+    """A durable run's held outputs are as undelivered as a foreground run's: the lease
+    stays when it finalizes, a later `resume` reports the finished run without clearing
+    it, and only resolve-unknown releases it."""
+    env = commit_env
+    transports = _detached_commit_transport(monkeypatch)
+    _, run_id = _launch(env["state"], [
+        "run", "--durable", "TEST", "--transfer", "commit", "--output", "out/", "--",
+        *_py(_write("out/r.txt", "r") + ";import os;os.symlink('r.txt','out/link')"),
+    ])
+    transports["TEST"].unreachable = False
+    transports["TEST"].finish(run_id)
+    assert main(["resume", run_id]) == EXIT_CONFLICT
+    assert (env["project"] / "out" / "r.txt").read_text() == "r"
+    assert _lease_fences(env) == {run_id: ["out/"]}
+    summary = _summary(env["state"], run_id)
+    assert (summary["completion_state"], summary["exit_code"]) == ("complete", EXIT_CONFLICT)
+    assert summary["work"]["unsupported_paths"] == ["out/link"]
+    assert summary["work"]["tree"] in summary["guidance"] and "out/link" in summary["guidance"]
+    assert main(["resume", run_id]) == EXIT_CONFLICT
+    assert _lease_fences(env) == {run_id: ["out/"]}
+    assert main(["resolve-unknown", run_id, "--confirmed-ended"]) == EXIT_OK
+    assert _lease_fences(env) == {}
 
 
 def test_resolve_unknown_releases_a_commit_lease(commit_env, monkeypatch, capsys):

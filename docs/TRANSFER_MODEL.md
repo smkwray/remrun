@@ -118,9 +118,10 @@ bootstrap-not-ready       -> a declared [run.bootstrap] is not ready; setup neve
 
 The output lease is the run's completion fence plus its outputs. It is checked again
 and taken under the lock table's guard just before the command starts, and it stands
-through the pullback. A pullback that fails leaves it in place, with the outputs in the
-retained tree, until `remrun resume` (durable runs) or `remrun resolve-unknown` releases
-it. Leased paths are compared ignoring case and Unicode normalization. Ordinary runs ignore commit fences: a commit run never touches the
+through the pullback. A pullback that fails, or that holds unsupported outputs
+(symlinks or special files), leaves it in place, with the outputs in the retained tree,
+until `remrun resolve-unknown` releases it; `remrun resume` releases it only by retrying
+a durable run's failed pullback. Leased paths are compared ignoring case and Unicode normalization. Ordinary runs ignore commit fences: a commit run never touches the
 target's checkout, and a same-path change on the controller ends in a saved conflict on
 whichever pullback comes second, never an overwrite.
 
