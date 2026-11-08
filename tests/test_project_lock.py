@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -307,6 +310,7 @@ def test_hazard_owned_by_live_holder_is_waitable(tmp_path: Path, monkeypatch):
     owner.release()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="simulates a Windows host without kernel32")
 def test_windows_liveness_probe_never_sends_a_signal(tmp_path: Path, monkeypatch):
     # os.kill(pid, 0) is CTRL_C_EVENT on Windows. Without kernel32 (this host), the
     # probe must report "unknown", so the lock stays held, never fall back to a signal.
@@ -329,6 +333,26 @@ def test_windows_liveness_probe_never_sends_a_signal(tmp_path: Path, monkeypatch
 
     assert direct is None
     assert "not reclaimed: cannot prove holder pid" in refused
+    assert owner.path.is_dir()
+    owner.release()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises the real Windows process API")
+def test_native_windows_liveness_uses_process_handles_never_signals(tmp_path: Path, monkeypatch):
+    # The real kernel32 branch: a running process is alive, an exited child whose
+    # handle is still open is provably dead, and no signal is ever sent.
+    def no_signal(*_args):
+        raise AssertionError("os.kill used as a liveness probe on Windows")
+
+    monkeypatch.setattr(durable_runner.os, "kill", no_signal)
+    assert durable_runner.pid_liveness(os.getpid()) is True
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert durable_runner.pid_liveness(child.pid) is False  # Popen still holds its handle
+
+    owner = ProjectLock("proj", "MACBOX", state_root=tmp_path).acquire()
+    with pytest.raises(LockError, match="not reclaimed"):
+        ProjectLock("proj", "WINBOX", state_root=tmp_path).acquire()
     assert owner.path.is_dir()
     owner.release()
 
