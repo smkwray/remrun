@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -694,6 +695,38 @@ def test_install_hook_uses_project_config_peers(repos):
     assert "git-sync LOCAL_SIM --push --quiet" in text
     assert "gitsync-hook/demo.log" in text.replace("\\", "/")
     assert "tail -c 65536" in text
+
+
+def test_install_hook_keeps_the_stable_interpreter_link_and_status_flags_a_vanished_one(
+    repos, tmp_path, monkeypatch, capsys
+):
+    """A package manager upgrade removes its versioned install folder. The hook must
+    name the stable link Python reports, and status must say when the interpreter a
+    hook names is gone, because the hook itself fails silently on every commit."""
+    cfg, local, _remote = repos
+    real = Path(os.path.realpath(sys.executable))
+    link_dir = tmp_path / "stable-bin"
+    link_dir.mkdir()
+    link = link_dir / "python3"
+    link.symlink_to(real)
+    monkeypatch.setattr(gitsync_module.sys, "executable", str(link))
+
+    assert install_git_sync_hook(cfg, device_name="LOCAL_SIM", reporter=Reporter()) == EXIT_OK
+    text = (local / ".git" / "hooks" / "post-commit").read_text(encoding="utf-8")
+    assert str(link).replace("\\", "/") in text.replace("\\", "/")
+    assert str(real).replace("\\", "/") not in text.replace("\\", "/")
+
+    status = git_sync_status_result(cfg, device_name="LOCAL_SIM", reporter=Reporter())
+    assert status.hook_installed is True
+    assert status.hook_interpreter_ok is True
+
+    link.unlink()  # the upgrade removed what the hook names
+    capsys.readouterr()
+    status = git_sync_status_result(cfg, device_name="LOCAL_SIM", reporter=Reporter())
+    assert status.hook_installed is True
+    assert status.hook_interpreter_ok is False
+    assert status.as_dict()["hook_interpreter_ok"] is False
+    assert "git_sync_hook_broken" in capsys.readouterr().err
 
 
 def test_install_hook_uses_global_git_sync_peers(repos):

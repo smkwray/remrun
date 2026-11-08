@@ -424,7 +424,11 @@ starts best-effort background `git-sync <peer> --push --quiet` jobs for `[git_sy
 not block a commit. If a prior `post-commit` hook exists, remrun backs it up beside the
 hook and restores it on `--uninstall-hook`. Hook output is appended to a small bounded log
 under the controller state root (`logs/gitsync-hook/<project>.log`) so silent background
-skips are inspectable.
+skips are inspectable. The hook names the Python interpreter by the path Python reports
+(a package manager's stable link), not its versioned install folder, so a patch upgrade
+does not break it. `git-sync --status` reports `hook_interpreter_ok` and emits
+`git_sync_hook_broken` when the interpreter a hook names no longer exists; reinstall the
+hook to repair it.
 
 The safe default refuses to advance a dirty checked-out branch. For a dedicated Git-history
 hub—or an arriving controller—whose worktree bytes travel independently through Syncthing,

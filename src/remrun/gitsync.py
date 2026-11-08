@@ -219,6 +219,7 @@ class GitSyncStatus:
     hook_installed: bool
     hook_log: str | None
     line_endings_ok: bool
+    hook_interpreter_ok: bool | None = None
 
     @property
     def exit_code(self) -> int:
@@ -236,6 +237,7 @@ class GitSyncStatus:
             "local_dirty_summary": self.local_dirty_summary.as_dict(),
             "remote_dirty_summary": self.remote_dirty_summary.as_dict(),
             "hook_installed": self.hook_installed,
+            "hook_interpreter_ok": self.hook_interpreter_ok,
             "hook_log": self.hook_log,
             "line_endings_ok": self.line_endings_ok,
             "exit_code": self.exit_code,
@@ -575,11 +577,22 @@ def git_sync_status_result(
     local_dirty = local_summary.dirty
     remote_dirty = remote_summary.dirty
     hook_installed = False
+    hook_interpreter_ok: bool | None = None
     if local_history_present:
         hook = _hook_path(local_root)
-        hook_installed = hook.exists() and HOOK_BEGIN in hook.read_text(
-            encoding="utf-8", errors="replace"
-        )
+        hook_text = hook.read_text(encoding="utf-8", errors="replace") if hook.exists() else ""
+        hook_installed = HOOK_BEGIN in hook_text
+        if hook_installed:
+            missing = _missing_hook_interpreters(hook_text)
+            hook_interpreter_ok = not missing
+            if missing:
+                reporter.event(
+                    "git_sync_hook_broken",
+                    path=str(hook),
+                    missing_interpreter=missing[0],
+                    guidance="the post-commit hook cannot run; reinstall it with "
+                             "`remrun git-sync <peer> --install-hook`",
+                )
     log_path = _hook_log_path(config, project.project_id)
     line_endings_ok = _line_endings_ok(local_root)
     for action in branches:
@@ -588,6 +601,7 @@ def git_sync_status_result(
     reporter.event("git_sync_status_summary", device=device_name,
                    local_history_present=local_history_present, local_dirty=local_dirty,
                    remote_dirty=remote_dirty, hook_installed=hook_installed,
+                   hook_interpreter_ok=hook_interpreter_ok,
                    local_dirty_summary=local_summary.as_dict(),
                    remote_dirty_summary=remote_summary.as_dict(),
                    hook_log=str(log_path) if log_path.exists() else None,
@@ -608,7 +622,32 @@ def git_sync_status_result(
         hook_installed=hook_installed,
         hook_log=str(log_path) if log_path.exists() else None,
         line_endings_ok=line_endings_ok,
+        hook_interpreter_ok=hook_interpreter_ok,
     )
+
+
+def _missing_hook_interpreters(hook_text: str) -> list[str]:
+    """Interpreters named by a managed hook's git-sync lines that do not exist here.
+
+    The hook swallows its own failures (it must never block a commit), so a vanished
+    interpreter otherwise fails silently on every commit.
+    """
+    missing: list[str] = []
+    for line in hook_text.splitlines():
+        if " -m remrun.cli git-sync " not in line:
+            continue
+        try:
+            interpreter = shlex.split(line)[0]
+        except (ValueError, IndexError):
+            missing.append(line.strip())
+            continue
+        native = interpreter
+        drive = re.match(r"^/([a-z])/(.*)$", interpreter)
+        if os.name == "nt" and drive:
+            native = f"{drive.group(1).upper()}:/{drive.group(2)}"
+        if not Path(native).is_file() and interpreter not in missing:
+            missing.append(interpreter)
+    return missing
 
 
 def _detect_git_project(
@@ -779,7 +818,11 @@ def _hook_path(repo: Path) -> Path:
 
 
 def _hook_script(config: RemrunConfig, repo: Path, peers: list[str]) -> str:
-    py = _shell_path(Path(sys.executable))
+    # Keep the interpreter path the way Python reports it. Resolving it would bake in
+    # a package manager's versioned install folder (for example a Homebrew Cellar
+    # patch directory), which disappears on the next patch upgrade and silently
+    # breaks every installed hook; the reported path is the stable link.
+    py = _shell_path(Path(sys.executable), resolve=False)
     remrun_root = _native_env_path(config.repo_root)
     src_root = _native_env_path(config.repo_root / "src")
     state_root = _native_env_path(default_state_root())
@@ -816,8 +859,8 @@ exit 0
 """
 
 
-def _shell_path(path: Path) -> str:
-    text = str(path.resolve()).replace("\\", "/")
+def _shell_path(path: Path, *, resolve: bool = True) -> str:
+    text = str(path.resolve() if resolve else path.absolute()).replace("\\", "/")
     match = re.match(r"^([A-Za-z]):/(.*)$", text)
     if match:
         return f"/{match.group(1).lower()}/{match.group(2)}"
