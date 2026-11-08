@@ -739,9 +739,10 @@ def postrun_pullback(
 
     ``within`` (files and ``dir/`` prefixes) limits both the pullback and the local
     walk to those paths; every other command-caused change is listed in
-    ``outside`` and left on the remote side. Changes at or under a ``held`` path are
-    neither pulled nor mirrored as deletions: the caller found something there the
-    manifests cannot represent (a symlink or special file).
+    ``outside`` and left on the remote side. Changes at or under a ``held`` path,
+    compared ignoring case and Unicode form, are neither pulled nor mirrored as
+    deletions: the caller found something there the manifests cannot represent (a
+    symlink or special file).
     """
     result = PullbackResult()
 
@@ -756,9 +757,13 @@ def postrun_pullback(
         changed = [rel for rel in changed if path_within(rel, within)]
         deleted = [rel for rel in deleted if path_within(rel, within)]
     if held:
+        # By ``path_identity``: on a case-insensitive controller a held link
+        # ``out/Sub`` is also ``out/sub``, so a pull of ``out/sub/x`` would be written
+        # through it, and a deletion of ``out/keep.txt`` would remove the file a held
+        # ``out/KEEP.txt`` stands for. Over-matching on a case-sensitive one only holds more.
         held_dirs = [path.rstrip("/") + "/" for path in held]
-        changed = [rel for rel in changed if not path_within(rel + "/", held_dirs)]
-        deleted = [rel for rel in deleted if not path_within(rel + "/", held_dirs)]
+        changed = [rel for rel in changed if not path_within(rel + "/", held_dirs, fold=True)]
+        deleted = [rel for rel in deleted if not path_within(rel + "/", held_dirs, fold=True)]
     cur_local = _build_local_manifest(
         local_root,
         excludes,

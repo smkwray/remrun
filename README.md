@@ -255,9 +255,10 @@ time per project, without the target's checkout changing under them. It works wi
   run's copy is saved under the run's conflict directory, and the run exits `2`. The
   outputs come back after a failed or cancelled command too. Only regular files return:
   a symlink or special file at or under an output, in the private tree or locally, is
-  listed in `work.unsupported_paths`, nothing is pulled or deleted at that path, the
-  tree is kept and the run exits `2`. One already there when the run starts, locally
-  or in `HEAD`, refuses the run (exit `2`).
+  listed in `work.unsupported_paths`, nothing is pulled or deleted at or under that
+  path (in any spelling that differs only in case or Unicode form), the tree is kept
+  and the run exits `2`. One already there when the run starts, locally or in `HEAD`,
+  refuses the run (exit `2`).
 - **Other writes.** A file written or deleted outside the outputs that the project's
   transfer excludes cover is scratch: counted (`scratch_writes`) and discarded. Any
   other is an unexpected write: listed in the run's `work` record, never copied into

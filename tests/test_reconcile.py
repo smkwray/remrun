@@ -1024,3 +1024,82 @@ def test_measure_push_groups_by_first_two_directories():
     assert dict(size.top_by_files) == {".": 1, "a": 1, "a/b": 2, "z/y": 1}
     assert size.top_by_files[0] == ("a/b", 2)
     assert not size.refused
+
+
+class _ScriptedRemote:
+    """A target whose post-run manifest and file bytes are given, and whose pulls are
+    recorded: the pullback's decisions are observed without any filesystem's own case
+    rules deciding where a write lands."""
+
+    def __init__(self, files: dict[str, bytes]):
+        import hashlib
+
+        from remrun.manifest import FileEntry
+
+        self.files = files
+        self.pulls: list[str] = []
+        self.post = {
+            rel: FileEntry(path=rel, kind="file", size=len(data), mtime_ns=1,
+                           sha256=hashlib.sha256(data).hexdigest())
+            for rel, data in files.items()
+        }
+
+    def manifest(self, remote_root, excludes, hash_below_bytes, include_paths=()):  # noqa: ANN001
+        return dict(self.post)
+
+    def remote_join(self, root: str, rel: str) -> str:
+        return f"{root}/{rel}"
+
+    def pull_file(self, remote_path: str, local_path: Path) -> None:
+        rel = remote_path.removeprefix("tree/")
+        self.pulls.append(rel)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(self.files[rel])
+
+
+def _held_pullback(tmp_path: Path, remote: _ScriptedRemote, pre_remote, held):  # noqa: ANN001
+    local = tmp_path / "local"
+    return postrun_pullback(
+        transport=remote, local_root=local, remote_root="tree", excludes=[],
+        hash_below_bytes=1_000_000, pre_remote_manifest=pre_remote,
+        pre_local_manifest=build_manifest(local, [], hash_below_bytes=1_000_000),
+        backup_root=tmp_path / "backup", conflict_remote_root=tmp_path / "conflict",
+        include_paths=["out/"], within=["out/"], held=held,
+    )
+
+
+@pytest.mark.parametrize(("held", "incoming"), [
+    ("out/Sub", "out/sub/x.txt"),
+    ("out/café", "out/café/x.txt"),
+])
+def test_held_link_holds_every_spelling_of_the_paths_below_it(tmp_path: Path, held, incoming):
+    """A link the command left locally at ``out/Sub`` is ``out/sub`` too on a
+    case-insensitive controller (APFS, NTFS), so pulling ``out/sub/x.txt`` would write
+    through it, out of the project, and mirroring a deletion under it would delete
+    there. Every spelling of a held path is held; other outputs still return."""
+    local = tmp_path / "local"
+    gone = incoming.rsplit("/", 1)[0] + "/old.txt"
+    (local / gone).parent.mkdir(parents=True)
+    (local / gone).write_text("local copy")
+    remote = _ScriptedRemote({incoming: b"through the link?", "out/other.txt": b"fine"})
+    pre_remote = build_manifest(local, [], hash_below_bytes=1_000_000)
+
+    post = _held_pullback(tmp_path, remote, pre_remote, [held])
+
+    assert remote.pulls == ["out/other.txt"] and post.pulled == ["out/other.txt"]
+    assert post.deleted_local == [] and (local / gone).read_text() == "local copy"
+
+
+def test_held_link_with_another_case_keeps_the_file_it_replaced(tmp_path: Path):
+    """The command replaced ``out/keep.txt`` with a link named ``out/KEEP.txt``. The
+    manifests skip links, so the file reads as deleted remotely; on a case-insensitive
+    controller both names are one file, which must stay as it is, not be deleted."""
+    local = tmp_path / "local"
+    (local / "out").mkdir(parents=True)
+    (local / "out" / "keep.txt").write_text("keep me")
+    pre_remote = build_manifest(local, [], hash_below_bytes=1_000_000)
+
+    post = _held_pullback(tmp_path, _ScriptedRemote({}), pre_remote, ["out/KEEP.txt"])
+
+    assert post.deleted_local == [] and post.conflicts == []
+    assert (local / "out" / "keep.txt").read_text() == "keep me"
