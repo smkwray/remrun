@@ -160,10 +160,17 @@ def build_manifest(
     # normal excludes (for example the global ``*.lock`` rule).  Keep this
     # narrow: only the enumerated relative path, and parents needed to reach
     # it, are retained.  No exclude pattern is changed for any other path.
+    # A ``dir/`` entry (a commit run's directory --output) also keeps everything
+    # under it.
     forced = frozenset(path.strip("/") for path in include_paths if path)
+    forced_dirs = tuple(path for path in include_paths if path.endswith("/"))
 
     def forced_or_descendant(rel: str) -> bool:
-        return rel in forced or any(path.startswith(rel + "/") for path in forced)
+        return (
+            rel in forced
+            or any(path.startswith(rel + "/") for path in forced)
+            or any(rel.startswith(path) for path in forced_dirs)
+        )
 
     def excluded(rel: str) -> bool:
         return should_exclude(rel, exclude_patterns) and not forced_or_descendant(rel)

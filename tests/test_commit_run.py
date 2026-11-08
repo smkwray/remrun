@@ -381,6 +381,38 @@ def test_output_under_a_project_exclude_still_returns(commit_env):
     assert (env["project"] / "results" / "r.txt").read_text() == "r"
 
 
+def test_everything_under_a_directory_output_returns_even_globally_excluded_names(
+    commit_env,
+):
+    """`--output results/` names the whole directory. A file there that a global
+    exclude matches (`*.tmp`, `__pycache__/`) is still the command's output: before,
+    it was neither returned nor reported, and the clean run then deleted the tree that
+    held it. An unchanged tracked file of that kind is not pulled again."""
+    env = commit_env
+    env["defaults"].write_text(env["defaults"].read_text().replace(
+        '"__pycache__/**"]', '"__pycache__/**", "**/__pycache__/**", "*.tmp"]'
+    ))
+    (env["project"] / "results").mkdir()
+    (env["project"] / "results" / "old.tmp").write_text("tracked", encoding="utf-8")
+    _git(env["project"], "add", ".")
+    _git(env["project"], "commit", "-qm", "results")
+    code = ";".join([
+        _write("results/r.txt", "r"), _write("results/x.tmp", "temp result"),
+        _write("results/__pycache__/m.pyc", "cache"),
+    ])
+    status, run_id = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "results/", "--",
+        *_py(code),
+    ])
+    assert status == EXIT_OK
+    results = env["project"] / "results"
+    assert (results / "x.tmp").read_text() == "temp result"
+    assert (results / "__pycache__" / "m.pyc").read_text() == "cache"
+    assert (results / "r.txt").read_text() == "r"
+    summary = _summary(env["state"], run_id)
+    assert summary["files_pulled_post"] == 3 and summary["work"]["state"] == "removed"
+
+
 def test_local_edit_during_the_run_is_saved_as_a_conflict(commit_env):
     """Invariant 6: an output edited locally while the job ran is never overwritten.
     The command's copy is saved outside the project and the run exits 2."""

@@ -52,6 +52,26 @@ def test_within_scope_matches_case_and_unicode_variants(tmp_path: Path):
     assert set(manifest) == {"OUT/a.txt", "Res.CSV", "cafe\u0301/b.txt"}
 
 
+@pytest.mark.parametrize("side", ["controller", "target runner"])
+def test_a_forced_directory_keeps_everything_under_it(tmp_path: Path, side: str):
+    """A commit run's `--output results/` returns the whole directory, so its manifest
+    on either side keeps excluded names under it; the same names elsewhere stay out."""
+    from remrun.remote import runner as remote_runner
+
+    for rel in ("results/x.tmp", "results/__pycache__/m.pyc", "results/r.txt", "other/y.tmp"):
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+    excludes = ["*.tmp", "**/__pycache__/**"]
+    if side == "controller":
+        found = set(build_manifest(tmp_path, excludes, include_paths=["results/"]))
+    else:
+        found = set(remote_runner.build_manifest(
+            str(tmp_path), excludes, 0, include_paths=["results/"]
+        ))
+    assert found == {"results/x.tmp", "results/__pycache__/m.pyc", "results/r.txt"}
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory-symlink coverage; Windows uses junction test")
 def test_build_manifest_prunes_directory_symlinks(tmp_path: Path):
     # Guard, not a regression test: directory symlinks were already pruned before this fix set.

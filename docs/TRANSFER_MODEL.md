@@ -83,10 +83,10 @@ no baseline   -> commit runs never read or advance the ordinary baseline
 no project lock -> each run leases its outputs instead
 ```
 
-The private tree is manifested with only the global excludes, so an output under a
-project exclude is still seen and returned; an output under a global exclude is
-refused when the run is planned. Paths are compared as prefixes: `out/` covers
-everything under `out`, `out/a.csv` covers one file.
+A declared output returns whatever project or global exclude matches it: `out/`
+covers the directory and everything under it (`out/x.tmp` included), `out/a.csv` covers
+one file. An output that is itself under a global exclude (`.git/`, `node_modules/`) is
+refused when the run is planned. Paths are compared as prefixes.
 
 Refusals before the target is chosen (exit 2, nothing written anywhere):
 

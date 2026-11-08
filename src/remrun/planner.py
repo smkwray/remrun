@@ -112,8 +112,9 @@ def make_run_plan(
     if mode == "commit":
         if not output_paths:
             raise ValueError("--transfer commit needs at least one --output PATH")
-        # The private tree's manifest skips only the global excludes, so an output under
-        # one of them could never be seen, let alone returned.
+        # Everything under a declared output returns, but an output that is itself under
+        # a global exclude names VCS, environment, sync or remrun-private paths
+        # (`.git/`, `node_modules/`, `.remrun-*`); returning those is never intended.
         for path in output_paths:
             probe = path + "x" if path.endswith("/") else path
             if should_exclude(probe, tree_excludes):

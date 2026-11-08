@@ -502,12 +502,12 @@ def seed_commit_tree(
             raise TransportError(f"--input {item['path']} arrived with a different SHA-256")
     transport.ensure_remote_dir(remote_cwd)
     write_manifest(rdir / "pre_remote_manifest.json", transport.manifest(
-        work.tree, plan.tree_excludes, plan.hash_below_bytes,
+        work.tree, plan.tree_excludes, plan.hash_below_bytes, include_paths=plan.outputs,
     ))
     # Outputs as they stand locally at launch: a later local edit becomes a conflict.
     write_manifest(rdir / "pre_local_manifest.json", build_manifest(
         local_root, plan.tree_excludes, hash_below_bytes=plan.hash_below_bytes or None,
-        within=plan.outputs,
+        include_paths=plan.outputs, within=plan.outputs,
     ))
 
 
@@ -563,6 +563,12 @@ def finalize_commit_outputs(
             backup_root=conflict_dir(run_id) / "backup",
             conflict_remote_root=conflict_dir(run_id) / "remote",
             backup_below_bytes=policy.backup_below_bytes,
+            # Everything under a declared output returns, global excludes included
+            # (`results/x.tmp` under `--output results/`): the caller named the whole
+            # directory, and the tree holding anything left out is deleted after a
+            # clean run. remrun writes nothing of its own under the outputs in the
+            # private tree, so no scratch name needs keeping out there.
+            include_paths=plan.outputs,
             within=plan.outputs,
         )
     except TransportError as exc:

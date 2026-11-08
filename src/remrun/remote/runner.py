@@ -567,9 +567,15 @@ def build_manifest(
     if not os.path.isdir(root):
         return files
     forced = frozenset(path.strip("/") for path in include_paths if path)
+    # A ``dir/`` entry keeps everything under it (a commit run's directory output).
+    forced_dirs = tuple(path for path in include_paths if path.endswith("/"))
 
     def forced_or_descendant(rel: str) -> bool:
-        return rel in forced or any(path.startswith(rel + "/") for path in forced)
+        return (
+            rel in forced
+            or any(path.startswith(rel + "/") for path in forced)
+            or any(rel.startswith(path) for path in forced_dirs)
+        )
 
     def excluded(rel: str) -> bool:
         return should_exclude(rel, excludes) and not forced_or_descendant(rel)
