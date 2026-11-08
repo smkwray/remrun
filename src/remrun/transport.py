@@ -1970,6 +1970,11 @@ class BaseTransport:
         return None
 
     # --- project-less helpers (fleet mode) --------------------------------
+    @property
+    def target_is_windows(self) -> bool:
+        """Whether paths on this transport's target use Windows syntax."""
+        return self.device.is_windows
+
     def native_join(self, *parts: str) -> str:
         """Join path parts in the remote's native form (default POSIX).
 
@@ -2486,6 +2491,12 @@ class LocalSimTransport(BaseTransport):
         arguments: list[str] | None = None,
     ) -> list[str]:
         return [sys.executable, runner_path, operation, state_root, *(arguments or [])]
+
+    @property
+    def target_is_windows(self) -> bool:
+        # The simulated target is this host's own filesystem, whatever the device
+        # entry declares.
+        return os.name == "nt"
 
     def native_join(self, *parts: str) -> str:
         cleaned = [str(p) for p in parts if p]

@@ -199,7 +199,7 @@ def work_paths(transport: BaseTransport, plan: RunPlan) -> CommitWork:
     The short id keeps Windows paths short. A state root inside the target's project
     root would put remrun's work tree in the synced tree, so it is refused.
     """
-    windows = plan.target.is_windows
+    windows = transport.target_is_windows
     state_root = transport.expand_remote(plan.target.state_root)
     if not state_root or state_root.startswith("~") or not _target_path(
         windows, state_root
