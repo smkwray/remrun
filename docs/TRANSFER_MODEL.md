@@ -141,9 +141,11 @@ conflict copy (each `postrun_conflict` event gives its path) or from the retaine
 case and Unicode normalization.
 
 Ordinary runs ignore commit fences: a commit run never touches the target's checkout.
-On the controller, every remrun process that writes into a project's local tree (an
-ordinary run's preflight and pullback, a commit run's pullback) holds that tree's
-local-write lock while it re-checks each file and writes it. When two runs change the
+On the controller, the run phases that write into a project's local tree (an ordinary
+run's preflight and pullback, including a durable run's finalization, and a commit run's
+pullback) hold that tree's local-write lock while they re-check each file and write it.
+The lock follows the directory itself, so every spelling of its path shares it.
+`remrun sync` does not take this lock. When two runs change the
 same local file, whichever writes it second sees the first write as a local change: a
 pullback keeps the file and saves its own copy as a conflict, and a preflight leaves it
 and refuses to start the run (exit 2). Edits by other programs are caught by the same

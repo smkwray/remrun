@@ -465,9 +465,9 @@ The most common failure modes and their fixes:
    metadata is missing or unreadable, its PID cannot be checked, or the killed run may
    have left a remote command running (item 6). Never delete a lock by hand while that
    hazard stands; resolve it first.
-   Separately, each remrun process on a controller that writes into a project's local
-   tree (an ordinary run's preflight and pullback, a commit run's pullback) holds that
-   tree's local-write lock while it checks and writes those files. Another process
+   Separately, the run phases on a controller that write into a project's local tree (an
+   ordinary run's preflight and pullback, a commit run's pullback) hold that tree's
+   local-write lock while they check and write those files (`remrun sync` does not). Another process
    waits for it (a `lock_wait` event with `lock = "local_writes"`) for up to 30
    minutes, then fails that phase as a transfer error (exit `3`) before it writes
    into the project.
