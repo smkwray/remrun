@@ -1441,8 +1441,37 @@ def test_posix_cancel_refuses_a_reused_pid_and_never_signals(tmp_path, monkeypat
         stranger.wait(timeout=5)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cancel")
+def test_posix_cancel_asks_first_and_kills_only_what_outlives_the_grace(tmp_path, monkeypatch):
+    """A stop sends SIGTERM first so a job can flush or checkpoint; a job that ignores
+    it is still stopped, with SIGKILL, once the grace period has passed."""
+    command = [sys.executable, "-S", "-c",
+               "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+               "time.sleep(60)"]
+    session, root, rows = _start_session(tmp_path, {"run-a": command})
+    sent: list[int] = []
+    real_killpg = os.killpg
+
+    def recording_killpg(pgid, sig):  # noqa: ANN001
+        if sig != 0:
+            sent.append(sig)
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(observer.os, "killpg", recording_killpg)
+    monkeypatch.setattr(observer, "_CANCEL_TERM_GRACE_SECONDS", 0.5)
+    try:
+        started = time.monotonic()
+        receipt = observer._cancel_posix_job(root, _job_metadata("run-a", command).payload())
+        assert receipt["owned_job_cancelled"] is True
+        assert sent == [signal.SIGTERM, signal.SIGKILL]
+        assert time.monotonic() - started >= 0.5
+        assert _wait_gone(int(rows["run-a"]["root_pid"]))
+    finally:
+        _stop_session(session, rows)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX durable supervisor")
-def test_durable_supervisor_records_a_cancelled_observed_job_as_complete_137(tmp_path):
+def test_durable_supervisor_records_a_cancelled_observed_job_as_complete(tmp_path):
     """The stop reaches the supervisor as an ordinary wrapper exit, so resume can finalize."""
     from remrun import _durable_runner as durable_runner
 
@@ -1475,7 +1504,8 @@ def test_durable_supervisor_records_a_cancelled_observed_job_as_complete_137(tmp
             assert time.monotonic() < deadline, status
             time.sleep(0.05)
             status = durable_runner._status(root, run_id, "resume-token", False)
-        assert status["wrapper_exit_code"] == 128 + signal.SIGKILL
+        # The job ignored nothing, so the first, polite signal ended it.
+        assert status["wrapper_exit_code"] == 128 + signal.SIGTERM
     finally:
         records, _ = observer._read_records(root)
         for row in records:

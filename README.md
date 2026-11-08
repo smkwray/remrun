@@ -140,12 +140,14 @@ attributable durable run updates the learned job costs like an ordinary run.
 `remrun cancel <run_id>` stops a durable run, from the same controller and project as
 `resume`. It records the request with the run's saved state, then asks the target's job
 observer to stop exactly the processes it registered for that run: on POSIX the run's
-own process group, signalled with SIGKILL only after the run's root process, matched by
-PID and start time, is seen inside it; on Windows the run's own Job Object. No process
+own process group, signalled only after the run's root process, matched by PID and start
+time, is seen inside it: SIGTERM first, so the command can flush or checkpoint, then
+SIGKILL for anything still running ten seconds later; on Windows the run's own Job
+Object, terminated at once. No process
 group is ever taken from a process listing. Processes the command deliberately moved to
 another group, session or Job are not stopped. Once the target confirms the processes
 are gone, `cancel` finalizes like `resume`: it reports the stopped command's exit code
-(137 on POSIX) and pulls outputs back as after any other nonzero exit. A run that had
+(usually 143 on POSIX, 137 if it had to be killed) and pulls outputs back as after any other nonzero exit. A run that had
 already finished is finalized exactly as `resume` would. If another remrun process is
 still waiting on the run (the original `run --durable`, or a `resume`), `cancel` only
 stops the command and exits `0`; the waiting process finalizes it. `cancel` stops

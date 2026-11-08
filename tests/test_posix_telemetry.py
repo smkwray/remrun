@@ -1227,8 +1227,8 @@ def test_legacy_telemetry_sampler_leads_its_own_process_group(tmp_path: Path):
 
 def test_guarded_observed_job_reports_the_cancelled_command_exit(tmp_path: Path):
     """A durable guarded run is guard -> observer -> command. Cancelling the observer's
-    group must surface as the command's own SIGKILL exit with the guard clean, so the
-    ordinary finalization reports 137 instead of a guard failure."""
+    group must surface as the command's own signal exit with the guard clean, so the
+    ordinary finalization reports the command's exit instead of a guard failure."""
     from remrun import _job_observer as observer
     from remrun.job_observation import JobObservation
 
@@ -1266,9 +1266,9 @@ def test_guarded_observed_job_reports_the_cancelled_command_exit(tmp_path: Path)
         assert cancel.returncode == 0, cancel.stderr
         _out, err = guarded.communicate(timeout=20)
         payload = _guard_payload_from_stderr(err, token)
-        assert guarded.returncode == 128 + signal.SIGKILL
+        assert guarded.returncode == 128 + signal.SIGTERM
         assert payload["status"] == "ok"
-        assert payload["command_exit_code"] == 128 + signal.SIGKILL
+        assert payload["command_exit_code"] == 128 + signal.SIGTERM
         assert _ledger_leases(state_root) == []
     finally:
         if guarded.poll() is None:

@@ -54,6 +54,9 @@ _SCHEMA_READY_DELAY_SECONDS = 0.02
 _START_GATE_TIMEOUT_SECONDS = 60.0
 # How long ``cancel`` waits for a stopped boundary to have no processes left.
 _CANCEL_SETTLE_SECONDS = 5.0
+# A POSIX cancel asks first: SIGTERM lets the job flush, checkpoint, or remove its
+# temporary files. Whatever is still in the group after this grace period is killed.
+_CANCEL_TERM_GRACE_SECONDS = 10.0
 # A record that started more than this long before the current boot is stale:
 # no process survives a restart. The boot-time estimate (wall clock minus an
 # uptime that counts sleep) has under a second of sampling/rounding jitter, but a
@@ -2574,7 +2577,11 @@ def _posix_group_exists(pgid: int) -> bool:
 
 
 def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, object]:
-    """Kill only the exact registered process group, then wait for it to be empty.
+    """Stop only the exact registered process group, then wait for it to be empty.
+
+    SIGTERM first, then SIGKILL for anything still in the group after the grace period.
+    A process group's id is not reused while the group has members, so the second
+    signal still reaches only the group the proof below identified.
 
     The group is the observer's private one (``_posix_owner_row``). It is signalled
     only after the registered root process, by pid and start identity, is seen live
@@ -2605,17 +2612,23 @@ def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, obje
         return _cancel_refused(
             receipt, "the registered root process is not live inside its registered group"
         )
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass  # the group ended between the proof and the signal; confirm below
-    except PermissionError:
-        return _cancel_refused(receipt, "the registered process group cannot be signalled")
-    deadline = time.monotonic() + _CANCEL_SETTLE_SECONDS
-    while _posix_group_exists(pgid):
-        if time.monotonic() >= deadline:
-            return _cancel_refused(receipt, "the process group still has members")
-        time.sleep(0.02)
+    for sig, wait in (
+        (signal.SIGTERM, _CANCEL_TERM_GRACE_SECONDS),
+        (signal.SIGKILL, _CANCEL_SETTLE_SECONDS),
+    ):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            break  # the group ended between the proof (or the first signal) and this one
+        except PermissionError:
+            return _cancel_refused(receipt, "the registered process group cannot be signalled")
+        deadline = time.monotonic() + wait
+        while _posix_group_exists(pgid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not _posix_group_exists(pgid):
+            break
+    if _posix_group_exists(pgid):
+        return _cancel_refused(receipt, "the process group still has members")
     receipt["owned_job_cancelled"] = True
     return receipt
 
