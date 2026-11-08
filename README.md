@@ -142,7 +142,8 @@ attributable durable run updates the learned job costs like an ordinary run.
 observer to stop exactly the processes it registered for that run: on POSIX the run's
 own process group, signalled only after the run's root process, matched by PID and start
 time, is seen inside it: SIGTERM first, so the command can flush or checkpoint, then
-SIGKILL for anything still running ten seconds later; on Windows the run's own Job
+SIGKILL for anything still running ten seconds later, sent only while a process seen in
+the group at that check is still in it; on Windows the run's own Job
 Object, terminated at once. No process
 group is ever taken from a process listing. Processes the command deliberately moved to
 another group, session or Job are not stopped. Once the target confirms the processes

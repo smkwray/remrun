@@ -1482,6 +1482,64 @@ def test_posix_cancel_asks_first_and_kills_only_what_outlives_the_grace(tmp_path
         _stop_session(session, rows)
 
 
+@pytest.mark.parametrize("after_grace", ["reused", "unseen", "same", "late child"])
+def test_posix_cancel_kills_only_a_group_it_can_still_prove(tmp_path, monkeypatch, after_grace):
+    """During the grace period the job's group can empty and its number be taken by an
+    unrelated group. SIGKILL goes out only while a member seen at proof time, by pid
+    and start identity, is still in the group; otherwise the stranger is left alone
+    and the refusal says a signal was already sent."""
+    pgid = os.getpgrp() + 7919  # never this process's group; every signal is injected
+    leader = observer.ProcessRow(pgid, 1, "start:leader", 1, 0.0, 0, 1, pgid)
+    job = observer.ProcessRow(pgid + 1, pgid, "start:job", 2, 0.0, 0, 1, pgid)
+    metadata = _metadata().payload()
+    record = {
+        **metadata, "owner_kind": "posix_pgid", "owner_key": str(pgid),
+        "root_pid": job.pid, "root_identity": job.identity,
+    }
+    monkeypatch.setattr(observer, "_read_records", lambda _root: ([record], []))
+    stranger = observer.ProcessRow(pgid + 2, 1, "start:stranger", 9, 0.0, 0, 1, pgid)
+    reused_pid = observer.ProcessRow(job.pid, 1, "start:later", 9, 0.0, 0, 1, pgid)
+    late_child = observer.ProcessRow(pgid + 3, job.pid, "start:child", 3, 0.0, 0, 1, pgid)
+    members = {
+        "reused": [stranger, reused_pid],
+        # The group still answers kill(0) but shows no member to identify.
+        "unseen": [],
+        "same": [job],
+        "late child": [job, late_child],
+    }[after_grace]
+    snapshots = iter([
+        {leader.pid: leader, job.pid: job},
+        {row.pid: row for row in members},
+    ])
+    monkeypatch.setattr(observer, "_processes", lambda: next(snapshots))
+    sent: list[int] = []
+    group = {"exists": True}
+
+    def killpg(target, sig):  # noqa: ANN001
+        assert target == pgid
+        if sig == 0:
+            if not group["exists"]:
+                raise ProcessLookupError
+            return
+        sent.append(sig)
+        if sig == signal.SIGKILL:
+            group["exists"] = False
+
+    monkeypatch.setattr(observer.os, "killpg", killpg)
+    monkeypatch.setattr(observer, "_CANCEL_TERM_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(observer, "_CANCEL_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(observer.time, "sleep", lambda _seconds: None)
+
+    receipt = observer._cancel_posix_job(tmp_path, metadata)
+
+    if after_grace in {"reused", "unseen"}:
+        assert sent == [signal.SIGTERM]
+        assert (receipt["owned_job_cancelled"], receipt["signals_sent"]) == (False, True)
+    else:
+        assert sent == [signal.SIGTERM, signal.SIGKILL]
+        assert receipt["owned_job_cancelled"] is True
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX durable supervisor")
 def test_durable_supervisor_records_a_cancelled_observed_job_as_complete(tmp_path):
     """The stop reaches the supervisor as an ordinary wrapper exit, so resume can finalize."""

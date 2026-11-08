@@ -2579,18 +2579,32 @@ def _posix_group_exists(pgid: int) -> bool:
     return True
 
 
+def _posix_group_gone(pgid: int, wait: float) -> bool:
+    """Wait up to ``wait`` seconds for a process group to have no members left."""
+    deadline = time.monotonic() + wait
+    while _posix_group_exists(pgid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return not _posix_group_exists(pgid)
+
+
 def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, object]:
     """Stop only the exact registered process group, then wait for it to be empty.
-
-    SIGTERM first, then SIGKILL for anything still in the group after the grace period.
-    A process group's id is not reused while the group has members, so the second
-    signal still reaches only the group the proof below identified.
 
     The group is the observer's private one (``_posix_owner_row``). It is signalled
     only after the registered root process, by pid and start identity, is seen live
     inside it, so a group number read from anywhere else, such as the SSH session's
     group, is never a target. A member that deliberately changed its group or
     session is outside this proof and is not signalled.
+
+    SIGTERM first, then SIGKILL for anything still in the group after the grace
+    period. The group can empty during that grace and its number then be taken by an
+    unrelated group, so the members seen in the proof's process snapshot are kept by
+    pid and start identity, and SIGKILL goes out only while a fresh snapshot still
+    finds one of them in the group. A group none of whose members were proved is not
+    signalled; the cancel is refused instead. What this cannot close is the moment
+    between a snapshot and the ``killpg`` that follows it: signalling a group has no
+    handle that pins it, so a group that empties and is reused inside that window
+    would still receive the signal.
     """
     receipt = _cancel_receipt(metadata)
     record, detail = _exact_owned_record(root, metadata, "posix_pgid")
@@ -2603,7 +2617,8 @@ def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, obje
     if pgid <= 1 or pgid == os.getpgrp():
         return _cancel_refused(receipt, "the registered process group is not job-scoped")
     try:
-        root_row = _processes().get(int(record["root_pid"]))
+        snapshot = _processes()
+        root_row = snapshot.get(int(record["root_pid"]))
     except Exception as exc:
         return _cancel_refused(receipt, f"process table unreadable: {type(exc).__name__}")
     if (
@@ -2615,26 +2630,43 @@ def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, obje
         return _cancel_refused(
             receipt, "the registered root process is not live inside its registered group"
         )
-    signalled = False
-    for sig, wait in (
-        (signal.SIGTERM, _CANCEL_TERM_GRACE_SECONDS),
-        (signal.SIGKILL, _CANCEL_SETTLE_SECONDS),
-    ):
-        try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
-            break  # the group ended between the proof (or the first signal) and this one
-        except PermissionError:
-            return _cancel_refused(
-                receipt, "the registered process group cannot be signalled",
-                signals_sent=signalled,
-            )
+    proved = {
+        (row.pid, row.identity)
+        for row in snapshot.values()
+        if row.pgid == pgid and row.identity is not None
+    }
+    try:
+        os.killpg(pgid, signal.SIGTERM)
         signalled = True
-        deadline = time.monotonic() + wait
-        while _posix_group_exists(pgid) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if not _posix_group_exists(pgid):
-            break
+    except ProcessLookupError:
+        signalled = False  # the group ended between the proof and the signal
+    except PermissionError:
+        return _cancel_refused(receipt, "the registered process group cannot be signalled")
+    if signalled and not _posix_group_gone(pgid, _CANCEL_TERM_GRACE_SECONDS):
+        try:
+            members = [row for row in _processes().values() if row.pgid == pgid]
+        except Exception as exc:
+            return _cancel_refused(
+                receipt, f"process table unreadable: {type(exc).__name__}", signals_sent=True
+            )
+        if any((row.pid, row.identity) in proved for row in members):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # the group ended between the snapshot and the signal
+            except PermissionError:
+                return _cancel_refused(
+                    receipt, "the registered process group cannot be signalled",
+                    signals_sent=True,
+                )
+        elif members:
+            return _cancel_refused(
+                receipt,
+                "no process proved to be the job's is left in its process group; "
+                "the group number may now belong to another group",
+                signals_sent=True,
+            )
+        _posix_group_gone(pgid, _CANCEL_SETTLE_SECONDS)
     if _posix_group_exists(pgid):
         return _cancel_refused(
             receipt, "the process group still has members", signals_sent=signalled
