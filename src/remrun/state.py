@@ -9,8 +9,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
+from ._durable_runner import pid_liveness
 from .manifest import FileEntry, Manifest
 
 
@@ -361,7 +362,12 @@ def _active_unknown_completion_run_ids(state_root: Path) -> set[str]:
 # --- project lock (one in-place writer per project per target) ---------------
 
 class LockError(RuntimeError):
-    pass
+    """A project lock is held. ``waitable`` is true only when every holder is a
+    running process and any recorded unknown-completion hazard belongs to one of them."""
+
+    def __init__(self, message: str, *, waitable: bool = False) -> None:
+        super().__init__(message)
+        self.waitable = waitable
 
 
 class ProjectLock:
@@ -371,12 +377,18 @@ class ProjectLock:
     project tree. An unscoped run takes the whole-project lock and conflicts with
     every scoped run. Scoped runs also serialize with each other: scopes narrow
     post-run pullback validation, but baseline attribution is still project-wide.
+
+    A conflicting lock whose recorded pid has provably exited on this host is
+    reclaimed, unless the project has an unknown-completion hazard: that fence, not
+    the lock, guards a remote command that may still be running.
     """
 
     def __init__(self, project_id: str, target: str, state_root: Path | None = None,
                  scope: str | None = None, *, run_id: str | None = None,
-                 adopt_dead_run: bool = False) -> None:
+                 adopt_dead_run: bool = False,
+                 report: Callable[..., None] | None = None) -> None:
         root = state_root or default_state_root()
+        self.state_root = root
         project_key = hashlib.sha256(project_id.encode()).hexdigest()[:16]
         self.root = root / "locks" / "project" / project_key
         scope_name = scope or "project"
@@ -391,6 +403,7 @@ class ProjectLock:
         self.scope = scope
         self.run_id = run_id
         self.adopt_dead_run = adopt_dead_run
+        self.report = report
 
     def _acquire_guard(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -417,12 +430,17 @@ class ProjectLock:
         if not info_path.exists():
             return {"metadata_state": "missing"}
         try:
-            return read_json(info_path) or {"metadata_state": "missing"}
+            info = read_json(info_path)
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
             return {
                 "metadata_state": "invalid",
                 "metadata_error": type(exc).__name__,
             }
+        if info is None:
+            return {"metadata_state": "missing"}
+        if not isinstance(info, dict):
+            return {"metadata_state": "invalid", "metadata_error": "not an object"}
+        return info
 
     def _describe_holder(self, path: Path) -> str:
         info = self._lock_info(path)
@@ -444,17 +462,39 @@ class ProjectLock:
         return sorted(p for p in scopes_dir.glob("*.lock") if p.is_dir())
 
     @staticmethod
-    def _pid_is_alive(value: object) -> bool:
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            return True
+    def _holder_liveness(info: dict[str, object]) -> tuple[bool | None, str]:
+        """(running?, why) for a lock record; ``None`` when death cannot be proven."""
+        if info.get("metadata_state") == "missing":
+            return None, "lock metadata is missing"
+        if info.get("metadata_state") == "invalid":
+            return None, f"lock metadata is unreadable ({info.get('metadata_error')})"
+        pid = info.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int):
+            return None, "lock metadata has no integer pid"
+        alive = pid_liveness(pid)
+        if alive is None:
+            return None, f"cannot prove holder pid {pid} has exited"
+        return alive, f"holder pid {pid} is {'running' if alive else 'not running'}"
+
+    def live_holder_run_ids(self) -> set[str]:
+        """Run ids recorded by this project's locks whose holder pid is running."""
+        whole = self.root / "whole.lock"
+        paths = ([whole] if whole.is_dir() else []) + self._conflicting_scope_locks()
+        run_ids: set[str] = set()
+        for path in paths:
+            info = self._lock_info(path)
+            if isinstance(info.get("run_id"), str) and self._holder_liveness(info)[0] is True:
+                run_ids.add(str(info["run_id"]))
+        return run_ids
+
+    @staticmethod
+    def _remove_lock_dir(path: Path) -> bool:
         try:
-            os.kill(value, 0)
-            return True
-        except ProcessLookupError:
+            (path / "info.json").unlink(missing_ok=True)
+            path.rmdir()
+        except OSError:
             return False
-        except (PermissionError, OSError):
-            # Fail closed when this process cannot prove the recorded holder died.
-            return True
+        return True
 
     def _adopt_exact_dead_run(self, conflicts: list[Path]) -> bool:
         """Remove only this run's exact stale lock while holding the table guard."""
@@ -466,44 +506,60 @@ class ProjectLock:
             or info.get("project_id") != self.project_id
             or info.get("target") != self.target
             or info.get("scope") != (self.scope or "project")
-            or self._pid_is_alive(info.get("pid"))
+            or self._holder_liveness(info)[0] is not False
         ):
             return False
-        try:
-            (self.path / "info.json").unlink()
-            self.path.rmdir()
-        except OSError:
-            return False
-        return True
+        return self._remove_lock_dir(self.path)
 
-    def acquire(self) -> "ProjectLock":
+    def _reclaim_or_refuse(self, conflicts: list[Path]) -> None:
+        """Reclaim provably dead holders; raise ``LockError`` for any that remain."""
+        try:
+            hazard = read_unknown_completion_hazard(self.project_id, self.state_root)
+            hazard_note = None if hazard is None else (
+                f"unknown-completion hazard for run {hazard['run_id']} is recorded; "
+                "prove that command ended, then `remrun resolve-unknown "
+                f"{hazard['run_id']} --confirmed-ended`"
+            )
+        except UnknownCompletionHazardError as exc:
+            hazard, hazard_note = {"run_id": None}, str(exc)
+        blocking: list[tuple[Path, bool | None, str]] = []
+        live_run_ids: set[str] = set()
+        for path in conflicts:
+            info = self._lock_info(path)
+            alive, why = self._holder_liveness(info)
+            if alive is False and hazard_note is None and self._remove_lock_dir(path):
+                if self.report is not None:
+                    self.report(
+                        "stale_lock_reclaimed", path=str(path),
+                        run_id=info.get("run_id"), pid=info.get("pid"),
+                        target=info.get("target"), scope=info.get("scope"),
+                        acquired_at=info.get("acquired_at"),
+                    )
+                continue
+            if alive is False:
+                why = f"{why}, but {hazard_note}" if hazard_note else f"{why}; removal failed"
+            elif alive and isinstance(info.get("run_id"), str):
+                live_run_ids.add(info["run_id"])
+            blocking.append((path, alive, why))
+        if not blocking:
+            return
+        path, _alive, why = blocking[0]
+        raise LockError(
+            f"project {self.project_id} already locked at {path} "
+            f"({self._describe_holder(path)}); not reclaimed: {why}",
+            waitable=(
+                all(alive is True for _p, alive, _w in blocking)
+                and (hazard is None or hazard["run_id"] in live_run_ids)
+            ),
+        )
+
+    def _acquire_once(self) -> None:
         self._acquire_guard()
         try:
             whole = self.root / "whole.lock"
-            if self.scope is None:
-                conflicts = []
-                if whole.exists():
-                    conflicts.append(whole)
-                conflicts.extend(self._conflicting_scope_locks())
-                if conflicts and self._adopt_exact_dead_run(conflicts):
-                    conflicts = []
-                if conflicts:
-                    raise LockError(
-                        f"project {self.project_id} already locked at {conflicts[0]} "
-                        f"({self._describe_holder(conflicts[0])})"
-                    )
-            else:
-                conflicts = []
-                if whole.exists():
-                    conflicts.append(whole)
-                conflicts.extend(self._conflicting_scope_locks())
-                if conflicts and self._adopt_exact_dead_run(conflicts):
-                    conflicts = []
-                if conflicts:
-                    raise LockError(
-                        f"project {self.project_id} already locked at {conflicts[0]} "
-                        f"({self._describe_holder(conflicts[0])})"
-                    )
+            conflicts = ([whole] if whole.exists() else []) + self._conflicting_scope_locks()
+            if conflicts and not self._adopt_exact_dead_run(conflicts):
+                self._reclaim_or_refuse(conflicts)
 
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -522,7 +578,32 @@ class ProjectLock:
             )
         finally:
             self._release_guard()
-        return self
+
+    def acquire(self, wait_seconds: float = 0.0) -> "ProjectLock":
+        """Take the lock, polling up to ``wait_seconds`` while a running holder has it."""
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        delay = 0.5
+        waited = False
+        while True:
+            try:
+                self._acquire_once()
+                return self
+            except LockError as exc:
+                remaining = deadline - time.monotonic()
+                if not exc.waitable:
+                    raise
+                if remaining <= 0:
+                    if waited:
+                        raise LockError(
+                            f"{exc}; gave up after waiting {wait_seconds:g}s"
+                        ) from exc
+                    raise
+                if not waited:
+                    waited = True
+                    if self.report is not None:
+                        self.report("lock_wait", seconds=wait_seconds, message=str(exc))
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 5.0)
 
     def release(self) -> None:
         info = self.path / "info.json"

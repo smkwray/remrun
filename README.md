@@ -90,6 +90,7 @@ remrun resume <run_id>              # recover logs, exit code, and pullback
 remrun resume <run_id> --no-wait    # report authenticated target state and return
 remrun run --scope spec_a --auto -- <cmd>  # opt-in declared write scope
 remrun run macbox --memory-limit-mib 8192 -- <cmd>  # optional hard limit for a heavy first run
+remrun run macbox --wait-lock 600 -- <cmd>  # wait up to 600 s for a running holder of the project lock
 remrun status [DEVICE] [--limit N]  # recent runs, optionally filtered by target
 remrun logs [last|<run_id>] [--json]
 remrun clean [--older-than 30d] [--keep N] [--dry-run]   # prune state folder
@@ -282,21 +283,27 @@ The most common failure modes and their fixes:
    `[transfer] exclude = ["data/**", "tmp/**", ...]` (added to the global excludes;
    excluded paths are neither pushed nor pulled back — keep result/output dirs
    in-surface, or rely on Syncthing to deliver them).
-4. **One writer per project, and a killed run can leave a stale lock.** Runs of the
-   same project serialize across ALL devices (`--auto` failover included) — don't
-   launch a second remrun job for a project while one is in flight. If a run is
-   killed/crashes mid-flight, its lock persists and every later run fails with
-   "already locked": check the printed lock path under
-   `%LOCALAPPDATA%\remrun\locks\project\<hash>\whole.lock` (or
-   `~/.local/state/remrun/locks/...`) and confirm the recorded holder PID is dead.
-   If the command may have reached `command_started`, a dead controller PID is not
-   enough: first inspect the named remote process and expected artifacts to prove
-   the remote work ended. Only after both checks may the stale lock be moved aside
-   or removed and the command retried.
+4. **One writer per project; a killed run's lock is reclaimed only when that is safe.**
+   Runs of the same project serialize across ALL devices (`--auto` failover included).
+   A second run fails at once with "already locked" while the holder's process is
+   running; pass `--wait-lock SECONDS` to wait for it instead (one `lock_wait` event,
+   then polling with backoff). It also waits out the running holder's own
+   unknown-completion fence, but refuses if that run ends and leaves the fence behind,
+   and never waits on a fence with no running holder. If a run is killed or the machine
+   sleeps, its lock under
+   `%LOCALAPPDATA%\remrun\locks\project\<hash>\` (or `~/.local/state/remrun/locks/...`)
+   stays behind. The next run removes it and reports `stale_lock_reclaimed` (old
+   run_id, pid, target, scope, acquired_at) when the recorded PID has provably exited on
+   this machine and no unknown-completion hazard is recorded for the project. Otherwise
+   it refuses and says why after `not reclaimed:`: the PID is running, the lock
+   metadata is missing or unreadable, its PID cannot be checked, or the killed run may
+   have left a remote command running (item 6). Never delete a lock by hand while that
+   hazard stands; resolve it first.
 5. **An automation timeout does not prove remrun exited.** A supervising tool may stop
    waiting while the local remrun process and remote command continue. Confirm the local
-   process reached a terminal exit before starting another run for the project. A lock
-   whose recorded PID is still alive is correct and must not be deleted.
+   process reached a terminal exit before starting another run for the project, or use
+   `--wait-lock`. A lock whose recorded PID is still alive is correct and must not be
+   deleted.
 6. **An SSH reset after `command_started` means completion is unknown.** The remote
    command may still be running even though the controller exits `4`. Do not immediately
    retry a mutating command. Read the persisted `completion_state=unknown` guidance and

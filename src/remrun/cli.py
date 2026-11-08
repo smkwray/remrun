@@ -244,6 +244,16 @@ def _positive_mib(value: str) -> int:
     return result
 
 
+def _wait_seconds(value: str) -> float:
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative number of seconds") from exc
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative number of seconds")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     # On Windows the console defaults to a legacy codepage (e.g. cp1252).
     # Remote command output is decoded as UTF-8 and may contain characters that
@@ -377,6 +387,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--durable", action="store_true",
         help="opt into a target-supervised run resumable by this controller; "
              "with --auto, selection freezes before launch",
+    )
+    p.add_argument(
+        "--wait-lock", type=_wait_seconds, default=0.0, metavar="SECONDS",
+        help="when another running remrun holds this project's lock, wait up to "
+             "SECONDS for it instead of failing at once (default 0)",
     )
 
     p = sub.add_parser(
@@ -1125,9 +1140,21 @@ def _unknown_completion_guidance(hazard: dict[str, object]) -> str:
 def _report_unknown_completion_hazard(
     project_id: str,
     reporter: Reporter,
+    *,
+    wait_for_live_owner: bool = False,
 ) -> dict[str, object] | None:
+    """Report and return a hazard that blocks this project.
+
+    With ``wait_for_live_owner``, a hazard owned by a run that still holds this
+    project's lock with a running pid is the in-progress run's own fence: the
+    caller waits on the lock and re-checks the hazard after acquiring it.
+    """
     hazard = read_unknown_completion_hazard(project_id)
     if hazard is None:
+        return None
+    if wait_for_live_owner and hazard["run_id"] in ProjectLock(
+        project_id, "", scope=None
+    ).live_holder_run_ids():
         return None
     reporter.event(
         "unknown_completion_hazard",
@@ -1533,7 +1560,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             )
 
     if not args.dry_run and _report_unknown_completion_hazard(
-        plan.project.project_id, reporter
+        plan.project.project_id, reporter,
+        wait_for_live_owner=getattr(args, "wait_lock", 0.0) > 0,
     ):
         return EXIT_INTERNAL
 
@@ -1750,13 +1778,34 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                 plan.project.project_id,
                 plan.target.name,
                 scope=plan.write_scope,
-                run_id=run_id if getattr(args, "durable", False) else None,
-            ).acquire()
+                run_id=run_id,
+                report=reporter.event,
+            ).acquire(wait_seconds=getattr(args, "wait_lock", 0.0))
         except LockError as exc:
             if reservation is not None:
                 transport.release_memory_guard(reservation, reserved_only=True)
             reporter.event("locked", message=str(exc))
             write_json(summary_path, {"run_id": run_id, "error": str(exc), "plan": plan.as_dict()})
+            return EXIT_INTERNAL
+        # The pre-planning hazard check is stale by now: a holder waited on (or one
+        # that finished while this run was planning) may have left its fence behind.
+        def _drop_lock() -> None:
+            lock.release()
+            if reservation is not None:
+                transport.release_memory_guard(reservation, reserved_only=True)
+
+        try:
+            hazard = _report_unknown_completion_hazard(plan.project.project_id, reporter)
+        except Exception:
+            _drop_lock()
+            raise
+        if hazard is not None:
+            _drop_lock()
+            write_json(summary_path, {
+                "run_id": run_id,
+                "error": _unknown_completion_guidance(hazard),
+                "plan": plan.as_dict(),
+            })
             return EXIT_INTERNAL
 
         t0 = time.monotonic()
@@ -4190,6 +4239,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
         scope=plan.write_scope,
         run_id=args.run_id,
         adopt_dead_run=True,
+        report=reporter.event,
     ).acquire()
     try:
         status = transport.durable_status(args.run_id, _durable_record_token(record))

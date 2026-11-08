@@ -23,7 +23,10 @@ from remrun.profile import (
     LOCAL_DEVICE, WORKLOAD_PROFILES_KEY, command_key, device_profile, load_profiles,
 )
 from remrun.resource_context import ReceiptValidation
-from remrun.state import ProjectLock
+import remrun.state as state_module
+from remrun.state import (
+    ProjectLock, clear_unknown_completion_hazard, write_unknown_completion_hazard,
+)
 from remrun.transport import ExecResult, LocalSimTransport, TransportError
 
 
@@ -891,6 +894,171 @@ def test_unknown_completion_hazard_blocks_clean_and_resolves_explicitly(
 
     assert main(["run", "LOCAL_SIM", "--", "python", "-c", "print('safe-next')"]) == EXIT_OK
     assert tracked.read_text() == "remote-after-unknown"
+
+
+def _foreign_lock(pid: int, run_id: str = "run-holder") -> ProjectLock:
+    """A project lock as another controller process on this host would leave it."""
+    holder = ProjectLock("proj1", "LOCAL_SIM", run_id=run_id).acquire()
+    info_path = holder.path / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["pid"] = pid
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    return holder
+
+
+def _holder_pid_is(monkeypatch, pid: int, alive: bool) -> None:
+    real = state_module.pid_liveness
+    monkeypatch.setattr(
+        state_module, "pid_liveness", lambda p: alive if p == pid else real(p)
+    )
+
+
+def test_run_reclaims_lock_left_by_dead_controller(env, monkeypatch, capsys):
+    holder = _foreign_lock(4242)
+    _holder_pid_is(monkeypatch, 4242, alive=False)
+
+    code = main(["run", "LOCAL_SIM", "--", "python", "-c", "open('ran.txt','w')"])
+
+    assert code == EXIT_OK
+    assert (env["proj"] / "ran.txt").exists()
+    err = capsys.readouterr().err
+    assert "stale_lock_reclaimed" in err
+    assert "run_id=run-holder" in err and "pid=4242" in err
+    assert not holder.path.exists()
+
+
+def test_run_refuses_lock_of_live_controller_without_wait(env, monkeypatch, capsys):
+    holder = _foreign_lock(4242)
+    _holder_pid_is(monkeypatch, 4242, alive=True)
+
+    code = main(["run", "LOCAL_SIM", "--", "python", "-c", "open('ran.txt','w')"])
+
+    assert code == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "ran.txt").exists()
+    err = capsys.readouterr().err
+    assert "already locked" in err and "holder pid 4242 is running" in err
+    assert "lock_wait" not in err
+    holder.release()
+
+
+def test_run_wait_lock_proceeds_after_live_holder_finishes(env, monkeypatch, capsys):
+    # The holder is mid-command: its own unknown-completion fence is recorded. With
+    # --wait-lock the new run waits for it instead of reporting a blocking hazard.
+    holder = _foreign_lock(4242)
+    write_unknown_completion_hazard("proj1", "LOCAL_SIM", "run-holder")
+    _holder_pid_is(monkeypatch, 4242, alive=True)
+
+    def finish():
+        clear_unknown_completion_hazard("proj1", "run-holder")
+        holder.release()
+
+    finisher = threading.Timer(0.3, finish)
+    finisher.start()
+    try:
+        code = main([
+            "run", "LOCAL_SIM", "--wait-lock", "30", "--",
+            "python", "-c", "open('ran.txt','w')",
+        ])
+    finally:
+        finisher.join()
+
+    assert code == EXIT_OK
+    assert (env["proj"] / "ran.txt").exists()
+    err = capsys.readouterr().err
+    assert err.count("remrun: lock_wait") == 1
+    assert "unknown_completion_hazard" not in err
+
+
+def test_run_wait_lock_refuses_hazard_left_by_finished_holder(env, monkeypatch, capsys):
+    # The holder released its lock but its command's completion is unknown: taking
+    # the project now could race a remote command that is still writing.
+    holder = _foreign_lock(4242)
+    write_unknown_completion_hazard("proj1", "LOCAL_SIM", "run-holder")
+    _holder_pid_is(monkeypatch, 4242, alive=True)
+    finisher = threading.Timer(0.3, holder.release)
+    finisher.start()
+    try:
+        code = main([
+            "run", "LOCAL_SIM", "--wait-lock", "30", "--",
+            "python", "-c", "open('ran.txt','w')",
+        ])
+    finally:
+        finisher.join()
+
+    assert code == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "ran.txt").exists()
+    err = capsys.readouterr().err
+    assert "remrun: lock_wait" in err
+    assert "unknown_completion_hazard" in err
+    assert not list((env["state"] / "locks").glob("**/*.lock"))
+
+
+def test_run_unreadable_hazard_after_wait_releases_the_lock(env, monkeypatch, capsys):
+    holder = _foreign_lock(4242)
+    _holder_pid_is(monkeypatch, 4242, alive=True)
+    hazard = state_module.unknown_completion_hazard_path("proj1")
+
+    def leave_torn_hazard():
+        hazard.parent.mkdir(parents=True, exist_ok=True)
+        hazard.write_text("{torn", encoding="utf-8")
+        holder.release()
+
+    finisher = threading.Timer(0.3, leave_torn_hazard)
+    finisher.start()
+    try:
+        code = main([
+            "run", "LOCAL_SIM", "--wait-lock", "30", "--",
+            "python", "-c", "open('ran.txt','w')",
+        ])
+    finally:
+        finisher.join()
+
+    assert code == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "ran.txt").exists()
+    assert "hazard is unreadable" in capsys.readouterr().err
+    assert not list((env["state"] / "locks").glob("**/*.lock"))
+    assert hazard.read_text(encoding="utf-8") == "{torn"
+
+
+def test_run_wait_lock_refuses_hazard_without_live_owner_at_once(env, monkeypatch, capsys):
+    write_unknown_completion_hazard("proj1", "LOCAL_SIM", "run-gone")
+    monkeypatch.setattr(
+        state_module.time, "sleep", lambda _s: pytest.fail("waited on a hazard")
+    )
+
+    code = main([
+        "run", "LOCAL_SIM", "--wait-lock", "30", "--", "python", "-c", "print(1)",
+    ])
+
+    assert code == EXIT_INTERNAL
+    err = capsys.readouterr().err
+    assert "unknown_completion_hazard" in err
+    assert "lock_wait" not in err
+
+
+def test_run_wait_lock_gives_up_after_timeout(env, monkeypatch, capsys):
+    holder = _foreign_lock(4242)
+    _holder_pid_is(monkeypatch, 4242, alive=True)
+
+    code = main([
+        "run", "LOCAL_SIM", "--wait-lock", "0.6", "--",
+        "python", "-c", "open('ran.txt','w')",
+    ])
+
+    assert code == EXIT_INTERNAL
+    assert not (env["remote_proj"] / "ran.txt").exists()
+    err = capsys.readouterr().err
+    assert err.count("remrun: lock_wait") == 1
+    assert "gave up after waiting 0.6s" in err
+    assert holder.path.is_dir()
+    holder.release()
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "soon"])
+def test_run_wait_lock_rejects_invalid_seconds(env, value, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["run", "LOCAL_SIM", "--wait-lock", value, "--", "true"])
+    assert exc.value.code == 2
 
 
 def test_controller_loss_during_dispatch_leaves_receipt_and_unknown_hazard(

@@ -14,6 +14,7 @@ import pytest
 
 import remrun.cli as cli
 import remrun._durable_runner as durable_runner
+import remrun.state as state_module
 from remrun.cli import EXIT_GUARD, EXIT_INFRA, EXIT_INTERNAL, EXIT_OK, main
 from remrun._durable_runner import TRUNCATION_MARKER, _BoundedWriter, _boot_marker
 from remrun.job_observation import JobObservation
@@ -939,7 +940,10 @@ def test_resume_lock_adopts_only_the_exact_dead_durable_run(
     original = ProjectLock(
         "project", "TARGET", state_root=tmp_path, run_id="run-a"
     ).acquire()
-    monkeypatch.setattr(ProjectLock, "_pid_is_alive", staticmethod(lambda _pid: False))
+    # Resume runs only while the durable run's completion fence stands; that fence
+    # keeps any other run from reclaiming the dead holder's lock.
+    state_module.write_unknown_completion_hazard("project", "TARGET", "run-a", tmp_path)
+    monkeypatch.setattr(state_module, "pid_liveness", lambda _pid: False)
 
     with pytest.raises(LockError):
         ProjectLock(

@@ -238,22 +238,50 @@ def _boot_marker() -> str:
     return "epoch:" + str(int(round(epoch / 10.0) * 10))
 
 
-def _pid_alive(pid: object) -> bool:
+def pid_liveness(pid: object) -> bool | None:
+    """Whether ``pid`` names a running process on this host.
+
+    ``True`` means a process with that pid exists, which includes an unrelated
+    process that reused the pid; ``False`` means the OS proved no such process is
+    running; ``None`` means neither could be proven (invalid pid or a failed probe).
+    Never sends a signal: on Windows ``os.kill(pid, 0)`` is CTRL_C_EVENT.
+    """
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
+        return None
     if os.name == "nt":
+        if pid > 0xFFFFFFFF:
+            return None
         try:
             import ctypes
             from ctypes import wintypes
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            handle = kernel32.OpenProcess(0x1000, False, wintypes.DWORD(pid))
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.GetExitCodeProcess.argtypes = (
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
+            )
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            # PROCESS_QUERY_LIMITED_INFORMATION
+            handle = kernel32.OpenProcess(0x1000, False, pid)
             if not handle:
-                return False
-            kernel32.CloseHandle(handle)
-            return True
+                error = ctypes.get_last_error()
+                if error == 87:  # ERROR_INVALID_PARAMETER: no process has this pid
+                    return False
+                if error == 5:  # ERROR_ACCESS_DENIED: it exists
+                    return True
+                return None
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                # An exited process can stay openable while handles remain. A real
+                # exit code of 259 reads as running, which fails closed.
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         except Exception:
-            return False
+            return None
     try:
         os.kill(pid, 0)
         return True
@@ -261,6 +289,12 @@ def _pid_alive(pid: object) -> bool:
         return False
     except PermissionError:
         return True
+    except (OSError, OverflowError):
+        return None
+
+
+def _pid_alive(pid: object) -> bool:
+    return pid_liveness(pid) is True
 
 
 def _validate_spec(spec: dict[str, Any], root: Path) -> dict[str, Any]:
