@@ -577,6 +577,65 @@ def test_retained_trees_are_pruned_after_the_failed_log_retention(commit_env):
     assert _work_dirs(env) == set() and _registry(env) == {}
 
 
+def test_pruning_removes_only_the_work_directory_a_record_names_for_its_own_id(
+    commit_env, capsys
+):
+    """A registry path is deleted recursively, so a record that names any directory
+    other than `<state_root>/work/<its id>` is refused and reported, never trusted;
+    so is a record whose id disagrees with its file name. Both stay for inspection."""
+    env = commit_env
+    victim = env["project"].parent.parent / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("precious", encoding="utf-8")
+    status, _ = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--",
+        *_py("raise SystemExit(3)"),
+    ])
+    assert status == 3
+    (record_path,) = (env["state"] / "commit-work").glob("*/*.json")
+    record = json.loads(record_path.read_text())
+    record.update(created_at="2000-01-01T00:00:00Z", path=str(victim))
+    record_path.write_text(json.dumps(record))
+    misnamed = record_path.with_name("0123456789.json")
+    misnamed.write_text(json.dumps(record))
+    capsys.readouterr()
+    assert main(["run", "LOCAL_SIM", "--json", "--transfer", "commit", "--output", "out/",
+                 "--", *_py("print(1)")]) == EXIT_OK
+    assert (victim / "keep.txt").read_text() == "precious"
+    events = _events(capsys)
+    refused = [e for e in events if e.get("event") == "work_remove_refused"]
+    assert [e["work_id"] for e in refused] == [record["work_id"]]
+    assert [e["path"] for e in events if e.get("event") == "work_record_unreadable"] == [
+        str(misnamed)
+    ]
+    assert record_path.exists() and misnamed.exists()
+
+
+def test_a_home_relative_state_root_is_resolved_before_a_removal(commit_env, monkeypatch):
+    """Resume and cleanup use a transport that has not probed, so a `~` state root is
+    resolved with one read-only probe before the path is checked. If it still cannot
+    be resolved, nothing is removed and the removal is left to retry."""
+    from remrun.isolated import remove_work
+
+    t = SSHPosixTransport(Device.from_mapping("POSIX", {
+        "kind": "ssh-posix", "os": "posix", "address_candidates": ["h"],
+        "project_root": "/p", "state_root": "~/st",
+    }))
+    removed: list[str] = []
+    monkeypatch.setattr(t, "remove_remote_tree", removed.append)
+    monkeypatch.setattr(t, "probe", lambda: None)  # unreachable: home stays unknown
+    path = "/srv/u/st/work/0123456789"
+    assert remove_work(t, "POSIX", "0123456789", path, lambda *a, **k: None) == "remove_failed"
+    assert removed == [] and _registry(commit_env)["0123456789"]["state"] == "remove_failed"
+
+    def probe() -> None:
+        t._remote_home = "/srv/u"
+
+    monkeypatch.setattr(t, "probe", probe)
+    assert remove_work(t, "POSIX", "0123456789", path, lambda *a, **k: None) == "removed"
+    assert removed == [path] and _registry(commit_env) == {}
+
+
 # --- seeding --------------------------------------------------------------------------
 
 
@@ -847,6 +906,39 @@ def test_durable_resume_retries_a_failed_tree_removal(commit_env, monkeypatch):
     assert main(["resume", run_id]) == EXIT_OK
     assert _summary(env["state"], run_id)["work"]["state"] == "removed"
     assert _work_dirs(env) == set() and _registry(env) == {}
+
+
+def test_resume_never_removes_a_work_path_its_summary_was_given(commit_env, monkeypatch):
+    """The retry takes the tree's path from the run's summary. A path there that is
+    not this target's `<state_root>/work/<id>` is refused, and nothing is deleted."""
+    env = commit_env
+    transports = _detached_commit_transport(monkeypatch)
+    _, run_id = _launch(env["state"], [
+        "run", "--durable", "TEST", "--transfer", "commit", "--output", "out/", "--",
+        *_py(_write("out/r.txt", "durable")),
+    ])
+    transports["TEST"].unreachable = False
+    transports["TEST"].finish(run_id)
+    real_remove = LocalSimTransport.remove_remote_tree
+
+    def broken(self, remote_path):  # noqa: ANN001
+        raise TransportError("injected removal failure")
+
+    monkeypatch.setattr(LocalSimTransport, "remove_remote_tree", broken)
+    assert main(["resume", run_id]) == EXIT_OK
+    monkeypatch.setattr(LocalSimTransport, "remove_remote_tree", real_remove)
+    victim = env["project"].parent.parent / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("precious", encoding="utf-8")
+    summary_path = env["state"] / "runs" / run_id / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["work"]["state"] == "remove_failed"
+    summary["work"]["path"] = str(victim)
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    assert main(["resume", run_id]) == EXIT_OK
+    assert (victim / "keep.txt").read_text() == "precious"
+    assert _summary(env["state"], run_id)["work"]["state"] == "remove_refused"
+    assert len(_work_dirs(env)) == 1
 
 
 def test_cancel_of_a_durable_commit_run_returns_outputs_and_keeps_its_tree(

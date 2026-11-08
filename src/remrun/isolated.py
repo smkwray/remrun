@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import subprocess
 import tempfile
@@ -57,6 +58,8 @@ _CACHE_REFS = "refs/remrun/runs/"
 _CACHE_REFS_KEPT = 16
 # Lists in summaries and events stay bounded; the count is always exact.
 _LISTED_PATHS = 200
+# The work ids work_paths allocates; nothing else is ever removed as a work tree.
+_WORK_ID = re.compile(r"[0-9a-f]{10}")
 
 
 class CommitSourceError(ValueError):
@@ -244,6 +247,24 @@ def _inside(child: str, parent: str, *, windows: bool) -> bool:
     return fold(a.parts[: len(b.parts)]) == fold(b.parts)
 
 
+def _state_root(transport: BaseTransport) -> str:
+    """The target's state root as an absolute native path; ``ValueError`` otherwise.
+
+    A ``~`` root needs the target's home, which a transport learns by probing; one that
+    has not probed yet (resume, cleanup) probes once, read-only.
+    """
+    device = transport.device
+    state_root = transport.expand_remote(device.state_root)
+    if state_root.startswith("~"):
+        transport.probe()
+        state_root = transport.expand_remote(device.state_root)
+    if not state_root or state_root.startswith("~") or not _target_path(
+        transport.target_is_windows, state_root
+    ).is_absolute():
+        raise ValueError(f"{device.name}: state_root did not resolve to an absolute path")
+    return state_root
+
+
 def work_paths(transport: BaseTransport, plan: RunPlan) -> CommitWork:
     """Allocate this attempt's private tree under the target's state root.
 
@@ -251,11 +272,7 @@ def work_paths(transport: BaseTransport, plan: RunPlan) -> CommitWork:
     root would put remrun's work tree in the synced tree, so it is refused.
     """
     windows = transport.target_is_windows
-    state_root = transport.expand_remote(plan.target.state_root)
-    if not state_root or state_root.startswith("~") or not _target_path(
-        windows, state_root
-    ).is_absolute():
-        raise ValueError(f"{plan.target.name}: state_root did not resolve to an absolute path")
+    state_root = _state_root(transport)
     project_root = transport.expand_remote(plan.target.project_root)
     if project_root and _inside(state_root, project_root, windows=windows):
         raise ValueError(
@@ -294,17 +311,32 @@ def record_work(
 
 
 def remove_work(
-    transport: BaseTransport, target: str, work_id: str, path: str,
+    transport: BaseTransport, target: str, work_id: object, path: object,
+    report: Callable[..., None], *, tree: object = None,
 ) -> str:
-    """Remove one work tree and its registry record; ``removed`` or ``remove_failed``.
+    """Remove one work tree and its registry record: ``removed``, ``remove_failed`` or
+    ``remove_refused``.
 
-    A failed removal keeps the record (state ``remove_failed``) so the next commit
-    launch on this target, or ``resume``, retries it.
+    Only ``<state_root>/work/<work_id>`` (with its ``tree``), for an id remrun
+    allocates, is ever removed: the path comes from a record or summary, and a wrong
+    one would be deleted recursively. Any other is refused, reported, and left with
+    its record untouched. A failed removal, or a state root that cannot be resolved
+    right now, keeps the record (state ``remove_failed``) so the next commit launch on
+    this target, or ``resume``, retries it.
     """
+    if not isinstance(work_id, str) or not _WORK_ID.fullmatch(work_id):
+        report("work_remove_refused", work_id=work_id, path=path,
+               reason="not a work id remrun allocates")
+        return "remove_refused"
     record_path = _registry_path(target, work_id)
     try:
-        transport.remove_remote_tree(path)
-    except (TransportError, NotImplementedError, OSError) as exc:
+        expected = transport.native_join(_state_root(transport), "work", work_id)
+        if path != expected or tree not in {None, transport.native_join(expected, "tree")}:
+            report("work_remove_refused", work_id=work_id, path=path, tree=tree,
+                   reason=f"not this target's work directory {expected} and its tree")
+            return "remove_refused"
+        transport.remove_remote_tree(expected)
+    except (ValueError, TransportError, NotImplementedError, OSError) as exc:
         record = read_json(record_path) or {"version": 1, "work_id": work_id, "path": path}
         record.update(state="remove_failed", reason=f"removal failed: {exc}",
                       updated_at=utc_now_iso())
@@ -339,7 +371,7 @@ def prune_work_trees(
         if not isinstance(record, dict) or not all(
             isinstance(record.get(key), str) and record[key]
             for key in ("path", "project_id", "run_id")
-        ):
+        ) or record.get("work_id") != path.stem:
             report("work_record_unreadable", path=str(path))
             continue
         if only_run is not None and record["run_id"] != only_run:
@@ -358,8 +390,7 @@ def prune_work_trees(
             if created > cutoff:
                 continue
         outcome = remove_work(
-            transport, plan.target.name, str(record.get("work_id") or path.stem),
-            record["path"],
+            transport, plan.target.name, record["work_id"], record["path"], report,
         )
         report("work_pruned", work_id=record.get("work_id"), run_id=record.get("run_id"),
                path=record["path"], previous_state=record.get("state"), outcome=outcome)
@@ -652,11 +683,13 @@ def remove_commit_work(
     """Remove a finalized clean tree (or retry a failed removal); else change nothing."""
     if work.get("state") not in {"pending_removal", "remove_failed"}:
         return work
-    state = remove_work(transport, target, str(work["id"]), str(work["path"]))
+    state = remove_work(
+        transport, target, work.get("id"), work.get("path"), report, tree=work.get("tree"),
+    )
     if state == "remove_failed":
         report("work_remove_failed", path=work["path"],
                note="retried by `remrun resume` and the next commit run on this target")
-    else:
+    elif state == "removed":
         report("work_removed", path=work["path"])
     return {**work, "state": state}
 
@@ -678,8 +711,11 @@ def discard_unstarted_work(
     transport: BaseTransport, plan: RunPlan, work: CommitWork, report: Callable[..., None],
 ) -> str:
     """Remove a tree whose command never started (a pre-dispatch refusal or failure)."""
-    outcome = remove_work(transport, plan.target.name, work.work_id, work.path)
-    report("work_removed" if outcome == "removed" else "work_remove_failed",
-           path=work.path, note="the command never started")
+    outcome = remove_work(
+        transport, plan.target.name, work.work_id, work.path, report, tree=work.tree,
+    )
+    if outcome != "remove_refused":
+        report("work_removed" if outcome == "removed" else "work_remove_failed",
+               path=work.path, note="the command never started")
     return outcome
 
