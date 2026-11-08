@@ -72,6 +72,12 @@ def should_exclude(rel_posix: str, patterns: Iterable[str]) -> bool:
     return False
 
 
+def path_within(rel: str, paths: Iterable[str]) -> bool:
+    """Whether project-relative file ``rel`` is one of ``paths`` or under one of its
+    directories (a path ending in ``/``)."""
+    return any(rel == path or (path.endswith("/") and rel.startswith(path)) for path in paths)
+
+
 def build_manifest(
     root: Path,
     exclude_patterns: Iterable[str],
@@ -79,6 +85,7 @@ def build_manifest(
     hash_below_bytes: int | None = None,
     always_hash: bool = False,
     include_paths: Iterable[str] = (),
+    within: Iterable[str] | None = None,
 ) -> Manifest:
     """Build a manifest for a local filesystem tree.
 
@@ -87,7 +94,11 @@ def build_manifest(
     ``always_hash=True`` hashes every included file regardless of ``hash_below_bytes``
     (design 11.1: commit-gate manifests must hash every file; the size cap may stay only
     as a planning/cache optimization). Default False preserves current behavior.
+
+    ``within`` limits the walk to those files and ``dir/`` prefixes (see
+    ``path_within``); directories that cannot hold one are never entered.
     """
+    scope = None if within is None else tuple(within)
     root = root.resolve()
     # A declared bootstrap lock input is an exact, opt-in exception to the
     # normal excludes (for example the global ``*.lock`` rule).  Keep this
@@ -123,6 +134,11 @@ def build_manifest(
             rel = f"{rel_dir}/{dirname}" if rel_dir else dirname
             if excluded(rel):
                 continue
+            if scope is not None and not any(
+                path.startswith(rel + "/") or path_within(rel + "/", [path])
+                for path in scope
+            ):
+                continue
             try:
                 if _is_directory_link(current / dirname):
                     continue
@@ -134,7 +150,7 @@ def build_manifest(
         for filename in filenames:
             path = current / filename
             rel = path.relative_to(root).as_posix()
-            if excluded(rel):
+            if excluded(rel) or (scope is not None and not path_within(rel, scope)):
                 continue
             try:
                 # A symlink would manifest content OUTSIDE the tree, and a later pull

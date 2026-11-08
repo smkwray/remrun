@@ -259,6 +259,14 @@ def _validate_unknown_completion_hazard(
         raise UnknownCompletionHazardError(
             f"per-run completion fence at {path} names run {data['run_id']!r}, not {run_id!r}"
         )
+    outputs = data.get("outputs", [])
+    if not isinstance(outputs, list) or not all(
+        isinstance(item, str) and item for item in outputs
+    ):
+        raise UnknownCompletionHazardError(
+            f"unknown-completion hazard is malformed at {path}: "
+            "outputs must be a list of paths"
+        )
     return data
 
 
@@ -296,12 +304,14 @@ def write_unknown_completion_hazard(
     *,
     created_at: str | None = None,
     per_run: bool = False,
+    outputs: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Atomically record unknown command completion for a project.
 
     Repeating the same project/target/run write is idempotent. A different existing
     hazard, or malformed existing bytes, fails closed and is never overwritten.
     ``per_run`` writes the run's own fence, which does not block other runs.
+    ``outputs`` (per-run only) makes the fence a commit run's lease on those paths.
     """
     for field_name, value in (
         ("project_id", project_id),
@@ -332,6 +342,10 @@ def write_unknown_completion_hazard(
         "created_at": created_at or utc_now_iso(),
         "completion_state": "unknown",
     }
+    if outputs is not None:
+        if not per_run:
+            raise ValueError("only a per-run fence can lease outputs")
+        record["outputs"] = list(outputs)
     write_json(
         unknown_completion_hazard_path(project_id, state_root, run_id=fence_run), record
     )

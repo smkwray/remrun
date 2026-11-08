@@ -9,7 +9,8 @@ from typing import Callable
 
 from .config import case_insensitive, casefold_collisions, current_os_key, device_os_key
 from .manifest import (
-    FileEntry, Manifest, ManifestError, build_manifest, sha256_file, should_exclude,
+    FileEntry, Manifest, ManifestError, build_manifest, path_within, sha256_file,
+    should_exclude,
 )
 from .transfer_plan import (
     ABORT_CONFLICT,
@@ -189,6 +190,9 @@ class PullbackResult:
     # None means at least one command-attributed path was not positively
     # reconciled, so the prior baseline must remain untouched.
     next_baseline: NextBaseline | None = None
+    # With ``within``: command-changed or deleted paths outside it. They are neither
+    # pulled nor conflicts; they stay on the remote side for the caller to judge.
+    outside: list[str] = field(default_factory=list)
 
 
 def _fresh_local_entry(path: Path, *, hash_if_size: int | None) -> FileEntry | None:
@@ -225,6 +229,7 @@ def _build_local_manifest(
     *,
     hash_below_bytes: int | None,
     include_paths: list[str] | tuple[str, ...] = (),
+    within: list[str] | tuple[str, ...] | None = None,
 ) -> Manifest:
     """Map trustworthy-snapshot failures onto the run transfer-error seam."""
     try:
@@ -233,6 +238,7 @@ def _build_local_manifest(
             excludes,
             hash_below_bytes=hash_below_bytes,
             include_paths=include_paths,
+            within=within,
         )
     except ManifestError as exc:
         raise TransportError(str(exc)) from exc
@@ -720,6 +726,7 @@ def postrun_pullback(
     backup_below_bytes: int = 0,
     write_scope_paths: list[str] | tuple[str, ...] | None = None,
     include_paths: list[str] | tuple[str, ...] = (),
+    within: list[str] | tuple[str, ...] | None = None,
 ) -> PullbackResult:
     """Pull command-caused remote changes back to local project paths.
 
@@ -728,6 +735,10 @@ def postrun_pullback(
     project tree and the path is flagged as a conflict. Command-caused remote
     deletions are mirrored locally (with backup) only when the local copy is
     unchanged.
+
+    ``within`` (files and ``dir/`` prefixes) limits both the pullback and the local
+    walk to those paths; every other command-caused change is listed in
+    ``outside`` and left on the remote side.
     """
     result = PullbackResult()
 
@@ -735,11 +746,18 @@ def postrun_pullback(
         transport, remote_root, excludes, hash_below_bytes, include_paths
     )
     changed, deleted = diff_remote_changes(pre_remote_manifest, post_remote)
+    if within is not None:
+        result.outside = [
+            rel for rel in [*changed, *deleted] if not path_within(rel, within)
+        ]
+        changed = [rel for rel in changed if path_within(rel, within)]
+        deleted = [rel for rel in deleted if path_within(rel, within)]
     cur_local = _build_local_manifest(
         local_root,
         excludes,
         hash_below_bytes=hash_below_bytes or None,
         include_paths=include_paths,
+        within=within,
     )
     # Baseline advancement is path-attributed, not a whole-tree snapshot. An
     # unrelated local writer may create, edit, or delete a path while the remote
@@ -875,6 +893,7 @@ def postrun_pullback(
         excludes,
         hash_below_bytes=hash_below_bytes or None,
         include_paths=include_paths,
+        within=within,
     )
     if not result.conflicts:
         result.next_baseline = NextBaseline(

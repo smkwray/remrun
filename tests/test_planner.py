@@ -166,11 +166,11 @@ def test_transfer_mode_is_one_validated_value_set(monkeypatch, tmp_path: Path) -
     assert plan("none").transfer_mode == "none"
     assert plan("none", transfer_mode="safe").transfer_mode == "safe"
     assert plan(transfer_mode="none").as_dict()["verify"] == []
-    for bad in ("commit", "", "SAFE", 1, None):
+    for bad in ("isolated", "", "SAFE", 1, None):
         with pytest.raises(ValueError, match=r"\[transfer\] mode"):
             plan(bad)
     with pytest.raises(ValueError, match="--transfer"):
-        plan(transfer_mode="commit")
+        plan(transfer_mode="isolated")
 
     checked = plan(transfer_mode="none", verify=["src/model.py", "src\\model.py", "data.csv"])
     assert checked.verify == ("src/model.py", "data.csv")
@@ -182,3 +182,42 @@ def test_transfer_mode_is_one_validated_value_set(monkeypatch, tmp_path: Path) -
         plan(verify=["src/model.py"])
     with pytest.raises(ValueError, match="--scope"):
         plan(transfer_mode="none", scope_name="outputs")
+
+
+def test_commit_paths_are_normalized_prefixes_and_overlap_by_prefix(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Output leases are compared by prefix, so every path must be root-anchored,
+    normalized and glob-free; a trailing / is the only way to name a directory."""
+    from remrun.planner import paths_overlap
+
+    _patch_planning_dependencies(monkeypatch, tmp_path, {})
+    monkeypatch.setattr(
+        "remrun.planner.order_devices",
+        lambda devices, target_name, **kwargs: [devices["BOX"]],
+    )
+
+    def plan(**kwargs):
+        return make_run_plan(
+            cwd=tmp_path, config=_config(tmp_path), target_name="BOX", command=["true"],
+            transfer_mode="commit", **kwargs,
+        )
+
+    made = plan(outputs=["out/", "out\\", "res/a.csv"], inputs=["data/in.csv"])
+    assert made.outputs == ("out/", "res/a.csv") and made.inputs == ("data/in.csv",)
+    assert made.as_dict()["outputs"] == ["out/", "res/a.csv"]
+    assert made.as_dict()["inputs"] == ["data/in.csv"]
+    with pytest.raises(ValueError, match="at least one --output"):
+        plan()
+    for bad in ("../x", "/abs", "out/*.csv", "./out/", "C:x", "", "/"):
+        with pytest.raises(ValueError, match="--output"):
+            plan(outputs=[bad])
+    with pytest.raises(ValueError, match="--input"):
+        plan(outputs=["out/"], inputs=["data/"])
+    with pytest.raises(ValueError, match="only to --transfer commit"):
+        make_run_plan(cwd=tmp_path, config=_config(tmp_path), target_name="BOX",
+                      command=["true"], outputs=["out/"])
+    assert paths_overlap("out/", "out/a.txt") and paths_overlap("out/a/", "out/")
+    assert paths_overlap("out", "out/") and paths_overlap("a.txt", "a.txt")
+    assert not paths_overlap("out/", "output/") and not paths_overlap("out/a", "out/ab")
+

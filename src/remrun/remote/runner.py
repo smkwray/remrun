@@ -3849,6 +3849,28 @@ def rpc_main(state_root: str) -> int:
     return 0
 
 
+def work_probe(path):
+    """Disk space where a commit run's private tree would go, and the git it would use.
+
+    ``path`` need not exist yet: the filesystem is the one holding its nearest existing
+    parent. Reads only; a failure raises, so the caller refuses rather than guesses.
+    """
+    probe = os.path.abspath(path)
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    usage = shutil.disk_usage(probe)
+    return {
+        "path": probe,
+        "exists": os.path.exists(path),
+        "free_bytes": usage.free,
+        "total_bytes": usage.total,
+        "git": shutil.which("git"),
+    }
+
+
 def legacy_main(argv) -> int:
     if len(argv) < 2:
         sys.stderr.write("remrun-runner: missing request\n")
@@ -3865,6 +3887,9 @@ def legacy_main(argv) -> int:
         return 0
     if operation == "hash_file":
         sys.stdout.write(json.dumps({"sha256": sha256_file(request["path"])}))
+        return 0
+    if operation == "work_probe":
+        sys.stdout.write(json.dumps(work_probe(request["path"])))
         return 0
     if operation == "probe":
         sqlite_ok = True

@@ -209,6 +209,13 @@ class RunPlan:
     # Project-relative files whose target copy must hash-equal the local one before an
     # untransferred (``transfer_mode == "none"``) run dispatches.
     verify: tuple[str, ...] = ()
+    # ``transfer_mode == "commit"``: the declared outputs (files, or ``dir/`` prefixes)
+    # that return to the project, and the working-tree files copied over the commit.
+    outputs: tuple[str, ...] = ()
+    inputs: tuple[str, ...] = ()
+    # The global excludes alone; a commit run's private tree is manifested with these so
+    # outputs under project excludes stay visible. Already part of ``excludes``.
+    tree_excludes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         result = {
@@ -239,6 +246,9 @@ class RunPlan:
         # Only untransferred plans carry it, so a saved ordinary plan rebuilds exactly.
         if self.transfer_mode == "none":
             result["verify"] = list(self.verify)
+        if self.transfer_mode == "commit":
+            result["outputs"] = list(self.outputs)
+            result["inputs"] = list(self.inputs)
         if self.workload is not None:
             result["workload"] = self.workload.as_dict()
         if self.bootstrap is not None:

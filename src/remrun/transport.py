@@ -82,6 +82,31 @@ def _runner_source() -> bytes:
     return _RUNNER_SOURCE.encode("utf-8")
 
 
+def _runner_request(request: dict[str, Any]) -> str:
+    """A legacy runner request as one shell-safe base64 argv."""
+    return base64.b64encode(json.dumps(request).encode("utf-8")).decode("ascii")
+
+
+def _work_probe_result(proc: subprocess.CompletedProcess) -> dict[str, Any]:
+    """Parse the runner's ``work_probe`` answer; anything incomplete raises."""
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or f"exit {proc.returncode}"
+        raise TransportError(f"target work probe failed: {detail}")
+    try:
+        data = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise TransportError(f"target work probe returned invalid JSON: {exc}") from exc
+    if not isinstance(data, dict) or not all(
+        isinstance(data.get(key), int) and not isinstance(data.get(key), bool)
+        and data[key] >= 0
+        for key in ("free_bytes", "total_bytes")
+    ) or data["total_bytes"] == 0 or not isinstance(data.get("exists"), bool) or not (
+        data.get("git") is None or isinstance(data["git"], str)
+    ):
+        raise TransportError("target work probe returned no usable disk measurement")
+    return data
+
+
 @dataclass(frozen=True)
 class ExecResult:
     exit_code: int
@@ -1904,6 +1929,12 @@ class BaseTransport:
         idempotent skip-if-identical works for >64 MB outputs too)."""
         raise NotImplementedError
 
+    def work_probe(self, remote_path: str) -> dict[str, Any]:
+        """Whether ``remote_path`` exists, free/total bytes of the filesystem that holds
+        or would hold it, and the git executable the target resolves (``None`` when
+        absent). Read-only."""
+        raise NotImplementedError
+
     # --- diagnostics ------------------------------------------------------
     def probe(self) -> ProbeResult:
         raise NotImplementedError
@@ -2401,6 +2432,15 @@ class LocalSimTransport(BaseTransport):
 
     def hash_file(self, remote_path: str) -> str:
         return sha256_file(Path(remote_path))
+
+    def work_probe(self, remote_path: str) -> dict[str, Any]:
+        # The same runner op the SSH backends pipe to the target's python.
+        proc = subprocess.run(
+            [sys.executable, "-", _runner_request({"op": "work_probe", "path": remote_path})],
+            input=_runner_source(), capture_output=True, check=False,
+            creationflags=_NO_WINDOW,
+        )
+        return _work_probe_result(proc)
 
     def probe(self) -> ProbeResult:
         return ProbeResult(reachable=True, address="localhost", detail="local-sim", remote_os="posix")
@@ -4537,6 +4577,12 @@ class SSHPosixTransport(_SSHCommon):
                                  f"{proc.stderr.decode('utf-8', 'replace')}")
         return json.loads(proc.stdout.decode("utf-8", "replace") or "{}").get("sha256", "")
 
+    def work_probe(self, remote_path: str) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        request = _runner_request({"op": "work_probe", "path": remote_path})
+        script = f"{shlex.quote(self.device.remote_python)} - {request}"
+        return _work_probe_result(self._remote(address, script, input_bytes=_runner_source()))
+
 
 class SSHPowerShellTransport(_SSHCommon):
     """Windows backend over OpenSSH + PowerShell.
@@ -5757,6 +5803,13 @@ class SSHPowerShellTransport(_SSHCommon):
             raise TransportError(f"hash {remote_path} failed: "
                                  f"{proc.stderr.decode('utf-8', 'replace')}")
         return json.loads(proc.stdout.decode("utf-8", "replace") or "{}").get("sha256", "")
+
+    def work_probe(self, remote_path: str) -> dict[str, Any]:
+        address = self._address_or_resolve()
+        # The base64 request is a bare argv that survives a pwsh or cmd default shell.
+        request = _runner_request({"op": "work_probe", "path": remote_path})
+        script = f"{self.device.remote_python} - {request}"
+        return _work_probe_result(self._remote(address, script, input_bytes=_runner_source()))
 
 
 def make_transport(device: Device) -> BaseTransport:

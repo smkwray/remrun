@@ -314,6 +314,20 @@ def hash_below_bytes(config: RemrunConfig) -> int:
         return 0
 
 
+def work_min_free_fraction(config: RemrunConfig) -> float:
+    """``[transfer] work_min_free_fraction``: the disk floor a commit run must leave.
+
+    Required: a missing or malformed value raises rather than becoming a floor.
+    """
+    value = config.defaults.get("transfer", {}).get("work_min_free_fraction")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
+        raise ValueError(
+            "[transfer] work_min_free_fraction must be a number from 0 up to (not "
+            f"including) 1; got {value!r}"
+        )
+    return float(value)
+
+
 def large_file_warn_bytes(config: RemrunConfig) -> int:
     transfer = config.defaults.get("transfer", {})
     mb = transfer.get("large_file_warn_above_mb", 0)

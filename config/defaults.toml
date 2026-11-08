@@ -4,7 +4,13 @@
 # Default transfer mode for `run` and `plan`; `--transfer` overrides it per run.
 # "safe": reconcile the project tree before the command and pull outputs back after.
 # "none": run in the target's existing checkout; transfer nothing, outputs stay there.
+# "commit": run a clean HEAD in a private tree under the target's state root and pull
+#   back only the --output paths.
 mode = "safe"
+# --transfer commit refuses a target, before writing anything there, unless the disk
+# holding its state root keeps at least this fraction of its size free after the
+# private tree, its --input files and the git bundle are added.
+work_min_free_fraction = 0.15
 # Do not use .gitignore as the default remrun ignore list. Many generated project
 # outputs are gitignored but still important and synced.
 global_exclude = [

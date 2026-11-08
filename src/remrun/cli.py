@@ -27,7 +27,19 @@ from .config import (
     load_config, load_project_config, load_retention, offload_policy, offload_threshold,
     scheduler_config,
 )
-from .gitsync import HOOK_BEGIN
+from .gitsync import HOOK_BEGIN, GitSyncError
+from .isolated import (
+    CandidateRefusal,
+    CommitSourceError,
+    CommitWork,
+    commit_source,
+    discard_unstarted_work,
+    finalize_commit_outputs,
+    lease_conflicts,
+    remove_commit_work,
+    seed_commit_tree,
+    work_paths,
+)
 from .job_observation import (
     JobObservation, controller_label, job_observation_enabled, local_device,
     local_registry_root, observed_job_id, observed_project_id,
@@ -268,12 +280,24 @@ def _add_transfer_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--transfer", choices=TRANSFER_MODES,
         help="safe: reconcile the project tree before and after the command; none: run in "
-             "the target's existing checkout and transfer nothing (default: [transfer] mode)",
+             "the target's existing checkout and transfer nothing; commit: run a clean "
+             "HEAD in a private tree on the target and return only --output paths "
+             "(default: [transfer] mode)",
     )
     p.add_argument(
         "--verify", action="append", default=[], metavar="PATH",
         help="with --transfer none, refuse to run unless the target's copy of this "
              "project-relative file has the same SHA-256 as the local one (repeatable)",
+    )
+    p.add_argument(
+        "--output", action="append", default=[], metavar="PATH",
+        help="with --transfer commit, a project-relative file, or directory written dir/, "
+             "that the command produces and remrun pulls back (repeatable, required)",
+    )
+    p.add_argument(
+        "--input", action="append", default=[], metavar="PATH",
+        help="with --transfer commit, a working-tree file copied over the commit before "
+             "the command runs, recorded with its SHA-256 (repeatable)",
     )
 
 
@@ -877,14 +901,17 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         requested_workload=args.workload,
         transfer_mode=args.transfer,
         verify=args.verify,
+        outputs=args.output,
+        inputs=args.input,
     )
     candidates = None
     target_reason = None
     presence = None
-    untransferred = plan.transfer_mode == "none"
+    untransferred = plan.transfer_mode != "safe"
     # Measuring the push needs the target's manifest, a round-trip, so only with --probe.
     push: dict = (
-        {"status": "not_applicable", "detail": "--transfer none pushes nothing"}
+        {"status": "not_applicable",
+         "detail": f"--transfer {plan.transfer_mode} reconciles no project tree"}
         if untransferred else
         {"status": "not_measured", "max_files": plan.max_push_files,
          "max_bytes": plan.max_push_bytes, "hint": "add --probe to measure it"}
@@ -951,8 +978,7 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
             reporter.event("target", name=plan.target.name, kind=plan.target.kind,
                            reason=target_reason)
         reporter.event("command", argv=plan.command)
-        reporter.event("transfer_mode", mode=plan.transfer_mode,
-                       **({"verify": list(plan.verify)} if untransferred else {}))
+        reporter.event("transfer_mode", mode=plan.transfer_mode, **_mode_paths(plan))
         reporter.event("write_scope", name=plan.write_scope or "project",
                        paths=plan.write_scope_paths)
         if plan.workload is not None:
@@ -1207,11 +1233,22 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
     return [(device, transport, probe, reason), *rest]
 
 
+def _mode_paths(plan: RunPlan) -> dict[str, list[str]]:
+    """The per-mode path lists a plan carries, for events."""
+    if plan.transfer_mode == "none":
+        return {"verify": list(plan.verify)}
+    if plan.transfer_mode == "commit":
+        return {"outputs": list(plan.outputs), "inputs": list(plan.inputs)}
+    return {}
+
+
 def _unknown_completion_guidance(hazard: dict[str, object], *, per_run: bool = False) -> str:
     run_id = str(hazard["run_id"])
     if per_run:
         # An untransferred run fences only itself; nothing was pushed and nothing will be
-        # pulled back, so finalizing it changes no project files.
+        # pulled back, so finalizing it changes no project files. A commit run's fence
+        # also leases its declared outputs, which resume pulls back.
+        outputs = hazard.get("outputs")
         first = (
             f"run `remrun resume {run_id}` from this project: it reattaches, waits and "
             "finalizes. Only if resume reports the target's durable state is missing or "
@@ -1219,11 +1256,16 @@ def _unknown_completion_guidance(hazard: dict[str, object], *, per_run: bool = F
             if _durable_record_path(run_dir(run_id)).is_file()
             else "use"
         )
+        kind, blocks = (
+            ("commit run", f"holds its --output lease ({', '.join(map(str, outputs))}) "
+                           "but blocks no other run of this project")
+            if isinstance(outputs, list) else
+            ("untransferred run", "blocks only that run, not other runs of this project")
+        )
         return (
-            f"completion of untransferred run {run_id} is not confirmed; its fence blocks "
-            f"only that run, not other runs of this project. To clear it, {first} a "
-            "read-only process/artifact probe to prove the command ended, then run "
-            f"`remrun resolve-unknown {run_id} --confirmed-ended`"
+            f"completion of {kind} {run_id} is not confirmed; its fence {blocks}. To "
+            f"clear it, {first} a read-only process/artifact probe to prove the command "
+            f"ended, then run `remrun resolve-unknown {run_id} --confirmed-ended`"
         )
     if _durable_record_path(run_dir(run_id)).is_file():
         # A durable run's target supervisor may still own the job and its result.
@@ -1335,11 +1377,13 @@ def _refuse_candidate(
     phase: str,
     conflicts: list[dict[str, str]],
     verified: list[dict[str, str]],
+    retryable: bool = True,
 ) -> NoReturn:
     """Record why a run cannot start on this candidate, then skip it.
 
     Nothing was written to either tree and no fence exists yet, so ``--auto`` may try
-    the next candidate.
+    the next candidate, unless ``retryable`` is false (the refusal holds on every
+    target).
     """
     cdir = conflict_dir(run_id)
     write_json(cdir / "conflicts.json", {
@@ -1374,7 +1418,7 @@ def _refuse_candidate(
         exit_code=EXIT_CONFLICT,
         conflict_dir=cdir,
         detail=f"{len(conflicts)} refused path(s); first: {first['path']} ({first['state']})",
-        retryable=True,
+        retryable=retryable,
     )
 
 
@@ -1400,9 +1444,32 @@ def _publish_completion_fence(
     which follows the lock read, sees it.
     """
     project_id = plan.project.project_id
-    if plan.transfer_mode != "none":
+    if plan.transfer_mode == "safe":
         return write_unknown_completion_hazard(project_id, plan.target.name, run_id)
     table = ProjectLock(project_id, plan.target.name)
+    if plan.transfer_mode == "commit":
+        # A commit run never touches the target's checkout, so an ordinary run working
+        # there is no obstacle. Its fence is its lease on the declared outputs: checked
+        # against every other live commit run of the project and taken in one step under
+        # the guard. An overlap holds on every target, so it is not candidate-local.
+        with table.guarded():
+            leased = lease_conflicts(project_id, plan.outputs)
+            if not leased and read_unknown_completion_hazard(project_id) is None:
+                return write_unknown_completion_hazard(
+                    project_id, plan.target.name, run_id, per_run=True,
+                    outputs=plan.outputs,
+                )
+        if leased:
+            _refuse_candidate(
+                reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+                started_at=started_at, phase="dispatch", verified=verified,
+                conflicts=leased, retryable=False,
+            )
+        hazard = _report_unknown_completion_hazard(project_id, reporter)
+        raise UnknownCompletionHazardError(
+            _unknown_completion_guidance(hazard) if hazard is not None
+            else "an ordinary run's completion fence changed while this run was starting"
+        )
     with table.guarded():
         busy = table.busy_on_target()
         if not busy and read_unknown_completion_hazard(project_id) is None:
@@ -1811,10 +1878,15 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         allow_default_workload=not getattr(args, "suppress_default_workload", False),
         transfer_mode=getattr(args, "transfer", None),
         verify=getattr(args, "verify", None) or (),
+        outputs=getattr(args, "output", None) or (),
+        inputs=getattr(args, "input", None) or (),
     )
-    # An untransferred run moves no files, so it takes no project lock and fences only
-    # itself; it still refuses while an ordinary run's project-wide fence stands.
-    untransferred = plan.transfer_mode == "none"
+    # An untransferred or commit run never reconciles the target's checkout, so it takes
+    # no project lock and fences only itself (a commit run's fence also leases its
+    # outputs); it still refuses while an ordinary run's project-wide fence stands.
+    untransferred = plan.transfer_mode != "safe"
+    if plan.transfer_mode == "commit" and getattr(args, "no_pullback", False):
+        raise ValueError("--transfer commit returns its outputs by pullback; drop --no-pullback")
 
     if getattr(args, "durable", False):
         if (
@@ -1850,6 +1922,24 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         return EXIT_OK
 
     verify_digests = _local_verify_digests(plan)
+    source = None
+    if plan.transfer_mode == "commit":
+        # Both refusals hold on every target, so they come before any is chosen.
+        try:
+            source = commit_source(plan)
+        except CommitSourceError as exc:
+            for path in exc.paths[:200]:
+                reporter.event("conflict", path=path, state="source-dirty",
+                               reason="tracked file differs from HEAD")
+            reporter.event("source_refused", message=str(exc), paths=len(exc.paths))
+            return EXIT_CONFLICT
+        leased = lease_conflicts(plan.project.project_id, plan.outputs)
+        for item in leased:
+            reporter.event("conflict", **item)
+        if leased:
+            reporter.event("action", value="not running command")
+            return EXIT_CONFLICT
+        reporter.event("source", commit=source.commit, inputs=list(source.inputs))
     sched = scheduler_config(config)
     # When explicitly enabled, placement overlays the project's PORTABLE job costs so
     # --auto can use prior measurements from another controller.
@@ -1955,6 +2045,18 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             "terminal": False,
             "plan": plan.as_dict(),
         })
+        # A commit run's command runs in a private tree under the target's state root.
+        work: CommitWork | None = None
+        if source is not None:
+            try:
+                work = work_paths(transport, plan)
+            except ValueError as exc:
+                write_json(summary_path, {
+                    "run_id": run_id, "error": str(exc), "phase": "preflight",
+                    "completion_state": "not_started", "command_started": False,
+                    "terminal": True, "plan": plan.as_dict(),
+                })
+                raise
 
         resource_policy: ResourcePolicy | None = None
         if plan.workload is not None:
@@ -2040,7 +2142,10 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                 return EXIT_GUARD
             reservation = admission.reservation
 
-        remote_root = transport.remote_project_path(plan.project)
+        if work is not None:
+            remote_root = work.tree
+        else:
+            remote_root = transport.remote_project_path(plan.project)
         remote_cwd = transport.remote_join(remote_root, plan.project.relative_cwd)
         reporter.event("remote_cwd", path=remote_cwd)
 
@@ -2095,7 +2200,7 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
                                memory_limit_mib=memory_limit_mib,
                                predicted_rss_mb=(prediction.get("rss_mb") if prediction else None),
                                memory_reservation_ref=reservation_ref,
-                               verify_digests=verify_digests)
+                               verify_digests=verify_digests, work=work, source=source)
         except _PreflightConflict as exc:
             last_conflict_exit = exc.exit_code
             # A non-retryable conflict (e.g. local-vanished) is global: stop the whole run.
@@ -2138,6 +2243,8 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
             write_json(summary_path, checkpoint)
             raise
         finally:
+            if work is not None and work.seeded and not work.dispatched:
+                discard_unstarted_work(transport, plan, work, reporter.event)
             if lock is not None:
                 lock.release()
             current_reservation = reservation_ref["value"]
@@ -2176,11 +2283,18 @@ def _run_locked(
     predicted_rss_mb: object = None,
     memory_reservation_ref: dict[str, MemoryReservation | None] | None = None,
     verify_digests: dict[str, str] | None = None,
+    work: CommitWork | None = None,
+    source=None,  # noqa: ANN001 - isolated.CommitSource for a commit run
 ) -> int:
     local_root = plan.project.local_project_root
     # An untransferred run neither reconciles, nor reads or writes a baseline, nor pulls
     # back: the command runs on whatever the target's checkout holds.
     untransferred = plan.transfer_mode == "none"
+    # A commit run neither reconciles nor writes a baseline: it seeds a private tree
+    # from git and pulls back only its declared outputs.
+    commit = work is not None
+    # Bootstrap readiness is a property of the target's own checkout and environment.
+    checkout_root = transport.remote_project_path(plan.project) if commit else remote_root
     backup_root = conflict_dir(run_id) / "backup"
 
     if plan.bootstrap is not None and plan.bootstrap.status == "unsupported":
@@ -2309,8 +2423,11 @@ def _run_locked(
             )
         for item in verified:
             reporter.event("verify", path=item["path"], sha256=item["sha256"], status="match")
-    # Untransferred summaries carry what --verify proved about the code that ran.
-    verify_fields = {"verify": verified} if untransferred else {}
+    # Untransferred summaries carry what --verify proved about the code that ran; commit
+    # summaries carry the commit, the --input receipts and the private tree.
+    verify_fields: dict[str, object] = {"verify": verified} if untransferred else {}
+    if commit:
+        verify_fields = {"source": source.as_dict(), "work": work.as_dict()}
 
     # Preserve the ordinary path's pre-mutation rejection boundary.  Only a
     # declared bootstrap may defer validation, because it can install the
@@ -2337,6 +2454,32 @@ def _run_locked(
             "transfer_skipped", mode=plan.transfer_mode,
             note="no reconcile, baseline or pullback; outputs stay on the target",
         )
+    elif commit:
+        try:
+            seed_commit_tree(
+                transport=transport, plan=plan, config=load_config(), policy=policy,
+                run_id=run_id, rdir=rdir, work=work, source=source, remote_cwd=remote_cwd,
+                report=reporter.event,
+            )
+        except CandidateRefusal as exc:
+            _refuse_candidate(
+                reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+                started_at=started_at, phase="seed", verified=[],
+                conflicts=[{"path": ".", "state": exc.state, "reason": exc.reason}],
+            )
+        except (TransportError, GitSyncError, CommitSourceError, OSError) as exc:
+            reporter.event("transfer_error", phase="seed", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id, "project_id": plan.project.project_id,
+                "target": plan.target.name, "command": plan.command,
+                "started_at": started_at, "ended_at": utc_now_iso(), "error": str(exc),
+                "phase": "seed", "completion_state": "not_started",
+                "command_started": False, "terminal": True, **verify_fields,
+                "plan": plan.as_dict(),
+            })
+            return EXIT_TRANSFER
+        reporter.event("work_seeded", path=work.tree, commit=source.commit,
+                       inputs=len(source.inputs))
     else:
         # Untransferred runs work in this target's checkout without the project lock.
         # Reconciling that tree under them could change files they are reading and pull
@@ -2345,10 +2488,15 @@ def _run_locked(
         # run publishes its fence under that lock table's guard only when no live
         # holder is on its target (_publish_completion_fence). Whichever of the two
         # goes first, the other sees it.
+        # A commit run's fence (it has outputs) names a private tree, not this checkout,
+        # so it is no obstacle here. Nor does its lease need a guard in this run: a
+        # leased output this run changes locally makes the commit run's pullback save
+        # its copy as a conflict, and a commit-run pullback landing while this run works
+        # is a local change this run's own pullback treats the same way (invariant 6).
         busy = [
             fence["run_id"]
             for fence in per_run_completion_fences(plan.project.project_id)
-            if fence["target"] == plan.target.name
+            if fence["target"] == plan.target.name and "outputs" not in fence
         ]
         if busy:
             _refuse_candidate(
@@ -2507,7 +2655,7 @@ def _run_locked(
                 device=plan.target,
                 project=plan.project,
                 plan=plan.bootstrap,
-                remote_root=remote_root,
+                remote_root=checkout_root,
                 runenv=runenv,
             )
         except (OSError, TransportError, ValueError) as exc:
@@ -2526,9 +2674,11 @@ def _run_locked(
                 "bootstrap": target_bootstrap.as_dict(), "plan": plan.as_dict(),
             })
             return EXIT_INTERNAL
-        elif untransferred and target_bootstrap.status != "ready":
+        elif (untransferred or commit) and target_bootstrap.status != "ready":
             # Setup mutates an environment other in-flight runs may import from, and an
-            # untransferred run has not pushed the lock inputs it would build from.
+            # untransferred or commit run has not pushed the lock inputs it would build
+            # from. (A commit run's lock inputs are its clean HEAD's, which are the
+            # controller's working-tree bytes the environment's receipt is keyed to.)
             _refuse_candidate(
                 reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
                 started_at=started_at, phase="bootstrap", verified=verified,
@@ -2538,7 +2688,8 @@ def _run_locked(
                     "reason": (
                         f"the target's declared environment is not ready "
                         f"({target_bootstrap.detail or target_bootstrap.status}); "
-                        "--transfer none never runs setup, so run one ordinary run first"
+                        f"--transfer {plan.transfer_mode} never runs setup, so run one "
+                        "ordinary run first"
                     ),
                 }],
             )
@@ -2664,7 +2815,7 @@ def _run_locked(
             policy=policy, telemetry_default=telemetry_default, pre=pre,
             backup_root=backup_root, memory_reservation=memory_reservation,
             bootstrap_result=bootstrap_result, command=dispatch_command,
-            verify_fields=verify_fields,
+            verify_fields=verify_fields, work=work,
         )
 
     # --- execute -------------------------------------------------------------
@@ -2719,7 +2870,9 @@ def _run_locked(
         reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
         started_at=started_at, verified=verified,
     )
-    guidance = _unknown_completion_guidance(hazard, per_run=untransferred)
+    if work is not None:
+        work.dispatched = True  # from here the command may run; its tree is kept
+    guidance = _unknown_completion_guidance(hazard, per_run=untransferred or commit)
     write_json(summary_path, {
         "run_id": run_id,
         "project_id": plan.project.project_id,
@@ -2801,8 +2954,10 @@ def _run_locked(
         # refused the unsupported entry point before invoking user code. Remove the
         # conservative fence rather than manufacturing UNKNOWN.
         clear_unknown_completion_hazard(
-            plan.project.project_id, run_id, per_run=untransferred
+            plan.project.project_id, run_id, per_run=untransferred or commit
         )
+        if work is not None:
+            work.dispatched = False  # proved never started: its tree is removed
         reporter.event("command_rejected", phase="exec", message=str(exc))
         rejected_summary = {
             "run_id": run_id,
@@ -2889,7 +3044,11 @@ def _run_locked(
         **verify_fields,
         "plan": plan.as_dict(),
     })
-    clear_unknown_completion_hazard(plan.project.project_id, run_id, per_run=untransferred)
+    if not commit:
+        # A commit run's fence is also its output lease: it stands through the pullback.
+        clear_unknown_completion_hazard(
+            plan.project.project_id, run_id, per_run=untransferred
+        )
 
     for log_name, text in (("stdout.log", result.stdout), ("stderr.log", result.stderr)):
         try:
@@ -2984,10 +3143,53 @@ def _run_locked(
 
     # --- post-run pullback ---------------------------------------------------
     post = None
+    commit_final = None
     if untransferred:
         # Outputs stay where the command wrote them in the target's tree. There are no
         # launch manifests to attribute changes against, and no baseline to advance.
         pass
+    elif commit:
+        try:
+            commit_final = finalize_commit_outputs(
+                transport=transport, plan=plan, run_id=run_id, rdir=rdir,
+                work=work.as_dict(), policy=policy,
+                command_clean=not guard_failed and result.exit_code == 0,
+                command_note=(
+                    f"memory guard {guard_status}" if guard_failed
+                    else f"command exited {result.exit_code}"
+                ),
+                report=reporter.event,
+            )
+        except TransportError as exc:
+            reporter.event("transfer_error", phase="pullback", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id,
+                "exit_code": EXIT_GUARD if guard_failed else result.exit_code,
+                "command_exit_code": command_exit_code,
+                "error": str(exc),
+                "phase": "pullback",
+                "completion_state": "finalization_failed",
+                "command_started": guarded_started,
+                "terminal": True,
+                "ended_at": utc_now_iso(),
+                **verify_fields,
+                "work": {**work.as_dict(), "state": "retained", "reason": str(exc)},
+                "plan": plan.as_dict(),
+            })
+            return EXIT_GUARD if guard_failed else EXIT_TRANSFER
+        finally:
+            # The command's end is known either way; the lease ends with the pullback.
+            clear_unknown_completion_hazard(plan.project.project_id, run_id, per_run=True)
+        post = commit_final.post
+        verify_fields = {
+            **verify_fields,
+            "work": remove_commit_work(
+                transport, plan.target.name, commit_final.work, reporter.event
+            ),
+        }
+        for rel in post.conflicts:
+            reporter.event("postrun_conflict", path=rel,
+                           saved=str(conflict_dir(run_id) / "remote" / rel))
     elif not args.no_pullback:
         try:
             post = postrun_pullback(
@@ -3082,7 +3284,9 @@ def _run_locked(
     # state. If the command itself succeeded, surface that as a conflict (exit 2)
     # rather than reporting a clean success; the command's own code is preserved in
     # the summary as command_exit_code and in the command_finished event.
-    postrun_unresolved = bool(post and post.conflicts)
+    postrun_unresolved = bool(post and post.conflicts) or bool(
+        commit_final and commit_final.unexpected
+    )
     required_receipt_invalid = bool(
         plan.workload is not None
         and plan.workload.require_receipt
@@ -3121,6 +3325,8 @@ def _run_locked(
         and final_exit == EXIT_OK
         and (
             untransferred
+            # A clean commit pullback (no conflicts, no unexpected writes) is attributable.
+            or commit_final is not None
             or (
                 not args.no_pullback
                 and post is not None
@@ -3793,19 +3999,21 @@ def _durable_run_lock(
 ) -> ProjectLock:
     """The lock held by the one process waiting on or finalizing a durable run.
 
-    An ordinary run is serialized by its project lock. An untransferred run takes
-    none, so whoever waits on it (the launching ``run``, ``resume`` or ``cancel``)
-    holds a lock keyed to that run alone. It never conflicts with the project's own
-    lock, keeps two finalizations of one run from racing, and tells ``cancel`` that
-    a controller is still waiting. Dead holders are reclaimed like any project lock.
+    An ordinary run is serialized by its project lock. An untransferred or commit run
+    takes none, so whoever waits on it (the launching ``run``, ``resume`` or
+    ``cancel``) holds a lock keyed to that run alone. It never conflicts with the
+    project's own lock, keeps two finalizations of one run from racing, and tells
+    ``cancel`` that a controller is still waiting. Dead holders are reclaimed like any
+    project lock.
     """
-    if plan.transfer_mode != "none":
+    if plan.transfer_mode == "safe":
         return ProjectLock(
             plan.project.project_id, plan.target.name, scope=plan.write_scope,
             run_id=run_id, adopt_dead_run=adopt_dead_run, report=reporter.event,
         )
+    kind = "untransferred" if plan.transfer_mode == "none" else plan.transfer_mode
     return ProjectLock(
-        f"{plan.project.project_id} untransferred run {run_id}", plan.target.name,
+        f"{plan.project.project_id} {kind} run {run_id}", plan.target.name,
         run_id=run_id, adopt_dead_run=adopt_dead_run, report=reporter.event,
     )
 
@@ -3980,6 +4188,8 @@ def _finalize_durable_run(
         raise UnknownCompletionHazardError("completed durable summary has no valid exit code")
 
     untransferred = plan.transfer_mode == "none"
+    commit = plan.transfer_mode == "commit"
+    per_run = plan.transfer_mode != "safe"
     blocked = _cancel_gate(reporter, rdir, run_id)
     if blocked is not None:
         guidance = (
@@ -4007,13 +4217,28 @@ def _finalize_durable_run(
     execution = record.get("execution")
     if not isinstance(execution, dict):
         raise UnknownCompletionHazardError("saved durable execution metadata is missing")
-    verify_fields = {"verify": record.get("verify")} if untransferred else {}
+    verify_fields: dict[str, object] = (
+        {"verify": record.get("verify")} if untransferred
+        else {"source": record.get("source"), "work": record.get("work")} if commit
+        else {}
+    )
+    work = record.get("work") if commit else None
+    if commit and not (
+        isinstance(work, dict)
+        and all(isinstance(work.get(key), str) for key in ("id", "path", "tree"))
+    ):
+        raise UnknownCompletionHazardError("saved commit-run work record is malformed")
     try:
         result = finalize_durable_result(payload, execution)
     except CommandNotStartedError as exc:
         clear_unknown_completion_hazard(
-            plan.project.project_id, run_id, per_run=untransferred
+            plan.project.project_id, run_id, per_run=per_run
         )
+        if work is not None:  # proved never started: its tree goes
+            remove_commit_work(
+                transport, plan.target.name, {**work, "state": "pending_removal"},
+                reporter.event,
+            )
         reporter.event("command_rejected", phase="durable_exec", message=str(exc))
         write_json(summary_path, {
             "run_id": run_id,
@@ -4100,10 +4325,45 @@ def _finalize_durable_run(
     pre_remote = read_manifest(rdir / "pre_remote_manifest.json")
     backup_root = conflict_dir(run_id) / "backup"
     post = None
+    commit_final = None
     if untransferred:
         # No launch manifests exist for this run (both read back empty), so a pullback
         # here would treat every target path as a command output. Outputs stay put.
         pass
+    elif commit:
+        try:
+            commit_final = finalize_commit_outputs(
+                transport=transport, plan=plan, run_id=run_id, rdir=rdir, work=work,
+                policy=policy, command_clean=not guard_failed and result.exit_code == 0,
+                command_note=(
+                    f"memory guard {guard_status}" if guard_failed
+                    else f"command exited {result.exit_code}"
+                ),
+                report=reporter.event,
+            )
+        except TransportError as exc:
+            # The fence (and the output lease) stands, so `resume` retries this pullback.
+            reporter.event("transfer_error", phase="pullback", message=str(exc))
+            write_json(summary_path, {
+                "run_id": run_id,
+                "project_id": plan.project.project_id,
+                "target": plan.target.name,
+                "phase": "pullback",
+                "completion_state": "finalization_failed",
+                "terminal": True,
+                "command_exit_code": command_exit_code,
+                "error": str(exc),
+                "durable": True,
+                **verify_fields,
+                "plan": plan.as_dict(),
+            })
+            return EXIT_GUARD if guard_failed else EXIT_TRANSFER
+        post = commit_final.post
+        verify_fields = {**verify_fields, "work": commit_final.work}
+        for rel in post.conflicts:
+            reporter.event(
+                "postrun_conflict", path=rel, saved=str(conflict_dir(run_id) / "remote" / rel),
+            )
     elif not bool(record["no_pullback"]):
         try:
             post = postrun_pullback(
@@ -4156,7 +4416,9 @@ def _finalize_durable_run(
     else:
         write_baseline(plan.target.name, plan.project.project_id, pre_local, pre_remote)
 
-    postrun_unresolved = bool(post and post.conflicts)
+    postrun_unresolved = bool(post and post.conflicts) or bool(
+        commit_final and commit_final.unexpected
+    )
     if guard_failed:
         final_exit = EXIT_GUARD
     elif result.exit_code != 0:
@@ -4193,7 +4455,7 @@ def _finalize_durable_run(
     }
     write_json(summary_path, checkpoint)
     if not clear_unknown_completion_hazard(
-        plan.project.project_id, run_id, per_run=untransferred
+        plan.project.project_id, run_id, per_run=per_run
     ):
         raise UnknownCompletionHazardError(
             f"durable completion fence changed before finalization for {run_id!r}"
@@ -4205,7 +4467,7 @@ def _finalize_durable_run(
     # positively attributable pullback (none for an untransferred run) is evidence of
     # a reusable job cost. The trip time is not comparable (the controller may have
     # been detached), so only the target-measured command time is learned.
-    pullback_attributable = untransferred or (
+    pullback_attributable = untransferred or commit_final is not None or (
         not bool(record["no_pullback"])
         and post is not None
         and not post.conflicts
@@ -4227,6 +4489,13 @@ def _finalize_durable_run(
         command_exit_code=command_exit_code,
         durable=True,
     )
+    if commit_final is not None:
+        # After the checkpoint, so a crash here can never re-run the pullback against a
+        # removed tree: resume sees the checkpoint and only retries this removal.
+        checkpoint["work"] = remove_commit_work(
+            transport, plan.target.name, commit_final.work, reporter.event
+        )
+        write_json(summary_path, checkpoint)
     try:
         transport.durable_cleanup(run_id, _durable_record_token(record))
     except TransportError as exc:
@@ -4456,9 +4725,12 @@ def _run_durable_locked(
     bootstrap_result=None,
     command: list[str] | None = None,
     verify_fields: dict[str, object] | None = None,
+    work: CommitWork | None = None,
 ) -> int:
     del t0, pre, backup_root
     untransferred = plan.transfer_mode == "none"
+    # Untransferred and commit runs fence only themselves.
+    per_run = plan.transfer_mode != "safe"
     verify_fields = verify_fields or {}
     runenv = resolve_run_env(
         device=plan.target, project=plan.project, project_config=plan.project_config
@@ -4504,6 +4776,8 @@ def _run_durable_locked(
         # Refused before launch: a run that never started keeps no launch record.
         _durable_record_path(rdir).unlink(missing_ok=True)
         raise
+    if work is not None:
+        work.dispatched = True  # from here the command may run; its tree is kept
     write_json(summary_path, {
         "run_id": run_id,
         "project_id": plan.project.project_id,
@@ -4514,7 +4788,7 @@ def _run_durable_locked(
         "completion_state": "unknown",
         "command_started": None,
         "terminal": False,
-        "guidance": _unknown_completion_guidance(hazard, per_run=untransferred),
+        "guidance": _unknown_completion_guidance(hazard, per_run=per_run),
         "durable": True,
         **verify_fields,
         "plan": plan.as_dict(),
@@ -4540,8 +4814,10 @@ def _run_durable_locked(
         )
     except CommandNotStartedError as exc:
         clear_unknown_completion_hazard(
-            plan.project.project_id, run_id, per_run=untransferred
+            plan.project.project_id, run_id, per_run=per_run
         )
+        if work is not None:
+            work.dispatched = False  # proved never started: its tree is removed
         reporter.event(
             "durable_prestart_refused", run_id=run_id, target=plan.target.name,
             detail=str(exc),
@@ -4564,8 +4840,10 @@ def _run_durable_locked(
         return EXIT_INFRA
     except DurablePrestartError as exc:
         clear_unknown_completion_hazard(
-            plan.project.project_id, run_id, per_run=untransferred
+            plan.project.project_id, run_id, per_run=per_run
         )
+        if work is not None:
+            work.dispatched = False  # proved never started: its tree is removed
         reporter.event(
             "durable_prestart_refused", run_id=run_id, target=plan.target.name,
             detail=str(exc),
@@ -4649,11 +4927,15 @@ def _load_resume_plan(
     saved_reason, saved_label = saved_plan.get("target_reason"), saved_plan.get("label")
     if not all(value is None or isinstance(value, str) for value in (saved_reason, saved_label)):
         raise UnknownCompletionHazardError("saved durable plan is malformed")
-    # The run's transfer mode and verified files are part of what ran, so they come from
-    # the saved plan, never from today's [transfer] mode default.
-    saved_mode, saved_verify = saved_plan.get("transfer_mode"), saved_plan.get("verify", [])
-    if not isinstance(saved_mode, str) or not (
-        isinstance(saved_verify, list) and all(isinstance(path, str) for path in saved_verify)
+    # The run's transfer mode and its verified, output and input files are part of what
+    # ran, so they come from the saved plan, never from today's [transfer] mode default.
+    saved_mode = saved_plan.get("transfer_mode")
+    saved_paths = {
+        key: saved_plan.get(key, []) for key in ("verify", "outputs", "inputs")
+    }
+    if not isinstance(saved_mode, str) or not all(
+        isinstance(paths, list) and all(isinstance(path, str) for path in paths)
+        for paths in saved_paths.values()
     ):
         raise UnknownCompletionHazardError("saved durable plan is malformed")
     config = load_config()
@@ -4668,7 +4950,9 @@ def _load_resume_plan(
         requested_workload=None,
         allow_default_workload=False,
         transfer_mode=saved_mode,
-        verify=saved_verify,
+        verify=saved_paths["verify"],
+        outputs=saved_paths["outputs"],
+        inputs=saved_paths["inputs"],
     )
     plan = replace(plan, target_reason=saved_reason, label=saved_label)
     if plan.as_dict() != saved_plan:
@@ -4694,10 +4978,28 @@ def _load_resume_plan(
     return plan, record, rdir, summary_path, config
 
 
+def _retry_commit_work_removal(
+    plan: RunPlan, summary: dict, summary_path: Path, reporter: Reporter
+) -> None:
+    """Finish removing a finalized commit run's clean tree, or retry a failed removal."""
+    work = summary.get("work")
+    if (
+        plan.transfer_mode != "commit"
+        or not isinstance(work, dict)
+        or work.get("state") not in {"pending_removal", "remove_failed"}
+    ):
+        return
+    summary["work"] = remove_commit_work(
+        make_transport(plan.target), plan.target.name, work, reporter.event
+    )
+    write_json(summary_path, summary)
+
+
 def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
     plan, record, rdir, summary_path, _config = _load_resume_plan(args.run_id)
-    # An untransferred run is fenced by its own record and never held the project lock.
-    untransferred = plan.transfer_mode == "none"
+    # An untransferred or commit run is fenced by its own record and never held the
+    # project lock.
+    untransferred = plan.transfer_mode != "safe"
     fence_run = args.run_id if untransferred else None
     summary = read_json(summary_path)
     if (
@@ -4707,6 +5009,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
     ):
         code = summary.get("exit_code")
         if isinstance(code, int) and not isinstance(code, bool):
+            _retry_commit_work_removal(plan, summary, summary_path, reporter)
             if summary.get("durable_cleanup_complete") is not True:
                 try:
                     make_transport(plan.target).durable_cleanup(
@@ -4753,6 +5056,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event(
             "durable_finalization_recovered", run_id=args.run_id, exit_code=code
         )
+        _retry_commit_work_removal(plan, summary, summary_path, reporter)
         try:
             make_transport(plan.target).durable_cleanup(
                 args.run_id, _durable_record_token(record)
@@ -4821,7 +5125,7 @@ def _request_durable_stop(
     and owns its summary. True only when the observer confirms the tree is gone.
     """
     run_id = str(record["run_id"])
-    guidance = _unknown_completion_guidance(hazard, per_run=plan.transfer_mode == "none")
+    guidance = _unknown_completion_guidance(hazard, per_run=plan.transfer_mode != "safe")
     if (
         status.get("state") != "running"
         or status.get("acknowledged") is not True
@@ -4934,9 +5238,9 @@ def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
         "complete", "finalization_complete",
     }:
         return cmd_resume(resume_args, reporter)
-    # An untransferred run is fenced by its own record, not the project's.
+    # An untransferred or commit run is fenced by its own record, not the project's.
     hazard = read_unknown_completion_hazard(
-        plan.project.project_id, run_id=run_id if plan.transfer_mode == "none" else None
+        plan.project.project_id, run_id=run_id if plan.transfer_mode != "safe" else None
     )
     if hazard is None or hazard.get("run_id") != run_id or hazard.get("target") != plan.target.name:
         raise UnknownCompletionHazardError(
@@ -4959,7 +5263,7 @@ def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
                 "completion_unknown", run_id=run_id,
                 reason="target durable state is missing, corrupt, mismatched, or ambiguous",
                 guidance=_unknown_completion_guidance(
-                    hazard, per_run=plan.transfer_mode == "none"
+                    hazard, per_run=plan.transfer_mode != "safe"
                 ),
             )
             return EXIT_INFRA
@@ -5069,7 +5373,10 @@ def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
         target=hazard["target"],
         run_id=args.run_id,
         note=(
-            "untransferred run: nothing was transferred and no baseline exists"
+            "commit run: its output lease is released; nothing was pulled back, and its "
+            "private tree stays on the target until a later commit run prunes it"
+            if per_run and "outputs" in hazard
+            else "untransferred run: nothing was transferred and no baseline exists"
             if per_run
             else "baseline unchanged; next run will perform normal whole-project preflight"
         ),
