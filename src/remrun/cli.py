@@ -1257,14 +1257,15 @@ def _kept_lease_guidance(run_id: str, plan: RunPlan, tree: object, why: str) -> 
     )
 
 
-def _unsupported_outputs_why(command_exit_code: object, unsupported: list[str]) -> str:
-    listed = ", ".join(unsupported[:5]) + (
-        f" and {len(unsupported) - 5} more" if len(unsupported) > 5 else ""
+def _undelivered_outputs_why(command_exit_code: object, undelivered: list[str]) -> str:
+    listed = ", ".join(undelivered[:5]) + (
+        f" and {len(undelivered) - 5} more" if len(undelivered) > 5 else ""
     )
     return (
-        f"the command ended (exit {command_exit_code}) but {len(unsupported)} path(s) at "
-        f"or under --output are symlinks or special files, which remrun does not return "
-        f"({listed}); nothing at or under them was pulled or deleted"
+        f"the command ended (exit {command_exit_code}) but {len(undelivered)} path(s) at "
+        f"or under --output were not cleanly delivered ({listed}): symlinks or special "
+        "files remrun does not return, or output conflicts (a case-fold collision saves "
+        "neither copy); the retained private tree still holds them"
     )
 
 
@@ -3246,11 +3247,12 @@ def _run_locked(
                 "plan": plan.as_dict(),
             })
             return failed_exit
-        if commit_final.unsupported:
-            # What is at or under a held path was not delivered: the fence stays.
+        if commit_final.undelivered:
+            # An output that was not cleanly delivered lives only in the retained tree:
+            # the fence stays, so the tree is protected and overlapping runs wait.
             lease_guidance = _kept_lease_guidance(
                 run_id, plan, work.tree,
-                _unsupported_outputs_why(command_exit_code, commit_final.unsupported),
+                _undelivered_outputs_why(command_exit_code, commit_final.undelivered),
             )
             reporter.event("output_lease_kept", run_id=run_id, guidance=lease_guidance)
         else:
@@ -4530,13 +4532,13 @@ def _finalize_durable_run(
         **verify_fields,
         "plan": plan.as_dict(),
     }
-    if commit_final is not None and commit_final.unsupported:
-        # What is at or under a held path was not delivered: the fence stays, and the
-        # summary goes straight to complete, so `resume` never reaches the
-        # finalization_complete step that clears it.
+    if commit_final is not None and commit_final.undelivered:
+        # An output not cleanly delivered lives only in the retained tree: the fence
+        # stays, and the summary goes straight to complete, so `resume` never reaches
+        # the finalization_complete step that clears it.
         checkpoint["guidance"] = _kept_lease_guidance(
             run_id, plan, work["tree"],
-            _unsupported_outputs_why(command_exit_code, commit_final.unsupported),
+            _undelivered_outputs_why(command_exit_code, commit_final.undelivered),
         )
         reporter.event("output_lease_kept", run_id=run_id, guidance=checkpoint["guidance"])
     else:

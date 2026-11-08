@@ -592,6 +592,16 @@ class CommitFinal:
         """Something the pullback could not return; the run exits 2."""
         return bool(self.unexpected or self.unsupported)
 
+    @property
+    def undelivered(self) -> list[str]:
+        """Output paths not cleanly delivered into the project; they keep the lease.
+
+        Unsupported entries, plus every pullback conflict: a case-fold collision
+        (``out/A.txt`` beside ``out/a.txt`` on a case-insensitive controller) saves
+        neither copy, so only the retained tree still holds them.
+        """
+        return sorted({*self.unsupported, *self.post.conflicts})
+
 
 def finalize_commit_outputs(
     *,

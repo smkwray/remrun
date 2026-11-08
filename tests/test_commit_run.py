@@ -521,6 +521,43 @@ def test_local_edit_during_the_run_is_saved_as_a_conflict(commit_env):
     assert _summary(env["state"], run_id)["work"]["state"] == "retained"
 
 
+def test_a_case_fold_collision_keeps_the_lease_and_the_tree(commit_env, monkeypatch):
+    """A case-sensitive target can write `out/A.txt` beside `out/a.txt`; a case-insensitive
+    controller can hold only one, so the pullback skips both as a conflict and saves
+    neither. Those outputs then exist only in the retained tree: the lease must stay
+    (an overlapping run waits, pruning keeps the tree) until resolve-unknown."""
+    env = commit_env
+    import remrun.isolated as isolated
+
+    real_pullback = isolated.postrun_pullback
+
+    def colliding_pullback(**kwargs):  # noqa: ANN003
+        result = real_pullback(**kwargs)
+        result.conflicts.extend(["out/A.txt", "out/a.txt"])  # as the collision guard reports
+        return result
+
+    monkeypatch.setattr(isolated, "postrun_pullback", colliding_pullback)
+    status, run_id = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--",
+        *_py(_write("out/r.txt", "made")),
+    ])
+    assert status == EXIT_CONFLICT
+    summary = _summary(env["state"], run_id)
+    assert summary["work"]["state"] == "retained"
+    assert "not cleanly delivered" in summary["guidance"]
+    assert f"remrun resolve-unknown {run_id} --confirmed-ended" in summary["guidance"]
+    assert _lease_fences(env) == {run_id: ["out/"]}
+
+    monkeypatch.setattr(isolated, "postrun_pullback", real_pullback)
+    blocked, _ = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/sub/", "--",
+        *_py(_write("out/sub/x.txt", "x")),
+    ])
+    assert blocked != EXIT_OK
+    assert main(["resolve-unknown", run_id, "--confirmed-ended"]) == EXIT_OK
+    assert _lease_fences(env) == {}
+
+
 def test_tree_is_removed_only_after_a_clean_pullback(commit_env, monkeypatch):
     """A failed command keeps its tree; so does a pullback that cannot finish. Only a
     clean, verified pullback removes it, and a failed removal is reported and kept on
