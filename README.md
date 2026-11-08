@@ -150,11 +150,15 @@ are gone, `cancel` finalizes like `resume`: it reports the stopped command's exi
 (usually 143 on POSIX, 137 if it had to be killed) and pulls outputs back as after any other nonzero exit. A run that had
 already finished is finalized exactly as `resume` would. If another remrun process is
 still waiting on the run (the original `run --durable`, or a `resume`), `cancel` only
-stops the command and exits `0`; the waiting process finalizes it. `cancel` stops
+stops the command and exits `0`; the waiting process finalizes it, but only once the
+cancel has confirmed the processes are gone (it waits up to two minutes for that and
+reports `cancel_pending`). A cancel that signalled the command but could not confirm
+its processes are gone leaves completion unknown, for any later `resume` too: prove
+the processes ended, then use `resolve-unknown`. `cancel` stops
 nothing while the run is still starting or when the target holds no record with the
 run's exact identity; it then exits `4`, completion stays unknown, and the guidance
 names `remrun resume <run_id>`. Events: `cancel_requested`, `cancel_refused`,
-`cancel_handed_off`, `completion_unknown`.
+`cancel_handed_off`, `cancel_pending`, `completion_unknown`.
 
 With `--auto`, remrun uses the ordinary reachability, learned RAM/duration, live-load,
 memory-admission, and conflict-safe preflight selection path. It may shop another

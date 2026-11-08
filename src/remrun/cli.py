@@ -118,6 +118,10 @@ DURABLE_STATUS_RETRY_SECONDS = 300.0
 # How long `cancel` waits, after the target confirmed the stop, for the durable
 # supervisor to record the command's exit before leaving completion unknown.
 DURABLE_CANCEL_SETTLE_SECONDS = 60.0
+# How long finalization waits for a pending `cancel` to record whether it stopped the
+# job. The target observer's own cancel takes at most its 10 s grace, a 5 s settle
+# and the round trips around them.
+DURABLE_CANCEL_PENDING_SECONDS = 120.0
 RUN_CONTEXT_ENV = "REMRUN_RUN_CONTEXT"
 
 
@@ -3912,6 +3916,45 @@ def _running_observation_matches(transport, record: dict[str, object]) -> bool: 
     return True
 
 
+def _cancel_gate(reporter: Reporter, rdir: Path, run_id: str) -> str | None:
+    """None when no cancel stands between this run and finalization, else why one does.
+
+    The target reports a cancelled run complete as soon as the observer wrapping it
+    exits, which on POSIX is at the first SIGTERM; a member that ignores it runs on
+    until the cancel's SIGKILL. So the saved cancel request, re-read from disk because
+    another process may be making it, decides: none, or a confirmed stop, proceeds; a
+    refusal that signalled nothing proves the completion genuine; a pending request is
+    waited on for a bounded time; anything else leaves completion unknown.
+    """
+    deadline: float | None = None
+    while True:
+        record = read_json(_durable_record_path(rdir))
+        if not isinstance(record, dict):
+            return "the saved durable record is missing"
+        cancel = record.get("cancel")
+        if cancel is None:
+            return None
+        if not isinstance(cancel, dict):
+            return "the saved cancel request is malformed"
+        outcome = cancel.get("owned_job_cancelled")
+        if outcome is True or (outcome is False and cancel.get("signals_sent") is False):
+            return None
+        if outcome is not None:
+            return (
+                "a cancel signalled the job but the target did not confirm that all of "
+                "its processes are gone"
+            )
+        if deadline is None:
+            deadline = time.monotonic() + DURABLE_CANCEL_PENDING_SECONDS
+            reporter.event(
+                "cancel_pending", run_id=run_id, wait_s=DURABLE_CANCEL_PENDING_SECONDS,
+                note="waiting for the cancel to confirm the job's processes are gone",
+            )
+        if time.monotonic() >= deadline:
+            return "a cancel request has not recorded whether it stopped the job"
+        time.sleep(0.5)
+
+
 def _finalize_durable_run(
     *,
     args: argparse.Namespace,
@@ -3936,6 +3979,24 @@ def _finalize_durable_run(
             return code
         raise UnknownCompletionHazardError("completed durable summary has no valid exit code")
 
+    untransferred = plan.transfer_mode == "none"
+    blocked = _cancel_gate(reporter, rdir, run_id)
+    if blocked is not None:
+        guidance = (
+            f"if that `remrun cancel {run_id}` is still running, run `remrun resume "
+            f"{run_id}` from this project after it ends; otherwise use a read-only "
+            "process/artifact probe to prove the command's processes ended, then run "
+            f"`remrun resolve-unknown {run_id} --confirmed-ended`"
+        )
+        summary = existing if isinstance(existing, dict) else {"run_id": run_id}
+        summary.update(
+            phase="durable_wait", completion_state="unknown", terminal=True,
+            error=blocked, guidance=guidance, durable=True, plan=plan.as_dict(),
+        )
+        write_json(summary_path, summary)
+        reporter.event("completion_unknown", run_id=run_id, reason=blocked, guidance=guidance)
+        return EXIT_INFRA
+
     payload = transport.durable_status(
         run_id, _durable_record_token(record), include_logs=True
     )
@@ -3946,7 +4007,6 @@ def _finalize_durable_run(
     execution = record.get("execution")
     if not isinstance(execution, dict):
         raise UnknownCompletionHazardError("saved durable execution metadata is missing")
-    untransferred = plan.transfer_mode == "none"
     verify_fields = {"verify": record.get("verify")} if untransferred else {}
     try:
         result = finalize_durable_result(payload, execution)
@@ -4761,7 +4821,7 @@ def _request_durable_stop(
     and owns its summary. True only when the observer confirms the tree is gone.
     """
     run_id = str(record["run_id"])
-    guidance = _unknown_completion_guidance(hazard)
+    guidance = _unknown_completion_guidance(hazard, per_run=plan.transfer_mode == "none")
     if (
         status.get("state") != "running"
         or status.get("acknowledged") is not True
@@ -4773,6 +4833,14 @@ def _request_durable_stop(
             guidance=guidance,
         )
         return False
+    # An earlier cancel that may have signalled the job without confirming the stop
+    # stays unproven: this cancel signalling nothing does not show nothing was stopped.
+    earlier = (read_json(_durable_record_path(rdir)) or {}).get("cancel")
+    earlier_unproven = (
+        isinstance(earlier, dict)
+        and earlier.get("owned_job_cancelled") is not True
+        and earlier.get("signals_sent") is not False
+    )
     request: dict[str, object] = {"requested_at": utc_now_iso(), "owned_job_cancelled": None}
 
     def save() -> None:
@@ -4786,12 +4854,16 @@ def _request_durable_stop(
     save()
     reporter.event("cancel_requested", run_id=run_id, target=plan.target.name)
     try:
-        cancelled, detail = transport.cancel_observed(
+        cancelled, signals_sent, detail = transport.cancel_observed(
             _durable_observation(record, plan), cwd=str(record["remote_cwd"]), timeout=60.0
         )
     except TransportError as exc:
-        cancelled, detail = False, str(exc)
+        cancelled, signals_sent, detail = False, None, str(exc)
+    if not cancelled and signals_sent is False and earlier_unproven:
+        signals_sent = None
+    # A waiting controller finalizes only once this outcome is saved (_cancel_gate).
     request["owned_job_cancelled"] = cancelled
+    request["signals_sent"] = signals_sent
     if detail:
         request["detail"] = detail
     save()

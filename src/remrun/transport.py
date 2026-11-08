@@ -1239,24 +1239,42 @@ def _parse_job_query_payload(stdout: bytes, stderr: bytes = b"") -> dict[str, ob
 
 def _observer_cancel_outcome(
     result: ExecResult, observation: JobObservation
-) -> tuple[bool, str]:
-    """True only for the observer's exact confirmed receipt; otherwise why not.
+) -> tuple[bool, bool | None, str]:
+    """``(confirmed, signals_sent, refusal detail)`` from the observer's cancel receipt.
 
-    A refusal, a malformed receipt, or a receipt for another identity is never
-    treated as a stop.
+    Confirmed only for the exact confirmed receipt; a refusal, a malformed receipt, or
+    a receipt for another identity is never treated as a stop. ``signals_sent`` is
+    read only from an exact refusal receipt: False there proves the observer signalled
+    nothing. It is None when the receipt is unreadable or names another job, and True
+    for a confirmed stop.
     """
-    expected = {
+    identity = {
         "schema": 1, "job_id": observation.job_id,
-        "command_sha256": observation.command_sha256, "owned_job_cancelled": True,
+        "command_sha256": observation.command_sha256,
     }
     try:
         receipt = json.loads(result.stdout)
     except json.JSONDecodeError:
         receipt = None
-    if result.exit_code == 0 and receipt == expected:
-        return True, ""
+    exact = isinstance(receipt, dict) and all(
+        type(receipt.get(key)) is type(value) and receipt.get(key) == value
+        for key, value in identity.items()
+    )
+    if (
+        exact and result.exit_code == 0 and set(receipt) == {*identity, "owned_job_cancelled"}
+        and receipt["owned_job_cancelled"] is True
+    ):
+        return True, True, ""
+    signals_sent = None
+    if (
+        exact and result.exit_code == 2
+        and set(receipt) == {*identity, "owned_job_cancelled", "signals_sent"}
+        and receipt["owned_job_cancelled"] is False
+        and isinstance(receipt["signals_sent"], bool)
+    ):
+        signals_sent = receipt["signals_sent"]
     detail = result.stderr.strip()[-500:]
-    return False, detail or f"observer cancel exited {result.exit_code}"
+    return False, signals_sent, detail or f"observer cancel exited {result.exit_code}"
 
 
 @dataclass(frozen=True)
@@ -1795,8 +1813,12 @@ class BaseTransport:
 
     def cancel_observed(
         self, observation: JobObservation, *, cwd: str, timeout: float = 30.0
-    ) -> tuple[bool, str]:
-        """Stop exactly one registered observer job; (confirmed, refusal detail)."""
+    ) -> tuple[bool, bool | None, str]:
+        """Stop exactly one registered observer job.
+
+        Returns ``(confirmed, signals_sent, refusal detail)``; see
+        ``_observer_cancel_outcome``.
+        """
         del observation, cwd, timeout
         raise TransportError(
             f"observed-job cancellation is unsupported by transport {type(self).__name__}"
@@ -3700,7 +3722,7 @@ class SSHPosixTransport(_SSHCommon):
 
     def cancel_observed(
         self, observation: JobObservation, *, cwd: str, timeout: float = 30.0
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, bool | None, str]:
         state_root, helper = self._ensure_job_observer()
         result = self.exec_control(
             [self.device.remote_python or "python3", "-S", helper, "cancel",
@@ -4657,7 +4679,9 @@ class SSHPowerShellTransport(_SSHCommon):
             cancelled = False
             detail = "Windows owned-job cancellation is unconfirmed"
             try:
-                cancelled, refusal = self.cancel_observed(observation, cwd=cwd, timeout=15.0)
+                cancelled, _signals_sent, refusal = self.cancel_observed(
+                    observation, cwd=cwd, timeout=15.0
+                )
                 if cancelled:
                     detail = "Windows owned job cancelled; escaped work remains unproved"
                 elif refusal:
@@ -4712,7 +4736,7 @@ class SSHPowerShellTransport(_SSHCommon):
 
     def cancel_observed(
         self, observation: JobObservation, *, cwd: str, timeout: float = 30.0
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, bool | None, str]:
         state_root, helper = self._ensure_job_observer()
         result = self.exec_control(
             [self.device.remote_python or "python", "-S", helper, "cancel",

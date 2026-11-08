@@ -1116,9 +1116,11 @@ def test_windows_handle_keeper_unregisters_only_after_job_is_empty(tmp_path, mon
     assert events == ["ready", "sample", "sample", "unregister", "closed"]
 
 
-@pytest.mark.parametrize("keeper_matches", [True, False])
+@pytest.mark.parametrize(
+    ("keeper_matches", "lingering"), [(True, False), (False, False), (True, True)]
+)
 def test_cancel_windows_job_requires_exact_keeper_and_only_terminates_owned_handle(
-    tmp_path, monkeypatch, keeper_matches,
+    tmp_path, monkeypatch, keeper_matches, lingering,
 ):
     from types import SimpleNamespace
 
@@ -1138,15 +1140,22 @@ def test_cancel_windows_job_requires_exact_keeper_and_only_terminates_owned_hand
 
     def terminate(handle, code):
         terminated.append((handle, code))
-        members.clear()
+        if not lingering:
+            members.clear()
         return True
 
     monkeypatch.setattr(observer, "_win_open_job", open_job)
     monkeypatch.setattr(observer, "_win_kernel32", lambda: SimpleNamespace(TerminateJobObject=terminate))
     monkeypatch.setattr(observer, "_win_job_pids", lambda handle: set(members))
     monkeypatch.setattr(observer, "_win_close", closed.append)
+    monkeypatch.setattr(observer, "_CANCEL_SETTLE_SECONDS", 0.0)
     receipt = observer._cancel_windows_job(tmp_path, metadata)
-    assert receipt["owned_job_cancelled"] is keeper_matches
+    assert receipt["owned_job_cancelled"] is (keeper_matches and not lingering)
+    # A refusal says whether the Job was terminated: only one that signalled nothing
+    # proves the job's completion was not caused by this cancel.
+    assert receipt.get("signals_sent", "absent") == (
+        True if lingering else False if not keeper_matches else "absent"
+    )
     assert opened == [("unique-job", True)]
     assert terminated == ([("owned-handle", 130)] if keeper_matches else [])
     assert closed == ["owned-handle"]
@@ -1434,7 +1443,8 @@ def test_posix_cancel_refuses_a_reused_pid_and_never_signals(tmp_path, monkeypat
             return os.killpg(pgid, sig)
 
         monkeypatch.setattr(observer.os, "killpg", killpg)
-        assert observer._cancel_posix_job(tmp_path, metadata)["owned_job_cancelled"] is False
+        receipt = observer._cancel_posix_job(tmp_path, metadata)
+        assert (receipt["owned_job_cancelled"], receipt["signals_sent"]) == (False, False)
         assert stranger.poll() is None
     finally:
         stranger.kill()
@@ -1463,6 +1473,8 @@ def test_posix_cancel_asks_first_and_kills_only_what_outlives_the_grace(tmp_path
         started = time.monotonic()
         receipt = observer._cancel_posix_job(root, _job_metadata("run-a", command).payload())
         assert receipt["owned_job_cancelled"] is True
+        # The confirmed receipt is unchanged: no refusal-only fields.
+        assert set(receipt) == {"schema", "job_id", "command_sha256", "owned_job_cancelled"}
         assert sent == [signal.SIGTERM, signal.SIGKILL]
         assert time.monotonic() - started >= 0.5
         assert _wait_gone(int(rows["run-a"]["root_pid"]))

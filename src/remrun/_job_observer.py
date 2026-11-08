@@ -2542,9 +2542,12 @@ def _cancel_receipt(metadata: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _cancel_refused(receipt: dict[str, object], detail: str) -> dict[str, object]:
+def _cancel_refused(
+    receipt: dict[str, object], detail: str, *, signals_sent: bool = False
+) -> dict[str, object]:
+    """A refusal receipt. ``signals_sent`` false proves this cancel signalled nothing."""
     print(f"remrun cancel refused: {detail}", file=sys.stderr, flush=True)
-    return receipt
+    return {**receipt, "signals_sent": signals_sent}
 
 
 def _exact_owned_record(
@@ -2612,6 +2615,7 @@ def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, obje
         return _cancel_refused(
             receipt, "the registered root process is not live inside its registered group"
         )
+    signalled = False
     for sig, wait in (
         (signal.SIGTERM, _CANCEL_TERM_GRACE_SECONDS),
         (signal.SIGKILL, _CANCEL_SETTLE_SECONDS),
@@ -2621,14 +2625,20 @@ def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, obje
         except ProcessLookupError:
             break  # the group ended between the proof (or the first signal) and this one
         except PermissionError:
-            return _cancel_refused(receipt, "the registered process group cannot be signalled")
+            return _cancel_refused(
+                receipt, "the registered process group cannot be signalled",
+                signals_sent=signalled,
+            )
+        signalled = True
         deadline = time.monotonic() + wait
         while _posix_group_exists(pgid) and time.monotonic() < deadline:
             time.sleep(0.02)
         if not _posix_group_exists(pgid):
             break
     if _posix_group_exists(pgid):
-        return _cancel_refused(receipt, "the process group still has members")
+        return _cancel_refused(
+            receipt, "the process group still has members", signals_sent=signalled
+        )
     receipt["owned_job_cancelled"] = True
     return receipt
 
@@ -2653,7 +2663,9 @@ def _cancel_windows_job(root: Path, metadata: dict[str, object]) -> dict[str, ob
         deadline = time.monotonic() + _CANCEL_SETTLE_SECONDS
         while _win_job_pids(handle):
             if time.monotonic() >= deadline:
-                return _cancel_refused(receipt, "the Job still has processes")
+                return _cancel_refused(
+                    receipt, "the Job still has processes", signals_sent=True
+                )
             time.sleep(0.02)
         receipt["owned_job_cancelled"] = True
         return receipt
