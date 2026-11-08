@@ -119,12 +119,35 @@ bootstrap-not-ready       -> a declared [run.bootstrap] is not ready; setup neve
 
 The output lease is the run's completion fence plus its outputs. It is checked again
 and taken under the lock table's guard just before the command starts, and it stands
-through the pullback. A pullback that fails, or that holds unsupported outputs
-(symlinks or special files), leaves it in place, with the outputs in the retained tree,
-until `remrun resolve-unknown` releases it; `remrun resume` releases it only by retrying
-a durable run's failed pullback. Leased paths are compared ignoring case and Unicode normalization. Ordinary runs ignore commit fences: a commit run never touches the
-target's checkout, and a same-path change on the controller ends in a saved conflict on
-whichever pullback comes second, never an overwrite.
+through the pullback. It stays, with the retained tree, while any output is not cleanly
+delivered into the project:
+
+```text
+pullback failed      -> exit 3; the outputs are in the retained tree
+unsupported output   -> a symlink or special file, held in the retained tree; exit 2
+output conflict      -> exit 2; an output edited locally during the run: the run's copy
+                        is saved in its conflict directory, and the retained tree holds
+                        it too; an output whose name matches another path's ignoring
+                        case and Unicode form on a case-insensitive controller: no copy
+                        is saved, only the retained tree holds it
+```
+
+`remrun resume` releases the lease only by retrying a durable run's failed pullback. A
+durable run whose pullback finished with undelivered outputs is complete: `resume`
+reports its result and the lease stays. Copy the outputs you need from the saved
+conflict copy (each `postrun_conflict` event gives its path) or from the retained tree
+(named in the `output_lease_kept` guidance), then release the lease with
+`remrun resolve-unknown RUN_ID --confirmed-ended`. Leased paths are compared ignoring
+case and Unicode normalization.
+
+Ordinary runs ignore commit fences: a commit run never touches the target's checkout.
+On the controller, every remrun process that writes into a project's local tree (an
+ordinary run's preflight and pullback, a commit run's pullback) holds that tree's
+local-write lock while it re-checks each file and writes it. When two runs change the
+same local file, whichever writes it second sees the first write as a local change: a
+pullback keeps the file and saves its own copy as a conflict, and a preflight leaves it
+and refuses to start the run (exit 2). Edits by other programs are caught by the same
+re-check, made just before each write, but they do not take the lock.
 
 ## Why remote-newer is pulled by default
 

@@ -253,7 +253,8 @@ time per project, without the target's checkout changing under them. It works wi
 - **Outputs.** After the command, its changes under the `--output` paths come back
   through the ordinary pullback: unchanged local files are backed up and replaced, with
   the result hash-checked; an output you edited locally during the run is kept, the
-  run's copy is saved under the run's conflict directory, and the run exits `2`. The
+  run's copy is saved under the run's conflict directory, the run exits `2` and it keeps
+  its lease (see Concurrency). The
   outputs come back after a failed or cancelled command too. Only regular files return:
   a symlink or special file at or under an output, in the private tree or locally, is
   listed in `work.unsupported_paths`, nothing is pulled or deleted at or under that
@@ -275,15 +276,26 @@ time per project, without the target's checkout changing under them. It works wi
   is kept, and each later commit run there that prunes it refuses and reports it again.
   A tree still being set up is never pruned while the controller that started it runs.
 - **Concurrency.** No project lock is taken. Each run holds a lease on its outputs
-  until its pullback ends: a commit run whose outputs overlap a live one's (one path
-  is a prefix of the other, ignoring case and Unicode form) is refused before any
-  target is touched. If the pullback fails (exit `3`) or holds unsupported outputs
-  (exit `2`), the outputs it did not return stay in the retained tree named in
-  `summary.json`, and the lease stays until
-  `remrun resolve-unknown RUN_ID --confirmed-ended`; `resume` releases it only by
-  retrying a durable run's failed pullback. Commit runs with
-  disjoint outputs, and ordinary runs, may run at the same time. A commit run still
-  refuses while an ordinary run of the project has unknown completion.
+  until its pullback delivers them all: a commit run whose outputs overlap a live
+  one's (one path is a prefix of the other, ignoring case and Unicode form) is refused
+  before any target is touched. The lease stays, with the retained tree named in
+  `summary.json`, while any output is not cleanly delivered: the pullback failed
+  (exit `3`), held unsupported outputs (exit `2`), or ended with any output conflict
+  (exit `2`). An output you edited locally during the run is such a conflict (the
+  run's copy is saved under the run's conflict directory), and so is an output whose
+  name matches another path's ignoring case and Unicode form on a case-insensitive
+  controller (no copy is saved; only the retained tree holds it). `resume` releases
+  the lease only by retrying a durable run's failed pullback; a durable run whose
+  pullback finished with undelivered outputs is complete, and `resume` reports its
+  result and keeps the lease. Copy the outputs you need from the saved conflict copy
+  (each `postrun_conflict` event gives its path) or from the retained tree (named in
+  the `output_lease_kept` guidance), then run
+  `remrun resolve-unknown RUN_ID --confirmed-ended` to release the lease. Commit runs
+  with disjoint outputs, and ordinary runs, may run at the same time; when one of
+  each changes the same local file, whichever writes it second keeps the first result
+  and saves its own copy as a conflict (an ordinary run's preflight instead refuses to
+  start, exit `2`). A commit run still refuses while an ordinary run of the project
+  has unknown completion.
 - **Environment.** The command runs in `tree/<your relative directory>`. The project's
   virtual environment is the target's usual one (an absolute path), so a declared
   `[run.bootstrap]` must already be ready there; a commit run never runs setup. Code
@@ -453,6 +465,14 @@ The most common failure modes and their fixes:
    metadata is missing or unreadable, its PID cannot be checked, or the killed run may
    have left a remote command running (item 6). Never delete a lock by hand while that
    hazard stands; resolve it first.
+   Separately, each remrun process on a controller that writes into a project's local
+   tree (an ordinary run's preflight and pullback, a commit run's pullback) holds that
+   tree's local-write lock while it checks and writes those files. Another process
+   waits for it (a `lock_wait` event with `lock = "local_writes"`) for up to 30
+   minutes, then fails that phase as a transfer error (exit `3`) before it writes
+   into the project.
+   A holder whose PID has provably exited is reclaimed (`stale_lock_reclaimed`, with
+   the same `lock` field).
 5. **An automation timeout does not prove remrun exited.** A supervising tool may stop
    waiting while the local remrun process and remote command continue. Confirm the local
    process reached a terminal exit before starting another run for the project, or use
