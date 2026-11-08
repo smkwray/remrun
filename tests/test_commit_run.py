@@ -604,7 +604,8 @@ def test_pruning_removes_only_the_work_directory_a_record_names_for_its_own_id(
 ):
     """A registry path is deleted recursively, so a record that names any directory
     other than `<state_root>/work/<its id>` is refused and reported, never trusted;
-    so is a record whose id disagrees with its file name. Both stay for inspection."""
+    so is a record whose id disagrees with its file name. Both stay for inspection,
+    and each later launch that prunes refuses and reports the record again."""
     env = commit_env
     victim = env["project"].parent.parent / "victim"
     victim.mkdir()
@@ -631,6 +632,11 @@ def test_pruning_removes_only_the_work_directory_a_record_names_for_its_own_id(
         str(misnamed)
     ]
     assert record_path.exists() and misnamed.exists()
+    assert main(["run", "LOCAL_SIM", "--json", "--transfer", "commit", "--output", "out/",
+                 "--", *_py("print(1)")]) == EXIT_OK
+    refused = [e for e in _events(capsys) if e.get("event") == "work_remove_refused"]
+    assert [e["work_id"] for e in refused] == [record["work_id"]]
+    assert (victim / "keep.txt").read_text() == "precious" and record_path.exists()
 
 
 def test_a_tree_being_seeded_is_never_pruned_by_a_concurrent_launch(commit_env, monkeypatch):

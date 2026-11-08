@@ -323,10 +323,12 @@ def remove_work(
 
     Only ``<state_root>/work/<work_id>`` (with its ``tree``), for an id remrun
     allocates, is ever removed: the path comes from a record or summary, and a wrong
-    one would be deleted recursively. Any other is refused, reported, and left with
-    its record untouched. A failed removal, or a state root that cannot be resolved
-    right now, keeps the record (state ``remove_failed``) so the next commit launch on
-    this target, or ``resume``, retries it.
+    one would be deleted recursively. Any other is refused and reported, and its
+    record is left untouched, so ``prune_work_trees`` reaches it again on later commit
+    launches on this target and refuses it again. A summary's ``remove_refused`` is final:
+    ``resume`` does not retry it. A failed removal, or a state root that cannot be
+    resolved right now, keeps the record (state ``remove_failed``) so the next commit
+    launch on this target, or ``resume``, retries it.
     """
     if not isinstance(work_id, str) or not _WORK_ID.fullmatch(work_id):
         report("work_remove_refused", work_id=work_id, path=path,
@@ -364,7 +366,8 @@ def prune_work_trees(
     A failed removal is retried at once; a retained tree, or one orphaned by a crash
     before its run finished, only after ``[logging] failed_log_retention_days``. A
     tree whose run still holds a completion fence may be in use and is never touched,
-    nor is an ``active`` one whose controller may still be seeding it.
+    nor is an ``active`` one whose controller may still be seeding it. A record whose
+    removal ``remove_work`` refuses is kept, so every later launch reports it again.
     """
     directory = _registry_dir(plan.target.name)
     if not directory.is_dir():
