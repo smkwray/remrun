@@ -2625,7 +2625,20 @@ class _SSHCommon(BaseTransport):
             actual = ""
         if actual == expected:
             return
-        self.push_file(source, remote_path)
+        try:
+            self.push_file(source, remote_path)
+        except TransportError:
+            # Concurrent runs install the same content-addressed helper at once, and
+            # Windows refuses to rename onto a file another installer just created.
+            # The bytes are fixed by the name, so a destination that now hashes as
+            # expected is the helper; anything else is still a setup failure.
+            try:
+                actual = self._job_helper_sha256(remote_path)
+            except Exception:
+                actual = ""
+            if actual != expected:
+                raise
+            return
         try:
             actual = self._job_helper_sha256(remote_path)
         except Exception as exc:
@@ -3863,8 +3876,17 @@ class SSHPosixTransport(_SSHCommon):
         memory_reservation: MemoryReservation | None = None,
         target_acceptance: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
-        root, observer = self._ensure_job_observer()
-        durable_root, _durable = self._ensure_durable_runner()
+        try:
+            root, observer = self._ensure_job_observer()
+            durable_root, _durable = self._ensure_durable_runner()
+        except DurablePrestartError:
+            raise
+        except TransportError as exc:
+            # Only helper files have been written; nothing was launched, so the
+            # command has conclusively not started and the run needs no fence.
+            raise DurablePrestartError(
+                f"durable helper setup failed before launch: {exc}", exit_code=4
+            ) from exc
         if durable_root != root:
             raise TransportError("durable and observer state roots disagree")
         ready_path = posixpath.join(root, "durable-runs", run_id, "observer-ready.json")
@@ -4938,8 +4960,17 @@ class SSHPowerShellTransport(_SSHCommon):
         self.validate_command_context(
             command, env=env, path_prepend=path_prepend
         )
-        root, observer = self._ensure_job_observer()
-        durable_root, _durable = self._ensure_durable_runner()
+        try:
+            root, observer = self._ensure_job_observer()
+            durable_root, _durable = self._ensure_durable_runner()
+        except DurablePrestartError:
+            raise
+        except TransportError as exc:
+            # Only helper files have been written; nothing was launched, so the
+            # command has conclusively not started and the run needs no fence.
+            raise DurablePrestartError(
+                f"durable helper setup failed before launch: {exc}", exit_code=4
+            ) from exc
         if durable_root != root:
             raise TransportError("durable and observer state roots disagree")
         ready_path = self.native_join(root, "durable-runs", run_id, "observer-ready.json")

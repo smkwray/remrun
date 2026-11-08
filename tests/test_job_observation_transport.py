@@ -16,9 +16,11 @@ from remrun.memory_guard import MemoryAdmissionResult, MemoryReservation
 from remrun.models import Device
 from remrun.transport import (
     BaseTransport,
+    DurablePrestartError,
     ExecResult,
     SSHPosixTransport,
     SSHPowerShellTransport,
+    TransportError,
 )
 
 
@@ -265,6 +267,64 @@ def test_job_observer_helper_replaces_corrupt_existing_bytes_and_verifies(factor
     assert state_root
     assert helper.endswith(".py")
     assert pushed == [(source, helper)]
+
+
+@pytest.mark.parametrize("factory", [posix_device, windows_device])
+def test_concurrent_helper_install_accepts_an_identical_winner(factory, monkeypatch):
+    """Two runs launching at once on one target both install the same new helper; on
+    Windows the loser's rename fails because the file now exists. The name fixes the
+    bytes, so a destination that hashes as expected is success, not a launch failure."""
+    transport = (
+        SSHPosixTransport(factory())
+        if factory is posix_device
+        else SSHPowerShellTransport(factory())
+    )
+    expected = hashlib.sha256(Path(observer.__file__).read_bytes()).hexdigest()
+    hashes = iter(["", expected])
+
+    def lost_race(*_args):
+        raise TransportError("push failed: Cannot create a file when that file already exists.")
+
+    monkeypatch.setattr(transport, "_job_helper_sha256", lambda _path: next(hashes))
+    monkeypatch.setattr(transport, "push_file", lost_race)
+
+    _, helper = transport._ensure_job_observer()
+    assert helper.endswith(".py")
+
+    # A failed push that leaves anything else in place is still a setup failure.
+    transport = (
+        SSHPosixTransport(factory())
+        if factory is posix_device
+        else SSHPowerShellTransport(factory())
+    )
+    hashes = iter(["", "0" * 64])
+    monkeypatch.setattr(transport, "_job_helper_sha256", lambda _path: next(hashes))
+    monkeypatch.setattr(transport, "push_file", lost_race)
+    with pytest.raises(TransportError):
+        transport._ensure_job_observer()
+
+
+@pytest.mark.parametrize("factory", [posix_device, windows_device])
+def test_durable_helper_setup_failure_is_a_conclusive_prestart_refusal(factory, monkeypatch):
+    """Helper setup happens before anything is launched, so its failure must not
+    leave an unknown-completion fence that needs a manual resolve."""
+    transport = (
+        SSHPosixTransport(factory())
+        if factory is posix_device
+        else SSHPowerShellTransport(factory())
+    )
+
+    def broken():
+        raise TransportError("helper push failed")
+
+    monkeypatch.setattr(transport, "_ensure_job_observer", broken)
+    monkeypatch.setattr(transport, "validate_command_context", lambda *a, **k: None)
+    with pytest.raises(DurablePrestartError, match="before launch"):
+        transport.launch_durable(
+            ["python", "job.py"], "/work", run_id="run", resume_token="resume",
+            observation=observation(), controller="ctrl", project_id="project",
+            max_log_bytes=1024, created_at="now",
+        )
 
 
 @pytest.mark.parametrize("factory", [posix_device, windows_device])
