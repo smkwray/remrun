@@ -2455,6 +2455,16 @@ def _run_locked(
             note="no reconcile, baseline or pullback; outputs stay on the target",
         )
     elif commit:
+        # Seeding runs guarded git commands, each holding its own lease on a
+        # memory-guarded target, while this run's reservation (held, unused until
+        # dispatch) can occupy the target's only guarded slot. Release it for the
+        # seed and admit the command again afterwards.
+        reseat = memory_reservation is not None
+        if reseat:
+            transport.release_memory_guard(memory_reservation, reserved_only=True)
+            memory_reservation = None
+            if memory_reservation_ref is not None:
+                memory_reservation_ref["value"] = None
         try:
             seed_commit_tree(
                 transport=transport, plan=plan, config=load_config(), policy=policy,
@@ -2480,6 +2490,29 @@ def _run_locked(
             return EXIT_TRANSFER
         reporter.event("work_seeded", path=work.tree, commit=source.commit,
                        inputs=len(source.inputs))
+        if reseat:
+            if memory_limit_mib is not None:
+                admission = transport.reserve_memory_guard(explicit_limit_mib=memory_limit_mib)
+            else:
+                admission = transport.reserve_memory_guard(predicted_rss_mb=predicted_rss_mb)
+            if not admission.admitted:
+                # The seeded tree is removed by the caller: the command never started.
+                detail = "target capacity was unavailable after seeding: " + admission.detail
+                reporter.event("memory_admission", target=plan.target.name,
+                               status=admission.status, reason=admission.reason,
+                               detail=detail, phase="post_seed")
+                write_json(summary_path, {
+                    "run_id": run_id, "project_id": plan.project.project_id,
+                    "target": plan.target.name, "command": plan.command,
+                    "started_at": started_at, "ended_at": utc_now_iso(),
+                    "phase": "memory_admission", "completion_state": "not_started",
+                    "command_started": False, "terminal": True, "error": detail,
+                    "memory_admission": admission.payload, "plan": plan.as_dict(),
+                })
+                return EXIT_GUARD
+            memory_reservation = admission.reservation
+            if memory_reservation_ref is not None:
+                memory_reservation_ref["value"] = memory_reservation
     else:
         # Untransferred runs work in this target's checkout without the project lock.
         # Reconciling that tree under them could change files they are reading and pull
