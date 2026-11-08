@@ -1455,9 +1455,11 @@ def test_posix_cancel_refuses_a_reused_pid_and_never_signals(tmp_path, monkeypat
 def test_posix_cancel_asks_first_and_kills_only_what_outlives_the_grace(tmp_path, monkeypatch):
     """A stop sends SIGTERM first so a job can flush or checkpoint; a job that ignores
     it is still stopped, with SIGKILL, once the grace period has passed."""
+    ignoring = tmp_path / "ignoring-sigterm"
     command = [sys.executable, "-S", "-c",
-               "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-               "time.sleep(60)"]
+               "import pathlib, signal, sys, time; "
+               "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+               "pathlib.Path(sys.argv[1]).write_text('1'); time.sleep(60)", str(ignoring)]
     session, root, rows = _start_session(tmp_path, {"run-a": command})
     sent: list[int] = []
     real_killpg = os.killpg
@@ -1470,6 +1472,12 @@ def test_posix_cancel_asks_first_and_kills_only_what_outlives_the_grace(tmp_path
     monkeypatch.setattr(observer.os, "killpg", recording_killpg)
     monkeypatch.setattr(observer, "_CANCEL_TERM_GRACE_SECONDS", 0.5)
     try:
+        # Registration precedes the job's own setup; a SIGTERM sent before it ignores
+        # the signal would end it at once and prove nothing about SIGKILL.
+        deadline = time.monotonic() + 10
+        while not ignoring.exists():
+            assert time.monotonic() < deadline, "job did not start ignoring SIGTERM"
+            time.sleep(0.02)
         started = time.monotonic()
         receipt = observer._cancel_posix_job(root, _job_metadata("run-a", command).payload())
         assert receipt["owned_job_cancelled"] is True
