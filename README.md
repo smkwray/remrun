@@ -269,6 +269,7 @@ time per project, without the target's checkout changing under them. It works wi
   `[logging] failed_log_retention_days`. A removal that fails is reported and retried by
   `resume` and by the next commit run there. Only `<state_root>/work/<id>` is ever
   removed; a record or summary naming any other path is reported as refused and kept.
+  A tree still being set up is never pruned while the controller that started it runs.
 - **Concurrency.** No project lock is taken. Each run holds a lease on its outputs
   until its pullback ends: a commit run whose outputs overlap a live one's (one path
   is a prefix of the other, ignoring case and Unicode form) is refused before any

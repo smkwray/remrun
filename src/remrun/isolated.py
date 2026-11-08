@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
+from ._durable_runner import pid_liveness
 from .config import RemrunConfig, work_min_free_fraction
 from .gitsync import (
     GitSyncError,
@@ -307,6 +308,9 @@ def record_work(
         "project_id": plan.project.project_id, "target": plan.target.name,
         "path": work.path, "created_at": work.extra.get("created_at") or utc_now_iso(),
         "updated_at": utc_now_iso(), "state": state, "reason": reason,
+        # The controller seeding the tree: until its fence is published at dispatch,
+        # this process being alive is what keeps the tree from being pruned.
+        "pid": os.getpid(),
     })
 
 
@@ -359,7 +363,8 @@ def prune_work_trees(
 
     A failed removal is retried at once; a retained tree, or one orphaned by a crash
     before its run finished, only after ``[logging] failed_log_retention_days``. A
-    tree whose run still holds a completion fence may be in use and is never touched.
+    tree whose run still holds a completion fence may be in use and is never touched,
+    nor is an ``active`` one whose controller may still be seeding it.
     """
     directory = _registry_dir(plan.target.name)
     if not directory.is_dir():
@@ -378,6 +383,13 @@ def prune_work_trees(
             continue
         # Any project's run on this target may own the record; its fence is checked.
         if read_unknown_completion_hazard(record["project_id"], run_id=record["run_id"]):
+            continue
+        # A tree is recorded `active` before seeding but fenced only at dispatch, so in
+        # between only its controller protects it: while that pid runs, or cannot be
+        # proven gone, the tree may be mid-seed. Taking the fence before seeding instead
+        # would hold the output lease through every pre-dispatch refusal, and a crash
+        # there would leave it for a manual resolve-unknown; a dead pid needs no cleanup.
+        if record.get("state") == "active" and pid_liveness(record.get("pid")) is not False:
             continue
         if record.get("state") != "remove_failed":
             try:

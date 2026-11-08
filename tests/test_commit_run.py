@@ -611,6 +611,58 @@ def test_pruning_removes_only_the_work_directory_a_record_names_for_its_own_id(
     assert record_path.exists() and misnamed.exists()
 
 
+def test_a_tree_being_seeded_is_never_pruned_by_a_concurrent_launch(commit_env, monkeypatch):
+    """Seeding records the tree before writing it, but the run's fence comes only at
+    dispatch. Another launch that prunes in between, with zero-day retention, must
+    leave a tree whose controller is still running alone."""
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+
+    from remrun.isolated import prune_work_trees
+
+    env = commit_env
+    seen: dict = {}
+    real_seed, real_push = cli.seed_commit_tree, LocalSimTransport.push_file
+
+    def capture(**kwargs):  # noqa: ANN003
+        seen.update(kwargs)
+        return real_seed(**kwargs)
+
+    def push_then_concurrent_prune(self, local_path, remote_path):  # noqa: ANN001
+        real_push(self, local_path, remote_path)
+        if str(remote_path).endswith("seed.bundle"):
+            prune_work_trees(
+                self, seen["plan"], replace(seen["policy"], failed_log_days=0),
+                lambda *a, **k: None, now=datetime.now(timezone.utc) + timedelta(seconds=5),
+            )
+
+    monkeypatch.setattr(cli, "seed_commit_tree", capture)
+    monkeypatch.setattr(LocalSimTransport, "push_file", push_then_concurrent_prune)
+    assert main(["run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--",
+                 *_py(_write("out/r.txt", "r"))]) == EXIT_OK
+    assert (env["project"] / "out" / "r.txt").read_text() == "r"
+
+
+def test_an_active_tree_is_pruned_only_once_its_controller_is_gone(commit_env):
+    """A tree left `active` by a controller that died before dispatch is an orphan and
+    is pruned after retention; one whose controller still runs is not."""
+    env = commit_env
+    for _ in range(2):
+        assert main(["run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--",
+                     *_py("raise SystemExit(3)")]) == 3
+    records = sorted((env["state"] / "commit-work").glob("*/*.json"))
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait()
+    for record_path, pid in zip(records, (os.getpid(), exited.pid)):
+        record = json.loads(record_path.read_text())
+        record.update(state="active", pid=pid, created_at="2000-01-01T00:00:00Z")
+        record_path.write_text(json.dumps(record))
+    live_id = records[0].stem
+    assert main(["run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--",
+                 *_py("print(1)")]) == EXIT_OK
+    assert _work_dirs(env) == {live_id} and set(_registry(env)) == {live_id}
+
+
 def test_a_home_relative_state_root_is_resolved_before_a_removal(commit_env, monkeypatch):
     """Resume and cleanup use a transport that has not probed, so a `~` state root is
     resolved with one read-only probe before the path is checked. If it still cannot
