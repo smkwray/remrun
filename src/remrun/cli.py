@@ -108,6 +108,10 @@ EXIT_TRANSFER = 3
 EXIT_INFRA = 4
 EXIT_GUARD = 5
 EXIT_CANCELLED = 130
+# How long a durable wait keeps retrying a failed status read (an SSH drop, a
+# sleeping laptop's network coming back) before it stops waiting and reports the
+# run as detached. Reads are read-only, so retrying is always safe.
+DURABLE_STATUS_RETRY_SECONDS = 300.0
 RUN_CONTEXT_ENV = "REMRUN_RUN_CONTEXT"
 
 
@@ -1097,6 +1101,18 @@ def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, report
 
 def _unknown_completion_guidance(hazard: dict[str, object]) -> str:
     run_id = str(hazard["run_id"])
+    if _durable_record_path(run_dir(run_id)).is_file():
+        # A durable run's target supervisor may still own the job and its result.
+        # Resuming finalizes it and pulls outputs back; resolving it as ended would
+        # discard that finalization.
+        return (
+            f"project is blocked by durable run {run_id}, whose completion this controller "
+            "has not yet confirmed; do not retry this project. First run "
+            f"`remrun resume {run_id}` from this project: it reattaches, waits, finalizes "
+            "and pulls outputs back. Only if resume reports the target's durable state is "
+            "missing or failed, use a read-only process/artifact probe to prove the command "
+            f"ended, then run `remrun resolve-unknown {run_id} --confirmed-ended`"
+        )
     return (
         f"project is blocked by controller-local unknown-completion hazard for run {run_id}; "
         "do not retry this project; use a read-only process/artifact probe to prove the prior "
@@ -2649,51 +2665,13 @@ def _run_locked(
         and post.next_baseline is not None
     )
     if profile_admissible:
-        try:
-            tel = result.telemetry or {}
-            profile_peak_rss_mb = tel.get("peak_rss_mb")
-            if not (
-                isinstance(profile_peak_rss_mb, (int, float))
-                and not isinstance(profile_peak_rss_mb, bool)
-                and math.isfinite(float(profile_peak_rss_mb))
-                and float(profile_peak_rss_mb) > 0
-            ):
-                guard_peak = (
-                    guard_result.get("peak_command_bytes")
-                    if guard_result is not None and guard_result.get("status") == "ok"
-                    else None
-                )
-                profile_peak_rss_mb = (
-                    guard_peak / MIB
-                    if isinstance(guard_peak, int)
-                    and not isinstance(guard_peak, bool)
-                    and guard_peak > 0
-                    else None
-                )
-            ckey = command_key(plan.command)
-            profile_exec_s = exec_s
-            target_wall = tel.get("wall_sec")
-            if (
-                plan.workload is not None
-                and isinstance(target_wall, (int, float))
-                and not isinstance(target_wall, bool)
-                and math.isfinite(target_wall)
-                and target_wall > 0
-            ):
-                profile_exec_s = float(target_wall)
-            update_profile(
-                default_state_root(),
-                profile_project_id(plan.project.project_id),
-                ckey,
-                plan.target.name,
-                peak_rss_mb=profile_peak_rss_mb,
-                avg_cpu_pct=tel.get("avg_cpu_pct"),
-                exec_s=profile_exec_s,
-                trip_s=duration,
-                now=utc_now_iso(),
-            )
-        except Exception:
-            pass
+        profile_exec_s = exec_s
+        target_wall = (result.telemetry or {}).get("wall_sec")
+        if plan.workload is not None and _positive_number(target_wall):
+            profile_exec_s = float(target_wall)
+        _record_job_profile(
+            plan, result.telemetry, guard_result, exec_s=profile_exec_s, trip_s=duration
+        )
 
     workload_profile_result: dict[str, str] | None = None
     if plan.workload is not None:
@@ -3270,6 +3248,76 @@ def cmd_logs(args: argparse.Namespace, reporter: Reporter) -> int:
     return EXIT_OK
 
 
+def _positive_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _record_job_profile(
+    plan: RunPlan,
+    telemetry: dict | None,
+    guard_result: dict | None,
+    *,
+    exec_s: float | None,
+    trip_s: float | None,
+) -> None:
+    """Fold one admissible run's measured cost into the learned job profiles.
+
+    Callers decide admissibility (successful command, attributable pullback).
+    Best-effort storage must never break a valid run.
+    """
+    try:
+        tel = telemetry or {}
+        peak_rss_mb = tel.get("peak_rss_mb")
+        if not _positive_number(peak_rss_mb):
+            guard_peak = (
+                guard_result.get("peak_command_bytes")
+                if guard_result is not None and guard_result.get("status") == "ok"
+                else None
+            )
+            peak_rss_mb = (
+                guard_peak / MIB
+                if isinstance(guard_peak, int)
+                and not isinstance(guard_peak, bool)
+                and guard_peak > 0
+                else None
+            )
+        update_profile(
+            default_state_root(),
+            profile_project_id(plan.project.project_id),
+            command_key(plan.command),
+            plan.target.name,
+            peak_rss_mb=peak_rss_mb,
+            avg_cpu_pct=tel.get("avg_cpu_pct"),
+            exec_s=exec_s,
+            trip_s=trip_s,
+            now=utc_now_iso(),
+        )
+    except Exception:
+        pass
+
+
+def _durable_command_seconds(status: dict[str, object]) -> float | None:
+    """The command's runtime on the target's own clock, or None when unproven.
+
+    The target records when the command was confirmed started (``started_at`` on
+    the accepted path, ``acknowledged_at`` otherwise) and when it ended. Both are
+    target epoch seconds, so controller clock skew and detached time do not count.
+    """
+    ended = status.get("ended_at")
+    began = status.get("started_at")
+    if not _positive_number(began):
+        began = status.get("acknowledged_at")
+    if not (_positive_number(ended) and _positive_number(began)):
+        return None
+    seconds = float(ended) - float(began)
+    return round(seconds, 3) if seconds >= 0 else None
+
+
 def _durable_record_path(rdir: Path) -> Path:
     return rdir / "durable.json"
 
@@ -3320,7 +3368,18 @@ def _detached_durable(
     status: dict[str, object],
     *,
     reason: str,
+    exit_code: int,
 ) -> int:
+    """Stop waiting on an acknowledged durable run without finalizing it.
+
+    ``exit_code`` is EXIT_OK only when the caller asked to stop waiting (``--no-wait``
+    or an interrupt); a lost connection is EXIT_INFRA so ``run --durable && next``
+    never proceeds as if the job had finished.
+    """
+    guidance = (
+        f"the job keeps running on {record['target']}; run `remrun resume {record['run_id']}` "
+        "from this project to wait for it, finalize, and pull its outputs back"
+    )
     summary = read_json(summary_path) or {"run_id": record["run_id"]}
     summary.update(
         phase="durable_wait",
@@ -3329,6 +3388,7 @@ def _detached_durable(
         durable_state=status.get("state", "running_or_pending"),
         durable_acknowledged=True,
         detached_reason=reason,
+        guidance=guidance,
         plan=record["plan"],
     )
     write_json(summary_path, summary)
@@ -3336,9 +3396,10 @@ def _detached_durable(
         "durable_detached",
         run_id=record["run_id"],
         state=status.get("state", "running_or_pending"),
-        note="target supervisor remains authoritative; resume with the exact run ID",
+        exit_code=exit_code,
+        note=guidance,
     )
-    return EXIT_OK
+    return exit_code
 
 
 def _running_observation_matches(transport, record: dict[str, object]) -> bool:  # noqa: ANN001
@@ -3552,7 +3613,10 @@ def _finalize_durable_run(
     else:
         final_exit = EXIT_OK
 
-    duration = max(0.0, time.time() - float(status.get("created_epoch", time.time())))
+    # A durable run's controller may have been detached for hours, so its own wall
+    # clock says nothing about the job. Report the command's runtime as the target
+    # recorded it, or None when the target did not record both ends.
+    duration = _durable_command_seconds(status)
     checkpoint = {
         "run_id": run_id,
         "project_id": plan.project.project_id,
@@ -3564,7 +3628,7 @@ def _finalize_durable_run(
         "ended_at": utc_now_iso(),
         "completion_state": "finalization_complete",
         "terminal": False,
-        "duration_sec": round(duration, 3),
+        "duration_sec": duration,
         "files_pulled_post": len(post.pulled) if post else 0,
         "postrun_conflicts": len(post.conflicts) if post else 0,
         "telemetry": result.telemetry,
@@ -3581,6 +3645,23 @@ def _finalize_durable_run(
     checkpoint["completion_state"] = "complete"
     checkpoint["terminal"] = True
     write_json(summary_path, checkpoint)
+    # Same admission rule as an ordinary run: only a successful command with a
+    # positively attributable pullback is evidence of a reusable job cost. The trip
+    # time is not comparable (the controller may have been detached), so only the
+    # target-measured command time is learned.
+    if (
+        not guard_failed
+        and result.exit_code == 0
+        and final_exit == EXIT_OK
+        and not bool(record["no_pullback"])
+        and post is not None
+        and not post.conflicts
+        and post.next_baseline is not None
+        and duration is not None
+    ):
+        _record_job_profile(
+            plan, result.telemetry, guard_result, exec_s=duration, trip_s=None
+        )
     reporter.event(
         "command_finished",
         exit_code=final_exit,
@@ -3618,9 +3699,39 @@ def _poll_durable(
     if acknowledged:
         reporter.event("durable_acknowledged", run_id=run_id, state=status.get("state"))
     if status.get("detached_after_ack") and acknowledged:
-        return _detached_durable(
-            reporter, summary_path, record, status, reason="launch connection lost after acknowledgement"
+        # The launch stream dropped, but an authenticated status read already
+        # succeeded, so the target is reachable: keep waiting rather than detach.
+        reporter.event(
+            "durable_launch_reconnected", run_id=run_id, state=status.get("state")
         )
+    # Separate budgets: a working status read must not reset the ownership check's.
+    failure_since: dict[str, float] = {}
+    failures: dict[str, int] = {}
+    poll_delay = 1.0
+
+    def retry_read(kind: str, exc: TransportError) -> bool:
+        """Schedule a backed-off re-read; False once this read's retry budget is spent.
+
+        The wait itself happens in the poll's sleep below, where an interrupt after
+        acknowledgement still detaches cleanly.
+        """
+        nonlocal poll_delay
+        now = time.monotonic()
+        since = failure_since.setdefault(kind, now)
+        failures[kind] = failures.get(kind, 0) + 1
+        if now - since >= DURABLE_STATUS_RETRY_SECONDS:
+            return False
+        poll_delay = min(30.0, 2.0 ** min(failures[kind], 5))
+        reporter.event(
+            "durable_status_retry",
+            run_id=run_id,
+            read=kind,
+            attempt=failures[kind],
+            retry_in_s=poll_delay,
+            message=str(exc),
+        )
+        return True
+
     while True:
         _validate_durable_identity(status, record)
         state = status.get("state")
@@ -3682,20 +3793,27 @@ def _poll_durable(
                 )
                 return EXIT_INFRA
             except TransportError as exc:
-                return _detached_durable(
-                    reporter, summary_path, record, status, reason=str(exc)
-                )
+                # Retried on the next pass, after the poll below waits out the backoff.
+                if not retry_read("ownership", exc):
+                    return _detached_durable(
+                        reporter, summary_path, record, status, reason=str(exc),
+                        exit_code=EXIT_INFRA,
+                    )
         if no_wait and acknowledged:
             return _detached_durable(
-                reporter, summary_path, record, status, reason="resume requested --no-wait"
+                reporter, summary_path, record, status, reason="resume requested --no-wait",
+                exit_code=EXIT_OK,
             )
         try:
-            time.sleep(1.0)
+            time.sleep(poll_delay)
             next_status = transport.durable_status(
                 run_id, _durable_record_token(record)
             )
             _validate_durable_identity(next_status, record)
             status = next_status
+            failure_since.pop("status", None)
+            failures.pop("status", None)
+            poll_delay = 1.0
             if status.get("acknowledged") and not acknowledged:
                 acknowledged = True
                 reporter.event(
@@ -3708,6 +3826,7 @@ def _poll_durable(
                 return _detached_durable(
                     reporter, summary_path, record, status,
                     reason="controller interrupted after acknowledgement",
+                    exit_code=EXIT_OK,
                 )
             raise
         except DurableStateError as exc:
@@ -3730,9 +3849,12 @@ def _poll_durable(
             )
             return EXIT_INFRA
         except TransportError as exc:
+            if retry_read("status", exc):
+                continue
             if acknowledged:
                 return _detached_durable(
-                    reporter, summary_path, record, status, reason=str(exc)
+                    reporter, summary_path, record, status, reason=str(exc),
+                    exit_code=EXIT_INFRA,
                 )
             reporter.event(
                 "completion_unknown",

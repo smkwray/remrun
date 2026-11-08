@@ -28,6 +28,7 @@ from remrun.transport import (
     TransportError,
 )
 from remrun.models import Device
+from remrun.profile import command_key, load_profiles
 
 
 def _posix(path: Path) -> str:
@@ -98,6 +99,15 @@ class _FakeDurableTransport(LocalSimTransport):
         self.command_seen: list[str] = []
         self.reservation_seen: MemoryReservation | None = None
         self.load: float | None = None
+        # Connection-loss simulation for the controller's wait loop: status and
+        # observer reads raise while ``unreachable`` is set, or for the next
+        # ``fail_status_reads`` status reads.
+        self.unreachable = False
+        self.fail_status_reads = 0
+        self.status_reads = 0
+        self.final_status: dict[str, object] | None = None
+        if mode == "flaky":
+            self.fail_status_reads = 2
 
     def probe(self) -> ProbeResult:
         return ProbeResult(True, "fake", remote_os="posix")
@@ -145,6 +155,8 @@ class _FakeDurableTransport(LocalSimTransport):
         if self.mode == "prestart_refusal":
             raise DurablePrestartError("injected guard renewal refusal")
         if self.mode == "detached":
+            # The launch stream drops after acknowledgement and the target then
+            # stays unreachable for the controller.
             self.status = {
                 **identity,
                 "state": "running",
@@ -152,6 +164,7 @@ class _FakeDurableTransport(LocalSimTransport):
                 "command_started": True,
                 "detached_after_ack": True,
             }
+            self.unreachable = True
             return dict(self.status), {"platform": "POSIX", "telemetry": "none"}
         result = super().exec(
             command,
@@ -161,13 +174,29 @@ class _FakeDurableTransport(LocalSimTransport):
             telemetry=False,
         )
         self.stdout, self.stderr = result.stdout, result.stderr
-        self.status = {
+        complete = {
             **identity,
             "state": "complete",
             "acknowledged": True,
             "command_started": True,
             "wrapper_exit_code": result.exit_code,
+            # Target-clock timestamps, as the durable supervisor records them.
+            "acknowledged_at": 1000.0,
+            "ended_at": 1012.5,
         }
+        if self.mode in ("reconnect", "flaky"):
+            # The command finished on the target, but the launch stream dropped
+            # after acknowledgement while the target stays reachable.
+            self.final_status = complete
+            self.status = {
+                **identity,
+                "state": "running",
+                "acknowledged": True,
+                "command_started": True,
+                "detached_after_ack": True,
+            }
+            return dict(self.status), {"platform": "POSIX", "telemetry": "none"}
+        self.status = complete
         return dict(self.status), {"platform": "POSIX", "telemetry": "none"}
 
     def durable_status(
@@ -176,6 +205,16 @@ class _FakeDurableTransport(LocalSimTransport):
         del run_id, resume_token
         if self.status is None:
             raise TransportError("no target durable state")
+        if not include_logs:
+            self.status_reads += 1
+            if self.unreachable:
+                raise TransportError("injected connection loss during status read")
+            if self.fail_status_reads > 0:
+                self.fail_status_reads -= 1
+                raise TransportError("injected transient status read failure")
+            if self.final_status is not None:
+                # The first successful status read observes the finished command.
+                self.status, self.final_status = self.final_status, None
         if include_logs:
             return {
                 "status": dict(self.status),
@@ -192,6 +231,8 @@ class _FakeDurableTransport(LocalSimTransport):
     def query_observed_jobs(self, *, sample_interval=0.05, timeout=30.0):  # noqa: ANN001
         del sample_interval, timeout
         assert self.status is not None
+        if self.unreachable:
+            raise TransportError("injected connection loss during observer query")
         return {
             "status": "ok",
             "jobs": [{
@@ -349,21 +390,30 @@ def test_resume_completes_finalization_checkpoint_without_second_pullback(
     assert not list((durable_env["state"] / "hazards" / "project").glob("*/unknown.json"))
 
 
-def test_acknowledged_request_loss_detaches_blocks_new_run_and_rejects_mismatch(
+def test_lost_connection_after_ack_detaches_nonzero_blocks_new_run_and_rejects_mismatch(
     durable_env, monkeypatch, capsys
 ):
+    """Losing the target after acknowledgement is not success: `run --durable && next`
+    must not proceed. The job keeps running, so every message points at `resume`."""
     holder = _install_fake(monkeypatch, "detached")
-    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", "print(1)"]) == EXIT_OK
+    monkeypatch.setattr(cli, "DURABLE_STATUS_RETRY_SECONDS", 0.0)
+    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", "print(1)"]) == EXIT_INFRA
     fake = holder["transport"]
     assert fake.launch_calls == 1
     run_id = _only_run_id(durable_env["state"])
     assert "durable_detached" in capsys.readouterr().err
+    summary = json.loads((durable_env["state"] / "runs" / run_id / "summary.json").read_text())
+    assert summary["completion_state"] == "detached"
+    assert f"remrun resume {run_id}" in summary["guidance"]
 
-    # The existing one-writer completion fence blocks any new mutating run.
+    # The existing one-writer completion fence blocks any new mutating run, and its
+    # guidance sends the operator to resume rather than to resolve-unknown first.
     assert main(["run", "TEST", "--", sys.executable, "-c", "print('duplicate')"]) == EXIT_INTERNAL
+    assert f"remrun resume {run_id}" in capsys.readouterr().err
     assert fake.launch_calls == 1
     assert fake.exec_calls == 0
 
+    fake.unreachable = False
     assert main(["resume", run_id, "--no-wait"]) == EXIT_OK
     assert fake.launch_calls == 1
     assert fake.status is not None
@@ -373,12 +423,66 @@ def test_acknowledged_request_loss_detaches_blocks_new_run_and_rejects_mismatch(
 
 def test_resume_rejects_a_different_controller_identity(durable_env, monkeypatch):
     holder = _install_fake(monkeypatch, "detached")
+    monkeypatch.setattr(cli, "DURABLE_STATUS_RETRY_SECONDS", 0.0)
     monkeypatch.setattr(cli, "controller_label", lambda: "controller-a")
-    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", "print(1)"]) == EXIT_OK
+    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", "print(1)"]) == EXIT_INFRA
     run_id = _only_run_id(durable_env["state"])
+    holder["transport"].unreachable = False
     monkeypatch.setattr(cli, "controller_label", lambda: "controller-b")
     assert main(["resume", run_id, "--no-wait"]) == EXIT_INTERNAL
     assert holder["transport"].launch_calls == 1
+
+
+def test_launch_stream_loss_after_ack_keeps_waiting_and_finalizes(
+    durable_env, monkeypatch, capsys
+):
+    """A dropped launch stream is not completion: while the target stays reachable
+    the controller keeps waiting, then finalizes once and pulls outputs back."""
+    holder = _install_fake(monkeypatch, "reconnect")
+    script = "import pathlib,sys; pathlib.Path('result.txt').write_text('late'); sys.exit(7)"
+    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", script]) == 7
+    assert (durable_env["project"] / "result.txt").read_text() == "late"
+    assert holder["transport"].cleanup_calls == 1
+    err = capsys.readouterr().err
+    assert "durable_launch_reconnected" in err
+    assert "durable_detached" not in err
+
+
+def test_transient_status_read_failures_are_retried_with_backoff(
+    durable_env, monkeypatch, capsys
+):
+    """An SSH blip during the wait is retried (read-only, always safe) with a growing
+    delay instead of detaching on the first failed read."""
+    holder = _install_fake(monkeypatch, "flaky")
+    sleeps: list[float] = []
+    monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+    script = "import pathlib,sys; pathlib.Path('result.txt').write_text('ok'); sys.exit(7)"
+    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", script]) == 7
+    assert holder["transport"].fail_status_reads == 0
+    assert sleeps[:3] == [1.0, 2.0, 4.0]
+    err = capsys.readouterr().err
+    assert err.count("durable_status_retry") == 2
+    assert "durable_detached" not in err
+    assert (durable_env["project"] / "result.txt").read_text() == "ok"
+
+
+def test_durable_run_records_target_measured_duration_and_learns_its_cost(
+    durable_env, monkeypatch
+):
+    """Durable jobs must feed the learned costs that admission and --auto use, timed
+    by the target's own clock; a failed command teaches nothing."""
+    _install_fake(monkeypatch)
+    ok_cmd = [sys.executable, "-c", "print('ok')"]
+    assert main(["run", "--durable", "TEST", "--", *ok_cmd]) == EXIT_OK
+    run_id = _only_run_id(durable_env["state"])
+    summary = json.loads((durable_env["state"] / "runs" / run_id / "summary.json").read_text())
+    assert summary["duration_sec"] == 12.5
+    learned = load_profiles(durable_env["state"])["proj1"][command_key(ok_cmd)]["TEST"]
+    assert learned["exec_s"] == 12.5
+
+    fail_cmd = [sys.executable, "-c", "raise SystemExit(3)"]
+    assert main(["run", "--durable", "TEST", "--", *fail_cmd]) == 3
+    assert command_key(fail_cmd) not in load_profiles(durable_env["state"])["proj1"]
 
 
 def test_loss_before_positive_ack_is_unknown_and_never_retried(durable_env, monkeypatch):

@@ -124,6 +124,15 @@ The first invocation still waits by default; interrupt or close it only after th
 acknowledgement, remrun fails closed and the command must not be retried until its
 completion state is resolved.
 
+While waiting, a failed status read (an SSH drop, a network that comes back after
+sleep) is retried with a growing delay for up to five minutes; status reads never
+touch the job. If the target stays unreachable after acknowledgement, the wait stops
+with `durable_detached`, exit code `4`, and the summary's `guidance` names the
+`remrun resume <run_id>` command that reattaches. Only `resume --no-wait` and an
+interrupt after acknowledgement stop waiting with exit code `0`. A durable summary's
+`duration_sec` is the command's runtime on the target's own clock, and a successful,
+attributable durable run updates the learned job costs like an ordinary run.
+
 With `--auto`, remrun uses the ordinary reachability, learned RAM/duration, live-load,
 memory-admission, and conflict-safe preflight selection path. It may shop another
 candidate only before durable launch. Immediately before launch it records
