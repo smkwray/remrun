@@ -253,13 +253,17 @@ time per project, without the target's checkout changing under them. It works wi
   through the ordinary pullback: unchanged local files are backed up and replaced, with
   the result hash-checked; an output you edited locally during the run is kept, the
   run's copy is saved under the run's conflict directory, and the run exits `2`. The
-  outputs come back after a failed or cancelled command too.
+  outputs come back after a failed or cancelled command too. Only regular files return:
+  a symlink or special file at or under an output, in the private tree or locally, is
+  listed in `work.unsupported_paths`, nothing is pulled or deleted at that path, the
+  tree is kept and the run exits `2`. One already there when the run starts, locally
+  or in `HEAD`, refuses the run (exit `2`).
 - **Other writes.** A file written or deleted outside the outputs that the project's
   transfer excludes cover is scratch: counted (`scratch_writes`) and discarded. Any
   other is an unexpected write: listed in the run's `work` record, never copied into
   the project, and the run exits `2`.
 - **Cleanup.** The private tree is removed only after exit `0`, a conflict-free
-  pullback and no unexpected writes. Otherwise it stays on the target with the reason
+  pullback, no unexpected writes and no unsupported outputs. Otherwise it stays on the target with the reason
   in `summary.json` (`work.state = "retained"`), and the next commit run from this
   controller to that target removes retained trees older than
   `[logging] failed_log_retention_days`. A removal that fails is reported and retried by

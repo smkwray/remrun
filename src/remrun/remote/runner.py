@@ -626,6 +626,48 @@ def build_manifest(
     return files
 
 
+def nonregular_paths(root: str, paths) -> list:
+    """Paths at, above or under ``paths`` (files, or ``dir/``) that are neither regular
+    files nor plain directories: symlinks, junctions, FIFOs, sockets, devices.
+
+    The target-side twin of ``remrun.manifest.nonregular_paths``: an ancestor counts,
+    excludes do not apply, a missing path reports nothing, and an entry that cannot be
+    inspected raises rather than reading as plain.
+    """
+    found = set()
+
+    def plain(full: str, rel: str) -> bool:
+        try:
+            mode = os.lstat(full).st_mode
+            return stat.S_ISREG(mode) or (stat.S_ISDIR(mode) and not _is_directory_link(full))
+        except OSError as exc:
+            raise RunnerError(f"cannot inspect {rel}: {exc}") from exc
+
+    def walk_error(error):
+        raise RunnerError(f"output scan failed: {error}")
+
+    for declared in paths:
+        parts = [part for part in declared.split("/") if part]
+        current, rel = root, ""
+        for part in parts:
+            current, rel = os.path.join(current, part), f"{rel}/{part}" if rel else part
+            if not os.path.lexists(current):
+                break
+            if not plain(current, rel):
+                found.add(rel)
+                break
+        else:
+            if not declared.endswith("/") or not os.path.isdir(current):
+                continue
+            for dirpath, dirnames, filenames in os.walk(current, onerror=walk_error):
+                base = os.path.relpath(dirpath, root).replace(os.sep, "/")
+                for name in dirnames + filenames:
+                    if not plain(os.path.join(dirpath, name), f"{base}/{name}"):
+                        found.add(f"{base}/{name}")
+                dirnames[:] = [name for name in dirnames if f"{base}/{name}" not in found]
+    return sorted(found)
+
+
 def _nearest_existing(path: str) -> str:
     current = os.path.abspath(os.path.expanduser(path))
     while not os.path.exists(current):
@@ -3896,6 +3938,9 @@ def legacy_main(argv) -> int:
         return 0
     if operation == "work_probe":
         sys.stdout.write(json.dumps(work_probe(request["path"])))
+        return 0
+    if operation == "nonregular":
+        sys.stdout.write(json.dumps({"paths": nonregular_paths(request["root"], request["paths"])}))
         return 0
     if operation == "probe":
         sqlite_ok = True

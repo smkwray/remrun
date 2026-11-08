@@ -72,6 +72,31 @@ def test_a_forced_directory_keeps_everything_under_it(tmp_path: Path, side: str)
     assert found == {"results/x.tmp", "results/__pycache__/m.pyc", "results/r.txt"}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX symlinks and FIFOs")
+@pytest.mark.parametrize("side", ["controller", "target runner"])
+def test_nonregular_paths_finds_links_and_special_files_at_above_and_under(
+    tmp_path: Path, side: str
+):
+    from remrun.manifest import nonregular_paths
+    from remrun.remote import runner as remote_runner
+
+    (tmp_path / "out" / "deep").mkdir(parents=True)
+    (tmp_path / "out" / "deep" / "a.txt").write_text("a")
+    (tmp_path / "out" / "file-link").symlink_to("deep/a.txt")
+    (tmp_path / "out" / "dir-link").symlink_to(tmp_path / "out" / "deep")
+    (tmp_path / "out" / "dangling").symlink_to("missing")
+    os.mkfifo(tmp_path / "out" / "deep" / "pipe")
+    (tmp_path / "above").symlink_to(tmp_path / "out")
+    paths = ["out/", "above/x.txt", "missing/y.txt", "out/deep/a.txt"]
+    found = (
+        nonregular_paths(tmp_path, paths) if side == "controller"
+        else remote_runner.nonregular_paths(str(tmp_path), paths)
+    )
+    assert found == [
+        "above", "out/dangling", "out/deep/pipe", "out/dir-link", "out/file-link",
+    ]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory-symlink coverage; Windows uses junction test")
 def test_build_manifest_prunes_directory_symlinks(tmp_path: Path):
     # Guard, not a regression test: directory symlinks were already pruned before this fix set.

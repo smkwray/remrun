@@ -413,6 +413,73 @@ def test_everything_under_a_directory_output_returns_even_globally_excluded_name
     assert summary["files_pulled_post"] == 3 and summary["work"]["state"] == "removed"
 
 
+@_posix_links
+def test_symlinks_the_command_leaves_under_an_output_are_held_never_dropped(commit_env):
+    """Manifests cannot represent a symlink, so a link the command makes under
+    `--output` would be silently left behind with its tree, and a regular output it
+    replaced with a link would read as deleted and delete the local copy. Both paths
+    are held: nothing is pulled or deleted there, the other outputs still return, the
+    tree is kept and the run exits 2."""
+    env = commit_env
+    code = _write("out/r.txt", "r") + (
+        ";import os;os.symlink('r.txt','out/link');"
+        "os.remove('out/keep.txt');os.symlink('r.txt','out/keep.txt')"
+    )
+    status, run_id = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--", *_py(code),
+    ])
+    assert status == EXIT_CONFLICT
+    out = env["project"] / "out"
+    assert (out / "r.txt").read_text() == "r"
+    assert (out / "keep.txt").read_text() == "tracked output\n"  # never read as deleted
+    assert not os.path.lexists(out / "link")
+    work = _summary(env["state"], run_id)["work"]
+    assert work["state"] == "retained" and "unsupported" in work["reason"]
+    assert work["unsupported_paths"] == ["out/keep.txt", "out/link"]
+    assert (Path(work["tree"]) / "out" / "link").is_symlink()
+    assert _lease_fences(env) == {}
+
+
+@_posix_links
+def test_a_local_symlink_appearing_under_an_output_is_never_written_through(commit_env):
+    """A directory link made locally under an output while the job ran would carry the
+    pullback's write out of the project. The path is held instead."""
+    env = commit_env
+    elsewhere = env["project"].parent.parent / "elsewhere"
+    elsewhere.mkdir()
+    local_link = env["project"] / "out" / "sub"
+    code = (
+        _write("out/sub/x.txt", "remote")
+        + f";import os;os.symlink({str(elsewhere)!r},{str(local_link)!r})"
+    )
+    status, run_id = _launch(env["state"], [
+        "run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--", *_py(code),
+    ])
+    assert status == EXIT_CONFLICT
+    assert list(elsewhere.iterdir()) == []
+    assert local_link.is_symlink()
+    work = _summary(env["state"], run_id)["work"]
+    assert work["state"] == "retained" and work["unsupported_paths"] == ["out/sub"]
+
+
+@_posix_links
+def test_a_symlink_at_an_output_before_launch_is_refused(commit_env):
+    """A link already at, above or under an output, locally or only in HEAD, refuses
+    the run before any target: remrun returns only regular files."""
+    env = commit_env
+    argv = ["run", "LOCAL_SIM", "--transfer", "commit", "--output", "out/", "--",
+            *_py("print(1)")]
+    (env["project"] / "out" / "link").symlink_to("keep.txt")
+    assert _launch(env["state"], argv) == (EXIT_CONFLICT, None)
+    _git(env["project"], "add", "out/link")
+    _git(env["project"], "commit", "-qm", "link")
+    _git(env["project"], "update-index", "--skip-worktree", "out/link")
+    (env["project"] / "out" / "link").unlink()
+    assert _git(env["project"], "status", "--porcelain", "--untracked-files=no") == ""
+    assert _launch(env["state"], argv) == (EXIT_CONFLICT, None)
+    assert not env["target_state"].exists()
+
+
 def test_local_edit_during_the_run_is_saved_as_a_conflict(commit_env):
     """Invariant 6: an output edited locally while the job ran is never overwritten.
     The command's copy is saved outside the project and the run exits 2."""
@@ -866,6 +933,34 @@ def test_work_probe_pipes_the_runner_and_fails_closed(transport_cls, device, pyt
         monkeypatch.setattr(t, "_run", run)
         with pytest.raises(TransportError):
             t.work_probe("/s/work/git/p.git")
+
+
+@pytest.mark.parametrize("transport_cls,device,python", [
+    (SSHPowerShellTransport, _ps_device(), "python"),
+    (SSHPosixTransport, Device.from_mapping("POSIX", {
+        "kind": "ssh-posix", "os": "posix", "address_candidates": ["h"],
+        "project_root": "/p", "state_root": "/s", "remote_python": "python3",
+    }), "python3"),
+])
+def test_output_scan_pipes_the_runner_and_fails_closed(
+    transport_cls, device, python, monkeypatch
+):
+    """The target-side symlink scan runs the same runner op as the local simulation;
+    an answer that is not a list of paths is an error, never "nothing found"."""
+    t = transport_cls(device)
+    t._address = "h"
+    calls, run = _recorder(json.dumps({"paths": ["out/link"]}).encode())
+    monkeypatch.setattr(t, "_run", run)
+    assert t.nonregular_paths("D:\\w\\tree", ["out/"]) == ["out/link"]
+    command = calls[-1]["argv"][-1]
+    assert command.startswith(f"{python} - ")
+    request = json.loads(base64.b64decode(command.split(" - ", 1)[1]))
+    assert request == {"op": "nonregular", "root": "D:\\w\\tree", "paths": ["out/"]}
+    for bad in (b"{}", b'{"paths": "out/link"}', b'{"paths": [""]}', b"not json"):
+        _calls, run = _recorder(bad)
+        monkeypatch.setattr(t, "_run", run)
+        with pytest.raises(TransportError):
+            t.nonregular_paths("/w/tree", ["out/"])
 
 
 def test_windows_seeding_uses_native_paths_and_long_path_git(commit_env, monkeypatch):

@@ -108,6 +108,21 @@ def _work_probe_result(proc: subprocess.CompletedProcess) -> dict[str, Any]:
     return data
 
 
+def _nonregular_result(proc: subprocess.CompletedProcess) -> list[str]:
+    """Parse the runner's ``nonregular`` answer; anything else raises."""
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or f"exit {proc.returncode}"
+        raise TransportError(f"target output scan failed: {detail}")
+    try:
+        data = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise TransportError(f"target output scan returned invalid JSON: {exc}") from exc
+    paths = data.get("paths") if isinstance(data, dict) else None
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise TransportError("target output scan returned no usable answer")
+    return paths
+
+
 @dataclass(frozen=True)
 class ExecResult:
     exit_code: int
@@ -1936,6 +1951,12 @@ class BaseTransport:
         absent). Read-only."""
         raise NotImplementedError
 
+    def nonregular_paths(self, remote_root: str, paths: Iterable[str]) -> list[str]:
+        """Project paths at, above or under ``paths`` in ``remote_root`` that are not
+        regular files or plain directories (symlinks, junctions, special files).
+        Read-only; a scan that cannot finish raises."""
+        raise NotImplementedError
+
     # --- diagnostics ------------------------------------------------------
     def probe(self) -> ProbeResult:
         raise NotImplementedError
@@ -2447,6 +2468,15 @@ class LocalSimTransport(BaseTransport):
             creationflags=_NO_WINDOW,
         )
         return _work_probe_result(proc)
+
+    def nonregular_paths(self, remote_root: str, paths: Iterable[str]) -> list[str]:
+        request = {"op": "nonregular", "root": remote_root, "paths": list(paths)}
+        proc = subprocess.run(
+            [sys.executable, "-", _runner_request(request)],
+            input=_runner_source(), capture_output=True, check=False,
+            creationflags=_NO_WINDOW,
+        )
+        return _nonregular_result(proc)
 
     def probe(self) -> ProbeResult:
         return ProbeResult(reachable=True, address="localhost", detail="local-sim", remote_os="posix")
@@ -4605,6 +4635,12 @@ class SSHPosixTransport(_SSHCommon):
         script = f"{shlex.quote(self.device.remote_python)} - {request}"
         return _work_probe_result(self._remote(address, script, input_bytes=_runner_source()))
 
+    def nonregular_paths(self, remote_root: str, paths: Iterable[str]) -> list[str]:
+        address = self._address_or_resolve()
+        request = _runner_request({"op": "nonregular", "root": remote_root, "paths": list(paths)})
+        script = f"{shlex.quote(self.device.remote_python)} - {request}"
+        return _nonregular_result(self._remote(address, script, input_bytes=_runner_source()))
+
 
 class SSHPowerShellTransport(_SSHCommon):
     """Windows backend over OpenSSH + PowerShell.
@@ -5832,6 +5868,12 @@ class SSHPowerShellTransport(_SSHCommon):
         request = _runner_request({"op": "work_probe", "path": remote_path})
         script = f"{self.device.remote_python} - {request}"
         return _work_probe_result(self._remote(address, script, input_bytes=_runner_source()))
+
+    def nonregular_paths(self, remote_root: str, paths: Iterable[str]) -> list[str]:
+        address = self._address_or_resolve()
+        request = _runner_request({"op": "nonregular", "root": remote_root, "paths": list(paths)})
+        script = f"{self.device.remote_python} - {request}"
+        return _nonregular_result(self._remote(address, script, input_bytes=_runner_source()))
 
 
 def make_transport(device: Device) -> BaseTransport:

@@ -3318,7 +3318,7 @@ def _run_locked(
     # rather than reporting a clean success; the command's own code is preserved in
     # the summary as command_exit_code and in the command_finished event.
     postrun_unresolved = bool(post and post.conflicts) or bool(
-        commit_final and commit_final.unexpected
+        commit_final and commit_final.unresolved
     )
     required_receipt_invalid = bool(
         plan.workload is not None
@@ -4450,7 +4450,7 @@ def _finalize_durable_run(
         write_baseline(plan.target.name, plan.project.project_id, pre_local, pre_remote)
 
     postrun_unresolved = bool(post and post.conflicts) or bool(
-        commit_final and commit_final.unexpected
+        commit_final and commit_final.unresolved
     )
     if guard_failed:
         final_exit = EXIT_GUARD

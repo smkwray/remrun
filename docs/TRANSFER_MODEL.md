@@ -74,11 +74,14 @@ source        -> HEAD, plus each --input file (SHA-256 recorded); dirty tracked 
 seeding       -> a bundle (incremental once the target's cache holds an ancestor) into a
                  bare cache under <state_root>/work/git/, then a local clone and checkout
 the command   -> runs in tree/<relative cwd>; the target's checkout is never read or written
-outputs       -> ordinary pullback, limited to the --output paths
+outputs       -> ordinary pullback, limited to the --output paths; a symlink or special
+                 file at or under one (target or local) is held: not pulled, its local
+                 path untouched, the tree is kept, exit 2
 other writes  -> under the project's excludes: scratch, discarded
                  anywhere else: reported, never pulled, the tree is kept, exit 2
-cleanup       -> the tree is removed only after exit 0, a clean verified pullback and no
-                 unexpected writes; otherwise it is kept, and pruned later
+cleanup       -> the tree is removed only after exit 0, a clean verified pullback, no
+                 unexpected writes and no held outputs; otherwise it is kept, and
+                 pruned later
 no baseline   -> commit runs never read or advance the ordinary baseline
 no project lock -> each run leases its outputs instead
 ```
@@ -97,7 +100,9 @@ output-leased  -> a live commit run of the project holds an overlapping --output
 
 An `--input` that is not a regular file, or has a symlink at or above it in the working
 tree or in `HEAD`, is refused the same way: the overlay is written into `HEAD`'s
-checkout, where such a link would carry the write out of the private tree.
+checkout, where such a link would carry the write out of the private tree. A symlink or
+special file at, above or under an `--output`, in the working tree or in `HEAD`, is
+refused too: remrun returns only regular files.
 
 Refusals of one candidate (exit 2, nothing written to it; `--auto` tries the next):
 

@@ -727,6 +727,7 @@ def postrun_pullback(
     write_scope_paths: list[str] | tuple[str, ...] | None = None,
     include_paths: list[str] | tuple[str, ...] = (),
     within: list[str] | tuple[str, ...] | None = None,
+    held: list[str] | tuple[str, ...] = (),
 ) -> PullbackResult:
     """Pull command-caused remote changes back to local project paths.
 
@@ -738,7 +739,9 @@ def postrun_pullback(
 
     ``within`` (files and ``dir/`` prefixes) limits both the pullback and the local
     walk to those paths; every other command-caused change is listed in
-    ``outside`` and left on the remote side.
+    ``outside`` and left on the remote side. Changes at or under a ``held`` path are
+    neither pulled nor mirrored as deletions: the caller found something there the
+    manifests cannot represent (a symlink or special file).
     """
     result = PullbackResult()
 
@@ -752,6 +755,10 @@ def postrun_pullback(
         ]
         changed = [rel for rel in changed if path_within(rel, within)]
         deleted = [rel for rel in deleted if path_within(rel, within)]
+    if held:
+        held_dirs = [path.rstrip("/") + "/" for path in held]
+        changed = [rel for rel in changed if not path_within(rel + "/", held_dirs)]
+        deleted = [rel for rel in deleted if not path_within(rel + "/", held_dirs)]
     cur_local = _build_local_manifest(
         local_root,
         excludes,

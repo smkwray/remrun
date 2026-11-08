@@ -182,6 +182,25 @@ def commit_source(plan: RunPlan) -> CommitSource:
             links.append(path)
         if len(parts) == 4 and parts[3].isdigit():
             tree_bytes += int(parts[3])
+    # remrun returns only regular files. A symlink or special file at, above or under an
+    # output would be skipped by the manifests (or, locally, written through), so one
+    # already in HEAD or in the working tree refuses the run before any target.
+    for rel in plan.outputs:
+        link = _head_link(rel, links)
+        if link is not None:
+            raise CommitSourceError(
+                f"--output {rel}: HEAD has a symlink at {link}; remrun returns only "
+                "regular files"
+            )
+    try:
+        odd = nonregular_paths(root, plan.outputs)
+    except ManifestError as exc:
+        raise CommitSourceError(f"--output: {exc}") from exc
+    if odd:
+        raise CommitSourceError(
+            f"--output: {odd[0]} is a symlink or special file in this project; remrun "
+            "returns only regular files"
+        )
     inputs = []
     for rel in plan.inputs:
         # The overlay is written into the checked-out commit, where a symlink of HEAD's
@@ -519,6 +538,13 @@ class CommitFinal:
     scratch: list[str]
     unexpected: list[str]
     work: dict[str, Any]
+    # Symlinks or special files at or under an output, on either side: held, not pulled.
+    unsupported: list[str] = field(default_factory=list)
+
+    @property
+    def unresolved(self) -> bool:
+        """Something the pullback could not return; the run exits 2."""
+        return bool(self.unexpected or self.unsupported)
 
 
 def finalize_commit_outputs(
@@ -537,10 +563,12 @@ def finalize_commit_outputs(
 
     A write outside the outputs that the project's transfer excludes cover is scratch,
     counted and discarded; any other is unexpected: reported, never pulled, and it
-    keeps the tree. Only a clean command, a conflict-free verified pullback and no
-    unexpected writes leave the work ``pending_removal`` (see ``remove_commit_work``);
-    otherwise it is ``retained`` with the reason. ``TransportError`` from the pullback
-    propagates with the tree retained.
+    keeps the tree. A symlink or special file at or under an output, in the tree or
+    locally, is unsupported: manifests cannot see it, so its path is held (neither
+    pulled nor mirrored as a deletion) and it keeps the tree. Only a clean command, a
+    conflict-free verified pullback and neither kind of write leave the work
+    ``pending_removal`` (see ``remove_commit_work``); otherwise it is ``retained`` with
+    the reason. ``TransportError`` from the pullback propagates with the tree retained.
     """
     pre_paths = (rdir / "pre_remote_manifest.json", rdir / "pre_local_manifest.json")
     if not all(path.is_file() for path in pre_paths):
@@ -552,6 +580,13 @@ def finalize_commit_outputs(
         # A vanished tree would read as every file deleted; never attribute that.
         if not transport.remote_path_exists(work["tree"]):
             raise TransportError(f"the run's private tree {work['tree']} is gone")
+        try:
+            local_odd = nonregular_paths(plan.project.local_project_root, plan.outputs)
+        except ManifestError as exc:
+            raise TransportError(str(exc)) from exc
+        unsupported = sorted({
+            *transport.nonregular_paths(work["tree"], plan.outputs), *local_odd,
+        })
         post = postrun_pullback(
             transport=transport,
             local_root=plan.project.local_project_root,
@@ -570,6 +605,7 @@ def finalize_commit_outputs(
             # private tree, so no scratch name needs keeping out there.
             include_paths=plan.outputs,
             within=plan.outputs,
+            held=unsupported,
         )
     except TransportError as exc:
         _retain(plan, run_id, registry, f"pullback failed: {exc}", report)
@@ -584,11 +620,19 @@ def finalize_commit_outputs(
     if unexpected:
         report("unexpected_writes", count=len(unexpected), paths=unexpected[:_LISTED_PATHS],
                note="written outside --output; left in the retained private tree")
+    if unsupported:
+        report("unsupported_outputs", count=len(unsupported),
+               paths=unsupported[:_LISTED_PATHS],
+               note="symlink or special file at or under --output, in the private tree or "
+                    "locally: not returned, its local counterpart left as it is; the "
+                    "private tree is retained")
     reasons = [command_note] if not command_clean else []
     if post.conflicts:
         reasons.append(f"{len(post.conflicts)} output conflict(s)")
     if unexpected:
         reasons.append(f"{len(unexpected)} unexpected write(s)")
+    if unsupported:
+        reasons.append(f"{len(unsupported)} unsupported output(s) (symlink or special file)")
     reason = "; ".join(reasons) or None
     state = (
         _retain(plan, run_id, registry, reason, report) if reason else "pending_removal"
@@ -597,7 +641,8 @@ def finalize_commit_outputs(
         **work, "state": state, "reason": reason,
         "scratch_writes": len(scratch), "unexpected_writes": len(unexpected),
         "unexpected_paths": unexpected[:_LISTED_PATHS],
-    })
+        "unsupported_paths": unsupported[:_LISTED_PATHS],
+    }, unsupported=unsupported)
 
 
 def remove_commit_work(
