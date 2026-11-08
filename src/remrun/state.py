@@ -6,10 +6,11 @@ import os
 import secrets
 import shutil
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 from ._durable_runner import pid_liveness
 from .manifest import FileEntry, Manifest
@@ -477,6 +478,15 @@ class ProjectLock:
         except OSError:
             pass
 
+    @contextmanager
+    def guarded(self) -> Iterator[None]:
+        """Hold the lock table's guard: no lock of this project is taken meanwhile."""
+        self._acquire_guard()
+        try:
+            yield
+        finally:
+            self._release_guard()
+
     def _lock_info(self, path: Path) -> dict[str, object]:
         info_path = path / "info.json"
         if not info_path.exists():
@@ -538,6 +548,25 @@ class ProjectLock:
             if isinstance(info.get("run_id"), str) and self._holder_liveness(info)[0] is True:
                 run_ids.add(str(info["run_id"]))
         return run_ids
+
+    def busy_on_target(self) -> list[str]:
+        """This project's locks whose holder may still be working on ``self.target``.
+
+        Call inside ``guarded()``. A holder counts unless its pid has provably exited
+        or its readable metadata names another target; unreadable metadata, which
+        cannot say where its holder works, counts (fail closed).
+        """
+        whole = self.root / "whole.lock"
+        paths = ([whole] if whole.exists() else []) + self._conflicting_scope_locks()
+        busy: list[str] = []
+        for path in paths:
+            info = self._lock_info(path)
+            alive, why = self._holder_liveness(info)
+            target = info.get("target")
+            if alive is False or (isinstance(target, str) and target != self.target):
+                continue
+            busy.append(f"{self._describe_holder(path)}; {why}")
+        return busy
 
     @staticmethod
     def _remove_lock_dir(path: Path) -> bool:

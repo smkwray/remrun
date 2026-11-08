@@ -194,7 +194,9 @@ on every run. It works with `--durable`, `--auto` and `--label`.
   ordinary run of the project has unknown completion. An ordinary (reconciling) run
   refuses a target while an untransferred run of the project may still be working
   there (`target-busy-untransferred`; `--auto` tries another target), so it never
-  changes files under that run or pulls back its half-written outputs.
+  changes files under that run or pulls back its half-written outputs. Likewise, an
+  untransferred run refuses a target where an ordinary run of the project may still
+  hold the project lock (`target-busy-ordinary`; `--auto` tries another target).
 - A project that declares `[run.bootstrap]` must already be set up on the target. An
   untransferred run checks readiness but never runs setup; run one ordinary run there
   first.

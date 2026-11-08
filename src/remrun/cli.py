@@ -1374,6 +1374,60 @@ def _refuse_candidate(
     )
 
 
+def _publish_completion_fence(
+    *,
+    reporter: Reporter,
+    plan: RunPlan,
+    run_id: str,
+    summary_path: Path,
+    started_at: str,
+    verified: list[dict[str, str]],
+) -> dict[str, object]:
+    """Write the fence that marks this run's completion unknown, just before dispatch.
+
+    An ordinary run holds the project lock, so it writes the project-wide fence. An
+    untransferred run takes no project lock: it checks for an ordinary run on its
+    target and publishes its own fence in one step under the lock table's guard, which
+    every project-lock acquisition also holds. Both orders are then safe. Lock first:
+    the check below sees the holder and refuses this candidate. Fence first: the
+    ordinary run takes its lock afterwards, and its per-run-fence check, made while it
+    holds that lock, sees this fence and refuses. An ordinary durable run that detached
+    wrote its project-wide fence before it released its lock, so the fence read below,
+    which follows the lock read, sees it.
+    """
+    project_id = plan.project.project_id
+    if plan.transfer_mode != "none":
+        return write_unknown_completion_hazard(project_id, plan.target.name, run_id)
+    table = ProjectLock(project_id, plan.target.name)
+    with table.guarded():
+        busy = table.busy_on_target()
+        if not busy and read_unknown_completion_hazard(project_id) is None:
+            return write_unknown_completion_hazard(
+                project_id, plan.target.name, run_id, per_run=True
+            )
+    if busy:
+        _refuse_candidate(
+            reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+            started_at=started_at, phase="dispatch", verified=verified,
+            conflicts=[{
+                "path": plan.project.relative_cwd or ".",
+                "state": "target-busy-ordinary",
+                "reason": (
+                    f"an ordinary run of this project may be reconciling or running in "
+                    f"{plan.target.name}'s checkout ({busy[0]}); wait for it or choose "
+                    "another target"
+                ),
+            }],
+        )
+    # An ordinary run's fence appeared after this run's admission check; it blocks
+    # every target, so this is not a candidate-local refusal.
+    hazard = _report_unknown_completion_hazard(project_id, reporter)
+    raise UnknownCompletionHazardError(
+        _unknown_completion_guidance(hazard) if hazard is not None
+        else "an ordinary run's completion fence changed while this run was starting"
+    )
+
+
 def _stage_workload_context(
     *,
     plan: RunPlan,
@@ -2283,6 +2337,10 @@ def _run_locked(
         # Untransferred runs work in this target's checkout without the project lock.
         # Reconciling that tree under them could change files they are reading and pull
         # back their half-written outputs, so a reconciling run takes another target.
+        # This check runs while this run holds the project lock, and an untransferred
+        # run publishes its fence under that lock table's guard only when no live
+        # holder is on its target (_publish_completion_fence). Whichever of the two
+        # goes first, the other sees it.
         busy = [
             fence["run_id"]
             for fence in per_run_completion_fences(plan.project.project_id)
@@ -2653,11 +2711,9 @@ def _run_locked(
     # Fence before dispatch, not after a transport exception. A controller can be
     # killed without Python regaining control; in that case the remote start/result
     # is unknowable and an automatic retry is unsafe.
-    hazard = write_unknown_completion_hazard(
-        plan.project.project_id,
-        plan.target.name,
-        run_id,
-        per_run=untransferred,
+    hazard = _publish_completion_fence(
+        reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+        started_at=started_at, verified=verified,
     )
     guidance = _unknown_completion_guidance(hazard, per_run=untransferred)
     write_json(summary_path, {
@@ -4379,9 +4435,15 @@ def _run_durable_locked(
         **verify_fields,
     }
     write_json(_durable_record_path(rdir), record)
-    hazard = write_unknown_completion_hazard(
-        plan.project.project_id, plan.target.name, run_id, per_run=untransferred
-    )
+    try:
+        hazard = _publish_completion_fence(
+            reporter=reporter, plan=plan, run_id=run_id, summary_path=summary_path,
+            started_at=started_at, verified=list(verify_fields.get("verify") or []),
+        )
+    except (_PreflightConflict, LockError, UnknownCompletionHazardError):
+        # Refused before launch: a run that never started keeps no launch record.
+        _durable_record_path(rdir).unlink(missing_ok=True)
+        raise
     write_json(summary_path, {
         "run_id": run_id,
         "project_id": plan.project.project_id,

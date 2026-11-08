@@ -55,9 +55,10 @@ target-checkout-missing -> the checkout or the run's directory is absent on the 
 verify-mismatch         -> a --verify file differs on the target
 verify-unavailable      -> the target could not hash a --verify file (fail closed)
 bootstrap-not-ready     -> a declared [run.bootstrap] is not ready; setup never runs here
+target-busy-ordinary    -> an ordinary run of the project may still hold its lock there
 ```
 
-All four are candidate-local, so `--auto` tries the next candidate. Each untransferred
+All five are candidate-local, so `--auto` tries the next candidate. Each untransferred
 run keeps its own completion fence; it still refuses while an ordinary run of the
 project has unknown completion. An ordinary run refuses a target named by any live
 untransferred fence of the project (`target-busy-untransferred`, candidate-local).

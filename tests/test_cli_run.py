@@ -1770,7 +1770,8 @@ def test_untransferred_run_never_reconciles_or_pulls_back(env, capsys):
     assert (env["proj"] / "input.txt").read_text() == "local copy"
     assert not (env["proj"] / "result.txt").exists()
     assert not (env["state"] / "manifests").exists()
-    assert not (env["state"] / "locks").exists()
+    # It holds the lock table's guard only while publishing its fence; no lock is taken.
+    assert not list((env["state"] / "locks").glob("**/*.lock"))
     assert not list((env["state"] / "hazards").glob("**/*.json"))
     (summary_path,) = (env["state"] / "runs").glob("*/summary.json")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))

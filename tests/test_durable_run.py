@@ -786,9 +786,11 @@ def test_two_untransferred_durable_runs_on_one_project_launch_concurrently(
         summary = _summary(state, run_id)
         assert summary["completion_state"] == "detached"
         assert summary["plan"]["transfer_mode"] == "none"
-    # Neither touched the project's own lock table (only per-run waiter locks exist).
+    # Neither took the project's own lock (only per-run waiter locks exist); they only
+    # held its table's guard while publishing their fences.
     project_locks = state / "locks" / "project" / hashlib.sha256(b"proj1").hexdigest()[:16]
-    assert not project_locks.exists()
+    assert not (project_locks / "whole.lock").exists()
+    assert not (project_locks / "scopes").exists()
     assert not (state / "manifests").exists()
 
 
@@ -816,6 +818,141 @@ def test_reconciling_run_refuses_a_target_where_an_untransferred_run_works(
 
     code, _other = _launch(state, ["run", "--transfer", "safe", "OTHER", "--", *LONG_JOB])
     assert code == EXIT_OK
+
+
+_MARK_JOB = [sys.executable, "-c", "import pathlib; pathlib.Path('ran.txt').write_text('ran')"]
+
+
+def _ranked_fakes(monkeypatch) -> dict[str, _FakeDurableTransport]:  # noqa: ANN001
+    """One fake per device, with TEST ranked first under --auto."""
+    transports: dict[str, _FakeDurableTransport] = {}
+
+    def factory(device: Device):
+        transport = transports.setdefault(device.name, _FakeDurableTransport(device))
+        transport.load = 0.0 if device.name == "TEST" else 90.0
+        return transport
+
+    monkeypatch.setattr(cli, "make_transport", factory)
+    return transports
+
+
+@pytest.mark.parametrize(
+    ("holder_target", "liveness", "refused"),
+    [
+        ("TEST", True, True),
+        ("TEST", None, True),  # a holder not proven dead may still be reconciling
+        ("TEST", False, False),
+        ("OTHER", True, False),
+    ],
+)
+def test_untransferred_run_refuses_a_target_an_ordinary_run_holds(
+    durable_env, monkeypatch, capsys, holder_target, liveness, refused
+):
+    """An ordinary run holding the project lock may be reconciling the target's checkout
+    or pulling it back. An untransferred job launched there would read files as they
+    change and leave half-written outputs for that pullback, so the target is refused
+    before anything is dispatched, as a candidate-local conflict. A dead holder, or one
+    working on another target, is no reason to refuse."""
+    state = durable_env["state"]
+    remote = durable_env["remote_project"]
+    other_remote = remote.parent.parent / "remote-other" / "proj1"
+    for root in (remote, other_remote):
+        root.mkdir()
+    transports = _ranked_fakes(monkeypatch)
+    owner = ProjectLock("proj1", holder_target, run_id="ordinary-run").acquire()
+    info_path = owner.path / "info.json"
+    info_path.write_text(
+        json.dumps({**json.loads(info_path.read_text()), "pid": 4242}), encoding="utf-8"
+    )
+    real_liveness = state_module.pid_liveness
+    monkeypatch.setattr(
+        state_module, "pid_liveness",
+        lambda pid: liveness if pid == 4242 else real_liveness(pid),
+    )
+    try:
+        capsys.readouterr()
+        code, run_id = _launch(state, ["run", "--transfer", "none", "TEST", "--", *_MARK_JOB])
+        if not refused:
+            assert code == EXIT_OK
+            assert (remote / "ran.txt").read_text() == "ran"
+            return
+        assert code == EXIT_CONFLICT
+        assert "target-busy-ordinary" in capsys.readouterr().err
+        assert transports["TEST"].exec_calls == 0
+        assert not (remote / "ran.txt").exists()
+        assert not list((state / "hazards").glob("**/*.json"))
+        assert _summary(state, run_id)["completion_state"] == "not_started"
+        conflicts = json.loads((state / "conflicts" / run_id / "conflicts.json").read_text())
+        assert [c["state"] for c in conflicts["conflicts"]] == ["target-busy-ordinary"]
+
+        code, run_id = _launch(
+            state, ["run", "--durable", "--transfer", "none", "TEST", "--", *_MARK_JOB]
+        )
+        assert code == EXIT_CONFLICT
+        assert transports["TEST"].launch_calls == 0
+        assert not (state / "runs" / run_id / "durable.json").exists()
+        assert not list((state / "hazards").glob("**/*.json"))
+
+        # Candidate-local: --auto moves on to a target the ordinary run is not using.
+        assert main(["run", "--auto", "--transfer", "none", "--", *_MARK_JOB]) == EXIT_OK
+        assert transports["TEST"].exec_calls == 0
+        assert (other_remote / "ran.txt").read_text() == "ran"
+        assert not (remote / "ran.txt").exists()
+    finally:
+        owner.release()
+
+
+def test_untransferred_run_started_mid_reconcile_is_refused(durable_env, monkeypatch, capsys):
+    """The race itself: an ordinary run has taken the lock and passed its per-run-fence
+    check, and is reconciling, when an untransferred run of the project starts on the
+    same target. Checking for the ordinary run and publishing the untransferred fence
+    happen under the lock table's guard, so the late starter is refused."""
+    durable_env["remote_project"].mkdir()
+    transports = _ranked_fakes(monkeypatch)
+    real_preflight = cli.preflight_reconcile
+    nested: list[int] = []
+
+    def preflight(*args, **kwargs):  # noqa: ANN002, ANN003
+        if not nested:
+            nested.append(main(["run", "--transfer", "none", "TEST", "--", *_MARK_JOB]))
+        return real_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "preflight_reconcile", preflight)
+    capsys.readouterr()
+
+    assert main(["run", "--transfer", "safe", "TEST", "--", *LONG_JOB]) == EXIT_OK
+
+    assert nested == [EXIT_CONFLICT]
+    assert "target-busy-ordinary" in capsys.readouterr().err
+    assert transports["TEST"].exec_calls == 1  # only the ordinary run's command
+    assert not (durable_env["project"] / "ran.txt").exists()
+    assert not (durable_env["remote_project"] / "ran.txt").exists()
+
+
+def test_ordinary_run_started_after_an_untransferred_fence_is_refused(
+    durable_env, monkeypatch, capsys
+):
+    """The other order: an untransferred run has published its fence and is running when
+    an ordinary run starts on its target; the ordinary run's fence check sees it."""
+    durable_env["remote_project"].mkdir()
+    transports = _ranked_fakes(monkeypatch)
+    fake_exec = _FakeDurableTransport.exec
+    nested: list[int] = []
+
+    def exec_and_race(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if not nested:
+            nested.append(main(["run", "--transfer", "safe", "TEST", "--", *LONG_JOB]))
+        return fake_exec(self, *args, **kwargs)
+
+    monkeypatch.setattr(_FakeDurableTransport, "exec", exec_and_race)
+    capsys.readouterr()
+
+    assert main(["run", "--transfer", "none", "TEST", "--", *_MARK_JOB]) == EXIT_OK
+
+    assert nested == [EXIT_CONFLICT]
+    assert "target-busy-untransferred" in capsys.readouterr().err
+    assert transports["TEST"].exec_calls == 1
+    assert (durable_env["remote_project"] / "ran.txt").read_text() == "ran"
 
 
 def test_verify_mismatch_refuses_before_dispatch_without_fence(
