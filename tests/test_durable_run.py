@@ -110,6 +110,13 @@ class _FakeDurableTransport(LocalSimTransport):
         self.final_status: dict[str, object] | None = None
         if mode == "flaky":
             self.fail_status_reads = 2
+        # The target observer's registry row for the launched run, and how the
+        # target answers `cancel`: "confirm" (the supervisor then records the
+        # stop), "confirm_unsettled" (stop confirmed, exit not yet recorded),
+        # or "refuse" (no exact row).
+        self.observation_seen: JobObservation | None = None
+        self.cancel_mode = "confirm"
+        self.cancel_calls: list[tuple[JobObservation, str]] = []
 
     def probe(self) -> ProbeResult:
         return ProbeResult(True, "fake", remote_os="posix")
@@ -142,6 +149,7 @@ class _FakeDurableTransport(LocalSimTransport):
         del resume_token, max_log_bytes, created_at, telemetry, telemetry_request
         self.launch_calls += 1
         self.command_seen = list(command)
+        self.observation_seen = observation
         self.reservation_seen = memory_reservation
         identity = {
             "schema": 1,
@@ -229,6 +237,25 @@ class _FakeDurableTransport(LocalSimTransport):
         del run_id, resume_token
         self.cleanup_calls += 1
         return {"cleaned": True}
+
+    def cancel_observed(self, observation, *, cwd, timeout=30.0):  # noqa: ANN001
+        del timeout
+        self.cancel_calls.append((observation, cwd))
+        registered = self.observation_seen
+        exact = ("job_id", "project", "source_controller", "target", "phase", "command_sha256")
+        if self.cancel_mode == "refuse" or registered is None or any(
+            getattr(observation, key) != getattr(registered, key) for key in exact
+        ):
+            return False, "remrun cancel refused: no registered job has this exact identity"
+        # The command had written partial output before it was stopped.
+        (Path(cwd) / "partial.txt").write_text("partial", encoding="utf-8")
+        if self.cancel_mode == "confirm":
+            assert self.status is not None
+            self.status = {
+                **self.status, "state": "complete", "wrapper_exit_code": 137,
+                "acknowledged_at": 1000.0, "ended_at": 1001.0,
+            }
+        return True, ""
 
     def query_observed_jobs(self, *, sample_interval=0.05, timeout=30.0):  # noqa: ANN001
         del sample_interval, timeout
@@ -1503,3 +1530,239 @@ def test_windows_transport_builds_noninteractive_observed_durable_spec(tmp_path:
     assert "--ready-file" in argv
     assert "-NonInteractive" in argv
     assert "-EncodedCommand" in argv
+
+
+# --- remrun cancel -------------------------------------------------------------
+
+
+def _detached_run(durable_env, monkeypatch):  # noqa: ANN001
+    """A durable run that is still running on the target after its controller left."""
+    holder = _install_fake(monkeypatch, "detached")
+    monkeypatch.setattr(cli, "DURABLE_STATUS_RETRY_SECONDS", 0.0)
+    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", "print(1)"]) == EXIT_INFRA
+    fake = holder["transport"]
+    fake.unreachable = False
+    return fake, _only_run_id(durable_env["state"])
+
+
+def _count_pullbacks(monkeypatch) -> list[int]:  # noqa: ANN001
+    counter = [0]
+    real = cli.postrun_pullback
+
+    def counted(*args, **kwargs):  # noqa: ANN002, ANN003
+        counter[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "postrun_pullback", counted)
+    return counter
+
+
+_IDENTITY = ("job_id", "project", "source_controller", "target", "phase", "command_sha256")
+
+
+def test_cancel_stops_the_exact_registered_job_then_finalizes_like_resume(
+    durable_env, monkeypatch, capsys
+):
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    pullbacks = _count_pullbacks(monkeypatch)
+    rdir = durable_env["state"] / "runs" / run_id
+
+    assert main(["cancel", run_id]) == 137
+
+    (observation, _cwd), = fake.cancel_calls
+    registered = fake.observation_seen
+    assert registered is not None
+    assert [getattr(observation, key) for key in _IDENTITY] == [
+        getattr(registered, key) for key in _IDENTITY
+    ]
+    # Outputs come back as for any nonzero exit, and the fence is cleared only by
+    # the ordinary finalization.
+    assert pullbacks[0] == 1
+    assert (durable_env["project"] / "partial.txt").read_text() == "partial"
+    summary = json.loads((rdir / "summary.json").read_text())
+    assert (summary["completion_state"], summary["terminal"], summary["exit_code"]) == (
+        "complete", True, 137,
+    )
+    assert summary["cancel"]["owned_job_cancelled"] is True
+    record = json.loads((rdir / "durable.json").read_text())
+    assert record["cancel"]["owned_job_cancelled"] is True
+    assert cli.read_unknown_completion_hazard("proj1") is None
+    assert (fake.launch_calls, fake.cleanup_calls) == (1, 1)
+    assert "cancel_requested" in capsys.readouterr().err
+
+    # Repeating either verb neither signals again nor pulls outputs twice.
+    assert main(["cancel", run_id]) == 137
+    assert main(["resume", run_id]) == 137
+    assert len(fake.cancel_calls) == 1
+    assert pullbacks[0] == 1
+
+
+def test_cancel_that_cannot_prove_ownership_leaves_completion_unknown(
+    durable_env, monkeypatch, capsys
+):
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    pullbacks = _count_pullbacks(monkeypatch)
+    fake.cancel_mode = "refuse"
+    capsys.readouterr()
+
+    assert main(["cancel", run_id]) == EXIT_INFRA
+
+    err = capsys.readouterr().err
+    assert "completion_unknown" in err
+    assert f"remrun resume {run_id}" in err
+    assert fake.status is not None and fake.status["state"] == "running"
+    summary = json.loads((durable_env["state"] / "runs" / run_id / "summary.json").read_text())
+    assert summary["completion_state"] == "detached"
+    assert summary["cancel"]["owned_job_cancelled"] is False
+    assert "no registered job" in summary["cancel"]["detail"]
+    hazard = cli.read_unknown_completion_hazard("proj1")
+    assert hazard is not None and hazard["run_id"] == run_id
+    assert (pullbacks[0], fake.cleanup_calls) == (0, 0)
+    # The completion fence still blocks a new run in this project.
+    assert main(["run", "TEST", "--", sys.executable, "-c", "print('next')"]) == EXIT_INTERNAL
+    assert fake.exec_calls == 0
+
+
+def test_cancel_never_signals_a_run_that_is_still_starting(durable_env, monkeypatch, capsys):
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    assert fake.status is not None
+    fake.status.update(state="pending", acknowledged=False)
+    capsys.readouterr()
+
+    assert main(["cancel", run_id]) == EXIT_INFRA
+
+    assert fake.cancel_calls == []
+    assert "cancel_refused" in capsys.readouterr().err
+    hazard = cli.read_unknown_completion_hazard("proj1")
+    assert hazard is not None and hazard["run_id"] == run_id
+
+
+def test_cancel_while_the_original_controller_waits_only_requests_the_stop(
+    durable_env, monkeypatch, capsys
+):
+    """The waiting controller owns the summary and finalization; cancel must not race it."""
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    pullbacks = _count_pullbacks(monkeypatch)
+    rdir = durable_env["state"] / "runs" / run_id
+    summary_before = (rdir / "summary.json").read_bytes()
+    # A live process holding this run's project lock is exactly a controller still
+    # polling it (the original `run --durable`, or a `resume`).
+    waiting = ProjectLock("proj1", "TEST", run_id=run_id).acquire()
+    try:
+        capsys.readouterr()
+        assert main(["cancel", run_id]) == EXIT_OK
+        assert len(fake.cancel_calls) == 1
+        assert "cancel_handed_off" in capsys.readouterr().err
+        assert (rdir / "summary.json").read_bytes() == summary_before
+        assert (pullbacks[0], fake.cleanup_calls) == (0, 0)
+        hazard = cli.read_unknown_completion_hazard("proj1")
+        assert hazard is not None and hazard["run_id"] == run_id
+        record = json.loads((rdir / "durable.json").read_text())
+        assert record["cancel"]["owned_job_cancelled"] is True
+    finally:
+        waiting.release()
+    # The waiting controller then finalizes the stopped command once.
+    assert main(["resume", run_id]) == 137
+    assert pullbacks[0] == 1
+    assert (durable_env["project"] / "partial.txt").read_text() == "partial"
+
+
+def test_cancel_of_a_run_that_already_finished_behaves_like_resume(durable_env, monkeypatch):
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    assert fake.status is not None
+    fake.status = {
+        **fake.status, "state": "complete", "wrapper_exit_code": 0,
+        "acknowledged_at": 1000.0, "ended_at": 1002.0,
+    }
+
+    assert main(["cancel", run_id]) == EXIT_OK
+
+    assert fake.cancel_calls == []
+    summary = json.loads((durable_env["state"] / "runs" / run_id / "summary.json").read_text())
+    assert (summary["completion_state"], summary["exit_code"]) == ("complete", 0)
+    assert "cancel" not in summary
+
+
+def test_cancel_is_restricted_to_the_creating_controller_and_project(
+    durable_env, monkeypatch
+):
+    holder = _install_fake(monkeypatch, "detached")
+    monkeypatch.setattr(cli, "DURABLE_STATUS_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(cli, "controller_label", lambda: "controller-a")
+    assert main(["run", "--durable", "TEST", "--", sys.executable, "-c", "print(1)"]) == EXIT_INFRA
+    run_id = _only_run_id(durable_env["state"])
+    fake = holder["transport"]
+    fake.unreachable = False
+
+    monkeypatch.setattr(cli, "controller_label", lambda: "controller-b")
+    assert main(["cancel", run_id]) == EXIT_INTERNAL
+    monkeypatch.setattr(cli, "controller_label", lambda: "controller-a")
+    other = durable_env["project"].parent / "proj2"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    assert main(["cancel", run_id]) == EXIT_INTERNAL
+    assert fake.cancel_calls == []
+
+
+def test_confirmed_stop_without_a_recorded_exit_stays_unknown(
+    durable_env, monkeypatch, capsys
+):
+    fake, run_id = _detached_run(durable_env, monkeypatch)
+    fake.cancel_mode = "confirm_unsettled"
+    monkeypatch.setattr(cli, "DURABLE_CANCEL_SETTLE_SECONDS", 0.0)
+    capsys.readouterr()
+
+    assert main(["cancel", run_id]) == EXIT_INFRA
+
+    assert "completion_unknown" in capsys.readouterr().err
+    hazard = cli.read_unknown_completion_hazard("proj1")
+    assert hazard is not None and hazard["run_id"] == run_id
+    summary = json.loads((durable_env["state"] / "runs" / run_id / "summary.json").read_text())
+    assert summary["completion_state"] == "detached"
+    assert summary["cancel"]["owned_job_cancelled"] is True
+
+
+def test_posix_cancel_observed_requires_the_exact_confirmed_receipt(tmp_path, monkeypatch):
+    from remrun.transport import ExecResult
+
+    transport = SSHPosixTransport(_posix_device(tmp_path))
+    monkeypatch.setattr(transport, "_ensure_job_observer", lambda: (str(tmp_path), "/observer.py"))
+    observation = JobObservation.for_command(
+        job_id="run", project="project", target="POSIX", phase="command",
+        command=["python", "job.py"], source_controller="controller",
+    )
+    exact = {
+        "schema": 1, "job_id": "run", "command_sha256": observation.command_sha256,
+        "owned_job_cancelled": True,
+    }
+    replies = {
+        "confirmed": ExecResult(0, json.dumps(exact), ""),
+        "other job": ExecResult(0, json.dumps({**exact, "job_id": "other"}), ""),
+        "refused": ExecResult(
+            2, json.dumps({**exact, "owned_job_cancelled": False}),
+            "remrun cancel refused: no registered job has this exact identity\n",
+        ),
+        "malformed": ExecResult(0, "not json", ""),
+    }
+    seen: list[tuple[list[str], str]] = []
+    outcomes = {}
+    for case, reply in replies.items():
+        def control(command, *, cwd, timeout, reply=reply):  # noqa: ANN001
+            del timeout
+            seen.append((command, cwd))
+            return reply
+
+        monkeypatch.setattr(transport, "exec_control", control)
+        outcomes[case] = transport.cancel_observed(observation, cwd="/projects/project")
+
+    assert outcomes["confirmed"] == (True, "")
+    assert outcomes["other job"][0] is False
+    assert outcomes["refused"] == (
+        False, "remrun cancel refused: no registered job has this exact identity",
+    )
+    assert outcomes["malformed"][0] is False
+    assert seen[0] == (
+        ["python3", "-S", "/observer.py", "cancel", "--state-root", str(tmp_path),
+         "--metadata-b64", observation.encoded()],
+        "/projects/project",
+    )

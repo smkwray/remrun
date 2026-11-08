@@ -4004,6 +4004,29 @@ def _guarded_run(
                 pass
 
 
+def _enter_private_process_group() -> None:
+    """Lead a new process group so the job's group holds only this job.
+
+    Some SSH servers start a session's command inside the server's own process
+    group, so signalling "the job's group" would reach unrelated sessions. A
+    group leader (for example a session leader) already owns its group. With a
+    controlling terminal the helper stays in the terminal's foreground group, so
+    terminal hangup and interrupt delivery, and terminal reads, are unchanged.
+    """
+    if os.getpgrp() == os.getpid():
+        return
+    try:
+        os.close(os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY))
+    except OSError:
+        pass
+    else:
+        return
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+
+
 def main() -> int:
     if len(sys.argv) == 3 and sys.argv[1] == "--memory-admission":
         try:
@@ -4058,6 +4081,7 @@ def main() -> int:
                 pass
             return 125
 
+    _enter_private_process_group()
     detailed = "--detailed" in options
     telemetry = "--telemetry" in options
 

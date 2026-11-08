@@ -495,7 +495,16 @@ def _stream_file_process(
 # getrusage(RUSAGE_CHILDREN) for peak RSS and CPU seconds (no polling, no
 # psutil) and emits a telemetry sentinel on stderr. Exits with the child code.
 _POSIX_TELEMETRY_SAMPLER = (
-    "import sys,time,json,resource,platform,subprocess\n"
+    "import os,sys,time,json,resource,platform,subprocess\n"
+    # Lead a private process group, as _posix_telemetry does, unless a controlling
+    # terminal is attached (then terminal job control stays unchanged).
+    "try:\n"
+    " os.close(os.open('/dev/tty',os.O_RDONLY|os.O_NOCTTY))\n"
+    "except OSError:\n"
+    " try:\n"
+    "  os.getpgrp()==os.getpid() or os.setpgid(0,0)\n"
+    " except OSError:\n"
+    "  pass\n"
     "i=sys.argv.index('--');cmd=sys.argv[i+1:]\n"
     "t0=time.time();rc=subprocess.call(cmd);wall=time.time()-t0\n"
     "try:\n"
@@ -1228,6 +1237,28 @@ def _parse_job_query_payload(stdout: bytes, stderr: bytes = b"") -> dict[str, ob
     return payload
 
 
+def _observer_cancel_outcome(
+    result: ExecResult, observation: JobObservation
+) -> tuple[bool, str]:
+    """True only for the observer's exact confirmed receipt; otherwise why not.
+
+    A refusal, a malformed receipt, or a receipt for another identity is never
+    treated as a stop.
+    """
+    expected = {
+        "schema": 1, "job_id": observation.job_id,
+        "command_sha256": observation.command_sha256, "owned_job_cancelled": True,
+    }
+    try:
+        receipt = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        receipt = None
+    if result.exit_code == 0 and receipt == expected:
+        return True, ""
+    detail = result.stderr.strip()[-500:]
+    return False, detail or f"observer cancel exited {result.exit_code}"
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     reachable: bool
@@ -1761,6 +1792,15 @@ class BaseTransport:
                 "detail": "this transport cannot query target-local active jobs",
             },
         }
+
+    def cancel_observed(
+        self, observation: JobObservation, *, cwd: str, timeout: float = 30.0
+    ) -> tuple[bool, str]:
+        """Stop exactly one registered observer job; (confirmed, refusal detail)."""
+        del observation, cwd, timeout
+        raise TransportError(
+            f"observed-job cancellation is unsupported by transport {type(self).__name__}"
+        )
 
     # --- filesystem -------------------------------------------------------
     def ensure_remote_dir(self, remote_path: str) -> None:
@@ -3645,6 +3685,17 @@ class SSHPosixTransport(_SSHCommon):
             )
         return _parse_job_query_payload(proc.stdout, proc.stderr)
 
+    def cancel_observed(
+        self, observation: JobObservation, *, cwd: str, timeout: float = 30.0
+    ) -> tuple[bool, str]:
+        state_root, helper = self._ensure_job_observer()
+        result = self.exec_control(
+            [self.device.remote_python or "python3", "-S", helper, "cancel",
+             "--state-root", state_root, "--metadata-b64", observation.encoded()],
+            cwd=cwd, timeout=timeout,
+        )
+        return _observer_cancel_outcome(result, observation)
+
     def _invoke_memory_admission(
         self, request: dict[str, object]
     ) -> dict[str, object]:
@@ -4584,17 +4635,11 @@ class SSHPowerShellTransport(_SSHCommon):
             cancelled = False
             detail = "Windows owned-job cancellation is unconfirmed"
             try:
-                receipt = self.exec_control(
-                    [self.device.remote_python or "python", "-S", helper, "cancel-windows",
-                     "--state-root", state_root, "--metadata-b64", metadata],
-                    cwd=cwd, timeout=15.0,
-                )
-                cancelled = receipt.exit_code == 0 and json.loads(receipt.stdout) == {
-                    "schema": 1, "job_id": observation.payload()["job_id"],
-                    "command_sha256": observation.command_sha256, "owned_job_cancelled": True,
-                }
+                cancelled, refusal = self.cancel_observed(observation, cwd=cwd, timeout=15.0)
                 if cancelled:
                     detail = "Windows owned job cancelled; escaped work remains unproved"
+                elif refusal:
+                    detail += f": {refusal}"
             except Exception as exc:
                 detail += f": {type(exc).__name__}: {exc}"
             raise CommandCancelledError(detail, owned_job_cancelled=cancelled) from interrupted
@@ -4642,6 +4687,17 @@ class SSHPowerShellTransport(_SSHCommon):
                 + proc.stderr.decode("utf-8", "replace").strip()
             )
         return _parse_job_query_payload(proc.stdout, proc.stderr)
+
+    def cancel_observed(
+        self, observation: JobObservation, *, cwd: str, timeout: float = 30.0
+    ) -> tuple[bool, str]:
+        state_root, helper = self._ensure_job_observer()
+        result = self.exec_control(
+            [self.device.remote_python or "python", "-S", helper, "cancel",
+             "--state-root", state_root, "--metadata-b64", observation.encoded()],
+            cwd=cwd, timeout=timeout,
+        )
+        return _observer_cancel_outcome(result, observation)
 
     def remote_project_path(self, project: ProjectContext) -> str:
         root = self._expand_remote(self.device.project_root).rstrip("\\/")

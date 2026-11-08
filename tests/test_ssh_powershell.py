@@ -1141,7 +1141,7 @@ def test_observed_windows_interrupt_cancels_only_exact_owned_job(monkeypatch, ca
         raise KeyboardInterrupt
 
     def cancel(command, **_kwargs):
-        assert "cancel-windows" in command
+        assert "cancel" in command
         assert command[command.index("--metadata-b64") + 1] == metadata.encoded()
         return transport_mod.ExecResult(0 if cancelled else 2, json.dumps({
             "schema": 1, "job_id": metadata.payload()["job_id"],

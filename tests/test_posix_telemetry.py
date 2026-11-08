@@ -1138,3 +1138,144 @@ def test_guard_preserves_shell_signal_exit_semantics(tmp_path):
     assert payload["command_exit_code"] == 128 + signal.SIGTERM
     assert payload["helper_exit_code"] == 128 + signal.SIGTERM
     assert _ledger_leases(state_root) == []
+
+
+# --- the helper leads the job's process group --------------------------------
+#
+# Some SSH servers run a session's command inside the server's own process group,
+# so "the job's group" was the server's: signalling it ended unrelated sessions.
+# The top-level helper must lead a group of its own, except under a controlling
+# terminal, where terminal hangup/interrupt delivery has to stay as it was.
+
+_SESSION_LEADER = (
+    "import fcntl,os,subprocess,sys,termios,time\n"
+    "tty, marker = sys.argv[1], sys.argv[2]\n"
+    "if tty:\n"
+    "    fd = os.open(tty, os.O_RDWR)\n"
+    "    fcntl.ioctl(fd, termios.TIOCSCTTY, 0)\n"
+    "p = subprocess.Popen(sys.argv[3:], stdin=subprocess.DEVNULL)\n"
+    "deadline = time.monotonic() + 20\n"
+    "while not os.path.exists(marker) and p.poll() is None and time.monotonic() < deadline:\n"
+    "    time.sleep(0.01)\n"
+    "print(os.getpgrp(), os.getpgid(p.pid), p.pid, flush=True)\n"
+    "sys.exit(p.wait())\n"
+)
+
+
+def _helper_group(tmp_path: Path, build, *, terminal: bool = False) -> tuple[int, int, int]:  # noqa: ANN001
+    """(session leader's group, helper's group, helper pid), read once the command runs.
+
+    The helper is a non-leader child of a fresh session leader, which is how an SSH
+    server that does not create a session per command starts it.
+    """
+    marker = tmp_path / f"started-{uuid.uuid4().hex}"
+    probe = [
+        sys.executable, "-c",
+        f"import pathlib,time; pathlib.Path({str(marker)!r}).write_text('x'); time.sleep(0.5)",
+    ]
+    master = slave = None
+    tty = ""
+    if terminal:
+        master, slave = os.openpty()
+        tty = os.ttyname(slave)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _SESSION_LEADER, tty, str(marker), *build(probe)],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    finally:
+        for fd in (master, slave):
+            if fd is not None:
+                os.close(fd)
+    assert result.returncode == 0, result.stderr
+    leader_group, helper_group, helper_pid = map(int, result.stdout.splitlines()[0].split())
+    return leader_group, helper_group, helper_pid
+
+
+def _assert_private_group_only_without_terminal(tmp_path: Path, build) -> None:  # noqa: ANN001
+    leader_group, helper_group, helper_pid = _helper_group(tmp_path, build)
+    assert helper_group == helper_pid
+    assert helper_group != leader_group
+    leader_group, helper_group, _pid = _helper_group(tmp_path, build, terminal=True)
+    assert helper_group == leader_group
+
+
+def test_detailed_helper_leads_its_own_process_group(tmp_path: Path):
+    _assert_private_group_only_without_terminal(
+        tmp_path, lambda probe: [sys.executable, str(HELPER), "--detailed", "--", *probe]
+    )
+
+
+def test_guarded_helper_leads_its_own_process_group(tmp_path: Path):
+    def build(probe: list[str]) -> list[str]:
+        reserved = _renew_guard(
+            _reserve_guard(tmp_path / f"state-{uuid.uuid4().hex}", max_command_mib=128)
+        )
+        return _guarded_helper_argv(reserved, token=uuid.uuid4().hex, command=probe)
+
+    _assert_private_group_only_without_terminal(tmp_path, build)
+
+
+def test_legacy_telemetry_sampler_leads_its_own_process_group(tmp_path: Path):
+    from remrun.transport import _POSIX_TELEMETRY_SAMPLER
+
+    _assert_private_group_only_without_terminal(
+        tmp_path, lambda probe: [sys.executable, "-c", _POSIX_TELEMETRY_SAMPLER, "--", *probe]
+    )
+
+
+def test_guarded_observed_job_reports_the_cancelled_command_exit(tmp_path: Path):
+    """A durable guarded run is guard -> observer -> command. Cancelling the observer's
+    group must surface as the command's own SIGKILL exit with the guard clean, so the
+    ordinary finalization reports 137 instead of a guard failure."""
+    from remrun import _job_observer as observer
+    from remrun.job_observation import JobObservation
+
+    state_root = tmp_path / "state"
+    observer_root = tmp_path / "observer"
+    reserved = _renew_guard(_reserve_guard(state_root, max_command_mib=128))
+    token = uuid.uuid4().hex
+    command = [sys.executable, "-S", "-c", "import time; time.sleep(60)"]
+    item = JobObservation.for_command(
+        job_id="run-guarded", project="example-project", target="POSIXBOX",
+        phase="command", command=command, source_controller="CTRL",
+    )
+    observed = [
+        sys.executable, "-S", str(Path(observer.__file__)), "run",
+        "--state-root", str(observer_root), "--metadata-b64", item.encoded(), "--", *command,
+    ]
+    guarded = subprocess.Popen(
+        _guarded_helper_argv(reserved, token=token, command=observed),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            records, _ = observer._read_records(observer_root)
+            if records and int(records[0]["root_pid"]) != int(records[0]["owner_pid"]):
+                break
+            assert time.monotonic() < deadline, "guarded observed job did not start"
+            time.sleep(0.02)
+        cancel = subprocess.run(
+            [sys.executable, "-S", str(Path(observer.__file__)), "cancel",
+             "--state-root", str(observer_root), "--metadata-b64", item.encoded()],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        assert cancel.returncode == 0, cancel.stderr
+        _out, err = guarded.communicate(timeout=20)
+        payload = _guard_payload_from_stderr(err, token)
+        assert guarded.returncode == 128 + signal.SIGKILL
+        assert payload["status"] == "ok"
+        assert payload["command_exit_code"] == 128 + signal.SIGKILL
+        assert _ledger_leases(state_root) == []
+    finally:
+        if guarded.poll() is None:
+            os.killpg(guarded.pid, signal.SIGKILL)
+            guarded.wait(timeout=5)
+        for row in observer._read_records(observer_root)[0]:
+            try:
+                os.killpg(int(row["owner_key"]), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass

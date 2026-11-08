@@ -88,6 +88,7 @@ remrun run --durable --auto -- <cmd>  # auto-select once, then survive source di
 remrun run --durable macbox -- <cmd>  # explicit target; same durable behavior
 remrun resume <run_id>              # recover logs, exit code, and pullback
 remrun resume <run_id> --no-wait    # report authenticated target state and return
+remrun cancel <run_id>              # stop that run's own processes, then finalize like resume
 remrun run --scope spec_a --auto -- <cmd>  # opt-in declared write scope
 remrun run macbox --memory-limit-mib 8192 -- <cmd>  # optional hard limit for a heavy first run
 remrun run macbox --wait-lock 600 -- <cmd>  # wait up to 600 s for a running holder of the project lock
@@ -135,6 +136,23 @@ with `durable_detached`, exit code `4`, and the summary's `guidance` names the
 interrupt after acknowledgement stop waiting with exit code `0`. A durable summary's
 `duration_sec` is the command's runtime on the target's own clock, and a successful,
 attributable durable run updates the learned job costs like an ordinary run.
+
+`remrun cancel <run_id>` stops a durable run, from the same controller and project as
+`resume`. It records the request with the run's saved state, then asks the target's job
+observer to stop exactly the processes it registered for that run: on POSIX the run's
+own process group, signalled with SIGKILL only after the run's root process, matched by
+PID and start time, is seen inside it; on Windows the run's own Job Object. No process
+group is ever taken from a process listing. Processes the command deliberately moved to
+another group, session or Job are not stopped. Once the target confirms the processes
+are gone, `cancel` finalizes like `resume`: it reports the stopped command's exit code
+(137 on POSIX) and pulls outputs back as after any other nonzero exit. A run that had
+already finished is finalized exactly as `resume` would. If another remrun process is
+still waiting on the run (the original `run --durable`, or a `resume`), `cancel` only
+stops the command and exits `0`; the waiting process finalizes it. `cancel` stops
+nothing while the run is still starting or when the target holds no record with the
+run's exact identity; it then exits `4`, completion stays unknown, and the guidance
+names `remrun resume <run_id>`. Events: `cancel_requested`, `cancel_refused`,
+`cancel_handed_off`, `completion_unknown`.
 
 With `--auto`, remrun uses the ordinary reachability, learned RAM/duration, live-load,
 memory-admission, and conflict-safe preflight selection path. It may shop another
@@ -353,7 +371,12 @@ The most common failure modes and their fixes:
 6. **An SSH reset after `command_started` means completion is unknown.** The remote
    command may still be running even though the controller exits `4`. Do not immediately
    retry a mutating command. Read the persisted `completion_state=unknown` guidance and
-   probe the runner's process/artifact state first.
+   probe the runner's process/artifact state first. To stop such a command by hand,
+   signal its own process IDs. On POSIX, remrun's remote helper leads a process group of
+   its own when job observation, telemetry or the memory guard wraps the run (telemetry
+   and the memory guard keep the terminal's group if the SSH session has a terminal). A
+   run with none of these starts the command directly in the SSH session's process
+   group, which some SSH servers share with other sessions, so never signal that group.
 7. **A Syncthing-delivered project usually has NO `.git` — that is normal, not
    broken.** `.git` is excluded from Syncthing, so a project arriving on a new device
    is a full working tree with no history. Do not `git clone` over it (that would fight

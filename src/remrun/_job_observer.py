@@ -1,12 +1,14 @@
 """Stdlib-only target helper for ``remrun fleet jobs``.
 
-The helper has two operations:
+The helper's main operations:
 
 * ``run`` establishes a target-local ownership boundary, registers it before user
   code can start, launches one already-constructed argv, and retains the bounded
   row while a truthfully attributable process tree survives.
 * ``query`` opens that registry read-only, takes at most two shared process-table
   snapshots, and emits one JSON document. It never deletes or repairs state.
+* ``cancel`` stops exactly one registered ownership boundary (a POSIX process
+  group or a Windows Job) after proving it still belongs to that row.
 
 POSIX ownership is a private process group with an exact generation witness.
 Windows ownership is a named Job Object whose handle is retained by one detached,
@@ -25,6 +27,7 @@ import ntpath
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -49,6 +52,8 @@ _WIN_KEEPER_CLEANUP_RETRIES = 50
 _SCHEMA_READY_ATTEMPTS = 25
 _SCHEMA_READY_DELAY_SECONDS = 0.02
 _START_GATE_TIMEOUT_SECONDS = 60.0
+# How long ``cancel`` waits for a stopped boundary to have no processes left.
+_CANCEL_SETTLE_SECONDS = 5.0
 # A record that started more than this long before the current boot is stale:
 # no process survives a restart. The boot-time estimate (wall clock minus an
 # uptime that counts sleep) has under a second of sampling/rounding jitter, but a
@@ -2527,34 +2532,115 @@ def _run_command(
     return (128 - return_code) if return_code < 0 else return_code
 
 
-def _cancel_windows_job(root: Path, metadata: dict[str, object]) -> dict[str, object]:
-    """Cancel only an exact observed Job. Explicit breakaway is outside this proof."""
-    receipt = {
+def _cancel_receipt(metadata: dict[str, object]) -> dict[str, object]:
+    return {
         "schema": 1, "job_id": metadata["job_id"],
         "command_sha256": metadata["command_sha256"], "owned_job_cancelled": False,
     }
+
+
+def _cancel_refused(receipt: dict[str, object], detail: str) -> dict[str, object]:
+    print(f"remrun cancel refused: {detail}", file=sys.stderr, flush=True)
+    return receipt
+
+
+def _exact_owned_record(
+    root: Path, metadata: dict[str, object], owner_kind: str
+) -> tuple[dict[str, object] | None, str]:
+    """Return the one registry row with this job's full identity, or why there is none."""
     records, errors = _read_records(root)
+    if errors:
+        return None, "the active-job registry has unreadable rows"
     keys = ("job_id", "command_sha256", "project", "target", "source_controller", "phase")
     matches = [record for record in records
                if all(record.get(key) == metadata.get(key) for key in keys)]
-    if errors or len(matches) != 1 or matches[0]["owner_kind"] != "windows_job_v2":
-        return receipt
-    record = matches[0]
+    if not matches:
+        return None, "no registered job has this exact identity"
+    if len(matches) != 1:
+        return None, "more than one registered job has this identity"
+    if matches[0]["owner_kind"] != owner_kind:
+        return None, f"the registered job is not owned by a {owner_kind} boundary"
+    return matches[0], ""
+
+
+def _posix_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # a member we cannot signal is still a member
+    return True
+
+
+def _cancel_posix_job(root: Path, metadata: dict[str, object]) -> dict[str, object]:
+    """Kill only the exact registered process group, then wait for it to be empty.
+
+    The group is the observer's private one (``_posix_owner_row``). It is signalled
+    only after the registered root process, by pid and start identity, is seen live
+    inside it, so a group number read from anywhere else, such as the SSH session's
+    group, is never a target. A member that deliberately changed its group or
+    session is outside this proof and is not signalled.
+    """
+    receipt = _cancel_receipt(metadata)
+    record, detail = _exact_owned_record(root, metadata, "posix_pgid")
+    if record is None:
+        return _cancel_refused(receipt, detail)
+    try:
+        pgid = int(str(record["owner_key"]))
+    except (TypeError, ValueError):
+        return _cancel_refused(receipt, "the registered process-group key is invalid")
+    if pgid <= 1 or pgid == os.getpgrp():
+        return _cancel_refused(receipt, "the registered process group is not job-scoped")
+    try:
+        root_row = _processes().get(int(record["root_pid"]))
+    except Exception as exc:
+        return _cancel_refused(receipt, f"process table unreadable: {type(exc).__name__}")
+    if (
+        root_row is None
+        or root_row.identity is None
+        or root_row.identity != record["root_identity"]
+        or root_row.pgid != pgid
+    ):
+        return _cancel_refused(
+            receipt, "the registered root process is not live inside its registered group"
+        )
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # the group ended between the proof and the signal; confirm below
+    except PermissionError:
+        return _cancel_refused(receipt, "the registered process group cannot be signalled")
+    deadline = time.monotonic() + _CANCEL_SETTLE_SECONDS
+    while _posix_group_exists(pgid):
+        if time.monotonic() >= deadline:
+            return _cancel_refused(receipt, "the process group still has members")
+        time.sleep(0.02)
+    receipt["owned_job_cancelled"] = True
+    return receipt
+
+
+def _cancel_windows_job(root: Path, metadata: dict[str, object]) -> dict[str, object]:
+    """Cancel only an exact observed Job. Explicit breakaway is outside this proof."""
+    receipt = _cancel_receipt(metadata)
+    record, detail = _exact_owned_record(root, metadata, "windows_job_v2")
+    if record is None:
+        return _cancel_refused(receipt, detail)
     # Pin the object before checking the keeper generation, preventing name reuse
     # between the identity check and termination. Never target a shared build Job.
     handle = _win_open_job(str(record["owner_key"]), terminate=True)
     if handle is None:
-        return receipt
+        return _cancel_refused(receipt, "the registered Job Object cannot be opened")
     try:
-        state, _rows, _detail = _windows_owned_sample(record, _processes())
+        state, _rows, detail = _windows_owned_sample(record, _processes())
         if state not in {"live", "stale"}:
-            return receipt
+            return _cancel_refused(receipt, detail or "Job ownership is unproved")
         if not _win_kernel32().TerminateJobObject(handle, 130):
             raise _win_error("TerminateJobObject")
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + _CANCEL_SETTLE_SECONDS
         while _win_job_pids(handle):
             if time.monotonic() >= deadline:
-                return receipt
+                return _cancel_refused(receipt, "the Job still has processes")
             time.sleep(0.02)
         receipt["owned_job_cancelled"] = True
         return receipt
@@ -2573,7 +2659,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--started-file")
     run.add_argument("--exit-token")
     run.add_argument("command", nargs=argparse.REMAINDER)
-    cancel = sub.add_parser("cancel-windows")
+    cancel = sub.add_parser("cancel")
     cancel.add_argument("--state-root", required=True)
     cancel.add_argument("--metadata-b64", required=True)
     query_parser = sub.add_parser("query")
@@ -2611,8 +2697,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"__REMRUN_OBSERVED_EXIT_{exit_token}__{code};")
             sys.stderr.flush()
         return code
-    if args.operation == "cancel-windows":
-        receipt = _cancel_windows_job(root, _decode_metadata(args.metadata_b64))
+    if args.operation == "cancel":
+        cancel = _cancel_windows_job if os.name == "nt" else _cancel_posix_job
+        receipt = cancel(root, _decode_metadata(args.metadata_b64))
         print(json.dumps(receipt, sort_keys=True))
         return 0 if receipt["owned_job_cancelled"] else 2
     if args.operation == "hold-windows-job":

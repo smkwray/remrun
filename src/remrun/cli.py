@@ -100,7 +100,7 @@ from .transport import (
 
 KNOWN_COMMANDS = {
     "capabilities", "devices", "doctor", "plan", "run", "status", "logs", "clean", "bench", "sync",
-    "git-sync", "runner", "action", "resolve-unknown", "resume", "observe",
+    "git-sync", "runner", "action", "resolve-unknown", "resume", "observe", "cancel",
 }
 
 # Exit codes (see docs/AGENT_OUTPUT_SPEC.md).
@@ -115,6 +115,9 @@ EXIT_CANCELLED = 130
 # sleeping laptop's network coming back) before it stops waiting and reports the
 # run as detached. Reads are read-only, so retrying is always safe.
 DURABLE_STATUS_RETRY_SECONDS = 300.0
+# How long `cancel` waits, after the target confirmed the stop, for the durable
+# supervisor to record the command's exit before leaving completion unknown.
+DURABLE_CANCEL_SETTLE_SECONDS = 60.0
 RUN_CONTEXT_ENV = "REMRUN_RUN_CONTEXT"
 
 
@@ -319,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_observe(args, reporter)
         if args.command_name == "resume":
             return cmd_resume(args, reporter)
+        if args.command_name == "cancel":
+            return cmd_cancel(args, reporter)
         if args.command_name == "status":
             return cmd_status(args, reporter)
         if args.command_name == "logs":
@@ -427,6 +432,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("resume", help="Resume an exact controller-owned durable run")
     p.add_argument("run_id", help="the exact durable run ID")
     p.add_argument("--no-wait", action="store_true", help="report a running state and return")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser(
+        "cancel",
+        help="Stop an exact controller-owned durable run, then finalize it like resume",
+    )
+    p.add_argument("run_id", help="the exact durable run ID")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("status", help="Show recent remrun status")
@@ -4632,6 +4644,177 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
     finally:
         if lock is not None:
             lock.release()
+
+
+def _durable_observation(record: dict[str, object], plan: RunPlan) -> JobObservation:
+    """The exact observer identity this durable run registered at launch.
+
+    ``_run_durable_locked`` registers durable runs in phase ``command``. The saved
+    digest is authoritative because the dispatched argv can differ from the plan's.
+    The label is display-only and plays no part in the observer's match.
+    """
+    return replace(
+        JobObservation.for_command(
+            job_id=str(record["run_id"]), project=str(record["project_id"]),
+            target=str(record["target"]), phase="command", command=plan.command,
+            source_controller=str(record["controller"]),
+        ),
+        command_sha256=str(record["command_sha256"]),
+    )
+
+
+def _request_durable_stop(
+    *,
+    reporter: Reporter,
+    transport,  # noqa: ANN001
+    plan: RunPlan,
+    record: dict[str, object],
+    rdir: Path,
+    status: dict[str, object],
+    hazard: dict[str, object],
+    summary_path: Path | None,
+) -> bool:
+    """Record the request, then ask the target observer to stop exactly this run.
+
+    Nothing is signalled until the target has acknowledged a running command and
+    the saved launch record is complete: before that, ownership is not published.
+    ``summary_path`` is None when another controller process is waiting on the run
+    and owns its summary. True only when the observer confirms the tree is gone.
+    """
+    run_id = str(record["run_id"])
+    guidance = _unknown_completion_guidance(hazard)
+    if (
+        status.get("state") != "running"
+        or status.get("acknowledged") is not True
+        or not isinstance(record.get("execution"), dict)
+    ):
+        reporter.event(
+            "cancel_refused", run_id=run_id, state=status.get("state"),
+            reason="the run is still starting; its process ownership is not published yet",
+            guidance=guidance,
+        )
+        return False
+    request: dict[str, object] = {"requested_at": utc_now_iso(), "owned_job_cancelled": None}
+
+    def save() -> None:
+        record["cancel"] = request
+        write_json(_durable_record_path(rdir), record)
+        if summary_path is not None:
+            summary = read_json(summary_path) or {"run_id": run_id}
+            summary["cancel"] = request
+            write_json(summary_path, summary)
+
+    save()
+    reporter.event("cancel_requested", run_id=run_id, target=plan.target.name)
+    try:
+        cancelled, detail = transport.cancel_observed(
+            _durable_observation(record, plan), cwd=str(record["remote_cwd"]), timeout=60.0
+        )
+    except TransportError as exc:
+        cancelled, detail = False, str(exc)
+    request["owned_job_cancelled"] = cancelled
+    if detail:
+        request["detail"] = detail
+    save()
+    if not cancelled:
+        reporter.event(
+            "completion_unknown", run_id=run_id,
+            reason=f"the target did not confirm the stop: {detail}", guidance=guidance,
+        )
+    return cancelled
+
+
+def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
+    """Stop a durable run's exact registered process tree, then finalize it as resume does.
+
+    The stop goes to the target observer's registry row for this run (job id,
+    command digest, project, target, source controller and phase), never to a
+    process group read from ``ps``. A run whose completion is already recorded is
+    handled exactly like ``resume``. When another controller process is still
+    waiting on the run, this only requests the stop and that process finalizes.
+    Anything that cannot be proved leaves completion unknown.
+    """
+    run_id = args.run_id
+    resume_args = argparse.Namespace(run_id=run_id, no_wait=False, json=args.json)
+    plan, record, rdir, summary_path, config = _load_resume_plan(run_id)
+    summary = read_json(summary_path)
+    if isinstance(summary, dict) and summary.get("completion_state") in {
+        "complete", "finalization_complete",
+    }:
+        return cmd_resume(resume_args, reporter)
+    hazard = read_unknown_completion_hazard(plan.project.project_id)
+    if hazard is None or hazard.get("run_id") != run_id or hazard.get("target") != plan.target.name:
+        raise UnknownCompletionHazardError(
+            "durable completion fence is missing or names a different run"
+        )
+    transport = make_transport(plan.target)
+    token = _durable_record_token(record)
+    stop = {
+        "reporter": reporter, "transport": transport, "plan": plan, "record": record,
+        "rdir": rdir, "hazard": hazard,
+    }
+    if run_id in ProjectLock(plan.project.project_id, plan.target.name).live_holder_run_ids():
+        # The original `run` (or a `resume`) is still waiting on this run and owns its
+        # summary and finalization; racing it could pull outputs back twice.
+        status = transport.durable_status(run_id, token)
+        _validate_durable_identity(status, record)
+        if status.get("state") not in {"complete", "failed"} and not _request_durable_stop(
+            **stop, status=status, summary_path=None
+        ):
+            return EXIT_INFRA
+        reporter.event(
+            "cancel_handed_off", run_id=run_id, state=status.get("state"),
+            note=(
+                "the controller already waiting on this run finalizes it; if that "
+                f"process stops waiting, run `remrun resume {run_id}`"
+            ),
+        )
+        return EXIT_OK
+    lock = ProjectLock(
+        plan.project.project_id,
+        plan.target.name,
+        scope=plan.write_scope,
+        run_id=run_id,
+        adopt_dead_run=True,
+        report=reporter.event,
+    ).acquire()
+    try:
+        status = transport.durable_status(run_id, token)
+        _validate_durable_identity(status, record)
+        if status.get("state") not in {"complete", "failed"}:
+            if not _request_durable_stop(**stop, status=status, summary_path=summary_path):
+                return EXIT_INFRA
+            deadline = time.monotonic() + DURABLE_CANCEL_SETTLE_SECONDS
+            while status.get("state") not in {"complete", "failed"}:
+                if time.monotonic() >= deadline:
+                    reporter.event(
+                        "completion_unknown", run_id=run_id,
+                        reason="the stop was confirmed but the target has not recorded "
+                               "the command's exit yet",
+                        guidance=f"run `remrun resume {run_id}` from this project",
+                    )
+                    return EXIT_INFRA
+                time.sleep(0.5)
+                try:
+                    status = transport.durable_status(run_id, token)
+                except DurableStateError:
+                    raise
+                except TransportError:
+                    continue
+                _validate_durable_identity(status, record)
+        code = _poll_durable(
+            args=resume_args, reporter=reporter, plan=plan, transport=transport,
+            remote_root=str(record["remote_root"]), run_id=run_id, rdir=rdir,
+            summary_path=summary_path, policy=load_retention(config), record=record,
+            initial_status=status,
+        )
+        if "cancel" in record:
+            final = read_json(summary_path) or {"run_id": run_id}
+            final["cancel"] = record["cancel"]
+            write_json(summary_path, final)
+        return code
+    finally:
+        lock.release()
 
 
 def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:

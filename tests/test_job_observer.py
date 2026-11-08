@@ -1215,3 +1215,271 @@ def test_windows_postpublication_resume_failure_never_relaunches(tmp_path, monke
     with pytest.raises(OSError, match="cancelled before ResumeThread"):
         observer._run_windows_command(tmp_path, metadata, ["example.exe"])
     assert events == ["published", "unregistered", "discarded"]
+
+
+# --- exact POSIX cancel ------------------------------------------------------
+#
+# The incident this guards against: an operator stopped a job by signalling the
+# group of its top-level remote helper, which was the SSH server's session group,
+# and ended unrelated sessions of the same user. Cancel must reach exactly the
+# registered job's own group and nothing else in the shared session.
+
+_JOB_CODE = (
+    "import pathlib,subprocess,sys,time; "
+    "g=subprocess.Popen([sys.executable,'-S','-c','import time; time.sleep(60)']); "
+    "pathlib.Path(sys.argv[1]).write_text(f'{g.pid}'); time.sleep(60)"
+)
+
+
+def _job_metadata(job_id: str, command: list[str], **changes: str) -> JobObservation:
+    from dataclasses import replace
+
+    item = JobObservation.for_command(
+        job_id=job_id, project="example-project", source_controller="CTRL",
+        target="POSIXBOX", phase="command", command=command,
+    )
+    return replace(item, **changes) if changes else item
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _start_session(tmp_path: Path, jobs: dict[str, list[str]]):
+    """Start one session (like one SSH login) holding an observer per job.
+
+    The session leader reaps every child as the durable supervisor does, and its
+    own process group stands in for the server's session group.
+    """
+    root = tmp_path / "state"
+    leader = (
+        "import os,subprocess,sys,json\n"
+        "for argv in json.loads(sys.argv[1]): subprocess.Popen(argv)\n"
+        "while True:\n"
+        "    try: os.wait()\n"
+        "    except ChildProcessError: break\n"
+    )
+    argvs = []
+    for job_id, command in jobs.items():
+        argvs.append([
+            sys.executable, "-S", str(Path(observer.__file__)), "run",
+            "--state-root", str(root),
+            "--metadata-b64", _job_metadata(job_id, command).encoded(), "--", *command,
+        ])
+    session = subprocess.Popen(
+        [sys.executable, "-S", "-c", leader, json.dumps(argvs)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        records, _ = observer._read_records(root)
+        rows = {str(row["job_id"]): row for row in records}
+        if set(rows) == set(jobs) and all(
+            int(row["root_pid"]) != int(row["owner_pid"]) for row in rows.values()
+        ):
+            return session, root, rows
+        time.sleep(0.02)
+    session.kill()
+    raise AssertionError("observed jobs did not register their command roots")
+
+
+def _stop_session(session, rows) -> None:  # noqa: ANN001
+    for row in rows.values():
+        try:
+            os.killpg(int(row["owner_key"]), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        os.killpg(session.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    session.wait(timeout=5)
+
+
+def _cancel_cli(root: Path, item: JobObservation) -> tuple[int, dict, str]:
+    result = subprocess.run(
+        [sys.executable, "-S", str(Path(observer.__file__)), "cancel",
+         "--state-root", str(root), "--metadata-b64", item.encoded()],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    return result.returncode, json.loads(result.stdout), result.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cancel")
+def test_posix_cancel_stops_only_the_exact_job_in_a_shared_session(tmp_path):
+    marks = {name: tmp_path / f"{name}.grandchild" for name in ("run-a", "run-b")}
+    commands = {
+        name: [sys.executable, "-S", "-c", _JOB_CODE, str(mark)] for name, mark in marks.items()
+    }
+    session, root, rows = _start_session(tmp_path, commands)
+    try:
+        deadline = time.monotonic() + 10
+        while not all(mark.exists() for mark in marks.values()):
+            assert time.monotonic() < deadline, "job grandchildren did not start"
+            time.sleep(0.02)
+        grandchild = {name: int(mark.read_text()) for name, mark in marks.items()}
+        # Both jobs share the session; each observer leads its own group.
+        assert os.getsid(int(rows["run-a"]["owner_pid"])) == session.pid
+        assert os.getsid(int(rows["run-b"]["owner_pid"])) == session.pid
+        assert int(rows["run-a"]["owner_key"]) != session.pid
+
+        code, receipt, _stderr = _cancel_cli(root, _job_metadata("run-a", commands["run-a"]))
+
+        assert code == 0
+        assert receipt["owned_job_cancelled"] is True
+        for pid in (rows["run-a"]["owner_pid"], rows["run-a"]["root_pid"], grandchild["run-a"]):
+            assert _wait_gone(int(pid))
+        # The other job and the session's own group (other sessions in the
+        # incident) are untouched.
+        assert session.poll() is None
+        for pid in (rows["run-b"]["owner_pid"], rows["run-b"]["root_pid"], grandchild["run-b"]):
+            assert _alive(int(pid))
+        snapshot = observer._processes()
+        assert snapshot[int(rows["run-b"]["root_pid"])].identity == rows["run-b"]["root_identity"]
+    finally:
+        _stop_session(session, rows)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cancel")
+def test_posix_cancel_refuses_any_identity_but_the_exact_registered_one(tmp_path):
+    command = [sys.executable, "-S", "-c", "import time; time.sleep(60)"]
+    session, root, rows = _start_session(tmp_path, {"run-a": command})
+    row = rows["run-a"]
+    try:
+        exact = _job_metadata("run-a", command)
+        wrong = {
+            "no observer row": _job_metadata("run-unregistered", command),
+            "other project": _job_metadata("run-a", command, project="other-project"),
+            "other target": _job_metadata("run-a", command, target="OTHERBOX"),
+            "other controller": _job_metadata("run-a", command, source_controller="OTHER"),
+            "other phase": _job_metadata("run-a", command, phase="fleet-worker"),
+            "other command": _job_metadata("run-a", [*command, "x"]),
+        }
+        for case, item in wrong.items():
+            code, receipt, stderr = _cancel_cli(root, item)
+            assert (code, receipt["owned_job_cancelled"]) == (2, False), case
+            assert "cancel refused" in stderr, case
+            assert _alive(int(row["root_pid"])), case
+        # The same live job is cancellable by its exact identity, so the refusals
+        # above were about identity and nothing else.
+        code, receipt, _stderr = _cancel_cli(root, exact)
+        assert (code, receipt["owned_job_cancelled"]) == (0, True)
+        assert _wait_gone(int(row["root_pid"]))
+    finally:
+        _stop_session(session, rows)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cancel")
+def test_posix_cancel_refuses_when_the_root_left_its_registered_group(tmp_path):
+    """A root that moved to another group no longer proves the group is the job's."""
+    command = [
+        sys.executable, "-S", "-c", "import os,time; os.setpgid(0,0); time.sleep(60)",
+    ]
+    session, root, rows = _start_session(tmp_path, {"run-a": command})
+    row = rows["run-a"]
+    try:
+        deadline = time.monotonic() + 5
+        while observer._processes()[int(row["root_pid"])].pgid != int(row["root_pid"]):
+            assert time.monotonic() < deadline, "root did not leave the observer's group"
+            time.sleep(0.02)
+        code, receipt, stderr = _cancel_cli(root, _job_metadata("run-a", command))
+        assert (code, receipt["owned_job_cancelled"]) == (2, False)
+        assert "not live inside its registered group" in stderr
+        assert _alive(int(row["owner_pid"]))
+        assert _alive(int(row["root_pid"]))
+    finally:
+        try:
+            os.killpg(int(row["root_pid"]), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        _stop_session(session, rows)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cancel")
+def test_posix_cancel_refuses_a_reused_pid_and_never_signals(tmp_path, monkeypatch):
+    """A live pid in the registered group whose start identity differs is a reused pid."""
+    stranger = subprocess.Popen(
+        [sys.executable, "-S", "-c", "import time; time.sleep(60)"], start_new_session=True,
+    )
+    try:
+        live = None
+        deadline = time.monotonic() + 5
+        while live is None or live.identity is None:
+            assert time.monotonic() < deadline
+            live = observer._processes().get(stranger.pid)
+        metadata = _metadata().payload()
+        record = {
+            **metadata, "owner_kind": "posix_pgid", "owner_key": str(stranger.pid),
+            "root_pid": stranger.pid, "root_identity": live.identity + "-earlier-generation",
+        }
+        monkeypatch.setattr(observer, "_read_records", lambda _root: ([record], []))
+
+        def killpg(pgid, sig):  # noqa: ANN001
+            if sig != 0:
+                pytest.fail("an unproved group must never be signalled")
+            return os.killpg(pgid, sig)
+
+        monkeypatch.setattr(observer.os, "killpg", killpg)
+        assert observer._cancel_posix_job(tmp_path, metadata)["owned_job_cancelled"] is False
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX durable supervisor")
+def test_durable_supervisor_records_a_cancelled_observed_job_as_complete_137(tmp_path):
+    """The stop reaches the supervisor as an ordinary wrapper exit, so resume can finalize."""
+    from remrun import _durable_runner as durable_runner
+
+    root = tmp_path / "target-state"
+    run_id = "run-cancel"
+    command = [sys.executable, "-S", "-c", "import time; time.sleep(60)"]
+    item = _job_metadata(run_id, command)
+    ready = root / "durable-runs" / run_id / "observer-ready.json"
+    spec = {
+        "schema": 1, "run_id": run_id, "resume_token": "resume-token",
+        "controller": "CTRL", "project_id": "example-project", "target": "POSIXBOX",
+        "command_sha256": item.command_sha256,
+        "argv": [
+            sys.executable, "-S", str(Path(observer.__file__)), "run",
+            "--state-root", str(root), "--metadata-b64", item.encoded(),
+            "--ready-file", str(ready), "--", *command,
+        ],
+        "ready_path": str(ready), "max_log_bytes": 4096,
+        "created_at": "2026-11-08T00:00:00Z",
+    }
+    launched = durable_runner._launch(root, json.dumps(spec).encode())
+    assert launched["state"] == "running"
+    status = launched
+    try:
+        _wait_for_record(root, predicate=lambda row: int(row["root_pid"]) != int(row["owner_pid"]))
+        code, receipt, _stderr = _cancel_cli(root, item)
+        assert (code, receipt["owned_job_cancelled"]) == (0, True)
+        deadline = time.monotonic() + 10
+        while status["state"] != "complete":
+            assert time.monotonic() < deadline, status
+            time.sleep(0.05)
+            status = durable_runner._status(root, run_id, "resume-token", False)
+        assert status["wrapper_exit_code"] == 128 + signal.SIGKILL
+    finally:
+        records, _ = observer._read_records(root)
+        for row in records:
+            try:
+                os.killpg(int(row["owner_key"]), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
