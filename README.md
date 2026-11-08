@@ -94,6 +94,7 @@ remrun run macbox --memory-limit-mib 8192 -- <cmd>  # optional hard limit for a 
 remrun run macbox --wait-lock 600 -- <cmd>  # wait up to 600 s for a running holder of the project lock
 remrun run macbox --transfer none -- <cmd>  # run in the target's checkout as it is; move no files
 remrun run macbox --transfer none --verify src/model.py -- <cmd>  # first prove that file matches
+remrun run macbox --transfer commit --output results/ -- <cmd>  # run HEAD privately; return results/
 remrun status [DEVICE] [--limit N]  # recent runs, optionally filtered by target
 remrun logs [last|<run_id>] [--json]
 remrun clean [--older-than 30d] [--keep N] [--dry-run]   # prune state folder
@@ -211,6 +212,67 @@ on every run. It works with `--durable`, `--auto` and `--label`.
 
 `[transfer] mode = "none"` in `config/defaults.toml` makes this the default; then
 `--transfer safe` gives one run the ordinary behavior. `plan` accepts both flags.
+
+### Commit runs (`--transfer commit`)
+
+```
+remrun run DEVICE --transfer commit --output PATH [--output PATH]... [--input PATH]... -- <cmd>
+```
+
+`--transfer commit` runs the command on the project's committed `HEAD` in a private
+directory under the target's `state_root` (`<state_root>/work/<id>/tree`), then pulls
+back only the `--output` paths. It never reads or writes the target's own checkout of
+the project. Use it for long jobs that must run on exactly one commit, several at a
+time per project, without the target's checkout changing under them. It works with
+`--durable`, `--auto`, `--label`, `resume` and `cancel`. The target needs `git` on its
+`PATH`.
+
+- **Paths.** `--output` (required, repeatable) and `--input` (repeatable) take paths
+  relative to the project root, without globs. An output ending in `/` is a directory
+  and everything under it. An output under a `[transfer] global_exclude` pattern is
+  refused, because it could never be returned.
+- **Source.** The project root must be its git repository's top level. A tracked file
+  that differs from `HEAD` refuses the run (exit `2`) unless it is under an `--output`
+  or named by `--input`. `--input FILE` copies that working-tree file (tracked or not)
+  over the commit before the command starts; the commit and each input's size and
+  SHA-256 are recorded under `source` in `summary.json`. Nothing else uncommitted
+  reaches the command. Submodules are refused, and Git LFS content is not fetched.
+- **Seeding.** remrun keeps one bare git cache per project under
+  `<state_root>/work/git/` on the target and sends it a git bundle: the whole history the
+  first time, then only commits it lacks. Each run clones that cache into its own tree
+  (with `core.longpaths` on) and checks out the commit.
+- **Disk floor.** Before writing anything to the target, remrun measures the free
+  space of the disk that holds its `state_root`. If the tree, the inputs and the bundle
+  would leave less than `[transfer] work_min_free_fraction` (default `0.15`) of the disk
+  free, or the free space cannot be measured, or `git` is missing, that target is
+  refused (exit `2`; with `--auto` the next one is tried).
+- **Outputs.** After the command, its changes under the `--output` paths come back
+  through the ordinary pullback: unchanged local files are backed up and replaced, with
+  the result hash-checked; an output you edited locally during the run is kept, the
+  run's copy is saved under the run's conflict directory, and the run exits `2`. The
+  outputs come back after a failed or cancelled command too.
+- **Other writes.** A file written or deleted outside the outputs that the project's
+  transfer excludes cover is scratch: counted (`scratch_writes`) and discarded. Any
+  other is an unexpected write: listed in the run's `work` record, never copied into
+  the project, and the run exits `2`.
+- **Cleanup.** The private tree is removed only after exit `0`, a conflict-free
+  pullback and no unexpected writes. Otherwise it stays on the target with the reason
+  in `summary.json` (`work.state = "retained"`), and the next commit run from this
+  controller to that target removes retained trees older than
+  `[logging] failed_log_retention_days`. A removal that fails is reported and retried by
+  `resume` and by the next commit run there.
+- **Concurrency.** No project lock is taken. Each run holds a lease on its outputs
+  until its pullback ends: a commit run whose outputs overlap a live one's (one path
+  is a prefix of the other) is refused before any target is touched. Commit runs with
+  disjoint outputs, and ordinary runs, may run at the same time. A commit run still
+  refuses while an ordinary run of the project has unknown completion.
+- **Environment.** The command runs in `tree/<your relative directory>`. The project's
+  virtual environment is the target's usual one (an absolute path), so a declared
+  `[run.bootstrap]` must already be ready there; a commit run never runs setup. Code
+  the environment imports from an editable install may come from the target's
+  checkout rather than the commit; put `src` first on the import path to be sure.
+- It cannot be combined with `--scope`, `--no-pullback`, `--verify` or a resource
+  workload. A clean commit run updates the learned job costs.
 
 ### Fleet utilities
 
@@ -546,8 +608,9 @@ do not need to install the helper.
 Target forms for `run`/`plan`: an explicit device (`macbox`, `winbox`, `LOCAL_SIM`),
 `--auto`, the literal `auto`, or omit it (defaults to auto). Run flags:
 `--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`, `--allow-large-push` (skip the
-push guard below for one run), `--transfer safe|none` and `--verify PATH` (see
-untransferred runs above), and `--label TEXT` (a short
+push guard below for one run), `--transfer safe|none|commit`, `--verify PATH`,
+`--output PATH` and `--input PATH` (see untransferred and commit runs above), and
+`--label TEXT` (a short
 name `fleet jobs` shows instead of the executable; spaces are stored as underscores). An owner
 who deliberately accepts
 the target's memory risk may use `--bypass-memory-guard` with an explicitly named target. The

@@ -3,8 +3,8 @@
 ## Default: Mode 1 / safe
 
 Mode 1 (`safe`) is the default. `[transfer] mode` in `config/defaults.toml` sets the
-default mode (`safe` or `none`); `run --transfer` and `plan --transfer` override it for
-one invocation. Any other value is a configuration error.
+default mode (`safe`, `none` or `commit`); `run --transfer` and `plan --transfer`
+override it for one invocation. Any other value is a configuration error.
 
 It reconciles the active run surface conservatively and incrementally:
 
@@ -62,6 +62,56 @@ All five are candidate-local, so `--auto` tries the next candidate. Each untrans
 run keeps its own completion fence; it still refuses while an ordinary run of the
 project has unknown completion. An ordinary run refuses a target named by any live
 untransferred fence of the project (`target-busy-untransferred`, candidate-local).
+
+## Mode `commit`: a clean HEAD in a private tree
+
+`--transfer commit --output PATH [--input PATH]` runs the committed `HEAD` in
+`<state_root>/work/<id>/tree` on the target and returns only the declared outputs:
+
+```text
+source        -> HEAD, plus each --input file (SHA-256 recorded); dirty tracked files
+                 outside --output/--input refuse the run
+seeding       -> a bundle (incremental once the target's cache holds an ancestor) into a
+                 bare cache under <state_root>/work/git/, then a local clone and checkout
+the command   -> runs in tree/<relative cwd>; the target's checkout is never read or written
+outputs       -> ordinary pullback, limited to the --output paths
+other writes  -> under the project's excludes: scratch, discarded
+                 anywhere else: reported, never pulled, the tree is kept, exit 2
+cleanup       -> the tree is removed only after exit 0, a clean verified pullback and no
+                 unexpected writes; otherwise it is kept, and pruned later
+no baseline   -> commit runs never read or advance the ordinary baseline
+no project lock -> each run leases its outputs instead
+```
+
+The private tree is manifested with only the global excludes, so an output under a
+project exclude is still seen and returned; an output under a global exclude is
+refused when the run is planned. Paths are compared as prefixes: `out/` covers
+everything under `out`, `out/a.csv` covers one file.
+
+Refusals before the target is chosen (exit 2, nothing written anywhere):
+
+```text
+source-dirty   -> a tracked file differs from HEAD outside --output/--input
+output-leased  -> a live commit run of the project holds an overlapping --output
+```
+
+Refusals of one candidate (exit 2, nothing written to it; `--auto` tries the next):
+
+```text
+disk-unmeasured           -> the target's free space at its state root cannot be measured
+disk-floor                -> tree + inputs + bundle would leave less than
+                             [transfer] work_min_free_fraction of that disk free
+git-unavailable           -> git is not on the target's PATH
+git-memory-limit-missing  -> a memory-guarded target has no [git_sync]
+                             remote_memory_limit_mib for the git steps
+bootstrap-not-ready       -> a declared [run.bootstrap] is not ready; setup never runs
+```
+
+The output lease is the run's completion fence plus its outputs. It is checked again
+and taken under the lock table's guard just before the command starts, and it stands
+through the pullback. Ordinary runs ignore commit fences: a commit run never touches the
+target's checkout, and a same-path change on the controller ends in a saved conflict on
+whichever pullback comes second, never an overwrite.
 
 ## Why remote-newer is pulled by default
 
