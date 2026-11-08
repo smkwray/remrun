@@ -3722,3 +3722,136 @@ def test_run_observation_is_dormant_by_default(env, monkeypatch):
     monkeypatch.setattr(cli.JobObservation, "for_command", classmethod(unexpected))
     code = main(["run", "LOCAL_SIM", "--", "python", "-c", "print('plain')"])
     assert code == EXIT_OK
+
+
+# --- push guard -------------------------------------------------------------------
+
+
+def _set_push_limits(env: dict, *, max_files: int | None = None,
+                     max_mb: float | None = None) -> None:
+    defaults = env["remrun_root"] / "config" / "defaults.toml"
+    lines = ""
+    if max_files is not None:
+        lines += f"max_push_files = {max_files}\n"
+    if max_mb is not None:
+        lines += f"max_push_mb = {max_mb!r}\n"
+    text = defaults.read_text(encoding="utf-8")
+    anchor = "hash_small_files_below_mb = 8\n"
+    assert anchor in text
+    defaults.write_text(text.replace(anchor, anchor + lines, 1), encoding="utf-8")
+
+
+def _stray_scratch_tree(env: dict) -> None:
+    """Five scratch files plus one real input locally, and one remote-only file that
+    an unrefused preflight would pull."""
+    scratch = env["proj"] / "scratch" / "deep"
+    scratch.mkdir(parents=True)
+    for i in range(5):
+        (scratch / f"s{i}.txt").write_text("x" * 10, encoding="utf-8")
+    (env["proj"] / "input.txt").write_text("in", encoding="utf-8")
+    env["remote_proj"].mkdir(parents=True)
+    (env["remote_proj"] / "remote_only.txt").write_text("remote", encoding="utf-8")
+
+
+_MARK = ["python", "-c", "open('ran.txt','w').write('ran')"]
+
+
+def test_push_guard_refuses_whole_tree_push_before_any_mutation(env, capsys):
+    # A stray scratch tree must not turn a run into a long whole-tree push: refuse
+    # while neither side has been touched, and point at the directory responsible.
+    _set_push_limits(env, max_files=3)
+    _stray_scratch_tree(env)
+
+    code = main(["run", "LOCAL_SIM", "--", *_MARK])
+
+    assert code == EXIT_GUARD
+    assert sorted(p.name for p in env["remote_proj"].iterdir()) == ["remote_only.txt"]
+    assert not (env["proj"] / "remote_only.txt").exists()
+    assert not (env["proj"] / "ran.txt").exists()
+    summaries = list((env["state"] / "runs").glob("*/summary.json"))
+    assert len(summaries) == 1
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["exit_code"] == EXIT_GUARD
+    assert summary["phase"] == "preflight"
+    assert summary["command_started"] is False
+    assert summary["completion_state"] == "not_started"
+    guard = summary["push_guard"]
+    assert (guard["files"], guard["max_files"], guard["refused"]) == (6, 3, True)
+    assert guard["top_by_files"][0] == {"dir": "scratch/deep", "files": 5}
+    assert "--allow-large-push" in summary["error"]
+    assert "scratch/deep (5)" in summary["error"]
+    assert "push_refused" in capsys.readouterr().err
+
+
+def test_allow_large_push_runs_the_refused_plan(env):
+    _set_push_limits(env, max_files=3)
+    _stray_scratch_tree(env)
+    assert main(["run", "LOCAL_SIM", "--", *_MARK]) == EXIT_GUARD
+
+    code = main(["run", "LOCAL_SIM", "--allow-large-push", "--", *_MARK])
+
+    assert code == EXIT_OK
+    assert (env["remote_proj"] / "scratch" / "deep" / "s4.txt").exists()
+    assert (env["proj"] / "remote_only.txt").read_text(encoding="utf-8") == "remote"
+    assert (env["proj"] / "ran.txt").read_text(encoding="utf-8") == "ran"
+
+
+def test_project_transfer_table_can_raise_the_push_limit(env):
+    _set_push_limits(env, max_files=3)
+    _stray_scratch_tree(env)
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "remrun.toml").write_text("[transfer]\nmax_push_files = 4\n",
+                                        encoding="utf-8")
+    assert main(["run", "LOCAL_SIM", "--", *_MARK]) == EXIT_GUARD   # 7 files > 4
+    (cfgdir / "remrun.toml").write_text("[transfer]\nmax_push_files = 100\n",
+                                        encoding="utf-8")
+
+    assert main(["run", "LOCAL_SIM", "--", *_MARK]) == EXIT_OK
+    assert (env["proj"] / "ran.txt").exists()
+
+
+def test_malformed_project_push_limit_is_a_config_error_not_a_default(env):
+    _set_push_limits(env, max_files=3)
+    _stray_scratch_tree(env)
+    cfgdir = env["proj"] / "do" / "remrun"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "remrun.toml").write_text('[transfer]\nmax_push_files = "lots"\n',
+                                        encoding="utf-8")
+
+    assert main(["run", "LOCAL_SIM", "--", *_MARK]) == EXIT_INTERNAL
+    assert sorted(p.name for p in env["remote_proj"].iterdir()) == ["remote_only.txt"]
+
+
+def test_plan_probe_reports_push_size_and_refusal(env, capsys, monkeypatch):
+    monkeypatch.setattr(LocalSimTransport, "sample_load", lambda self: 0.0, raising=False)
+    _set_push_limits(env, max_files=3)
+    _stray_scratch_tree(env)
+
+    code = main(["plan", "LOCAL_SIM", "--probe", "--json", "--", *_MARK])
+
+    assert code == EXIT_OK
+    push = json.loads(capsys.readouterr().out)["push"]
+    assert push["status"] == "measured"
+    assert (push["files"], push["bytes"], push["refused"]) == (6, 52, True)
+    assert push["top_by_files"][0] == {"dir": "scratch/deep", "files": 5}
+    assert "--allow-large-push" in push["message"]
+    # plan is read-only: nothing moved in either direction.
+    assert sorted(p.name for p in env["remote_proj"].iterdir()) == ["remote_only.txt"]
+    assert not (env["proj"] / "remote_only.txt").exists()
+
+    code = main(["plan", "LOCAL_SIM", "--probe", "--", *_MARK])
+    assert code == EXIT_OK
+    err = capsys.readouterr().err
+    assert "push_estimate status=measured files=6 bytes=52" in err
+    assert "refused=true" in err and "push_would_refuse" in err
+
+
+def test_plan_without_probe_says_push_was_not_measured(env, capsys):
+    _set_push_limits(env, max_files=3)
+    _stray_scratch_tree(env)
+
+    assert main(["plan", "LOCAL_SIM", "--json", "--", *_MARK]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["push"]["status"] == "not_measured"
+    assert payload["push"]["max_files"] == 3

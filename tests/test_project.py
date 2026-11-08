@@ -185,3 +185,53 @@ def test_linked_worktree_inherits_main_private_config_without_copy(
         ["git", "status", "--short", "--untracked-files=all"],
         cwd=str(main), capture_output=True, text=True, check=True,
     ).stdout == ""
+
+
+def _write_config(root: Path, devices_toml: str) -> None:
+    (root / "config").mkdir(parents=True, exist_ok=True)
+    (root / "config" / "defaults.toml").write_text(
+        '[transfer]\nglobal_exclude = [".git/**", "shared/**"]\n', encoding="utf-8")
+    (root / "config" / "devices.toml").write_text(devices_toml, encoding="utf-8")
+
+
+def test_deployment_excludes_merge_between_global_and_project(tmp_path: Path):
+    from remrun.config import load_config
+
+    _write_config(tmp_path, '[transfer]\nexclude = ["deploy/**", "shared/**"]\n')
+    cfg = load_config(tmp_path)
+    merged = resolve_excludes(cfg, {"transfer": {"exclude": ["proj/**", "deploy/**"]}})
+    assert merged == [".git/**", "shared/**", "deploy/**", "proj/**"]
+
+
+@pytest.mark.parametrize("devices_toml, message", [
+    ('transfer = "x"\n', "must be a table"),
+    ('[transfer]\nexclude = "scratch/**"\n', "list of non-empty pattern strings"),
+    ('[transfer]\nexclude = ["ok/**", 3]\n', "list of non-empty pattern strings"),
+    ('[transfer]\nexclude = [""]\n', "list of non-empty pattern strings"),
+    ('[transfer]\nmax_push_files = 5\n', "unsupported key"),
+])
+def test_malformed_deployment_excludes_raise(tmp_path: Path, devices_toml, message):
+    from remrun.config import load_config
+
+    _write_config(tmp_path, devices_toml)
+    with pytest.raises(ValueError, match=message):
+        load_config(tmp_path)
+
+
+def test_push_limits_project_overrides_defaults_and_rejects_malformed(tmp_path: Path):
+    from remrun.config import push_limits
+
+    cfg = RemrunConfig(
+        repo_root=tmp_path,
+        defaults={"transfer": {"max_push_files": 10, "max_push_mb": 1}},
+        devices={}, project_roots={},
+    )
+    assert push_limits(cfg, {}) == (10, 1024 * 1024)
+    assert push_limits(cfg, {"transfer": {"max_push_files": 50}}) == (50, 1024 * 1024)
+    assert push_limits(cfg, {"transfer": {"max_push_mb": 0.5}}) == (10, 512 * 1024)
+    for bad in ({"max_push_files": 0}, {"max_push_files": 1.5}, {"max_push_files": True},
+                {"max_push_mb": "4096"}, {"max_push_mb": -1}):
+        with pytest.raises(ValueError, match="must be a positive"):
+            push_limits(cfg, {"transfer": bad})
+    unlimited = RemrunConfig(repo_root=tmp_path, defaults={}, devices={}, project_roots={})
+    assert push_limits(unlimited, {}) == (None, None)

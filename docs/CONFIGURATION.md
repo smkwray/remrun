@@ -353,6 +353,20 @@ intentionally unavailable: a Git sync spans local Git, transfer, and peer Git, s
 metrics would misstate the operation. Concurrent operations from different projects remain
 separate rows.
 
+## Deployment-wide excludes
+
+`config/devices.toml` may carry excludes shared by every project of a deployment:
+
+```toml
+[transfer]
+exclude = [".scratch/**", "*.bak"]
+```
+
+They apply to project runs (`run`, `plan`, `bench`), after `defaults.toml`
+`global_exclude` and before the project's own `[transfer] exclude`. `exclude` is the only
+key this table accepts; any other key, or a value that is not a list of non-empty pattern
+strings, is a configuration error. Named `remrun sync` trees use only `global_exclude`.
+
 ## Machine-local overrides
 
 Future support should allow non-synced or ignored local overrides:

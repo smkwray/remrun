@@ -466,7 +466,8 @@ do not need to install the helper.
 
 Target forms for `run`/`plan`: an explicit device (`macbox`, `winbox`, `LOCAL_SIM`),
 `--auto`, the literal `auto`, or omit it (defaults to auto). Run flags:
-`--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`, and `--label TEXT` (a short
+`--dry-run`, `--no-pullback`, `--no-telemetry`, `--json`, `--allow-large-push` (skip the
+push guard below for one run), and `--label TEXT` (a short
 name `fleet jobs` shows instead of the executable; spaces are stored as underscores). An owner
 who deliberately accepts
 the target's memory risk may use `--bypass-memory-guard` with an explicitly named target. The
@@ -476,8 +477,17 @@ placement and cannot be combined with `--memory-limit-mib`.
 Exit codes: `0` ok · `1` config/internal · `2` conflict (pre-run, **or** an
 unresolved post-run divergence — local edited during the run and differs from the
 command's output; the command may have exited 0, see `command_exit_code` in the
-summary) · `3` transfer failure · `4` remote-exec/unreachable · otherwise the remote
-command's own code.
+summary) · `3` transfer failure · `4` remote-exec/unreachable · `5` a safety guard
+refused (memory policy, or the push guard: `phase = "preflight"` with a `push_guard`
+record) · otherwise the remote command's own code.
+
+**Push guard.** Before transferring anything, preflight refuses a push of more than
+`[transfer] max_push_files` files or `max_push_mb` MB (defaults in `config/defaults.toml`:
+10,000 files, 4096 MB) and lists the directories holding the most files and bytes. Usually
+the fix is a project exclude for a scratch or cache tree. For a legitimate first sync of a
+large project, rerun with `--allow-large-push`, or raise either key in the project's
+`do/remrun/remrun.toml` `[transfer]` table. `remrun plan --probe` reports the push the
+target would get (`push` in `--json`) and whether a run would be refused.
 
 ### LOCAL_SIM (no remote needed)
 

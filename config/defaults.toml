@@ -40,6 +40,11 @@ global_exclude = [
   ".stversions/**",
   "~syncthing~*",
   "**/~syncthing~*",
+  # Syncthing conflict copies (name.sync-conflict-<date>-<time>-<device>.ext). They are
+  # Syncthing's unresolved duplicates, not project data, and a copy named like
+  # tests/test_x.sync-conflict-....py would be collected by a bare pytest on the target.
+  # `*` crosses `/` in this matcher, so this one pattern covers every depth.
+  "*.sync-conflict-*",
   # remrun's own transfer scratch: atomic-write temp + backup files and tar staging
   # (.remrun-tmp-*, .remrun-backup-*, .remrun-tar-*). Private to a single transfer;
   # must never be treated as project data — e.g. an orphaned Windows .remrun-backup-*.bak
@@ -66,6 +71,13 @@ global_exclude = [
 ]
 large_file_warn_above_mb = 2048
 hash_small_files_below_mb = 64
+# Push guard: preflight refuses, before transferring anything, a push of more files or
+# more total bytes than this (exit 5, phase "preflight", summary `push_guard`), and
+# lists the largest directories. A project's do/remrun/remrun.toml [transfer] may set
+# either key to replace these; `remrun run --allow-large-push` skips the guard for one
+# run. Remove a key to disable that dimension.
+max_push_files = 10000
+max_push_mb = 4096
 
 [preflight]
 remote_newer = "pull-and-continue"

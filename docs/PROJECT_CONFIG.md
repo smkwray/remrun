@@ -19,6 +19,17 @@ exclude = [
 ]
 ```
 
+The same table may replace the push guard's limits from `config/defaults.toml`
+(`max_push_files`, a positive integer; `max_push_mb`, a positive number). A run whose
+preflight would push more than either refuses before transferring anything (exit 5);
+`remrun run --allow-large-push` skips the guard for one run.
+
+```toml
+[transfer]
+max_push_files = 50000
+max_push_mb = 20000
+```
+
 ## Opt-in target environment bootstrap
 
 Projects may declare an idempotent, target-local environment setup as argv arrays. The

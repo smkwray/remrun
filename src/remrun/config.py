@@ -40,6 +40,10 @@ class RemrunConfig:
     # registry rather than the published defaults.toml. Merged OVER defaults.toml by
     # scheduler_config(); tuning knobs stay in defaults where they are device-agnostic.
     device_scheduler: dict[str, Any] = field(default_factory=dict)
+    # Optional devices.toml [transfer] exclude: active-surface excludes shared by every
+    # project of this deployment. Merged after defaults.toml global_exclude and before a
+    # project's own excludes by resolve_excludes().
+    deployment_excludes: list[str] = field(default_factory=list)
 
 
 def find_remrun_root(start: Path | None = None) -> Path:
@@ -135,11 +139,34 @@ def load_config(remrun_root: Path | None = None) -> RemrunConfig:
     git_sync = dict(devices_doc.get("git_sync", {}) or {})
     coordination = dict(devices_doc.get("coordination", {}) or {})
     device_scheduler = dict(devices_doc.get("scheduler", {}) or {})
+    deployment_excludes = _deployment_excludes(devices_doc)
     return RemrunConfig(repo_root=root, defaults=defaults, devices=devices,
                         project_roots=project_roots, offload=offload, sync_roots=sync_roots,
                         fleet_tasks=fleet_tasks,
                         git_sync=git_sync,
-                        coordination=coordination, device_scheduler=device_scheduler)
+                        coordination=coordination, device_scheduler=device_scheduler,
+                        deployment_excludes=deployment_excludes)
+
+
+def _deployment_excludes(devices_doc: dict[str, Any]) -> list[str]:
+    """Validate devices.toml [transfer]: only an ``exclude`` list of pattern strings."""
+    transfer = devices_doc.get("transfer", {})
+    if not isinstance(transfer, dict):
+        raise ValueError("devices.toml [transfer] must be a table")
+    unsupported = sorted(set(transfer) - {"exclude"})
+    if unsupported:
+        raise ValueError(
+            "devices.toml [transfer] supports only `exclude`; unsupported key(s): "
+            + ", ".join(unsupported)
+        )
+    patterns = transfer.get("exclude", [])
+    if not isinstance(patterns, list) or not all(
+        isinstance(item, str) and item.strip() for item in patterns
+    ):
+        raise ValueError(
+            "devices.toml [transfer] exclude must be a list of non-empty pattern strings"
+        )
+    return list(patterns)
 
 
 # Conservative workstation defaults when a controller defines no explicit threshold
@@ -296,6 +323,35 @@ def large_file_warn_bytes(config: RemrunConfig) -> int:
         return 0
 
 
+def push_limits(
+    config: RemrunConfig, project_config: dict[str, Any]
+) -> tuple[int | None, int | None]:
+    """Resolve the preflight push guard as (max files, max bytes).
+
+    A project's ``[transfer] max_push_files`` / ``max_push_mb`` replaces the
+    defaults.toml value of the same key. An absent key means no limit on that
+    dimension; a present key that is not a positive number raises.
+    """
+    defaults = config.defaults.get("transfer", {})
+    project = (project_config or {}).get("transfer", {}) or {}
+    resolved: dict[str, int | None] = {}
+    for key in ("max_push_files", "max_push_mb"):
+        source = "project remrun.toml" if key in project else "defaults.toml"
+        value = project[key] if key in project else defaults.get(key)
+        if value is None:
+            resolved[key] = None
+            continue
+        integral = isinstance(value, int) or key == "max_push_mb"
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not integral or value <= 0):
+            raise ValueError(
+                f"{source} [transfer] {key} must be a positive "
+                f"{'integer' if key == 'max_push_files' else 'number'}, got {value!r}"
+            )
+        resolved[key] = int(value) if key == "max_push_files" else int(value * 1024 * 1024)
+    return resolved["max_push_files"], resolved["max_push_mb"]
+
+
 def load_retention(config: RemrunConfig):
     """Build a RetentionPolicy from defaults.toml [logging]."""
     from .state import RetentionPolicy
@@ -330,12 +386,13 @@ def load_project_config(path: Path | None) -> dict[str, Any]:
 
 
 def resolve_excludes(config: RemrunConfig, project_config: dict[str, Any]) -> list[str]:
-    """Merge global excludes with project-specific excludes (order preserved,
-    de-duplicated). Project config narrows the active surface; it never widens it
-    by removing global excludes."""
+    """Merge excludes in order: defaults.toml global_exclude, devices.toml
+    [transfer] exclude, then the project's own (order preserved, de-duplicated).
+    Project config narrows the active surface; it never widens it by removing
+    global or deployment excludes."""
     merged: list[str] = []
     seen: set[str] = set()
-    for pattern in global_excludes(config):
+    for pattern in [*global_excludes(config), *config.deployment_excludes]:
         if pattern not in seen:
             merged.append(pattern)
             seen.add(pattern)

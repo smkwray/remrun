@@ -955,3 +955,72 @@ def test_both_changed_aborts_without_mutation(tmp_path: Path):
     assert (local / "c.txt").read_text() == "local-edit"
     assert (Path(remote_root) / "c.txt").read_text() == "remote-edit"
     assert not res.pushed and not res.pulled
+
+
+# --- push guard -------------------------------------------------------------------
+
+
+def test_push_guard_byte_limit_refuses_before_creating_the_remote_root(tmp_path: Path):
+    # A few huge files are as costly as many small ones: the byte limit alone refuses,
+    # and it does so before ensure_remote_dir or any transfer.
+    local, remote_root, t, backup = setup(tmp_path)
+    (local / "data").mkdir()
+    (local / "data" / "big.bin").write_bytes(b"x" * 4000)
+    (local / "a.txt").write_text("small")
+
+    res = preflight_reconcile(
+        transport=t, local_root=local, remote_root=remote_root, excludes=[],
+        hash_below_bytes=1_000_000, prev_local=None, prev_remote=None,
+        backup_root=backup, max_push_files=100, max_push_bytes=1000,
+    )
+
+    assert res.push_refused is not None and res.push_refused.refused
+    assert (res.push_refused.files, res.push_refused.bytes) == (2, 4005)
+    assert res.push_refused.top_by_bytes[0] == ("data", 4000)
+    assert res.pushed == [] and res.pulled == [] and not res.has_conflicts
+    assert not Path(remote_root).exists()
+
+
+def test_push_guard_at_the_limit_still_pushes(tmp_path: Path):
+    local, remote_root, t, backup = setup(tmp_path)
+    for name in ("a.txt", "b.txt"):
+        (local / name).write_text("v")
+
+    res = preflight_reconcile(
+        transport=t, local_root=local, remote_root=remote_root, excludes=[],
+        hash_below_bytes=1_000_000, prev_local=None, prev_remote=None,
+        backup_root=backup, max_push_files=2, max_push_bytes=2,
+    )
+
+    assert res.push_refused is None
+    assert sorted(res.pushed) == ["a.txt", "b.txt"]
+
+
+def test_push_guard_counts_only_the_push_not_the_whole_tree(tmp_path: Path):
+    # After a first sync, a one-file edit must pass a limit the whole tree exceeds.
+    local, remote_root, t, backup = setup(tmp_path)
+    for i in range(5):
+        (local / f"f{i}.txt").write_text("v1")
+    first = reconcile(local, remote_root, t, backup)
+    (local / "f0.txt").write_text("v2")
+
+    res = preflight_reconcile(
+        transport=t, local_root=local, remote_root=remote_root, excludes=[],
+        hash_below_bytes=1_000_000, prev_local=first.local_manifest,
+        prev_remote=first.remote_manifest, backup_root=backup, max_push_files=1,
+    )
+
+    assert res.push_refused is None and res.pushed == ["f0.txt"]
+
+
+def test_measure_push_groups_by_first_two_directories():
+    from remrun.manifest import FileEntry
+    from remrun.reconcile import measure_push
+
+    paths = ["root.txt", "a/x.txt", "a/b/c/d.txt", "a/b/e.txt", "z/y/q.txt"]
+    manifest = {p: FileEntry(path=p, kind="file", size=1, mtime_ns=0) for p in paths}
+    size = measure_push(paths, manifest, max_files=None, max_bytes=None)
+
+    assert dict(size.top_by_files) == {".": 1, "a": 1, "a/b": 2, "z/y": 1}
+    assert size.top_by_files[0] == ("a/b", 2)
+    assert not size.refused

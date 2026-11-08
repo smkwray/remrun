@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import stat
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -47,6 +48,88 @@ _CANDIDATE_LOCAL_CONFLICT_STATES = frozenset({
 })
 
 
+@dataclass(frozen=True)
+class PushSize:
+    """Size of a preflight push plan, measured against the push guard."""
+
+    files: int
+    bytes: int
+    max_files: int | None
+    max_bytes: int | None
+    # Top directories (first one or two path components; "." = project root files),
+    # each as (directory, count) / (directory, bytes), largest first.
+    top_by_files: list[tuple[str, int]]
+    top_by_bytes: list[tuple[str, int]]
+
+    @property
+    def refused(self) -> bool:
+        return ((self.max_files is not None and self.files > self.max_files)
+                or (self.max_bytes is not None and self.bytes > self.max_bytes))
+
+    def as_dict(self) -> dict:
+        return {
+            "files": self.files,
+            "bytes": self.bytes,
+            "max_files": self.max_files,
+            "max_bytes": self.max_bytes,
+            "refused": self.refused,
+            "top_by_files": [{"dir": d, "files": n} for d, n in self.top_by_files],
+            "top_by_bytes": [{"dir": d, "bytes": n} for d, n in self.top_by_bytes],
+        }
+
+    def message(self) -> str:
+        def mb(n: int) -> str:
+            return f"{n / (1024 * 1024):.1f} MB"
+
+        limits = ", ".join(
+            part for part in (
+                f"{self.max_files} files" if self.max_files is not None else "",
+                mb(self.max_bytes) if self.max_bytes is not None else "",
+            ) if part
+        )
+        by_files = ", ".join(f"{d} ({n})" for d, n in self.top_by_files)
+        by_bytes = ", ".join(f"{d} ({mb(n)})" for d, n in self.top_by_bytes)
+        return (
+            f"refusing to push {self.files} files / {mb(self.bytes)} (push guard: {limits}). "
+            f"Largest directories by files: {by_files}. By size: {by_bytes}. "
+            "If these are not inputs the command needs, add them to [transfer] exclude in "
+            "the project's do/remrun/remrun.toml (e.g. \"scratch/**\"); for a legitimate "
+            "first sync rerun with --allow-large-push, or raise [transfer] max_push_files / "
+            "max_push_mb there. Nothing was transferred."
+        )
+
+
+def _push_dir(rel: str) -> str:
+    parts = rel.split("/")[:-1]
+    return "/".join(parts[:2]) or "."
+
+
+def measure_push(
+    paths: list[str],
+    local_manifest: Manifest,
+    *,
+    max_files: int | None,
+    max_bytes: int | None,
+    top: int = 10,
+) -> PushSize:
+    """Measure a planned push (paths taken from ``local_manifest``) against the guard."""
+    counts: Counter[str] = Counter()
+    sizes: Counter[str] = Counter()
+    for rel in paths:
+        entry = local_manifest.get(rel)
+        key = _push_dir(rel)
+        counts[key] += 1
+        sizes[key] += entry.size if entry is not None and entry.kind == "file" else 0
+    return PushSize(
+        files=len(paths),
+        bytes=sum(sizes.values()),
+        max_files=max_files,
+        max_bytes=max_bytes,
+        top_by_files=counts.most_common(top),
+        top_by_bytes=[item for item in sizes.most_common(top) if item[1]],
+    )
+
+
 @dataclass
 class ReconcileResult:
     pulled: list[str] = field(default_factory=list)
@@ -63,6 +146,8 @@ class ReconcileResult:
     # byte-identical by hashing. Not conflicts — recorded so the run can show it
     # examined them.
     converged_conflicts: list[str] = field(default_factory=list)
+    # Set when the push plan exceeded the push guard; nothing was mutated.
+    push_refused: PushSize | None = None
     # Converged manifests after reconcile == pre-run baselines.
     local_manifest: Manifest = field(default_factory=dict)
     remote_manifest: Manifest = field(default_factory=dict)
@@ -280,6 +365,37 @@ def _matches_any_scope_path(rel: str, patterns: list[str] | tuple[str, ...]) -> 
     return any(should_exclude(rel, [pattern]) for pattern in patterns)
 
 
+def estimate_push(
+    *,
+    transport: BaseTransport,
+    local_root: Path,
+    remote_root: str,
+    excludes: list[str],
+    hash_below_bytes: int,
+    prev_local: Manifest | None,
+    prev_remote: Manifest | None,
+    max_push_files: int | None,
+    max_push_bytes: int | None,
+    include_paths: list[str] | tuple[str, ...] = (),
+) -> PushSize:
+    """Read-only estimate of what preflight would push now, for ``remrun plan``.
+
+    Uses the same manifests and classification as preflight_reconcile; disputed paths
+    are not hashed here, so a path preflight would later prove identical is not counted.
+    """
+    local_manifest = _build_local_manifest(
+        local_root, excludes, hash_below_bytes=hash_below_bytes or None,
+        include_paths=include_paths,
+    )
+    remote_manifest = _remote_manifest(
+        transport, remote_root, excludes, hash_below_bytes, include_paths
+    )
+    plan = compare_manifests(local_manifest, remote_manifest, prev_local, prev_remote)
+    pushes = [item.path for item in plan.paths if item.action == PUSH]
+    return measure_push(pushes, local_manifest,
+                        max_files=max_push_files, max_bytes=max_push_bytes)
+
+
 def preflight_reconcile(
     *,
     transport: BaseTransport,
@@ -294,10 +410,13 @@ def preflight_reconcile(
     progress: Callable[[int, int, dict[str, int]], None] | None = None,
     is_fallback: bool = False,
     include_paths: list[str] | tuple[str, ...] = (),
+    max_push_files: int | None = None,
+    max_push_bytes: int | None = None,
 ) -> ReconcileResult:
     """Reconcile the active run surface before running the command (Mode 1/safe).
 
-    Conflicts abort *before* any mutation. Otherwise pulls remote-newer/-only,
+    Conflicts abort *before* any mutation, as does a push plan larger than
+    ``max_push_files`` / ``max_push_bytes`` (``result.push_refused``; None = no limit). Otherwise pulls remote-newer/-only,
     pushes local-newer/-only, and applies only known-safe deletes (backing up
     local files before deleting them). A fallback candidate may push local bytes
     outward but may not pull or delete anything locally while candidate selection
@@ -461,6 +580,17 @@ def preflight_reconcile(
             )
             for paths in collisions.values()
         ]
+        result.local_manifest = local_manifest
+        result.remote_manifest = remote_manifest
+        return result
+
+    # Push guard: an accidental whole-tree push (an unexcluded scratch folder, a fresh
+    # target) can run for many minutes before anyone notices. Refuse it while nothing
+    # has been pulled, pushed, or deleted, and say where the bulk is.
+    push_size = measure_push(pushes, local_manifest,
+                             max_files=max_push_files, max_bytes=max_push_bytes)
+    if push_size.refused:
+        result.push_refused = push_size
         result.local_manifest = local_manifest
         result.remote_manifest = remote_manifest
         return result
@@ -759,6 +889,9 @@ __all__ = [
     "ReconcileResult",
     "NextBaseline",
     "PullbackResult",
+    "PushSize",
+    "estimate_push",
+    "measure_push",
     "preflight_reconcile",
     "postrun_pullback",
     "TransportError",

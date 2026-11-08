@@ -268,3 +268,19 @@ def test_canonical_identity_shape():
     assert canonical_identity(e) == {
         "kind": "file", "size": 3, "mtime_ns": 111, "sha256": "aa", "mode": 0o644,
     }
+
+
+def test_global_excludes_drop_syncthing_conflict_copies_at_any_depth():
+    # A conflict copy such as tests/test_x.sync-conflict-....py would be collected by a
+    # bare pytest on the target; it is never project data.
+    config = load_config(Path(__file__).resolve().parents[1])
+    patterns = global_excludes(config)
+
+    copies = (
+        "notes.sync-conflict-20260101-120000-ABCDEFG.md",
+        "tests/test_core.sync-conflict-20260101-120000-ABCDEFG.py",
+        "a/b/c/data.sync-conflict-20260101-120000-ABCDEFG.csv",
+    )
+    assert all(should_exclude(path, patterns) for path in copies)
+    assert not should_exclude("tests/test_core.py", patterns)
+    assert not should_exclude("docs/sync-conflict-handling.md", patterns)

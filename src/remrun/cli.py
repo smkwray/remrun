@@ -48,7 +48,7 @@ from .protocol import (
 )
 from .presence import PresencePolicy, load_presence, local_now
 from .scheduler import pick_by_load
-from .reconcile import postrun_pullback, preflight_reconcile
+from .reconcile import estimate_push, postrun_pullback, preflight_reconcile
 from .resource_context import (
     MAX_RESOURCE_DOCUMENT_BYTES,
     ReceiptValidation,
@@ -372,6 +372,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Print plan and do not execute")
     p.add_argument("--no-pullback", action="store_true", help="Skip post-run pullback")
     p.add_argument("--no-telemetry", action="store_true", help="Skip resource telemetry")
+    p.add_argument(
+        "--allow-large-push", action="store_true",
+        help="skip the [transfer] max_push_files / max_push_mb preflight guard "
+             "(for a legitimate first sync of a large project)",
+    )
     p.add_argument(
         "--memory-limit-mib",
         type=_positive_mib,
@@ -840,6 +845,9 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
     candidates = None
     target_reason = None
     presence = None
+    # Measuring the push needs the target's manifest, a round-trip, so only with --probe.
+    push: dict = {"status": "not_measured", "max_files": plan.max_push_files,
+                  "max_bytes": plan.max_push_bytes, "hint": "add --probe to measure it"}
     if args.probe or args.check_git:
         candidates = []
         presence = load_presence(config)
@@ -879,14 +887,18 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
                             plan.bootstrap, status="unsupported", detail=str(exc)
                         ),
                     )
+            push = _plan_push_estimate(plan, selection[0][1])
         else:
             target_reason = "unreachable"
+            push = {"status": "unavailable", "max_files": plan.max_push_files,
+                    "max_bytes": plan.max_push_bytes, "error": "target unreachable"}
     if args.json:
         payload = plan.as_dict()
         if candidates is not None:
             payload["target_reason"] = target_reason
             payload["candidates_probed"] = candidates
             payload["owner_presence"] = presence.as_dict()
+        payload["push"] = push
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         reporter.event("project", project_id=plan.project.project_id, relative_cwd=plan.project.relative_cwd)
@@ -904,6 +916,12 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("active_surface", excludes=len(plan.excludes), hash_below_bytes=plan.hash_below_bytes)
         if plan.bootstrap is not None:
             reporter.event("bootstrap", **plan.bootstrap.as_dict())
+        reporter.event("push_estimate", **{
+            k: v for k, v in push.items()
+            if k not in {"message", "top_by_files", "top_by_bytes"}
+        })
+        if push.get("message"):
+            reporter.event("push_would_refuse", message=push["message"])
         for entry in (candidates or []):
             reporter.event("candidate_probe", **entry)
         reporter.event("project_config", path=str(plan.project_config_path) if plan.project_config_path else None)
@@ -928,6 +946,37 @@ def cmd_plan(args: argparse.Namespace, reporter: Reporter) -> int:
                            hint="run `remrun bench` to measure local-vs-remote",
                            text=_offload_directive(host, policy, thr))
     return EXIT_OK
+
+
+def _plan_push_estimate(plan: RunPlan, transport) -> dict:
+    """What a run's preflight would push to this target now, and whether the push
+    guard would refuse it. Read-only; a failure is reported, never guessed."""
+    bootstrap_inputs = (
+        plan.bootstrap.lock_inputs
+        if plan.bootstrap is not None and plan.bootstrap.status == "bootstrap-needed"
+        else ()
+    )
+    prev_local, prev_remote = read_baseline(plan.target.name, plan.project.project_id)
+    try:
+        size = estimate_push(
+            transport=transport,
+            local_root=plan.project.local_project_root,
+            remote_root=transport.remote_project_path(plan.project),
+            excludes=plan.excludes,
+            hash_below_bytes=plan.hash_below_bytes,
+            prev_local=prev_local,
+            prev_remote=prev_remote,
+            max_push_files=plan.max_push_files,
+            max_push_bytes=plan.max_push_bytes,
+            include_paths=bootstrap_inputs,
+        )
+    except (OSError, TransportError) as exc:
+        return {"status": "unavailable", "max_files": plan.max_push_files,
+                "max_bytes": plan.max_push_bytes, "error": str(exc)}
+    result = {"status": "measured", **size.as_dict()}
+    if size.refused:
+        result["message"] = size.message()
+    return result
 
 
 def _resolve_targets(plan: RunPlan, target_name: str | None, sched: dict, reporter: Reporter,
@@ -2014,6 +2063,7 @@ def _run_locked(
             **action_totals,
         )
 
+    allow_large_push = getattr(args, "allow_large_push", False)
     try:
         pre = preflight_reconcile(
             transport=transport,
@@ -2028,6 +2078,8 @@ def _run_locked(
             progress=report_preflight_progress,
             is_fallback=is_fallback,
             include_paths=bootstrap_inputs,
+            max_push_files=None if allow_large_push else plan.max_push_files,
+            max_push_bytes=None if allow_large_push else plan.max_push_bytes,
         )
     except TransportError as exc:
         reporter.event("transfer_error", phase="preflight", message=str(exc))
@@ -2046,6 +2098,31 @@ def _run_locked(
             "plan": plan.as_dict(),
         })
         return EXIT_TRANSFER
+
+    if pre.push_refused is not None:
+        # Not a candidate-local conflict: the bulk is in the local tree, so failing over
+        # would only repeat the same push elsewhere. Stop and let the user decide.
+        message = pre.push_refused.message()
+        reporter.event("push_refused", files=pre.push_refused.files,
+                       bytes=pre.push_refused.bytes, max_files=pre.push_refused.max_files,
+                       max_bytes=pre.push_refused.max_bytes, message=message)
+        write_json(summary_path, {
+            "run_id": run_id,
+            "project_id": plan.project.project_id,
+            "target": plan.target.name,
+            "command": plan.command,
+            "started_at": started_at,
+            "ended_at": utc_now_iso(),
+            "exit_code": EXIT_GUARD,
+            "error": message,
+            "phase": "preflight",
+            "completion_state": "not_started",
+            "command_started": False,
+            "terminal": True,
+            "push_guard": pre.push_refused.as_dict(),
+            "plan": plan.as_dict(),
+        })
+        return EXIT_GUARD
 
     if pre.has_conflicts:
         cdir = conflict_dir(run_id)

@@ -191,6 +191,9 @@ class RunPlan:
     project_config_path: Path | None
     excludes: list[str] = field(default_factory=list)
     hash_below_bytes: int = 0
+    # Preflight push guard ([transfer] max_push_files / max_push_mb); None = no limit.
+    max_push_files: int | None = None
+    max_push_bytes: int | None = None
     project_config: dict[str, Any] = field(default_factory=dict)
     json: bool = False
     write_scope: str | None = None

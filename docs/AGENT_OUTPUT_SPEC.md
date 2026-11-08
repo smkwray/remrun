@@ -142,11 +142,14 @@ The process exit code should be:
       own code is preserved as command_exit_code in the run summary.
 3     transfer failure
 4     remote execution infrastructure failure
-5     configured memory policy refused, terminated, or failed safe. A
-      pre-mutation capacity refusal has phase="memory_admission" and a
+5     a safety guard refused, terminated, or failed safe. Configured memory
+      policy: a pre-mutation capacity refusal has phase="memory_admission" and a
       structured memory_admission record. Runtime enforcement has a structured
       memory_guard record with whether user code started, the command exit (if
-      any), observed thresholds, and cleanup status
+      any), observed thresholds, and cleanup status. Push guard: the preflight
+      push plan exceeded [transfer] max_push_files / max_push_mb; phase="preflight",
+      command_started=false, nothing was transferred, and a push_guard record
+      gives files, bytes, the limits, and the top directories by files and bytes
 N     remote command's exit code, when command ran and remrun could collect status
 ```
 
@@ -158,8 +161,8 @@ required enforcement was initialized and user code was launched. `--no-telemetry
 suppresses optional telemetry only; it never suppresses the memory guard. Exit 5
 can collide numerically with a command that itself exits 5. Automation must use
 `phase = "memory_admission"` plus `memory_admission` for a pre-mutation refusal,
-or `memory_guard` plus `command_exit_code` for runtime enforcement, to
-distinguish those cases.
+`push_guard` for a push-guard refusal, or `memory_guard` plus `command_exit_code`
+for runtime enforcement, to distinguish those cases.
 
 For a successful non-durable guarded run, the final summary also contains a
 token-free `memory_admission` object. Unknown-command receipts identify

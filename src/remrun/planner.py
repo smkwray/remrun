@@ -7,6 +7,7 @@ from .config import (
     RemrunConfig,
     hash_below_bytes,
     load_project_config,
+    push_limits,
     resolve_excludes,
     scheduler_config,
 )
@@ -47,6 +48,7 @@ def make_run_plan(
     )
     transfer_mode = str(config.defaults.get("transfer", {}).get("mode", "safe"))
     write_scope = resolve_write_scope(project_config, scope_name)
+    max_push_files, max_push_bytes = push_limits(config, project_config)
 
     return RunPlan(
         target=candidates[0],
@@ -57,6 +59,8 @@ def make_run_plan(
         project_config_path=project_config_path,
         excludes=resolve_excludes(config, project_config),
         hash_below_bytes=hash_below_bytes(config),
+        max_push_files=max_push_files,
+        max_push_bytes=max_push_bytes,
         project_config=project_config,
         json=json_events,
         write_scope=write_scope.name,
