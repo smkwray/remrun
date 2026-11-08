@@ -1987,6 +1987,9 @@ def cmd_run(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.event("remote_cwd", path=remote_cwd)
 
         lock: ProjectLock | None = None
+        if untransferred and getattr(args, "durable", False):
+            # Released, like the project lock, when this controller stops waiting.
+            lock = _durable_run_lock(plan, run_id, reporter).acquire()
         if not untransferred:
             try:
                 lock = ProjectLock(
@@ -3725,6 +3728,28 @@ def _durable_record_path(rdir: Path) -> Path:
     return rdir / "durable.json"
 
 
+def _durable_run_lock(
+    plan: RunPlan, run_id: str, reporter: Reporter, *, adopt_dead_run: bool = False
+) -> ProjectLock:
+    """The lock held by the one process waiting on or finalizing a durable run.
+
+    An ordinary run is serialized by its project lock. An untransferred run takes
+    none, so whoever waits on it (the launching ``run``, ``resume`` or ``cancel``)
+    holds a lock keyed to that run alone. It never conflicts with the project's own
+    lock, keeps two finalizations of one run from racing, and tells ``cancel`` that
+    a controller is still waiting. Dead holders are reclaimed like any project lock.
+    """
+    if plan.transfer_mode != "none":
+        return ProjectLock(
+            plan.project.project_id, plan.target.name, scope=plan.write_scope,
+            run_id=run_id, adopt_dead_run=adopt_dead_run, report=reporter.event,
+        )
+    return ProjectLock(
+        f"{plan.project.project_id} untransferred run {run_id}", plan.target.name,
+        run_id=run_id, adopt_dead_run=adopt_dead_run, report=reporter.event,
+    )
+
+
 def _durable_record_token(record: dict[str, object]) -> str:
     """Return the saved resume token, refusing to invent one from malformed state.
 
@@ -4624,14 +4649,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
             "durable completion fence is missing or names a different run"
         )
     transport = make_transport(plan.target)
-    lock = None if untransferred else ProjectLock(
-        plan.project.project_id,
-        plan.target.name,
-        scope=plan.write_scope,
-        run_id=args.run_id,
-        adopt_dead_run=True,
-        report=reporter.event,
-    ).acquire()
+    lock = _durable_run_lock(plan, args.run_id, reporter, adopt_dead_run=True).acquire()
     try:
         status = transport.durable_status(args.run_id, _durable_record_token(record))
         _validate_durable_identity(status, record)
@@ -4642,8 +4660,7 @@ def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
             record=record, initial_status=status, no_wait=bool(args.no_wait),
         )
     finally:
-        if lock is not None:
-            lock.release()
+        lock.release()
 
 
 def _durable_observation(record: dict[str, object], plan: RunPlan) -> JobObservation:
@@ -4742,7 +4759,10 @@ def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
         "complete", "finalization_complete",
     }:
         return cmd_resume(resume_args, reporter)
-    hazard = read_unknown_completion_hazard(plan.project.project_id)
+    # An untransferred run is fenced by its own record, not the project's.
+    hazard = read_unknown_completion_hazard(
+        plan.project.project_id, run_id=run_id if plan.transfer_mode == "none" else None
+    )
     if hazard is None or hazard.get("run_id") != run_id or hazard.get("target") != plan.target.name:
         raise UnknownCompletionHazardError(
             "durable completion fence is missing or names a different run"
@@ -4753,7 +4773,7 @@ def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
         "reporter": reporter, "transport": transport, "plan": plan, "record": record,
         "rdir": rdir, "hazard": hazard,
     }
-    if run_id in ProjectLock(plan.project.project_id, plan.target.name).live_holder_run_ids():
+    if run_id in _durable_run_lock(plan, run_id, reporter).live_holder_run_ids():
         # The original `run` (or a `resume`) is still waiting on this run and owns its
         # summary and finalization; racing it could pull outputs back twice.
         status = transport.durable_status(run_id, token)
@@ -4770,14 +4790,7 @@ def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
             ),
         )
         return EXIT_OK
-    lock = ProjectLock(
-        plan.project.project_id,
-        plan.target.name,
-        scope=plan.write_scope,
-        run_id=run_id,
-        adopt_dead_run=True,
-        report=reporter.event,
-    ).acquire()
+    lock = _durable_run_lock(plan, run_id, reporter, adopt_dead_run=True).acquire()
     try:
         status = transport.durable_status(run_id, token)
         _validate_durable_identity(status, record)

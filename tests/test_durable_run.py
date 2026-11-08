@@ -786,7 +786,9 @@ def test_two_untransferred_durable_runs_on_one_project_launch_concurrently(
         summary = _summary(state, run_id)
         assert summary["completion_state"] == "detached"
         assert summary["plan"]["transfer_mode"] == "none"
-    assert not (state / "locks").exists()
+    # Neither touched the project's own lock table (only per-run waiter locks exist).
+    project_locks = state / "locks" / "project" / hashlib.sha256(b"proj1").hexdigest()[:16]
+    assert not project_locks.exists()
     assert not (state / "manifests").exists()
 
 
@@ -1665,6 +1667,53 @@ def test_cancel_while_the_original_controller_waits_only_requests_the_stop(
     assert main(["resume", run_id]) == 137
     assert pullbacks[0] == 1
     assert (durable_env["project"] / "partial.txt").read_text() == "partial"
+
+
+def _detached_untransferred_run(durable_env, monkeypatch):  # noqa: ANN001
+    """An untransferred durable run still running on the target after its controller left."""
+    _set_transfer_mode(durable_env, "none")
+    durable_env["remote_project"].mkdir()
+    return _detached_run(durable_env, monkeypatch)
+
+
+def test_cancel_stops_an_untransferred_run_and_clears_only_its_own_fence(
+    durable_env, monkeypatch
+):
+    """An untransferred run is fenced by its own record, not the project's, and moved
+    no files: cancel must find that record, stop the job, finalize it without a
+    pullback, and leave the project unfenced."""
+    fake, run_id = _detached_untransferred_run(durable_env, monkeypatch)
+    pullbacks = _count_pullbacks(monkeypatch)
+    assert _run_fences(durable_env["state"]) == {run_id}
+
+    assert main(["cancel", run_id]) == 137
+
+    assert len(fake.cancel_calls) == 1
+    assert pullbacks[0] == 0
+    assert not (durable_env["project"] / "partial.txt").exists()
+    assert _run_fences(durable_env["state"]) == set()
+    assert not _project_fences(durable_env["state"])
+    summary = _summary(durable_env["state"], run_id)
+    assert (summary["completion_state"], summary["exit_code"]) == ("complete", 137)
+
+
+def test_one_process_at_a_time_waits_on_an_untransferred_run(durable_env, monkeypatch, capsys):
+    """With no project lock, the per-run lock is what stops two processes finalizing
+    one untransferred run, and what tells cancel a controller is still waiting."""
+    fake, run_id = _detached_untransferred_run(durable_env, monkeypatch)
+    waiting = ProjectLock(f"proj1 untransferred run {run_id}", "TEST", run_id=run_id).acquire()
+    try:
+        assert main(["resume", run_id]) not in {EXIT_OK, 137}
+        assert _summary(durable_env["state"], run_id)["completion_state"] == "detached"
+        capsys.readouterr()
+        assert main(["cancel", run_id]) == EXIT_OK
+        assert "cancel_handed_off" in capsys.readouterr().err
+        assert _run_fences(durable_env["state"]) == {run_id}
+    finally:
+        waiting.release()
+    # The stop was requested; the next waiter finalizes it exactly once.
+    assert main(["resume", run_id]) == 137
+    assert _run_fences(durable_env["state"]) == set()
 
 
 def test_cancel_of_a_run_that_already_finished_behaves_like_resume(durable_env, monkeypatch):
