@@ -1295,7 +1295,13 @@ def _start_session(tmp_path: Path, jobs: dict[str, list[str]]):
     )
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        records, _ = observer._read_records(root)
+        try:
+            records, _ = observer._read_records(root)
+        except observer.RegistryError:
+            # The first observer may have created the registry file but not yet its
+            # table; the jobs are still registering, so keep waiting.
+            time.sleep(0.02)
+            continue
         rows = {str(row["job_id"]): row for row in records}
         if set(rows) == set(jobs) and all(
             int(row["root_pid"]) != int(row["owner_pid"]) for row in rows.values()
