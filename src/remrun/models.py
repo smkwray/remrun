@@ -216,6 +216,9 @@ class RunPlan:
     # The global excludes alone; a commit run's private tree is manifested with these so
     # outputs under project excludes stay visible. Already part of ``excludes``.
     tree_excludes: list[str] = field(default_factory=list)
+    # A declared run's admission grant: {"request_id", "coordinator"}. It is recorded in
+    # every summary and durable record so whatever later proves the run ended releases it.
+    admission: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         result = {
@@ -256,4 +259,6 @@ class RunPlan:
         if self.target_reason is not None:
             result["target_reason"] = self.target_reason
             result["label"] = self.label
+        if self.admission is not None:
+            result["admission"] = dict(self.admission)
         return result

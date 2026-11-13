@@ -45,6 +45,9 @@ class RemrunConfig:
     # project of this deployment. Merged after defaults.toml global_exclude and before a
     # project's own excludes by resolve_excludes().
     deployment_excludes: list[str] = field(default_factory=list)
+    # Optional devices.toml [admission]: only `coordinator`, the deployment's device that
+    # owns the admission ledger. Merged over defaults.toml by admission_settings().
+    device_admission: dict[str, Any] = field(default_factory=dict)
 
 
 def find_remrun_root(start: Path | None = None) -> Path:
@@ -141,12 +144,16 @@ def load_config(remrun_root: Path | None = None) -> RemrunConfig:
     coordination = dict(devices_doc.get("coordination", {}) or {})
     device_scheduler = dict(devices_doc.get("scheduler", {}) or {})
     deployment_excludes = _deployment_excludes(devices_doc)
+    device_admission = devices_doc.get("admission", {})
+    if not isinstance(device_admission, dict):
+        raise ValueError("devices.toml [admission] must be a table")
     return RemrunConfig(repo_root=root, defaults=defaults, devices=devices,
                         project_roots=project_roots, offload=offload, sync_roots=sync_roots,
                         fleet_tasks=fleet_tasks,
                         git_sync=git_sync,
                         coordination=coordination, device_scheduler=device_scheduler,
-                        deployment_excludes=deployment_excludes)
+                        deployment_excludes=deployment_excludes,
+                        device_admission=dict(device_admission))
 
 
 def _deployment_excludes(devices_doc: dict[str, Any]) -> list[str]:
@@ -329,24 +336,39 @@ def work_min_free_fraction(config: RemrunConfig) -> float:
     return float(value)
 
 
-def admission_settings(config: RemrunConfig) -> dict[str, float]:
-    """``[admission]`` as keyword arguments for ``AdmissionLedger``.
+def admission_settings(config: RemrunConfig) -> dict[str, Any]:
+    """``[admission]``: ledger timing, a declared run's default wait, and the coordinator.
 
-    Both keys are required: a missing or malformed value raises rather than defaulting.
+    defaults.toml must set every key; devices.toml [admission] may set only
+    ``coordinator``. ``coordinator`` is None when unset (empty). A missing or malformed
+    value raises rather than defaulting.
     """
     section = config.defaults.get("admission")
-    if not isinstance(section, dict) or set(section) != {"settle_seconds", "wait_ttl_seconds"}:
+    keys = {"settle_seconds", "wait_ttl_seconds", "run_wait_seconds", "coordinator"}
+    if not isinstance(section, dict) or set(section) != keys:
+        raise ValueError("defaults.toml [admission] must set exactly " + ", ".join(sorted(keys)))
+    unsupported = sorted(set(config.device_admission) - {"coordinator"})
+    if unsupported:
         raise ValueError(
-            "defaults.toml [admission] must set exactly settle_seconds and wait_ttl_seconds"
+            "devices.toml [admission] supports only `coordinator`; unsupported key(s): "
+            + ", ".join(unsupported)
         )
-    settings: dict[str, float] = {}
-    for key, allow_zero in (("settle_seconds", True), ("wait_ttl_seconds", False)):
+    settings: dict[str, Any] = {}
+    for key, allow_zero in (
+        ("settle_seconds", True), ("wait_ttl_seconds", False), ("run_wait_seconds", True),
+    ):
         value = section[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero)):
             bound = "non-negative" if allow_zero else "positive"
             raise ValueError(f"[admission] {key} must be a {bound} number; got {value!r}")
         settings[key] = float(value)
+    coordinator = config.device_admission.get("coordinator", section["coordinator"])
+    if not isinstance(coordinator, str):
+        raise ValueError(f"[admission] coordinator must be a device name; got {coordinator!r}")
+    if coordinator and coordinator not in config.devices:
+        raise ValueError(f"[admission] coordinator {coordinator!r} is not a configured device")
+    settings["coordinator"] = coordinator or None
     return settings
 
 

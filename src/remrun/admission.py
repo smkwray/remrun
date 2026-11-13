@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -31,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .config import RemrunConfig, admission_settings
+from .job_observation import local_device
 from .models import Device
 from .remote.runner import RESOURCE_KEY_RE, filesystem_probe
 from .resource_envelope import (
@@ -44,12 +47,17 @@ from .resource_envelope import (
     parse_device_resource_policy,
 )
 from .resource_probe import ResourceSnapshot, probe_target_resources, unavailable_snapshot
-from .transport import make_transport
+from .state import default_state_root
+from .transport import BaseTransport, TransportError, make_transport
 
 SCHEMA_VERSION = 1
 REQUEST_SCHEMA = "remrun.admission-request"
-# `--wait` refreshes the heartbeat this often, or three times per wait TTL if that is shorter.
+# A waiter replays its acquire this often, or three times per wait TTL if that is shorter.
 WAIT_POLL_SECONDS = 10.0
+# A coordinator answers one `remrun admit` call, including its own probe, within this.
+REMOTE_TIMEOUT_SECONDS = 120.0
+# Set on calls forwarded to the coordinator, which must answer them from its own ledger.
+FORWARDED_ENV = "REMRUN_ADMISSION_FORWARDED"
 _CLASSES = ("protected", "device_bound", "critical", "normal")
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MAX_TEXT = 200
@@ -94,6 +102,10 @@ class AdmissionError(ValueError):
 
 class AdmissionConflict(AdmissionError):
     """A request id was reused with different request content."""
+
+
+class AdmissionUnavailable(AdmissionError):
+    """The coordinator that owns the ledger could not be reached or did not answer."""
 
 
 @dataclass(frozen=True)
@@ -504,27 +516,213 @@ class AdmissionLedger:
         }
 
 
-def acquire_waiting(
-    ledger: AdmissionLedger,
-    request: AdmissionRequest,
-    gather: Callable[[], DeviceFacts],
+class AdmissionClient:
+    """This deployment's one admission authority, as seen from this controller.
+
+    With no coordinator, or when this controller is the coordinator, calls use the local
+    ledger and probe the device here. Otherwise every call runs ``remrun admit ... --json``
+    on the coordinator over its transport. An unreachable coordinator raises
+    ``AdmissionUnavailable``; nothing ever falls back to a local ledger.
+    """
+
+    def __init__(self, config: RemrunConfig, coordinator: str | None) -> None:
+        self.config = config
+        self.coordinator = coordinator
+        self._settings = admission_settings(config)
+        self.poll_seconds = min(WAIT_POLL_SECONDS, self._settings["wait_ttl_seconds"] / 3)
+        here = local_device(config)
+        self._remote: Device | None = None
+        self._transport: BaseTransport | None = None
+        if coordinator is not None and (here is None or here.name != coordinator):
+            if coordinator not in config.devices:
+                raise AdmissionError(f"admission coordinator {coordinator!r} is not configured")
+            if os.environ.get(FORWARDED_ENV):
+                # Forwarding again could loop; answering locally would be a second ledger.
+                raise AdmissionError(
+                    f"a forwarded admission call reached a controller that is not the "
+                    f"coordinator {coordinator!r}; its hostname must match that device name"
+                )
+            self._remote = config.devices[coordinator]
+
+    @classmethod
+    def for_config(cls, config: RemrunConfig) -> AdmissionClient:
+        return cls(config, admission_settings(config)["coordinator"])
+
+    def acquire(self, request: AdmissionRequest) -> dict[str, Any]:
+        if self._remote is not None:
+            argv = [
+                "acquire", f"--device={request.device}", f"--project={request.root_project}",
+                f"--thread={request.owner_thread}", f"--logical-thread={request.logical_thread}",
+                f"--label={request.label}", f"--request-id={request.request_id}",
+                f"--cpu={request.cpu_cores}", f"--ram-gib={request.ram_mib / 1024!r}",
+                *[f"--key={key}" for key in request.keys],
+                *(["--device-bound"] if request.device_bound else []),
+                *(["--critical"] if request.critical else []),
+            ]
+            return self._call(argv)
+        device = self.config.devices.get(request.device)
+        if device is None:
+            raise AdmissionError(f"unknown device {request.device!r}")
+        facts = probe_device_facts(device)
+        with self._ledger() as ledger:
+            return ledger.acquire(request, facts)
+
+    def status(self, request_id: str) -> dict[str, Any]:
+        return self._by_id("status", request_id)
+
+    def release(self, request_id: str) -> dict[str, Any]:
+        """End a grant. The queue is promoted by the next waiter's poll, not here."""
+        return self._by_id("release", request_id)
+
+    def cancel(self, request_id: str) -> dict[str, Any]:
+        return self._by_id("cancel", request_id)
+
+    def list_requests(self, device: str | None = None) -> list[dict[str, Any]]:
+        if self._remote is not None:
+            document = self._call(["list", *([f"--device={device}"] if device else [])])
+            return list(document.get("requests", []))
+        with self._ledger() as ledger:
+            return ledger.list_requests(device)
+
+    def _by_id(self, action: str, request_id: str) -> dict[str, Any]:
+        if self._remote is not None:
+            return self._call([action, request_id])
+        with self._ledger() as ledger:
+            return getattr(ledger, action)(request_id)
+
+    def _ledger(self) -> AdmissionLedger:
+        return AdmissionLedger(
+            default_state_root(),
+            settle_seconds=self._settings["settle_seconds"],
+            wait_ttl_seconds=self._settings["wait_ttl_seconds"],
+        )
+
+    def _call(self, argv: list[str]) -> dict[str, Any]:
+        device = self._remote
+        assert device is not None
+        if self._transport is None:
+            transport = make_transport(replace(device, memory_guard=None))
+            try:
+                probe = transport.probe()
+            except Exception as exc:  # noqa: BLE001 - any failure leaves no authority
+                raise AdmissionUnavailable(
+                    f"admission coordinator {device.name} is unreachable: {exc}"
+                ) from exc
+            if not probe.reachable:
+                raise AdmissionUnavailable(
+                    f"admission coordinator {device.name} is unreachable: {probe.detail}"
+                )
+            self._transport = transport
+        try:
+            result = self._transport.exec_control(
+                ["remrun", "admit", *argv, "--json"], "~", env={FORWARDED_ENV: "1"},
+                timeout=REMOTE_TIMEOUT_SECONDS, path_prepend=list(device.path) or None,
+            )
+        except (TransportError, OSError) as exc:
+            raise AdmissionUnavailable(
+                f"admission coordinator {device.name} did not answer: {exc}"
+            ) from exc
+        document = _last_json_object(result.stdout)
+        # `admit` prints its document for 0 granted or done, 75 waiting, and 1 when an
+        # acquire's request has already ended; any other 1 is a refusal it explained.
+        if document is not None and result.exit_code in (0, 1, 75):
+            return document
+        error = _last_json_object(result.stderr) or {}
+        detail = str(error.get("message") or result.stderr.strip()[-300:]
+                     or f"exit {result.exit_code}")
+        if result.exit_code == 1 and error.get("message"):
+            raise AdmissionError(f"admission coordinator {device.name}: {detail}")
+        raise AdmissionUnavailable(
+            f"admission coordinator {device.name} could not run `remrun admit` "
+            f"(exit {result.exit_code}): {detail}"
+        )
+
+
+def admit_first(
+    client: AdmissionClient,
+    requests: list[AdmissionRequest],
     *,
     wait_seconds: float,
+    report: Callable[[dict[str, Any]], None],
     clock: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    """Acquire, then keep replaying with fresh facts until granted or ``wait_seconds`` pass.
+    """Acquire each request in order and keep the first granted at once; if none is,
+    keep the first still queued on a device whose capacity is known (else the first
+    queued) and replay it, refreshing its heartbeat, until granted or ``wait_seconds``
+    pass. ``report`` sees the kept request each time its place in the queue changes.
 
-    Each replay refreshes the heartbeat. Facts are gathered before each transaction.
+    Returns the kept request's last document: granted, still waiting at the deadline, or
+    ended. Every other request made here is withdrawn, and an error or interrupt
+    withdraws them all, so nothing is left queued or held behind an exception.
     """
-    poll = min(WAIT_POLL_SECONDS, ledger.wait_ttl_seconds / 3)
-    deadline = clock() + wait_seconds
-    while True:
-        document = ledger.acquire(request, gather())
-        remaining = deadline - clock()
-        if document["state"] != "waiting" or remaining <= 0:
-            return document
-        sleep(min(poll, remaining))
+    if not requests:
+        raise AdmissionError("no admission request to make")
+    made: list[str] = []
+    try:
+        documents: list[dict[str, Any]] = []
+        for request in requests:
+            documents.append(client.acquire(request))
+            made.append(request.request_id)
+            if documents[-1]["state"] == "granted":
+                break
+        queued = [doc for doc in documents if doc["state"] == "waiting"]
+        known = [doc for doc in queued if doc.get("promotion", {}).get("facts", {}).get("known")]
+        document = next(
+            (doc for doc in documents if doc["state"] == "granted"),
+            (known or queued or documents)[0],
+        )
+        for request_id in made:
+            if request_id != document["request_id"]:
+                withdraw(client, request_id)
+        made = [document["request_id"]]
+        request = next(item for item in requests if item.request_id == made[0])
+        deadline = clock() + wait_seconds
+        seen = None
+        while document["state"] == "waiting":
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            place = (document["position"], document["ahead"],
+                     (document.get("promotion", {}).get("blocked") or {}).get("reason"))
+            if place != seen:
+                report(document)
+                seen = place
+            _sleep(min(client.poll_seconds, remaining))
+            document = client.acquire(request)
+        return document
+    except BaseException:
+        for request_id in made:
+            try:
+                withdraw(client, request_id)
+            except Exception:  # noqa: BLE001 - the original failure is what matters
+                pass
+        raise
+
+
+def withdraw(client: AdmissionClient, request_id: str) -> None:
+    """Cancel a request, or release it if it was granted meanwhile; its work never ran."""
+    try:
+        client.cancel(request_id)
+    except AdmissionUnavailable:
+        raise
+    except AdmissionError:
+        if client.status(request_id)["state"] == "granted":
+            client.release(request_id)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _last_json_object(text: str) -> dict[str, Any] | None:
+    for line in reversed((text or "").splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def _rank(row: sqlite3.Row) -> int:

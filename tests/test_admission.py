@@ -16,7 +16,7 @@ from remrun.admission import (
     AdmissionLedger,
     AdmissionRequest,
     DeviceFacts,
-    acquire_waiting,
+    admit_first,
     facts_from_snapshot,
 )
 from remrun.config import RemrunConfig, admission_settings, load_toml
@@ -361,7 +361,30 @@ def test_release_ends_only_grants_and_cancel_only_waiters(ledger, clock) -> None
     assert ledger.cancel("queued")["state"] == ledger.cancel("queued")["state"] == "cancelled"
 
 
-def test_wait_keeps_the_request_alive_until_granted(ledger, clock) -> None:
+class LedgerClient:
+    """The ledger behind the admission client interface, probing nothing."""
+
+    poll_seconds = TTL / 3
+
+    def __init__(self, ledger: AdmissionLedger, clock: Clock, **facts_kwargs) -> None:
+        self.ledger, self.clock, self.facts_kwargs = ledger, clock, facts_kwargs
+
+    def acquire(self, item: AdmissionRequest) -> dict:
+        return self.ledger.acquire(
+            item, facts(self.clock, device=item.device, **self.facts_kwargs)
+        )
+
+    def status(self, request_id: str) -> dict:
+        return self.ledger.status(request_id)
+
+    def release(self, request_id: str) -> dict:
+        return self.ledger.release(request_id)
+
+    def cancel(self, request_id: str) -> dict:
+        return self.ledger.cancel(request_id)
+
+
+def test_wait_keeps_the_request_alive_until_granted(ledger, clock, monkeypatch) -> None:
     # The wait outlasts the heartbeat TTL; only polling keeps the request queued.
     ledger.acquire(request("held", "alpha", cpu=16), facts(clock))
     sleeps: list[float] = []
@@ -369,26 +392,59 @@ def test_wait_keeps_the_request_alive_until_granted(ledger, clock) -> None:
     def sleep(seconds: float) -> None:
         sleeps.append(seconds)
         clock.now += seconds
-        if len(sleeps) == 40:
+        if len(sleeps) == 4:
             ledger.release("held")
 
-    document = acquire_waiting(
-        ledger, request("next", "beta", cpu=4), lambda: facts(clock),
-        wait_seconds=3600, clock=clock, sleep=sleep,
+    monkeypatch.setattr(admission, "_sleep", sleep)
+    reports: list[dict] = []
+    document = admit_first(
+        LedgerClient(ledger, clock), [request("next", "beta", cpu=4)],
+        wait_seconds=3600, report=reports.append, clock=clock,
     )
     assert document["state"] == "granted"
     assert sum(sleeps) > TTL and max(sleeps) <= TTL / 3
+    assert len(reports) == 1  # one status line while the place in the queue stays the same
+
+
+def test_auto_takes_the_first_candidate_that_grants_and_withdraws_the_rest(
+    ledger, clock, monkeypatch,
+) -> None:
+    # Candidate order is kept: the run lands on the first device with room now, and a
+    # request it made on a fuller device is cancelled rather than left to hold a place.
+    ledger.acquire(request("full", "alpha", cpu=16), facts(clock))
+    client = LedgerClient(ledger, clock)
+    candidates = [request("run-0", "beta", cpu=4), request("run-1", "beta", cpu=4,
+                                                           device="winbox")]
+    document = admit_first(client, candidates, wait_seconds=0, report=lambda _doc: None,
+                           clock=clock)
+    assert (document["request_id"], document["state"]) == ("run-1", "granted")
+    assert ledger.status("run-0")["state"] == "cancelled"
+
+    # When no candidate has room, the run queues on the first and gives the rest back.
+    ledger.acquire(request("full-too", "alpha", cpu=12, device="winbox"),
+                   facts(clock, device="winbox"))
+    monkeypatch.setattr(admission, "_sleep", lambda seconds: setattr(
+        clock, "now", clock.now + seconds))
+    queued = admit_first(client, [request("run-2", "beta", cpu=4),
+                                  request("run-3", "beta", cpu=4, device="winbox")],
+                         wait_seconds=1, report=lambda _doc: None, clock=clock)
+    assert (queued["request_id"], queued["state"]) == ("run-2", "waiting")
+    assert ledger.status("run-3")["state"] == "cancelled"
 
 
 def test_admission_settings_are_required_and_shipped(tmp_path: Path) -> None:
-    def settings(defaults: dict) -> dict[str, float]:
-        return admission_settings(RemrunConfig(tmp_path, defaults, {}, {}))
+    def settings(defaults: dict, devices: dict | None = None) -> dict:
+        return admission_settings(RemrunConfig(tmp_path, defaults, devices or {}, {},
+                                               device_admission={}))
 
     shipped = load_toml(Path(__file__).resolve().parents[1] / "config" / "defaults.toml")
-    assert set(settings(shipped)) == {"settle_seconds", "wait_ttl_seconds"}
+    assert settings(shipped)["coordinator"] is None  # the published default is one ledger each
+    valid = {"settle_seconds": 60, "wait_ttl_seconds": 300, "run_wait_seconds": 0,
+             "coordinator": ""}
     for broken in ({}, {"admission": {"settle_seconds": 60}},
-                   {"admission": {"settle_seconds": 60, "wait_ttl_seconds": 0}},
-                   {"admission": {"settle_seconds": "60", "wait_ttl_seconds": 300}}):
+                   {"admission": {**valid, "wait_ttl_seconds": 0}},
+                   {"admission": {**valid, "settle_seconds": "60"}},
+                   {"admission": {**valid, "coordinator": "nobox"}}):
         with pytest.raises(ValueError):
             settings(broken)
 
@@ -397,7 +453,8 @@ def test_admit_cli_end_to_end(tmp_path: Path, monkeypatch, capsys) -> None:
     root = tmp_path / "remrun"
     (root / "config").mkdir(parents=True)
     (root / "config" / "defaults.toml").write_text(
-        "[admission]\nsettle_seconds = 60\nwait_ttl_seconds = 300\n", encoding="utf-8"
+        "[admission]\nsettle_seconds = 60\nwait_ttl_seconds = 300\nrun_wait_seconds = 0\n"
+        'coordinator = ""\n', encoding="utf-8"
     )
     policy = {**POLICY, "cpu_reserve_cores": 0, "cpu_max_fraction": 1.0,
               "ram_reserve_mib": 0, "ram_max_fraction": 1.0, "allow_static_fallback": False}

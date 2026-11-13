@@ -248,10 +248,24 @@ and pullback fails as a conflict if the command wrote outside the declared scope
 ## Shared admission (`remrun admit`)
 
 `remrun admit` keeps one queue per device so that agents and projects sharing a fleet take
-turns on contended hardware. It only decides who may start: it launches nothing, and
-`remrun run` does not consult it. The ledger is one SQLite file in the controller's state
-root (`admission/ledger-v1.sqlite3`), which must be on a local filesystem. Every caller on
-one controller shares it; another controller keeps its own.
+turns on contended hardware. It decides who may start; `remrun run` waits for that decision
+when a run declares the resources it will hold (see "Declared runs" below). The ledger is
+one SQLite file in the state root of the controller that owns it
+(`admission/ledger-v1.sqlite3`), which must be on a local filesystem.
+
+**One authority.** With `[admission] coordinator` empty (the default) every controller keeps
+its own ledger. To share one ledger, name the controller that owns it in `devices.toml`:
+
+```toml
+[admission]
+coordinator = "macbox"
+```
+
+Every other controller then runs each `remrun admit` call, and each admission step of a
+declared run, as `remrun admit ... --json` on that device over its configured SSH
+transport, with the device's `path` entries prepended so `remrun` is found. The
+coordinator's hostname must match its device name. If the coordinator cannot be reached
+or cannot run `remrun`, the call fails; nothing falls back to a local ledger.
 
 ```bash
 remrun admit acquire --device macbox --project paper1 --thread t1 --cpu 8 --ram-gib 16 \
@@ -300,7 +314,48 @@ ends it.
 has already ended. JSON output gives the state, `position`, and the ids `ahead` in the
 queue. After `acquire` it also gives the facts the decision used and why the head of the
 queue is blocked: `facts_unknown`, `key_held`, `ledger_cpu`, `ledger_ram`, `live_cpu`, or
-`live_ram`.
+`live_ram`. Interrupting `acquire --wait` withdraws its request. Releasing a grant does
+not probe the device; the next waiter's poll (at most every 10 seconds) promotes the queue.
+
+### Declared runs
+
+```bash
+remrun run macbox --cpu 8 --ram-gib 16 -- python do/fit.py
+remrun run --auto --cpu 2 --key pool/gpu --device-bound --admission-wait 900 -- python train.py
+```
+
+A run that declares any of `--cpu N`, `--ram-gib G`, `--key K` (repeatable),
+`--device-bound` or `--critical` takes a turn from admission before it reconciles,
+reserves memory, or starts anything on the target. A run that declares none of them is
+unchanged and never reads `[admission]`. The request's root project is the run's project
+id, its owning thread is `--thread` (default: `$T3CODE_THREAD_ID`, else this controller and
+process), and `--logical-thread` names the work stream when it differs. `--thread`,
+`--logical-thread` and `--admission-wait` without a declaration are refused.
+
+- **Explicit target**: the run queues on that device.
+- **`--auto`**: in the usual candidate order, the run takes the first device that grants at
+  once and cancels the requests it made on the others. If none grants, it waits on the
+  first candidate whose capacity it could measure (else the first candidate) and cancels the
+  rest. Once granted, the run is bound to that device and does not fail over.
+
+While it waits the run renews its request and prints one `admission_waiting` event each
+time its place changes, with its `position`, the ids `ahead` of it, and why the head is
+blocked. After `--admission-wait` seconds (default `[admission] run_wait_seconds`) without
+a grant it cancels its request, emits `admission_timeout`, and exits 75 without having
+started anything. An unreachable coordinator exits 4 (`admission_unavailable`).
+
+The grant is recorded under `plan.admission` in the run's `summary.json` (and a durable
+run's record), and is released only when remrun knows the command is not running:
+
+- a run that ends, fails, or is interrupted before its command started releases at exit;
+- a run whose completion is unknown (a lost connection, an interrupt during the command)
+  keeps its grant until `remrun resolve-unknown RUN --confirmed-ended` records the end;
+- a `--durable` run that detaches (exit 4) keeps its grant until `remrun resume RUN` or
+  `remrun cancel RUN` finalizes it.
+
+Nothing releases a grant on a timer. If a release itself fails, the run reports
+`admission_release_failed`; release the grant with `remrun admit release ID` once the run
+is known to have ended.
 
 ## Benchmark mode
 

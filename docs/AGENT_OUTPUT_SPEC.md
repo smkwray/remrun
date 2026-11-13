@@ -154,7 +154,10 @@ N     remote command's exit code, when command ran and remrun could collect stat
 ```
 
 `remrun admit acquire` runs no command: it exits 0 when the request is granted, 75 while it
-is still waiting, and 1 on an error or when the request id has already ended.
+is still waiting, and 1 on an error or when the request id has already ended. A `remrun run`
+that declares resources (`--cpu`, `--ram-gib`, `--key`, ...) exits 75 when its admission
+wait ends without a grant, before anything has started, and 4 when the admission
+coordinator cannot be reached.
 
 If the remote command exits nonzero, `remrun` should still try to pull logs and changed files unless configured not to.
 

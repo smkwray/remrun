@@ -158,6 +158,14 @@ settle_seconds = 60
 # polling) within this many seconds is cancelled. It held nothing, so only its place in
 # the queue is lost. A grant never expires on a timer; only release ends it.
 wait_ttl_seconds = 300
+# How long `remrun run` with a resource declaration (--cpu, --ram-gib, --key, ...) waits
+# for its grant before it gives up, cancels its request and exits 75.
+# `--admission-wait` overrides it per run.
+run_wait_seconds = 3600
+# The device whose controller owns the ledger. Empty: each controller uses its own
+# ledger. Set it in devices.toml [admission] to the one controller every other
+# controller asks over SSH; nothing then falls back to a local ledger.
+coordinator = ""
 
 # Retention is ACTIVE: after each run remrun prunes its own state folder
 # (%LOCALAPPDATA%\remrun on Windows, ~/.local/state/remrun on POSIX). Per run it

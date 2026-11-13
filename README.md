@@ -114,6 +114,7 @@ remrun runner probe macbox          # verify the exact pinned helper and SQLite 
 remrun resolve-unknown <run_id> --confirmed-ended  # clear a verified completion fence
 remrun admit acquire --device macbox --project P --thread T --cpu 8 --wait 600  # take a turn
 remrun admit release <id>           # end that turn; also status, cancel, list
+remrun run macbox --cpu 8 --ram-gib 16 -- <cmd>  # wait for that turn, run, then release it
 ```
 
 ### Durable runs
