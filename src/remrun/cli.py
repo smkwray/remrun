@@ -643,28 +643,32 @@ def build_parser() -> argparse.ArgumentParser:
         "admit", help="Queue for, hold, and release shared compute on a device",
     )
     admit_sub = p.add_subparsers(dest="admit_command", required=True)
-    ap = admit_sub.add_parser(
-        "acquire", help="Queue a request, or replay one; exit 0 granted, 75 still waiting",
-    )
-    ap.add_argument("--device", required=True)
-    ap.add_argument("--project", required=True, help="root project the work belongs to")
-    ap.add_argument("--thread", required=True, help="agent thread that owns the request")
-    ap.add_argument("--logical-thread", default="",
-                    help="logical work stream the request belongs to (default: --thread)")
-    ap.add_argument("--cpu", type=int, default=0, metavar="N", help="cores to hold")
-    ap.add_argument("--ram-gib", dest="ram_mib", type=_ram_gib_as_mib, default=0,
-                    metavar="G", help="RAM to hold, in GiB")
-    ap.add_argument("--key", action="append", default=[], metavar="K",
-                    help="capacity-one resource key to hold, e.g. pool/gpu (repeatable)")
-    ap.add_argument("--device-bound", action="store_true",
-                    help="the work needs something only this device has")
-    ap.add_argument("--critical", action="store_true",
-                    help="the work is on a blocked critical path")
-    ap.add_argument("--label", default="")
+    for action, text in (
+        ("acquire", "Queue a request, or replay one; exit 0 granted, 75 still waiting"),
+        ("withdraw", "End your own request whatever its acquire did, even before it lands"),
+    ):
+        ap = admit_sub.add_parser(action, help=text)
+        ap.add_argument("--device", required=True)
+        ap.add_argument("--project", required=True, help="root project the work belongs to")
+        ap.add_argument("--thread", required=True, help="agent thread that owns the request")
+        ap.add_argument("--logical-thread", default="",
+                        help="logical work stream the request belongs to (default: --thread)")
+        ap.add_argument("--cpu", type=int, default=0, metavar="N", help="cores to hold")
+        ap.add_argument("--ram-gib", dest="ram_mib", type=_ram_gib_as_mib, default=0,
+                        metavar="G", help="RAM to hold, in GiB")
+        ap.add_argument("--key", action="append", default=[], metavar="K",
+                        help="capacity-one resource key to hold, e.g. pool/gpu (repeatable)")
+        ap.add_argument("--device-bound", action="store_true",
+                        help="the work needs something only this device has")
+        ap.add_argument("--critical", action="store_true",
+                        help="the work is on a blocked critical path")
+        ap.add_argument("--label", default="")
+        ap.add_argument("--json", action="store_true")
+    ap.add_argument("--request-id", required=True, help="the id the acquire used")
+    ap = admit_sub.choices["acquire"]
     ap.add_argument("--request-id", help="idempotency key; default: a new random id")
     ap.add_argument("--wait", type=_wait_seconds, default=0.0, metavar="SECONDS",
                     help="keep the request alive and retry until granted or SECONDS pass")
-    ap.add_argument("--json", action="store_true")
     for action, text in (("status", "Show one request"), ("release", "End a grant"),
                          ("cancel", "Withdraw a waiting request")):
         ap = admit_sub.add_parser(action, help=text)
@@ -932,7 +936,7 @@ def cmd_admit(args: argparse.Namespace, reporter: Reporter) -> int:
             for document in documents:
                 print(_admission_line(document))
         return EXIT_OK
-    if args.admit_command == "acquire":
+    if args.admit_command in {"acquire", "withdraw"}:
         if args.device not in config.devices:
             raise AdmissionError(f"unknown device {args.device!r}")
         request = AdmissionRequest(
@@ -942,10 +946,14 @@ def cmd_admit(args: argparse.Namespace, reporter: Reporter) -> int:
             ram_mib=args.ram_mib, keys=tuple(args.key), device_bound=args.device_bound,
             critical=args.critical,
         )
+    if args.admit_command == "acquire":
         document = admit_first(
-            client, [request], wait_seconds=args.wait,
+            client, [request], wait_seconds=args.wait, keep_waiting=True,
             report=lambda doc: reporter.event("admission_waiting", **_admission_place(doc)),
+            unresolved=lambda ids: _report_unresolved(reporter, client, ids),
         )
+    elif args.admit_command == "withdraw":
+        document = client.withdraw(request)
     else:
         document = getattr(client, args.admit_command)(args.request_id)
     if args.json:
@@ -961,6 +969,15 @@ def cmd_admit(args: argparse.Namespace, reporter: Reporter) -> int:
         reason=document["end_reason"], message="this request id is spent; acquire with a new one",
     )
     return EXIT_INTERNAL
+
+
+def _report_unresolved(reporter: Reporter, client, request_ids: list[str]) -> None:  # noqa: ANN001
+    """Name requests whose withdrawal could not be confirmed, and where they live."""
+    reporter.event(
+        "admission_unresolved", request_ids=request_ids, authority=client.authority,
+        guidance="each may still hold a place or a grant; once that ledger answers, check "
+                 "`remrun admit status ID` and release a grant or cancel a waiting request",
+    )
 
 
 def _admission_place(document: dict) -> dict:
@@ -2119,10 +2136,35 @@ def _release_admission(
     reporter.event("admission_released", request_id=request_id)
 
 
-def _release_recorded_admission(
-    run_id: str, reporter: Reporter, *, confirmed_ended: bool = False,
+def _release_after_recovery(
+    plan: RunPlan, run_id: str, reporter: Reporter, config,  # noqa: ANN001
 ) -> None:
-    """Release the grant a run recorded in its plan, if it has one and has ended."""
+    """Release a recovered run's grant, but only on affirmative evidence that it ended.
+
+    Callers have already validated the saved run and own its finalization. The summary
+    must still be terminal and record that the command completed or never started; a
+    missing, unreadable or nonterminal summary, or a fence naming the run, keeps it held.
+    A nonterminal ``not_started`` receipt belongs to an owner that may still launch.
+    """
+    if plan.admission is None:
+        return
+    try:
+        summary = read_json(run_dir(run_id) / "summary.json")
+    except (OSError, ValueError):
+        summary = None
+    if not (isinstance(summary, dict) and summary.get("terminal") is True
+            and summary.get("completion_state") in {
+                "complete", "not_started", "finalization_failed"}):
+        reporter.event(
+            "admission_held", request_id=plan.admission.get("request_id"), run_id=run_id,
+            note="the run's summary does not yet show that its command ended",
+        )
+        return
+    _release_admission(plan.admission, plan.project.project_id, [run_id], reporter, config)
+
+
+def _release_confirmed_ended(run_id: str, reporter: Reporter) -> None:
+    """After `resolve-unknown --confirmed-ended`: release the grant the run recorded."""
     rdir = run_dir(run_id)
     try:
         record = read_json(_durable_record_path(rdir)) or read_json(rdir / "summary.json")
@@ -2140,7 +2182,7 @@ def _release_recorded_admission(
                        message=str(exc))
         return
     _release_admission(admission, str(project.get("project_id")), [run_id], reporter, config,
-                       confirmed_ended=confirmed_ended)
+                       confirmed_ended=True)
 
 
 def _cmd_run(args: argparse.Namespace, reporter: Reporter, held: dict) -> int:
@@ -2285,8 +2327,8 @@ def _cmd_run(args: argparse.Namespace, reporter: Reporter, held: dict) -> int:
         # A declared run takes its turn before anything that could start user code, keeps
         # the candidate order, and is then bound to the device that granted it.
         from .admission import (
-            AdmissionClient, AdmissionError, AdmissionRequest, AdmissionUnavailable,
-            admit_first, withdraw,
+            AdmissionClient, AdmissionError, AdmissionRequest, AdmissionTimeout,
+            AdmissionUnavailable, admit_first,
         )
 
         settings = admission_settings(config)
@@ -2306,28 +2348,27 @@ def _cmd_run(args: argparse.Namespace, reporter: Reporter, held: dict) -> int:
             document = admit_first(
                 client, requests, wait_seconds=wait,
                 report=lambda doc: reporter.event("admission_waiting", **_admission_place(doc)),
+                unresolved=lambda ids: _report_unresolved(reporter, client, ids),
             )
-            if document["state"] == "waiting":
-                withdraw(client, document["request_id"])
+        except AdmissionTimeout as exc:
+            reporter.event("admission_timeout", waited_seconds=wait,
+                           exit_code=EXIT_ADMISSION_WAITING, **_admission_place(exc.document))
+            return EXIT_ADMISSION_WAITING
         except AdmissionUnavailable as exc:
             reporter.event("admission_unavailable", message=str(exc), exit_code=EXIT_INFRA)
             return EXIT_INFRA
-        if document["state"] == "waiting":
-            reporter.event("admission_timeout", waited_seconds=wait,
-                           exit_code=EXIT_ADMISSION_WAITING, **_admission_place(document))
-            return EXIT_ADMISSION_WAITING
         if document["state"] != "granted":
             raise AdmissionError(
                 f"admission request {document['request_id']} on {document['device']} "
                 f"ended: {document['end_reason']}"
             )
-        selection = [selection[[item.request_id for item in requests].index(
-            document["request_id"])]]
         plan = replace(plan, admission={
             "request_id": document["request_id"], "coordinator": client.coordinator,
         })
         held.update(admission=plan.admission, project_id=plan.project.project_id,
                     config=config, run_ids=set())
+        selection = [selection[[item.request_id for item in requests].index(
+            document["request_id"])]]
         reporter.event("admission_granted", request_id=document["request_id"],
                        device=document["device"])
 
@@ -5406,14 +5447,7 @@ def _retry_commit_work_removal(
 
 
 def cmd_resume(args: argparse.Namespace, reporter: Reporter) -> int:
-    try:
-        return _resume(args, reporter)
-    finally:
-        _release_recorded_admission(args.run_id, reporter)
-
-
-def _resume(args: argparse.Namespace, reporter: Reporter) -> int:
-    plan, record, rdir, summary_path, _config = _load_resume_plan(args.run_id)
+    plan, record, rdir, summary_path, config = _load_resume_plan(args.run_id)
     # An untransferred or commit run is fenced by its own record and never held the
     # project lock.
     untransferred = plan.transfer_mode != "safe"
@@ -5440,6 +5474,7 @@ def _resume(args: argparse.Namespace, reporter: Reporter) -> int:
                     summary["durable_cleanup_complete"] = True
                     write_json(summary_path, summary)
             reporter.event("durable_already_finalized", run_id=args.run_id, exit_code=code)
+            _release_after_recovery(plan, args.run_id, reporter, config)
             return code
         raise UnknownCompletionHazardError("completed durable summary has invalid exit code")
     if (
@@ -5485,6 +5520,7 @@ def _resume(args: argparse.Namespace, reporter: Reporter) -> int:
         else:
             summary["durable_cleanup_complete"] = True
             write_json(summary_path, summary)
+        _release_after_recovery(plan, args.run_id, reporter, config)
         return code
     hazard = read_unknown_completion_hazard(plan.project.project_id, run_id=fence_run)
     if hazard is None or hazard.get("run_id") != args.run_id or hazard.get("target") != plan.target.name:
@@ -5496,12 +5532,14 @@ def _resume(args: argparse.Namespace, reporter: Reporter) -> int:
     try:
         status = transport.durable_status(args.run_id, _durable_record_token(record))
         _validate_durable_identity(status, record)
-        return _poll_durable(
+        code = _poll_durable(
             args=args, reporter=reporter, plan=plan, transport=transport,
             remote_root=str(record["remote_root"]), run_id=args.run_id,
             rdir=rdir, summary_path=summary_path, policy=load_retention(load_config()),
             record=record, initial_status=status, no_wait=bool(args.no_wait),
         )
+        _release_after_recovery(plan, args.run_id, reporter, config)
+        return code
     finally:
         lock.release()
 
@@ -5638,13 +5676,6 @@ def _request_durable_stop_locked(
 
 
 def cmd_cancel(args: argparse.Namespace, reporter: Reporter) -> int:
-    try:
-        return _cancel(args, reporter)
-    finally:
-        _release_recorded_admission(args.run_id, reporter)
-
-
-def _cancel(args: argparse.Namespace, reporter: Reporter) -> int:
     """Stop a durable run's exact registered process tree, then finalize it as resume does.
 
     The stop goes to the target observer's registry row for this run (job id,
@@ -5661,7 +5692,7 @@ def _cancel(args: argparse.Namespace, reporter: Reporter) -> int:
     if isinstance(summary, dict) and summary.get("completion_state") in {
         "complete", "finalization_complete",
     }:
-        return _resume(resume_args, reporter)
+        return cmd_resume(resume_args, reporter)
     # An untransferred or commit run is fenced by its own record, not the project's.
     hazard = read_unknown_completion_hazard(
         plan.project.project_id, run_id=run_id if plan.transfer_mode != "safe" else None
@@ -5738,6 +5769,7 @@ def _cancel(args: argparse.Namespace, reporter: Reporter) -> int:
             final = read_json(summary_path) or {"run_id": run_id}
             final["cancel"] = record["cancel"]
             write_json(summary_path, final)
+        _release_after_recovery(plan, run_id, reporter, config)
         return code
     finally:
         lock.release()
@@ -5791,7 +5823,7 @@ def cmd_resolve_unknown(args: argparse.Namespace, reporter: Reporter) -> int:
         raise UnknownCompletionHazardError(
             f"unknown-completion hazard changed while resolving run {args.run_id!r}"
         )
-    _release_recorded_admission(args.run_id, reporter, confirmed_ended=True)
+    _release_confirmed_ended(args.run_id, reporter)
     reporter.event(
         "unknown_completion_resolved",
         project_id=project.project_id,

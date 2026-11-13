@@ -1,16 +1,23 @@
 """`remrun run` taking its turn from shared admission before it launches."""
 from __future__ import annotations
 
+import io
 import json
+import os
 import sys
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import pytest
 
 import remrun.admission as admission
 import remrun.cli as cli
-from remrun.admission import AdmissionLedger, AdmissionRequest, DeviceFacts
+from remrun.admission import (
+    AdmissionClient, AdmissionError, AdmissionLedger, AdmissionRequest, AdmissionUnavailable,
+    DeviceFacts,
+)
+from remrun.config import load_config
 from remrun.cli import EXIT_ADMISSION_WAITING, EXIT_CANCELLED, EXIT_INFRA, EXIT_OK, main
 from remrun.resource_envelope import Metric
 from remrun.resource_probe import ResourceSnapshot
@@ -82,10 +89,14 @@ def _run_admission(env: dict, run_id: str) -> dict:
 
 
 def test_undeclared_run_never_touches_admission(durable_env, monkeypatch):  # noqa: F811
-    # Invariant 1: a run that declares no resource behaves exactly as before. The
-    # config here has no [admission] section at all, so reading it would fail too.
+    # Invariant 1: a run that declares no resource behaves exactly as before. defaults
+    # here has no [admission] section, and devices.toml's is malformed: validating
+    # either would fail the run.
     def forbidden(*_args, **_kwargs):
         raise AssertionError("an undeclared run used admission")
+
+    devices = _config_path(durable_env, "devices.toml")
+    devices.write_text("admission = 5\n" + devices.read_text(encoding="utf-8"), encoding="utf-8")
 
     monkeypatch.setattr(admission, "AdmissionClient", forbidden)
     monkeypatch.setattr(admission, "AdmissionLedger", forbidden)
@@ -239,11 +250,22 @@ def test_auto_runs_on_the_first_candidate_that_grants(admitted, monkeypatch, cap
     assert admitted["ledger"].status(request_id)["device"] == "OTHER"
 
 
-class _Coordinator:
-    """The coordinator's transport, answering `remrun admit` as its ledger would."""
+class _Receiver:
+    """The coordinator's end of the transport. Each forwarded `remrun admit` call runs in
+    this process through the real receiving `cli.main`, with the receiver's own config,
+    state root and machine identity."""
 
-    def __init__(self, reachable: bool = True) -> None:
-        self.reachable = reachable
+    def __init__(self, env: dict, who: dict, *, coordinator: str, identity: str | None,
+                 reachable: bool = True) -> None:
+        self.root = env["state"].parent / "receiver"
+        (self.root / "config").mkdir(parents=True)
+        for name in ("defaults.toml", "devices.toml"):
+            text = _config_path(env, name).read_text(encoding="utf-8")
+            if name == "devices.toml":
+                text += f'\n[admission]\ncoordinator = "{coordinator}"\n'
+            (self.root / "config" / name).write_text(text, encoding="utf-8")
+        self.state = self.root / "state"
+        self.who, self.identity, self.reachable = who, identity, reachable
         self.calls: list[tuple[list[str], dict[str, str]]] = []
 
     def probe(self) -> ProbeResult:
@@ -253,57 +275,213 @@ class _Coordinator:
 
     def exec_control(self, command, cwd, *, env=None, timeout=None, path_prepend=None):  # noqa: ANN001
         del cwd, timeout, path_prepend
+        assert command[:2] == ["remrun", "admit"]
         self.calls.append((list(command), dict(env or {})))
-        options = dict(arg[2:].split("=", 1) for arg in command if "=" in arg)
-        action = command[2]
-        request_id = options.get("request-id") or command[3]
-        document = {
-            "request_id": request_id, "device": options.get("device", "TEST"),
-            "state": "granted" if action == "acquire" else "released", "position": None,
-            "ahead": [], "end_reason": None if action == "acquire" else "released",
-            "promotion": {"facts": {"known": True}, "granted": [request_id], "blocked": None},
-        }
-        return ExecResult(0, json.dumps(document) + "\n", "")
+        overrides = {"REMRUN_ROOT": str(self.root), "REMRUN_STATE_ROOT": str(self.state),
+                     **(env or {})}
+        saved = {key: os.environ.get(key) for key in overrides}
+        sender, self.who["name"] = self.who["name"], self.identity
+        os.environ.update(overrides)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = cli.main(command[1:])
+        finally:
+            self.who["name"] = sender
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return ExecResult(code, out.getvalue(), err.getvalue())
+
+    def ledger(self) -> AdmissionLedger:
+        return AdmissionLedger(self.state, settle_seconds=60, wait_ttl_seconds=300)
 
 
-def _coordinated(env: dict, monkeypatch, coordinator: _Coordinator) -> None:
+def _coordinated(env: dict, monkeypatch, *, coordinator: str = "OTHER",  # noqa: ANN001
+                 identity: str | None = "OTHER", reachable: bool = True) -> _Receiver:
+    """This controller (no configured identity) names OTHER as its coordinator."""
+    who: dict[str, str | None] = {"name": None}
+    receiver = _Receiver(env, who, coordinator=coordinator, identity=identity,
+                         reachable=reachable)
     _append(_config_path(env, "devices.toml"), '\n[admission]\ncoordinator = "OTHER"\n')
-    monkeypatch.setattr(admission, "local_device", lambda _config: None)
-    monkeypatch.setattr(admission, "make_transport", lambda _device: coordinator)
+    monkeypatch.setattr(admission, "local_device",
+                        lambda config: config.devices.get(who["name"] or ""))
+    monkeypatch.setattr(admission, "make_transport", lambda _device: receiver)
+    return receiver
 
 
 def test_another_coordinator_owns_every_admission_call(admitted, monkeypatch):
     # One authority: this controller asks the coordinator over its transport and never
     # opens a ledger of its own, or two controllers could grant the same cores.
-    coordinator = _Coordinator()
-    _coordinated(admitted, monkeypatch, coordinator)
+    receiver = _coordinated(admitted, monkeypatch)
     _install_fake(monkeypatch)
     assert main(["run", "TEST", "--cpu", "4", "--key", "pool/gpu", "--",
                  sys.executable, "-c", WRITE_RAN]) == EXIT_OK
 
-    actions = [command[:3] for command, _env in coordinator.calls]
-    assert actions == [["remrun", "admit", "acquire"], ["remrun", "admit", "release"]]
-    acquire, env = coordinator.calls[0]
+    assert [command[:3] for command, _env in receiver.calls] == [
+        ["remrun", "admit", "acquire"], ["remrun", "admit", "release"]]
+    acquire, env = receiver.calls[0]
     assert {"--device=TEST", "--cpu=4", "--key=pool/gpu", "--json"} <= set(acquire)
-    assert env == {admission.FORWARDED_ENV: "1"}
-    assert admitted["ledger"].list_requests() == []  # nothing in this controller's ledger
+    assert env == {admission.FORWARDED_ENV: "OTHER"}  # the coordinator the sender meant
     run_id = _only_run_id(admitted["state"])
+    request_id = _run_admission(admitted, run_id)["request_id"]
+    with receiver.ledger() as ledger:
+        assert ledger.status(request_id)["state"] == "released"
+    assert admitted["ledger"].list_requests() == []  # nothing in this controller's ledger
     assert _run_admission(admitted, run_id)["coordinator"] == "OTHER"
 
 
 def test_unreachable_coordinator_fails_closed(admitted, monkeypatch, capsys):
     # Falling back to a local ledger would grant cores the coordinator may have given away.
-    _coordinated(admitted, monkeypatch, _Coordinator(reachable=False))
+    receiver = _coordinated(admitted, monkeypatch, reachable=False)
     holder = _install_fake(monkeypatch)
     assert main(["run", "TEST", "--cpu", "4", "--", sys.executable, "-c", WRITE_RAN]) \
         == EXIT_INFRA
     assert "admission_unavailable" in capsys.readouterr().err
     assert holder["transport"].exec_calls == 0
     assert admitted["ledger"].list_requests() == []
+    assert not (receiver.state / "admission").exists()
 
 
-def test_forwarded_call_never_answers_from_a_non_coordinator_ledger(admitted, monkeypatch):
-    # A forwarded call that lands on the wrong controller must not open a second ledger.
-    _coordinated(admitted, monkeypatch, _Coordinator())
-    monkeypatch.setenv(admission.FORWARDED_ENV, "1")
-    assert main(["admit", "list", "--json"]) == cli.EXIT_INTERNAL
+@pytest.mark.parametrize(
+    ("coordinator", "identity", "accepted"),
+    [
+        ("", "OTHER", False),       # the receiver has no coordinator: it is nobody's ledger
+        ("OTHER", "TEST", False),   # the route reached the wrong machine
+        ("TEST", "TEST", False),    # a machine that coordinates a different deployment
+        ("OTHER", "OTHER", True),   # the coordinator the sender meant
+    ],
+    ids=["unset", "wrong-host", "different-self-coordinator", "intended"],
+)
+def test_forwarded_call_reaches_only_the_intended_coordinator(
+    admitted, monkeypatch, coordinator, identity, accepted,
+):
+    # A forwarded call answered by any other ledger makes two authorities over one fleet.
+    receiver = _coordinated(admitted, monkeypatch, coordinator=coordinator, identity=identity)
+    client = AdmissionClient(load_config(), "OTHER")
+    if accepted:
+        assert client.list_requests() == []
+        assert (receiver.state / "admission").exists()
+        return
+    with pytest.raises(AdmissionError, match="refusing an admission call forwarded to OTHER"):
+        client.list_requests()
+    assert not (receiver.state / "admission").exists()  # refused before any ledger opened
+
+
+@pytest.mark.parametrize("durable", [False, True], ids=["ordinary", "durable"])
+@pytest.mark.parametrize("recovery", ["resume", "cancel"])
+def test_recovery_during_preflight_keeps_live_owners_grant(
+    admitted, monkeypatch, recovery, durable,
+):
+    # A recovery command run against a run still in preflight fails, as it must; it must
+    # not release that run's grant, or the run launches without its reservation.
+    state = admitted["state"]
+
+    def grant(run_id: str) -> str:
+        return admitted["ledger"].status(_run_admission(admitted, run_id)["request_id"])["state"]
+
+    seen: dict[str, object] = {"dispatch": []}
+
+    class Dispatch(_FakeDurableTransport):
+        def exec(self, command, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if any("ran.txt" in str(token) for token in command):
+                seen["dispatch"].append(grant(_only_run_id(state)))
+            return super().exec(command, *args, **kwargs)
+
+        def launch_durable(self, command, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            seen["dispatch"].append(grant(_only_run_id(state)))
+            return super().launch_durable(command, *args, **kwargs)
+
+    transports: dict[str, Dispatch] = {}
+    monkeypatch.setattr(cli, "make_transport",
+                        lambda device: transports.setdefault(device.name, Dispatch(device)))
+    real_preflight = cli.preflight_reconcile
+
+    def preflight(*args, **kwargs):  # noqa: ANN002, ANN003
+        if "recovery" not in seen:
+            run_id = _only_run_id(state)
+            seen["recovery"] = main([recovery, run_id])
+            seen["after_recovery"] = grant(run_id)
+        return real_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "preflight_reconcile", preflight)
+    argv = ["run", *(["--durable"] if durable else []), "TEST", "--cpu", "4", "--",
+            sys.executable, "-c", WRITE_RAN]
+    assert main(argv) == EXIT_OK
+    assert seen["recovery"] != EXIT_OK
+    assert seen["after_recovery"] == "granted"
+    assert seen["dispatch"] == ["granted"]
+    assert grant(_only_run_id(state)) == "released"
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True], ids=["withdrawn", "unresolved"])
+def test_lost_acquire_reply_never_launches_and_names_the_request(
+    admitted, monkeypatch, capsys, cleanup_fails,
+):
+    # The grant committed but its reply was lost. The run must not launch, and the grant
+    # must be withdrawn by the id it sent, or be named so someone can release it.
+    acquire = AdmissionClient.acquire
+
+    def lost(self, request):  # noqa: ANN001
+        acquire(self, request)
+        raise AdmissionUnavailable("the reply was lost")
+
+    monkeypatch.setattr(AdmissionClient, "acquire", lost)
+    if cleanup_fails:
+        def unreachable(self, request):  # noqa: ANN001
+            raise AdmissionUnavailable("still unreachable")
+
+        monkeypatch.setattr(AdmissionClient, "withdraw", unreachable)
+    holder = _install_fake(monkeypatch)
+    assert main(["run", "TEST", "--cpu", "4", "--", sys.executable, "-c", WRITE_RAN]) \
+        == EXIT_INFRA
+    assert holder["transport"].exec_calls == 0
+    assert not (admitted["state"] / "runs").exists()
+    (request_id, state, end_reason), = admitted["ledger"]._db.execute(
+        "SELECT request_id, state, end_reason FROM requests").fetchall()
+    err = capsys.readouterr().err
+    if cleanup_fails:
+        assert state == "granted"
+        assert f'request_ids=["{request_id}"]' in err and "admission_unresolved" in err
+    else:
+        assert (state, end_reason) == ("released", "withdrawn")
+        assert "admission_unresolved" not in err
+
+
+class _Answers:
+    """A coordinator transport that answers every call with one fixed document."""
+
+    def __init__(self, document: dict) -> None:
+        self.document = document
+
+    def probe(self) -> ProbeResult:
+        return ProbeResult(True, "fake", remote_os="posix")
+
+    def exec_control(self, command, cwd, **_kwargs):  # noqa: ANN001, ANN003
+        return ExecResult(0, json.dumps(self.document) + "\n", "")
+
+
+@pytest.mark.parametrize("document", [
+    {"schema": "remrun.admission-request", "version": 1, "request_id": "someone-else",
+     "state": "released"},
+    {"schema": "remrun.admission-request", "version": 1, "request_id": "mine",
+     "state": "granted"},
+    {"request_id": "mine", "state": "released"},
+], ids=["other-request", "not-released", "no-schema"])
+def test_forwarded_reply_must_answer_the_call_that_was_made(admitted, monkeypatch, document):
+    # A reply about another request, or one that did not do what was asked, is not proof
+    # that this grant was released.
+    _coordinated(admitted, monkeypatch)
+    monkeypatch.setattr(admission, "make_transport", lambda _device: _Answers(document))
+    with pytest.raises(AdmissionUnavailable, match="malformed or mismatched"):
+        AdmissionClient(load_config(), "OTHER").release("mine")
+
+
+def test_forwarded_list_without_its_requests_is_not_an_empty_ledger(admitted, monkeypatch):
+    _coordinated(admitted, monkeypatch)
+    monkeypatch.setattr(admission, "make_transport", lambda _device: _Answers(
+        {"schema": "remrun.admission-list", "version": 1}))
+    with pytest.raises(AdmissionUnavailable):
+        AdmissionClient(load_config(), "OTHER").list_requests()

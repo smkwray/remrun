@@ -46,8 +46,9 @@ class RemrunConfig:
     # project's own excludes by resolve_excludes().
     deployment_excludes: list[str] = field(default_factory=list)
     # Optional devices.toml [admission]: only `coordinator`, the deployment's device that
-    # owns the admission ledger. Merged over defaults.toml by admission_settings().
-    device_admission: dict[str, Any] = field(default_factory=dict)
+    # owns the admission ledger. Kept raw: admission_settings() validates it, so a run
+    # that declares no resources never depends on it.
+    device_admission: Any = field(default_factory=dict)
 
 
 def find_remrun_root(start: Path | None = None) -> Path:
@@ -144,16 +145,13 @@ def load_config(remrun_root: Path | None = None) -> RemrunConfig:
     coordination = dict(devices_doc.get("coordination", {}) or {})
     device_scheduler = dict(devices_doc.get("scheduler", {}) or {})
     deployment_excludes = _deployment_excludes(devices_doc)
-    device_admission = devices_doc.get("admission", {})
-    if not isinstance(device_admission, dict):
-        raise ValueError("devices.toml [admission] must be a table")
     return RemrunConfig(repo_root=root, defaults=defaults, devices=devices,
                         project_roots=project_roots, offload=offload, sync_roots=sync_roots,
                         fleet_tasks=fleet_tasks,
                         git_sync=git_sync,
                         coordination=coordination, device_scheduler=device_scheduler,
                         deployment_excludes=deployment_excludes,
-                        device_admission=dict(device_admission))
+                        device_admission=devices_doc.get("admission", {}))
 
 
 def _deployment_excludes(devices_doc: dict[str, Any]) -> list[str]:
@@ -347,6 +345,8 @@ def admission_settings(config: RemrunConfig) -> dict[str, Any]:
     keys = {"settle_seconds", "wait_ttl_seconds", "run_wait_seconds", "coordinator"}
     if not isinstance(section, dict) or set(section) != keys:
         raise ValueError("defaults.toml [admission] must set exactly " + ", ".join(sorted(keys)))
+    if not isinstance(config.device_admission, dict):
+        raise ValueError("devices.toml [admission] must be a table")
     unsupported = sorted(set(config.device_admission) - {"coordinator"})
     if unsupported:
         raise ValueError(

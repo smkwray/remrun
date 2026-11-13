@@ -263,9 +263,17 @@ coordinator = "macbox"
 
 Every other controller then runs each `remrun admit` call, and each admission step of a
 declared run, as `remrun admit ... --json` on that device over its configured SSH
-transport, with the device's `path` entries prepended so `remrun` is found. The
-coordinator's hostname must match its device name. If the coordinator cannot be reached
-or cannot run `remrun`, the call fails; nothing falls back to a local ledger.
+transport, with the device's `path` entries prepended so `remrun` is found. If the
+coordinator cannot be reached or cannot run `remrun`, the call fails; nothing falls back
+to a local ledger. Its answer must be the document for the call that was made (the same
+request, in a state that action can produce); anything else is treated as no answer.
+
+A forwarded call names the coordinator its sender expects. The receiving controller
+answers only if its own `coordinator` setting names that device and its hostname matches
+that device name; otherwise it refuses before opening any ledger. Hostname agreement is
+not the whole requirement: every controller must reach the coordinator under the same
+account with the same state root (`REMRUN_STATE_ROOT`), or each account keeps a ledger of
+its own.
 
 ```bash
 remrun admit acquire --device macbox --project paper1 --thread t1 --cpu 8 --ram-gib 16 \
@@ -274,6 +282,7 @@ remrun admit acquire --device macbox --project vision --thread t2 --key pool/gpu
 remrun admit status <ID> --json
 remrun admit release <ID>     # end a grant once its work has finished
 remrun admit cancel <ID>      # withdraw a request that is still waiting
+remrun admit withdraw --request-id <ID> <same request flags as acquire>
 remrun admit list [--device macbox] [--json]
 ```
 
@@ -282,7 +291,10 @@ the work stream when it differs), and what it will hold: `--cpu` cores, `--ram-g
 any `--key`. Keys are capacity-one, per device, and use the target resource key vocabulary
 (for example `pool/gpu`). `--request-id` makes `acquire` idempotent: repeating the same
 request returns its current state, and reusing an id for a different request is an error.
-Without it remrun picks an id and prints it.
+Without it remrun picks an id and prints it. `withdraw` ends the caller's own request
+whatever its acquire did: it cancels a waiting request, releases a grant whose work never
+started, and, if no acquire with that id has landed yet, records the request as cancelled
+so a late one lands cancelled. It refuses an id that names a different request.
 
 **Order.** Waiting requests on a device are ordered by class, then by when the root project
 last received a grant on that device (never first), then by age. Classes, highest first:
@@ -300,6 +312,10 @@ fits when all of these hold:
 - no grant on the device holds one of its keys;
 - a fresh probe's offer covers it after subtracting grants younger than
   `[admission] settle_seconds`, whose load the probe may not show yet.
+
+The settle window is a headroom heuristic, not accounting for promised work: once a grant
+is older than it, the probe is trusted, even if that grant's command has not started or
+reached its full load. Only the budget check counts every grant for its whole life.
 
 A resource the request does not ask for never blocks it. A device with no
 `resource_policy`, or whose probe fails or lacks a CPU or RAM value, grants nothing. A
@@ -327,10 +343,10 @@ remrun run --auto --cpu 2 --key pool/gpu --device-bound --admission-wait 900 -- 
 A run that declares any of `--cpu N`, `--ram-gib G`, `--key K` (repeatable),
 `--device-bound` or `--critical` takes a turn from admission before it reconciles,
 reserves memory, or starts anything on the target. A run that declares none of them is
-unchanged and never reads `[admission]`. The request's root project is the run's project
-id, its owning thread is `--thread` (default: `$T3CODE_THREAD_ID`, else this controller and
-process), and `--logical-thread` names the work stream when it differs. `--thread`,
-`--logical-thread` and `--admission-wait` without a declaration are refused.
+unchanged and never validates or uses `[admission]`. The request's root project is the
+run's project id, its owning thread is `--thread` (default: `$T3CODE_THREAD_ID`, else this
+controller and process), and `--logical-thread` names the work stream when it differs.
+`--thread`, `--logical-thread` and `--admission-wait` without a declaration are refused.
 
 - **Explicit target**: the run queues on that device.
 - **`--auto`**: in the usual candidate order, the run takes the first device that grants at
@@ -344,6 +360,11 @@ blocked. After `--admission-wait` seconds (default `[admission] run_wait_seconds
 a grant it cancels its request, emits `admission_timeout`, and exits 75 without having
 started anything. An unreachable coordinator exits 4 (`admission_unavailable`).
 
+Each request is recorded before it is sent, so if an acquire's reply is lost, or the run
+stops while waiting, the run withdraws that exact request (see `withdraw` above) before it
+exits and launches nothing. If that cleanup cannot be confirmed, the run emits
+`admission_unresolved` with the request ids and the ledger they live in.
+
 The grant is recorded under `plan.admission` in the run's `summary.json` (and a durable
 run's record), and is released only when remrun knows the command is not running:
 
@@ -352,6 +373,11 @@ run's record), and is released only when remrun knows the command is not running
   keeps its grant until `remrun resolve-unknown RUN --confirmed-ended` records the end;
 - a `--durable` run that detaches (exit 4) keeps its grant until `remrun resume RUN` or
   `remrun cancel RUN` finalizes it.
+
+`resume` and `cancel` release only after they have validated the saved run, own its
+finalization, and find its summary terminal with the command completed or never started.
+A run they cannot load, one still owned by another process, and a nonterminal summary
+(such as a run still in preflight) all keep the grant.
 
 Nothing releases a grant on a timer. If a release itself fails, the run reports
 `admission_release_failed`; release the grant with `remrun admit release ID` once the run

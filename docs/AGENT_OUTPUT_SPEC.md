@@ -157,7 +157,10 @@ N     remote command's exit code, when command ran and remrun could collect stat
 is still waiting, and 1 on an error or when the request id has already ended. A `remrun run`
 that declares resources (`--cpu`, `--ram-gib`, `--key`, ...) exits 75 when its admission
 wait ends without a grant, before anything has started, and 4 when the admission
-coordinator cannot be reached.
+coordinator cannot be reached. Both numbers are shared: a remote command may itself exit
+75, and 4 also means an infrastructure failure or a detached durable run. Read the
+`admission_timeout` and `admission_unavailable` events and the run summary rather than the
+exit code alone.
 
 If the remote command exits nonzero, `remrun` should still try to pull logs and changed files unless configured not to.
 

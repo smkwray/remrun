@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from remrun.admission import (
     AdmissionError,
     AdmissionLedger,
     AdmissionRequest,
+    AdmissionUnavailable,
     DeviceFacts,
     admit_first,
     facts_from_snapshot,
@@ -383,6 +385,121 @@ class LedgerClient:
     def cancel(self, request_id: str) -> dict:
         return self.ledger.cancel(request_id)
 
+    def withdraw(self, item: AdmissionRequest) -> dict:
+        return self.ledger.withdraw(item)
+
+
+def _no_unresolved(request_ids: list[str]) -> None:
+    raise AssertionError(f"cleanup could not be confirmed for {request_ids}")
+
+
+class LostReply(LedgerClient):
+    """A coordinator that commits an acquire but whose reply never arrives.
+
+    ``commit`` False models a call that timed out before the coordinator acted on it;
+    ``withdraw_fails`` models a coordinator that stays unreachable for the cleanup.
+    """
+
+    def __init__(self, *args, commit: bool = True, withdraw_fails: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.commit, self.withdraw_fails = commit, withdraw_fails
+
+    def acquire(self, item: AdmissionRequest) -> dict:
+        if self.commit:
+            super().acquire(item)
+        raise AdmissionUnavailable("the coordinator's reply was lost")
+
+    def withdraw(self, item: AdmissionRequest) -> dict:
+        if self.withdraw_fails:
+            raise AdmissionUnavailable("the coordinator is still unreachable")
+        return super().withdraw(item)
+
+
+def test_lost_acquire_reply_after_commit_is_withdrawn(ledger, clock) -> None:
+    # The grant committed but the caller never heard: unless it withdraws by the exact
+    # id it sent, nobody ever releases that grant.
+    with pytest.raises(AdmissionUnavailable):
+        admit_first(LostReply(ledger, clock), [request("job", "alpha", cpu=4)], wait_seconds=0,
+                    report=lambda _doc: None, unresolved=_no_unresolved, clock=clock)
+    ended = ledger.status("job")
+    assert (ended["state"], ended["end_reason"]) == ("released", "withdrawn")
+
+
+def test_lost_acquire_reply_with_persistent_cleanup_failure_names_the_request(
+    ledger, clock,
+) -> None:
+    # When cleanup cannot be confirmed, the caller must learn which request may be left.
+    reported: list[list[str]] = []
+    with pytest.raises(AdmissionUnavailable):
+        admit_first(LostReply(ledger, clock, withdraw_fails=True),
+                    [request("job", "alpha", cpu=4)], wait_seconds=0,
+                    report=lambda _doc: None, unresolved=reported.append, clock=clock)
+    assert reported == [["job"]]
+    assert ledger.status("job")["state"] == "granted"  # left, but named
+
+
+def test_lost_acquire_reply_delayed_commit_lands_cancelled(ledger, clock) -> None:
+    # The acquire timed out before the coordinator acted on it. If the withdrawal only
+    # cancelled existing requests, the late acquire would land as a grant nobody uses.
+    item = request("job", "alpha", cpu=4)
+    with pytest.raises(AdmissionUnavailable):
+        admit_first(LostReply(ledger, clock, commit=False), [item], wait_seconds=0,
+                    report=lambda _doc: None, unresolved=_no_unresolved, clock=clock)
+    late = ledger.acquire(item, facts(clock))
+    assert (late["state"], late["end_reason"]) == ("cancelled", "withdrawn")
+    assert ledger.list_requests() == []
+
+
+def test_reused_request_id_is_never_withdrawn_for_its_owner(ledger, clock) -> None:
+    # An id that already names someone else's request is a definitive conflict: cleaning
+    # up "our" request by that id would release their grant.
+    theirs = ledger.acquire(request("shared-id", "alpha", cpu=4), facts(clock))
+    assert theirs["state"] == "granted"
+    with pytest.raises(AdmissionConflict):
+        admit_first(LedgerClient(ledger, clock), [request("shared-id", "beta", cpu=2)],
+                    wait_seconds=0, report=lambda _doc: None, unresolved=_no_unresolved,
+                    clock=clock)
+    with pytest.raises(AdmissionConflict):
+        ledger.withdraw(request("shared-id", "beta", cpu=2))
+    assert ledger.status("shared-id")["state"] == "granted"
+
+
+def test_ledger_refuses_network_filesystem_through_symlinks(tmp_path, monkeypatch) -> None:
+    # The filesystem helper judges the path it is given. Unless every symlink, the
+    # database file's own included, is resolved first, a local-looking path opens a
+    # ledger on network storage, where SQLite locking cannot be trusted.
+    from remrun.remote import runner
+
+    network = tmp_path / "network"
+    network.mkdir()
+    prefixes = (str(network), os.path.realpath(network))
+
+    def probe(path: str) -> dict:
+        existing = runner._nearest_existing(path)  # lexical, as the real helper is
+        remote = existing.startswith(prefixes)
+        return {"local": not remote, "kind": "nfs" if remote else "apfs", "path": existing}
+
+    monkeypatch.setattr(admission, "filesystem_probe", probe)
+
+    def opens(state_root: Path) -> bool:
+        try:
+            AdmissionLedger(state_root, settle_seconds=SETTLE, wait_ttl_seconds=TTL).close()
+        except AdmissionError:
+            return False
+        return True
+
+    assert not opens(network / "direct")
+    (tmp_path / "parent-link").symlink_to(network / "via-parent", target_is_directory=True)
+    (network / "via-parent").mkdir()
+    assert not opens(tmp_path / "parent-link")
+    local = tmp_path / "local"
+    (local / "admission").mkdir(parents=True)
+    (local / "admission" / "ledger-v1.sqlite3").symlink_to(network / "ledger.sqlite3")
+    assert not opens(local)
+    # Nothing was created on the network side, so SQLite never opened there.
+    assert sorted(path.name for path in network.rglob("*")) == ["via-parent"]
+    assert opens(tmp_path / "ordinary")
+
 
 def test_wait_keeps_the_request_alive_until_granted(ledger, clock, monkeypatch) -> None:
     # The wait outlasts the heartbeat TTL; only polling keeps the request queued.
@@ -399,7 +516,7 @@ def test_wait_keeps_the_request_alive_until_granted(ledger, clock, monkeypatch) 
     reports: list[dict] = []
     document = admit_first(
         LedgerClient(ledger, clock), [request("next", "beta", cpu=4)],
-        wait_seconds=3600, report=reports.append, clock=clock,
+        wait_seconds=3600, report=reports.append, unresolved=_no_unresolved, clock=clock,
     )
     assert document["state"] == "granted"
     assert sum(sleeps) > TTL and max(sleeps) <= TTL / 3
@@ -416,7 +533,7 @@ def test_auto_takes_the_first_candidate_that_grants_and_withdraws_the_rest(
     candidates = [request("run-0", "beta", cpu=4), request("run-1", "beta", cpu=4,
                                                            device="winbox")]
     document = admit_first(client, candidates, wait_seconds=0, report=lambda _doc: None,
-                           clock=clock)
+                           unresolved=_no_unresolved, clock=clock)
     assert (document["request_id"], document["state"]) == ("run-1", "granted")
     assert ledger.status("run-0")["state"] == "cancelled"
 
@@ -427,7 +544,8 @@ def test_auto_takes_the_first_candidate_that_grants_and_withdraws_the_rest(
         clock, "now", clock.now + seconds))
     queued = admit_first(client, [request("run-2", "beta", cpu=4),
                                   request("run-3", "beta", cpu=4, device="winbox")],
-                         wait_seconds=1, report=lambda _doc: None, clock=clock)
+                         wait_seconds=1, report=lambda _doc: None, unresolved=_no_unresolved,
+                         keep_waiting=True, clock=clock)
     assert (queued["request_id"], queued["state"]) == ("run-2", "waiting")
     assert ledger.status("run-3")["state"] == "cancelled"
 
