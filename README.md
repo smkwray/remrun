@@ -112,6 +112,8 @@ remrun git-sync --uninstall-hook    # remove remrun's hook and restore any prior
 remrun runner install macbox        # install + probe the inert versioned helper
 remrun runner probe macbox          # verify the exact pinned helper and SQLite store
 remrun resolve-unknown <run_id> --confirmed-ended  # clear a verified completion fence
+remrun admit acquire --device macbox --project P --thread T --cpu 8 --wait 600  # take a turn
+remrun admit release <id>           # end that turn; also status, cancel, list
 ```
 
 ### Durable runs

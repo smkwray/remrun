@@ -245,6 +245,63 @@ sandbox makes attribution safe. remrun enforces today's model conservatively:
 `--scope <name>` must refer to a configured scope, all project writers serialize,
 and pullback fails as a conflict if the command wrote outside the declared scope paths.
 
+## Shared admission (`remrun admit`)
+
+`remrun admit` keeps one queue per device so that agents and projects sharing a fleet take
+turns on contended hardware. It only decides who may start: it launches nothing, and
+`remrun run` does not consult it. The ledger is one SQLite file in the controller's state
+root (`admission/ledger-v1.sqlite3`), which must be on a local filesystem. Every caller on
+one controller shares it; another controller keeps its own.
+
+```bash
+remrun admit acquire --device macbox --project paper1 --thread t1 --cpu 8 --ram-gib 16 \
+  --wait 600 --json
+remrun admit acquire --device macbox --project vision --thread t2 --key pool/gpu --device-bound
+remrun admit status <ID> --json
+remrun admit release <ID>     # end a grant once its work has finished
+remrun admit cancel <ID>      # withdraw a request that is still waiting
+remrun admit list [--device macbox] [--json]
+```
+
+A request names one device, its root project, its owning thread (`--logical-thread` names
+the work stream when it differs), and what it will hold: `--cpu` cores, `--ram-gib`, and
+any `--key`. Keys are capacity-one, per device, and use the target resource key vocabulary
+(for example `pool/gpu`). `--request-id` makes `acquire` idempotent: repeating the same
+request returns its current state, and reusing an id for a different request is an error.
+Without it remrun picks an id and prints it.
+
+**Order.** Waiting requests on a device are ordered by class, then by when the root project
+last received a grant on that device (never first), then by age. Classes, highest first:
+protected, `--device-bound` (the work needs something only this device has), `--critical`,
+and everything else. A request passed by a newer one only because of class becomes
+protected, so class can pass it at most once.
+
+**Grants.** Promotion grants the head of the queue while it fits and stops at the first
+request that does not. Nothing behind a blocked head is granted, however small. A request
+fits when all of these hold:
+
+- the device's grants plus this request stay within its budget, for CPU and RAM separately.
+  The budget is what the device's `resource_policy` offers at zero load: the same reserve
+  and cap a workload launch envelope applies;
+- no grant on the device holds one of its keys;
+- a fresh probe's offer covers it after subtracting grants younger than
+  `[admission] settle_seconds`, whose load the probe may not show yet.
+
+A resource the request does not ask for never blocks it. A device with no
+`resource_policy`, or whose probe fails or lacks a CPU or RAM value, grants nothing. A
+request larger than the device's whole budget is cancelled (`exceeds_device_budget`).
+
+**Lifetimes.** A waiting request stays queued only while it is renewed: repeat the same
+`acquire`, or let `--wait` do it. A request not renewed within `[admission]
+wait_ttl_seconds` is cancelled (`heartbeat_expired`). A grant never expires; only `release`
+ends it.
+
+`acquire` exits 0 when granted, 75 while still waiting, and 1 on an error or when its id
+has already ended. JSON output gives the state, `position`, and the ids `ahead` in the
+queue. After `acquire` it also gives the facts the decision used and why the head of the
+queue is blocked: `facts_unknown`, `key_held`, `ledger_cpu`, `ledger_ram`, `live_cpu`, or
+`live_ram`.
+
 ## Benchmark mode
 
 `remrun bench` is implemented. It runs the command locally unless `--no-local` is

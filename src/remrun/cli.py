@@ -24,8 +24,8 @@ from .bootstrap import (
     validate_managed_command,
 )
 from .config import (
-    load_config, load_project_config, load_retention, offload_policy, offload_threshold,
-    scheduler_config,
+    admission_settings, load_config, load_project_config, load_retention, offload_policy,
+    offload_threshold, scheduler_config,
 )
 from .gitsync import HOOK_BEGIN, GitSyncError
 from .isolated import (
@@ -112,7 +112,7 @@ from .transport import (
 
 KNOWN_COMMANDS = {
     "capabilities", "devices", "doctor", "plan", "run", "status", "logs", "clean", "bench", "sync",
-    "git-sync", "runner", "action", "resolve-unknown", "resume", "observe", "cancel",
+    "git-sync", "runner", "action", "resolve-unknown", "resume", "observe", "cancel", "admit",
 }
 
 # Exit codes (see docs/AGENT_OUTPUT_SPEC.md).
@@ -123,6 +123,8 @@ EXIT_TRANSFER = 3
 EXIT_INFRA = 4
 EXIT_GUARD = 5
 EXIT_CANCELLED = 130
+# `admit acquire`: the request is recorded and queued, not granted (sysexits EX_TEMPFAIL).
+EXIT_ADMISSION_WAITING = 75
 # How long a durable wait keeps retrying a failed status read (an SSH drop, a
 # sleeping laptop's network coming back) before it stops waiting and reports the
 # run as detached. Reads are read-only, so retrying is always safe.
@@ -276,6 +278,16 @@ def _wait_seconds(value: str) -> float:
     return result
 
 
+def _ram_gib_as_mib(value: str) -> int:
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative number of GiB") from exc
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative number of GiB")
+    return math.ceil(result * 1024)
+
+
 def _add_transfer_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--transfer", choices=TRANSFER_MODES,
@@ -366,6 +378,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_git_sync(args, reporter)
         if args.command_name == "runner":
             return cmd_runner(args, reporter)
+        if args.command_name == "admit":
+            return cmd_admit(args, reporter)
         if args.command_name == "action":
             return cmd_action(args, reporter)
         if args.command_name == "resolve-unknown":
@@ -576,6 +590,41 @@ def build_parser() -> argparse.ArgumentParser:
         rp = runner_sub.add_parser(action)
         rp.add_argument("device")
         rp.add_argument("--json", action="store_true")
+
+    p = sub.add_parser(
+        "admit", help="Queue for, hold, and release shared compute on a device",
+    )
+    admit_sub = p.add_subparsers(dest="admit_command", required=True)
+    ap = admit_sub.add_parser(
+        "acquire", help="Queue a request, or replay one; exit 0 granted, 75 still waiting",
+    )
+    ap.add_argument("--device", required=True)
+    ap.add_argument("--project", required=True, help="root project the work belongs to")
+    ap.add_argument("--thread", required=True, help="agent thread that owns the request")
+    ap.add_argument("--logical-thread", default="",
+                    help="logical work stream the request belongs to (default: --thread)")
+    ap.add_argument("--cpu", type=int, default=0, metavar="N", help="cores to hold")
+    ap.add_argument("--ram-gib", dest="ram_mib", type=_ram_gib_as_mib, default=0,
+                    metavar="G", help="RAM to hold, in GiB")
+    ap.add_argument("--key", action="append", default=[], metavar="K",
+                    help="capacity-one resource key to hold, e.g. pool/gpu (repeatable)")
+    ap.add_argument("--device-bound", action="store_true",
+                    help="the work needs something only this device has")
+    ap.add_argument("--critical", action="store_true",
+                    help="the work is on a blocked critical path")
+    ap.add_argument("--label", default="")
+    ap.add_argument("--request-id", help="idempotency key; default: a new random id")
+    ap.add_argument("--wait", type=_wait_seconds, default=0.0, metavar="SECONDS",
+                    help="keep the request alive and retry until granted or SECONDS pass")
+    ap.add_argument("--json", action="store_true")
+    for action, text in (("status", "Show one request"), ("release", "End a grant"),
+                         ("cancel", "Withdraw a waiting request")):
+        ap = admit_sub.add_parser(action, help=text)
+        ap.add_argument("request_id")
+        ap.add_argument("--json", action="store_true")
+    ap = admit_sub.add_parser("list", help="Show granted and waiting requests in queue order")
+    ap.add_argument("--device")
+    ap.add_argument("--json", action="store_true")
 
     return parser
 
@@ -817,6 +866,71 @@ def cmd_runner(args: argparse.Namespace, reporter: Reporter) -> int:
     if args.json:
         print(json.dumps(info.as_dict(), indent=2, sort_keys=True))
     return EXIT_OK
+
+
+def cmd_admit(args: argparse.Namespace, reporter: Reporter) -> int:
+    """Controller-local admission ledger; see docs/SCHEDULING_AND_TELEMETRY.md."""
+    from .admission import (
+        AdmissionError, AdmissionLedger, AdmissionRequest, acquire_waiting, probe_device_facts,
+    )
+
+    config = load_config()
+    with AdmissionLedger(default_state_root(), **admission_settings(config)) as ledger:
+        if args.admit_command == "list":
+            documents = ledger.list_requests(args.device)
+            if args.json:
+                emit_json_document(
+                    {"schema": "remrun.admission-list", "version": 1, "requests": documents}
+                )
+            else:
+                for document in documents:
+                    print(_admission_line(document))
+            return EXIT_OK
+        if args.admit_command == "acquire":
+            device = config.devices.get(args.device)
+            if device is None:
+                raise AdmissionError(f"unknown device {args.device!r}")
+            request = AdmissionRequest(
+                request_id=args.request_id or secrets.token_hex(16), device=args.device,
+                root_project=args.project, owner_thread=args.thread,
+                logical_thread=args.logical_thread, label=args.label, cpu_cores=args.cpu,
+                ram_mib=args.ram_mib, keys=tuple(args.key), device_bound=args.device_bound,
+                critical=args.critical,
+            )
+            document = acquire_waiting(
+                ledger, request, lambda: probe_device_facts(device), wait_seconds=args.wait,
+            )
+        else:
+            action = {"status": ledger.status, "release": ledger.release,
+                      "cancel": ledger.cancel}[args.admit_command]
+            document = action(args.request_id)
+    if args.json:
+        emit_json_document(document)
+    else:
+        print(_admission_line(document))
+    if args.admit_command != "acquire" or document["state"] == "granted":
+        return EXIT_OK
+    if document["state"] == "waiting":
+        return EXIT_ADMISSION_WAITING
+    reporter.event(
+        "admission_ended", request_id=document["request_id"], state=document["state"],
+        reason=document["end_reason"], message="this request id is spent; acquire with a new one",
+    )
+    return EXIT_INTERNAL
+
+
+def _admission_line(document: dict) -> str:
+    fields = [document["request_id"], document["state"], document["device"],
+              document["root_project"]]
+    if document["position"] is not None:
+        fields.append(f"position={document['position']}")
+        fields.append(f"ahead={','.join(document['ahead']) or '-'}")
+    blocked = (document.get("promotion") or {}).get("blocked")
+    if document["state"] == "waiting" and blocked:
+        fields.append(f"head_blocked={blocked['reason']}")
+    if document["end_reason"]:
+        fields.append(f"reason={document['end_reason']}")
+    return "\t".join(fields)
 
 
 def _candidate_probe_entry(device, sched: dict) -> dict:

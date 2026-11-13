@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import platform
 import tomllib
@@ -326,6 +327,27 @@ def work_min_free_fraction(config: RemrunConfig) -> float:
             f"including) 1; got {value!r}"
         )
     return float(value)
+
+
+def admission_settings(config: RemrunConfig) -> dict[str, float]:
+    """``[admission]`` as keyword arguments for ``AdmissionLedger``.
+
+    Both keys are required: a missing or malformed value raises rather than defaulting.
+    """
+    section = config.defaults.get("admission")
+    if not isinstance(section, dict) or set(section) != {"settle_seconds", "wait_ttl_seconds"}:
+        raise ValueError(
+            "defaults.toml [admission] must set exactly settle_seconds and wait_ttl_seconds"
+        )
+    settings: dict[str, float] = {}
+    for key, allow_zero in (("settle_seconds", True), ("wait_ttl_seconds", False)):
+        value = section[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero)):
+            bound = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"[admission] {key} must be a {bound} number; got {value!r}")
+        settings[key] = float(value)
+    return settings
 
 
 def large_file_warn_bytes(config: RemrunConfig) -> int:

@@ -148,6 +148,17 @@ heavy_job_seconds = 300
 offload_bias = 1.25
 one_unknown_writer_per_project = true
 
+# Shared admission (`remrun admit`): a controller-local queue per device that decides
+# whose heavy work starts next. See docs/SCHEDULING_AND_TELEMETRY.md, "Shared admission".
+[admission]
+# A grant younger than this, measured from just before a probe, is pending: the probe
+# may not show its load yet, so its CPU and RAM come off the live offer.
+settle_seconds = 60
+# A waiting request whose holder has not renewed it (an acquire replay, or `--wait`
+# polling) within this many seconds is cancelled. It held nothing, so only its place in
+# the queue is lost. A grant never expires on a timer; only release ends it.
+wait_ttl_seconds = 300
+
 # Retention is ACTIVE: after each run remrun prunes its own state folder
 # (%LOCALAPPDATA%\remrun on Windows, ~/.local/state/remrun on POSIX). Per run it
 # stores a small summary.json, three manifest snapshots (~0.2 KB per tracked

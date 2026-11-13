@@ -153,6 +153,9 @@ The process exit code should be:
 N     remote command's exit code, when command ran and remrun could collect status
 ```
 
+`remrun admit acquire` runs no command: it exits 0 when the request is granted, 75 while it
+is still waiting, and 1 on an error or when the request id has already ended.
+
 If the remote command exits nonzero, `remrun` should still try to pull logs and changed files unless configured not to.
 
 For a guarded device, remrun emits `command_dispatch` before the protected helper
