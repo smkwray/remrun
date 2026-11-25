@@ -36,11 +36,6 @@ queue, launch, or service mutation:
 feature promotion increment the protocol minor. Removing or changing a field, type, stable status,
 or stable enum meaning requires a new protocol major.
 
-The initial protocol 1.0 document honestly reports controller-local queue coordination. It does
-not promise fleet-global ordering, global idempotency, cross-target exactly-once execution,
-target-owned recovery, prepared tasks, target-fenced admission, durable fleet launch, or service
-sessions.
-
 An internal failure after parsing writes one compact `remrun.error` version 1 document to stderr,
 writes nothing to stdout, and exits 1. Argparse usage errors retain argparse text and exit 2.
 
@@ -56,8 +51,6 @@ remrun: running command="Rscript do/tmp/test.R"
 remrun: exit_code=0 duration_sec=123.4 post_pull=7
 ```
 
-Keep these concise and avoid changing field names casually.
-
 ## JSON mode
 
 With `--json`, emit newline-delimited JSON events to stderr:
@@ -72,13 +65,13 @@ With `--json`, emit newline-delimited JSON events to stderr:
 {"event":"summary","run_id":"...","exit_code":0,"files_pushed":1,"files_pulled_post":7}
 ```
 
-Remote command output should remain passthrough unless `--capture-only` is set.
+Remote command output uses the normal stdout and stderr streams.
 
 In `remrun fleet plan --json`, each `batches[].jobs` value is a zero-based index into the input
 task list for that plan invocation. It is not a durable queue job ID. `makespan_s` is the planner’s
 top-level estimate. A batch with no honest estimate has `estimated_finish_s=null`, a non-null
 `estimate_reason`, and a `selection_basis` explaining why that target was selected; any such batch
-requires top-level `makespan_s=null`. Never display null as zero. The owner-facing wording is
+requires top-level `makespan_s=null`. Never display null as zero. The displayed message is
 `Uncalibrated placement; no duration estimate.` for an uncalibrated cold start.
 
 With `--save`, a completely placeable plan also returns `plan_id` and `plan_digest`; its
@@ -94,7 +87,7 @@ when a non-binding live placement hint is worth the extra device probes; then `r
 `true` and the route fields are included. The dispatcher still makes the authoritative placement
 when it claims queued work.
 
-Every durable submit now returns `submission_id`, ordered `job_ids`, ordered
+Every durable submit returns `submission_id`, ordered `job_ids`, ordered
 `prepared_ids`, and the optional caller `request_id` or saved `plan_id`. Use
 `fleet status --submission`, `--request-id`, or repeatable `--job` for exact lookup; do not
 scan the recent tail. `fleet dispatch --submission` or `--request-id` drains only those
@@ -127,7 +120,7 @@ part of this public receipt.
 
 ## Final summary
 
-Every run should have a final summary object in the local run journal. If `--summary-json` is requested, print it as the final JSON event.
+Completed runs record their result in the local run journal. In JSON event mode, read the `summary` event for the final exit code.
 
 ## Exit codes
 

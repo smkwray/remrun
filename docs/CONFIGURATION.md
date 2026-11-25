@@ -1,4 +1,4 @@
-# Configuration design
+# Configuration
 
 ## Global synced config
 
@@ -41,7 +41,7 @@ os = "windows"
 # a .ps1 wrapper that accepts positional data, or an explicit pwsh -Command.
 shell = "pwsh"
 address_candidates = ["winbox.local", "winbox"]
-project_root = "C:\\Users\\you\\projects"
+project_root = "C:\\projects"
 state_root = "~\\AppData\\Local\\remrun\\state"
 tags = ["windows", "x64", "fallback"]
 max_jobs = 2
@@ -395,18 +395,6 @@ They apply to project runs (`run`, `plan`, `bench`), after `defaults.toml`
 key this table accepts; any other key, or a value that is not a list of non-empty pattern
 strings, is a configuration error. Named `remrun sync` trees use only `global_exclude`.
 
-## Machine-local overrides
-
-Future support should allow non-synced or ignored local overrides:
-
-```text
-config/local.macbox.toml
-config/local.winbox.toml
-config/local.<current-hostname>.toml
-```
-
-Use for secrets, usernames, nonportable paths, and experimental settings.
-
 ## Project config
 
 Optional project config lives in:
@@ -460,13 +448,12 @@ or `role`. Unified-memory devices report shared system RAM, not invented VRAM.
 
 ## Config precedence
 
-Recommended merge order:
+Configuration sources, from lowest to highest precedence:
 
 ```text
 built-in defaults
 config/defaults.toml
 config/devices.toml
-config/local.<device>.toml
 project do/remrun/remrun.toml
 CLI flags
 ```

@@ -212,15 +212,6 @@ Propagate deletions only when remrun has previous manifest evidence.
 Back up before applying command-caused deletions locally.
 ```
 
-Potential strict flags:
-
-```bash
-remrun run --strict-delete macbox -- <command>
-remrun run --mirror macbox -- <command>
-```
-
-These are future modes and should not be default.
-
 ## Active run surface
 
 Default active surface:
@@ -271,30 +262,6 @@ with `--allow-large-push`, or raise either key in the project's `[transfer]` tab
 `remrun plan --probe` reports the push a target would get (`push` in `--json`) and whether
 the run would be refused.
 
-## Large files
-
-Large files should be handled carefully:
-
-```text
-small source/scripts: push/pull freely
-medium outputs: push/pull normally
-large raw data: prefer must-exist-on-remote policies
-large caches: exclude
-large generated outputs: pull if included, warn if above threshold
-```
-
-Future project config can define data policies:
-
-```toml
-[data.raw]
-path = "data/raw"
-policy = "must_exist_on_remote"
-
-[data.cache]
-path = "data/cache"
-policy = "never_copy"
-```
-
 ## Manifest comparison
 
 Use a staged comparison:
@@ -308,8 +275,6 @@ hash conflicted same-path files before declaring conflict
 Store manifests outside the project tree. Previous manifests allow safe delete detection and smarter remote-newer classification.
 
 ## Conflict handling
-
-Conflicts should be explicit and agent-friendly.
 
 Before running:
 
@@ -329,5 +294,3 @@ if remote output path changed but local path also changed during run:
   save remote version outside project tree
   report conflict
 ```
-
-Do not create synthetic conflict files inside the project tree unless the user later requests that mode.

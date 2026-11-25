@@ -110,7 +110,6 @@ prefer = "winbox"
 [[placement.rules]]
 match_command = "bootstrap|simulation|monte"
 prefer = "macbox"
-min_memory_gb = 64
 ```
 
 ## Opt-in resource workloads
@@ -163,34 +162,6 @@ versioned JSON documents are limited to 64 KiB.
 The context reports unavailable measurements as `null`, not zero. Unified-memory
 GPUs never receive fabricated VRAM totals, free-memory figures, or VRAM budgets;
 system available RAM remains the shared memory constraint.
-
-## Transfer/data policies
-
-```toml
-[transfer]
-exclude = [
-  "scratch/**",
-  "results/cache/**",
-  "logs/huge/**"
-]
-
-[data.raw]
-path = "data/raw"
-policy = "must_exist_on_remote"
-
-[data.cache]
-path = "data/cache"
-policy = "never_copy"
-```
-
-Policy meanings:
-
-```text
-normal                included in active run surface
-never_copy            exclude from remrun transfer
-must_exist_on_remote  do not copy, but preflight should verify path exists on target
-sync_later            exclude from immediate pullback; rely on background sync or explicit command
-```
 
 ## Write scopes
 

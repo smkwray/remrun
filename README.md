@@ -112,7 +112,7 @@ ruff check src tests
 - [docs/TRANSFER_MODEL.md](docs/TRANSFER_MODEL.md): reconciliation, conflicts and transfer modes
 - [docs/SCHEDULING_AND_TELEMETRY.md](docs/SCHEDULING_AND_TELEMETRY.md): automatic placement and shared admission
 - [docs/AGENT_OUTPUT_SPEC.md](docs/AGENT_OUTPUT_SPEC.md): output format and exit codes
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/REMOTE_PROTOCOL.md](docs/REMOTE_PROTOCOL.md), [docs/TARGET_RESOURCE_PROTOCOL.md](docs/TARGET_RESOURCE_PROTOCOL.md): design notes
+- [docs/TARGET_RESOURCE_PROTOCOL.md](docs/TARGET_RESOURCE_PROTOCOL.md): target resource reservations and durable launches
 
 ## License
 
