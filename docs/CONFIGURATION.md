@@ -17,7 +17,7 @@ config/devices.example.toml
 config/devices.toml       # private, ignored
 ```
 
-This config is safe to sync as long as it does not contain secrets. Tailscale IPs are not generally secrets, but they are personal infrastructure details and should be removed before public release.
+This config is safe to sync as long as it does not contain secrets. Device addresses such as Tailscale IPs are not secrets, but they describe your private network: keep them in the ignored `config/devices.toml`, not in a published repository.
 
 ## Example devices
 
