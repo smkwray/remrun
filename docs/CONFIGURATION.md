@@ -69,6 +69,31 @@ tailscale_ip = "100.x.y.z"
 address_candidates = ["100.x.y.z", "macbox.local"]
 ```
 
+## Device settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `kind` | `ssh-posix` | `ssh-posix` (macOS, Linux), `ssh-powershell` (Windows) or `local-sim` (this machine, for trying remrun without SSH) |
+| `os` | | `macos`, `windows`, or another value for Linux and other systems |
+| `address_candidates` | | SSH hosts or aliases, tried in order; put the one that authenticates first |
+| `tailscale_ip` | | An address tried before the candidates |
+| `user`, `ssh_opts` | | SSH user name and extra `ssh` options |
+| `project_root` | | Where projects live on the device; a project runs at the same relative path under it |
+| `state_root`, `cache_root` | | remrun's own folders on the device (locks, durable runs, work trees, fleet staging) |
+| `remote_python` | `python3` | Python interpreter on the device; set `python` on Windows if that is its name |
+| `shell`, `login_shell` | `bash`, `true` | POSIX commands run through `bash -lc` so `PATH` matches a login; Windows targets need `shell = "pwsh"` |
+| `path`, `[devices.<name>.env]` | | Folders prepended to `PATH`, and environment variables, for every command; useful on Windows, which has no login shell |
+| `venv_root` | | Base folder for external per-project virtual environments; required by `[run.bootstrap]` |
+| `enabled`, `allow_explicit_run`, `automatic_placement` | `true`, `false`, `true` | Placement switches; see above |
+| `observe_jobs` | `false` | Register runs so `fleet jobs` can see them |
+| `max_jobs` | `1` | Most jobs the device takes at once in fleet placement, and the cap on memory-guard leases |
+| `perf_cores`, `eff_cores`, `ram_gb`, `vram_gb`, `tags` | | Hardware hints for placement and display |
+
+A `local-sim` device needs absolute `project_root` and `state_root` paths; it runs the
+command on this machine against a separate copy of the project under its own
+`project_root`. Tables such as `memory_guard`, `resource_policy`, `cancel` and
+`actions` are described below and in [USAGE.md](USAGE.md).
+
 ## Per-device hard memory guard
 
 A POSIX device can opt into the strict relative memory boundary:

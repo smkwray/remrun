@@ -8,6 +8,10 @@ When useful, place config at:
 <project>/do/remrun/remrun.toml
 ```
 
+In a linked Git worktree (allowed with `REMRUN_ALLOW_WORKTREE=1`), a config inside the
+worktree wins. Without one, remrun reads the main checkout's file in place; it does not
+copy it into the worktree.
+
 ## Minimal example
 
 ```toml
@@ -29,6 +33,24 @@ preflight would push more than either refuses before transferring anything (exit
 max_push_files = 50000
 max_push_mb = 20000
 ```
+
+## Virtual environments and environment variables
+
+```toml
+[run]
+use_venv = true
+
+[env]
+OMP_NUM_THREADS = "4"      # set for every command in this project
+```
+
+With `use_venv = true`, remrun uses a project-local `<project>/.venv` on each device by
+default: it puts the environment's `bin/` (`Scripts\` on Windows) first on `PATH` and sets
+`VIRTUAL_ENV`. The `.venv` holds platform-specific files, so it stays on each device and is
+never transferred. `venv_layout = "external"` uses a folder named after the project
+under the device's `venv_root` instead (`venv_name` overrides the name), and a `[run.venv]`
+table pins a path per device. A project that declares `[run.bootstrap]` has stricter
+rules, below.
 
 ## Opt-in target environment bootstrap
 
@@ -186,7 +208,7 @@ paths = ["results/spec_b/**", "logs/spec_b/**"]
 Use them with:
 
 ```bash
-remrun run --scope spec_a --auto -- Rscript do/spec_a.R
+remrun run --scope spec_a --auto -- Rscript spec_a.R
 ```
 
 Scoped and unscoped runs currently serialize per project. The scope narrows

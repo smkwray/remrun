@@ -63,6 +63,16 @@ run keeps its own completion fence; it still refuses while an ordinary run of th
 project has unknown completion. An ordinary run refuses a target named by any live
 untransferred fence of the project (`target-busy-untransferred`, candidate-local).
 
+Use it when the target already holds the code and data and you want several long jobs of
+one project to run at once, or the project is too large to scan on every run. It works
+with `--durable`, `--auto` and `--label`, but not with `--scope` or a resource workload.
+The checkout, including the directory you run from, must already exist on the target;
+remrun never creates or changes files in it. Outputs stay on the target, where a sync tool
+or a later ordinary run picks them up. The verified digests are recorded under `verify` in
+the run's `summary.json`. A project that declares `[run.bootstrap]` must already be set up
+on the target, so make one ordinary run there first. `--transfer safe` gives one run the
+ordinary behavior when `[transfer] mode = "none"` is the default.
+
 ## Mode `commit`: a clean HEAD in a private tree
 
 `--transfer commit --output PATH [--input PATH]` runs the committed `HEAD` in
@@ -140,6 +150,22 @@ conflict copy (each `postrun_conflict` event gives its path) or from the retaine
 `remrun resolve-unknown RUN_ID --confirmed-ended`. Leased paths are compared ignoring
 case and Unicode normalization.
 
+Requirements and limits: the target needs `git` on its `PATH`, and the project root must
+be the top level of its Git repository. Submodules are refused, and Git LFS content is not
+fetched. Commit runs work with `--durable`, `--auto`, `--label`, `resume` and `cancel`, but
+not with `--scope`, `--no-pullback`, `--verify` or a resource workload. A clean commit run
+updates the learned job costs.
+
+A kept tree records its reason in `summary.json` (`work.state = "retained"`). The next
+commit run from this controller to that target removes kept trees older than
+`[logging] failed_log_retention_days`, and `resume` or the next commit run retries a
+removal that failed. remrun only ever removes `<state_root>/work/<id>`.
+
+The command runs in `tree/<your relative directory>` with the target's usual virtual
+environment for the project, so a declared `[run.bootstrap]` must already be ready there;
+a commit run never runs setup. Code imported through an editable install may come from the
+target's checkout rather than the commit; put `src` first on the import path to be sure.
+
 Ordinary runs ignore commit fences: a commit run never touches the target's checkout.
 On the controller, the run phases that write into a project's local tree (an ordinary
 run's preflight and pullback, including a durable run's finalization, and a commit run's
@@ -209,6 +235,12 @@ Default global excludes are in `config/defaults.toml`.
 
 Do not use `.gitignore` as the default exclude list. Many outputs are gitignored but still important.
 
+The global excludes cover version control, virtual environments, language caches and
+conventional build caches such as `dist/` and `target/`. `build/` stays included, because
+build commands often put their requested product there. Lockfiles such as `uv.lock`,
+`Cargo.lock` and `renv.lock` are included too. `config/devices.toml` may add
+deployment-wide `[transfer] exclude` patterns ([CONFIGURATION.md](CONFIGURATION.md)).
+
 ## Project-specific excludes
 
 A project can narrow the active surface:
@@ -227,6 +259,17 @@ exclude = [
 ```
 
 These paths are ignored by remrun's active reconciliation. Syncthing or project-specific tooling may still handle them.
+
+## Push guard
+
+Before transferring anything, preflight refuses a push of more than
+`[transfer] max_push_files` files or `max_push_mb` MB (defaults in `config/defaults.toml`:
+10,000 files and 4,096 MB). It exits 5 with `phase = "preflight"` and a `push_guard`
+record listing the directories with the most files and bytes. Usually the fix is a project
+exclude for a scratch or cache tree. For a legitimate first sync of a large project, rerun
+with `--allow-large-push`, or raise either key in the project's `[transfer]` table.
+`remrun plan --probe` reports the push a target would get (`push` in `--json`) and whether
+the run would be refused.
 
 ## Large files
 
